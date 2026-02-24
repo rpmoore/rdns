@@ -5,5 +5,6 @@ use crate::dns::Message;
 fn main()
 {
     println!("Hello, world!");
-    let _r = Message {};
+    let dns_message = [0u8; 12];
+    let _r = Message::new(&dns_message);
 }
