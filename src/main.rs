@@ -1,6 +1,4 @@
-mod dns;
-
-use crate::dns::Message;
+use rdns::dns::Message;
 
 fn main()
 {

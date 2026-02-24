@@ -362,21 +362,27 @@ impl <'a> Message<'a> {
         let header = Header { dns_header: &dns_message[0..DNS_HEADER_LEN] };
 
         // parse all the questions
-        let (questions, _offset) = parse_questions(&dns_message[DNS_HEADER_LEN..], header.qd_count());
+        let (questions, questions_len) = parse_questions(&dns_message[DNS_HEADER_LEN..], header.qd_count());
+        let mut offset = DNS_HEADER_LEN + questions_len;
 
         // parse all the answers
+        let (answers, answers_len) = parse_records(&dns_message[offset..], header.an_count());
+        offset += answers_len;
 
         // parse all the authorities
+        let (authorities, authorities_len) = parse_records(&dns_message[offset..], header.ns_count());
+        offset += authorities_len;
 
         // parse all the additionals
+        let (additionals, _) = parse_records(&dns_message[offset..], header.ar_count());
 
         Message {
             header,
             dns_message,
             questions,
-            answers: None,
-            authorities: None,
-            additionals: None,
+            answers: if answers.is_empty() { None } else { Some(answers) },
+            authorities: if authorities.is_empty() { None } else { Some(authorities) },
+            additionals: if additionals.is_empty() { None } else { Some(additionals) },
         }
         // will probably want to parse the dns_message to extract the questions and answers
     }
@@ -568,6 +574,21 @@ mod tests {
         let pointer = 0b1100_0000 | ((offset >> 8) as u8 & 0b0011_1111);
         out.push(pointer);
         out.push((offset & 0xff) as u8);
+    }
+
+    fn push_header(out: &mut Vec<u8>, qd: u16, an: u16, ns: u16, ar: u16) {
+        push_u16(out, 0x1234);
+        push_u16(out, 0x0100);
+        push_u16(out, qd);
+        push_u16(out, an);
+        push_u16(out, ns);
+        push_u16(out, ar);
+    }
+
+    fn push_record(out: &mut Vec<u8>, name: &str, rtype: u16, ttl: u32, rdata: &[u8]) {
+        push_name(out, name);
+        build_record_header(out, rtype, rdata.len() as u16, ttl);
+        out.extend_from_slice(rdata);
     }
 
     #[test]
@@ -930,6 +951,178 @@ mod tests {
             assert!(signature.is_empty());
         } else {
             panic!("expected RRSIG record");
+        }
+    }
+
+    #[test]
+    fn parse_message_sections() {
+        let mut message = Vec::new();
+        push_header(&mut message, 1, 1, 1, 1);
+
+        push_name(&mut message, "example.com");
+        push_u16(&mut message, 1);
+        push_u16(&mut message, 1);
+
+        let a_rdata = [1, 2, 3, 4];
+        push_record(&mut message, "example.com", 1, 300, &a_rdata);
+
+        let mut ns_rdata = Vec::new();
+        push_name(&mut ns_rdata, "ns1.example.com");
+        push_record(&mut message, "example.com", 2, 300, &ns_rdata);
+
+        let aaaa_rdata = [
+            0x20, 0x01, 0x0d, 0xb8,
+            0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x01,
+        ];
+        push_record(&mut message, "ns1.example.com", 28, 300, &aaaa_rdata);
+
+        let parsed = Message::new(&message);
+        assert_eq!(parsed.questions.len(), 1);
+        assert_eq!(parsed.answers.as_ref().unwrap().len(), 1);
+        assert_eq!(parsed.authorities.as_ref().unwrap().len(), 1);
+        assert_eq!(parsed.additionals.as_ref().unwrap().len(), 1);
+
+        assert_eq!(parsed.questions[0].qname, "example.com");
+        assert_eq!(parsed.questions[0].qtype, 1);
+
+        if let RecordData::A(addr) = &parsed.answers.as_ref().unwrap()[0].record {
+            assert_eq!(*addr, Ipv4Addr::new(1, 2, 3, 4));
+        } else {
+            panic!("expected A answer");
+        }
+
+        if let RecordData::NS(name) = &parsed.authorities.as_ref().unwrap()[0].record {
+            assert_eq!(name, "ns1.example.com");
+        } else {
+            panic!("expected NS authority");
+        }
+
+        if let RecordData::AAAA(addr) = &parsed.additionals.as_ref().unwrap()[0].record {
+            assert_eq!(*addr, Ipv6Addr::new(0x2001, 0x0db8, 0, 0, 0, 0, 0, 1));
+        } else {
+            panic!("expected AAAA additional");
+        }
+    }
+
+    #[test]
+    fn parse_message_multiple_records() {
+        let mut message = Vec::new();
+        push_header(&mut message, 1, 2, 2, 2);
+
+        push_name(&mut message, "example.com");
+        push_u16(&mut message, 1);
+        push_u16(&mut message, 1);
+
+        let a_rdata = [1, 2, 3, 4];
+        push_record(&mut message, "example.com", 1, 300, &a_rdata);
+
+        let aaaa_rdata = [
+            0x20, 0x01, 0x0d, 0xb8,
+            0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x01,
+        ];
+        push_record(&mut message, "example.com", 28, 300, &aaaa_rdata);
+
+        let mut ns_rdata = Vec::new();
+        push_name(&mut ns_rdata, "ns1.example.com");
+        push_record(&mut message, "example.com", 2, 300, &ns_rdata);
+
+        let mut ns2_rdata = Vec::new();
+        push_name(&mut ns2_rdata, "ns2.example.com");
+        push_record(&mut message, "example.com", 2, 300, &ns2_rdata);
+
+        let mx_rdata = {
+            let mut rdata = Vec::new();
+            push_u16(&mut rdata, 10);
+            push_name(&mut rdata, "mail.example.com");
+            rdata
+        };
+        push_record(&mut message, "example.com", 15, 300, &mx_rdata);
+
+        let a2_rdata = [5, 6, 7, 8];
+        push_record(&mut message, "mail.example.com", 1, 300, &a2_rdata);
+
+        let parsed = Message::new(&message);
+        assert_eq!(parsed.questions.len(), 1);
+        assert_eq!(parsed.answers.as_ref().unwrap().len(), 2);
+        assert_eq!(parsed.authorities.as_ref().unwrap().len(), 2);
+        assert_eq!(parsed.additionals.as_ref().unwrap().len(), 2);
+
+        let answers = parsed.answers.as_ref().unwrap();
+        if let RecordData::A(addr) = &answers[0].record {
+            assert_eq!(*addr, Ipv4Addr::new(1, 2, 3, 4));
+        } else {
+            panic!("expected A answer");
+        }
+        if let RecordData::AAAA(addr) = &answers[1].record {
+            assert_eq!(*addr, Ipv6Addr::new(0x2001, 0x0db8, 0, 0, 0, 0, 0, 1));
+        } else {
+            panic!("expected AAAA answer");
+        }
+
+        let authorities = parsed.authorities.as_ref().unwrap();
+        if let RecordData::NS(name) = &authorities[0].record {
+            assert_eq!(name, "ns1.example.com");
+        } else {
+            panic!("expected NS authority");
+        }
+        if let RecordData::NS(name) = &authorities[1].record {
+            assert_eq!(name, "ns2.example.com");
+        } else {
+            panic!("expected NS authority");
+        }
+
+        let additionals = parsed.additionals.as_ref().unwrap();
+        if let RecordData::MX { preference, exchange } = &additionals[0].record {
+            assert_eq!(*preference, 10);
+            assert_eq!(exchange, "mail.example.com");
+        } else {
+            panic!("expected MX additional");
+        }
+        if let RecordData::A(addr) = &additionals[1].record {
+            assert_eq!(*addr, Ipv4Addr::new(5, 6, 7, 8));
+        } else {
+            panic!("expected A additional");
+        }
+    }
+
+    #[test]
+    fn parse_message_with_compressed_names() {
+        let mut message = Vec::new();
+        push_header(&mut message, 1, 2, 0, 0);
+
+        push_name(&mut message, "example.com");
+        push_u16(&mut message, 1);
+        push_u16(&mut message, 1);
+
+        let a_rdata = [1, 2, 3, 4];
+        push_record(&mut message, "example.com", 1, 300, &a_rdata);
+
+        let mut cname_rdata = Vec::new();
+        // Pointer offsets are relative to the current records slice in this parser.
+        push_pointer(&mut cname_rdata, 0);
+        push_name(&mut message, "alias.example.com");
+        build_record_header(&mut message, 5, cname_rdata.len() as u16, 300);
+        message.extend_from_slice(&cname_rdata);
+
+        let parsed = Message::new(&message);
+        assert_eq!(parsed.questions.len(), 1);
+        assert_eq!(parsed.answers.as_ref().unwrap().len(), 2);
+
+        let answers = parsed.answers.as_ref().unwrap();
+        if let RecordData::A(addr) = &answers[0].record {
+            assert_eq!(*addr, Ipv4Addr::new(1, 2, 3, 4));
+        } else {
+            panic!("expected A answer");
+        }
+
+        if let RecordData::CNAME(name) = &answers[1].record {
+            assert_eq!(name, "example.com");
+        } else {
+            panic!("expected CNAME answer");
         }
     }
 }
