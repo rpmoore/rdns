@@ -1,4 +1,4 @@
-use rdns::dns::Message;
+use rdns::protocol::Message;
 
 fn main()
 {
