@@ -1,15 +1,22 @@
 use std::io;
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicU16, Ordering};
-use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::process;
+use std::sync::atomic::{AtomicU16, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::TcpStream;
 use tokio::net::UdpSocket;
-use tokio::time;
+use tokio::time::{self, Instant};
 
-use crate::config::{UpstreamConfig, UpstreamProtocol};
-use crate::protocol::{rewrite_response_id, Message};
+use crate::config::{RuntimeConfig, UpstreamConfig, UpstreamProtocol};
+use crate::protocol::{encode_tcp_frame, rewrite_response_id, Message};
 use crate::resolver::{UpstreamError, UpstreamRequest, UpstreamResolver, UpstreamResponse};
+
+const DEGRADED_FAILURE_THRESHOLD: u32 = 2;
+const SPLITMIX_INCREMENT: u64 = 0x9e37_79b9_7f4a_7c15;
+const MAX_TCP_MESSAGE_SIZE: usize = u16::MAX as usize;
 
 pub trait TransactionIdGenerator: Send + Sync {
     fn next_id(&self) -> u16;
@@ -41,16 +48,70 @@ impl TransactionIdGenerator for MonotonicTransactionIdGenerator {
     }
 }
 
+pub struct MixedTransactionIdGenerator {
+    state: AtomicU64,
+}
+
+impl MixedTransactionIdGenerator {
+    pub fn new(seed: u64) -> Self {
+        Self {
+            state: AtomicU64::new(seed),
+        }
+    }
+
+    pub fn seeded_from_environment() -> Self {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|duration| {
+                let nanos = duration.as_nanos();
+                (nanos as u64) ^ ((nanos >> 64) as u64)
+            })
+            .unwrap_or(0);
+        let process_seed = u64::from(process::id()) << 32;
+        Self::new(now ^ process_seed ^ SPLITMIX_INCREMENT)
+    }
+}
+
+impl TransactionIdGenerator for MixedTransactionIdGenerator {
+    fn next_id(&self) -> u16 {
+        let state = self.state.fetch_add(SPLITMIX_INCREMENT, Ordering::Relaxed);
+        splitmix64(state) as u16
+    }
+}
+
+fn splitmix64(value: u64) -> u64 {
+    let mut mixed = value.wrapping_add(SPLITMIX_INCREMENT);
+    mixed = (mixed ^ (mixed >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+    mixed = (mixed ^ (mixed >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+    mixed ^ (mixed >> 31)
+}
+
 pub struct UdpUpstreamResolver {
-    upstream: UpstreamConfig,
+    upstreams: Vec<UpstreamConfig>,
     id_generator: Arc<dyn TransactionIdGenerator>,
+    per_query_deadline: Duration,
+    health: Vec<Mutex<UpstreamHealth>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UpstreamHealthSnapshot {
+    pub name: String,
+    pub endpoint: SocketAddr,
+    pub consecutive_failures: u32,
+    pub degraded: bool,
+}
+
+#[derive(Debug, Clone, Default)]
+struct UpstreamHealth {
+    consecutive_failures: u32,
+    degraded: bool,
 }
 
 impl UdpUpstreamResolver {
     pub fn new(upstream: UpstreamConfig) -> Self {
         Self::with_id_generator(
             upstream,
-            Arc::new(MonotonicTransactionIdGenerator::seeded_from_time()),
+            Arc::new(MixedTransactionIdGenerator::seeded_from_environment()),
         )
     }
 
@@ -58,48 +119,135 @@ impl UdpUpstreamResolver {
         upstream: UpstreamConfig,
         id_generator: Arc<dyn TransactionIdGenerator>,
     ) -> Self {
-        Self {
-            upstream,
+        Self::with_upstreams_and_id_generator(
+            vec![upstream.clone()],
+            upstream.timeout,
             id_generator,
+        )
+        .expect("single upstream resolver requires one upstream")
+    }
+
+    pub fn with_upstreams_and_id_generator(
+        upstreams: Vec<UpstreamConfig>,
+        per_query_deadline: Duration,
+        id_generator: Arc<dyn TransactionIdGenerator>,
+    ) -> Result<Self, UpstreamError> {
+        let upstreams = ordered_enabled_udp_upstreams(upstreams);
+        if upstreams.is_empty() {
+            return Err(UpstreamError::NoUpstreamsAvailable);
         }
+        let health = upstreams
+            .iter()
+            .map(|_| Mutex::new(UpstreamHealth::default()))
+            .collect();
+        Ok(Self {
+            upstreams,
+            id_generator,
+            per_query_deadline,
+            health,
+        })
     }
 
     pub fn from_config(upstreams: &[UpstreamConfig]) -> Result<Self, UpstreamError> {
-        let upstream = upstreams
+        let deadline = upstreams
             .iter()
             .filter(|upstream| upstream.enabled && upstream.protocol == UpstreamProtocol::Udp)
-            .min_by_key(|upstream| upstream.priority)
-            .cloned()
-            .ok_or(UpstreamError::NoUpstreamsAvailable)?;
-        Ok(Self::new(upstream))
+            .fold(Duration::ZERO, |deadline, upstream| {
+                deadline + upstream.timeout
+            });
+        Self::with_upstreams_and_id_generator(
+            upstreams.to_vec(),
+            deadline,
+            Arc::new(MixedTransactionIdGenerator::seeded_from_environment()),
+        )
     }
 
+    pub fn from_runtime_config(config: &RuntimeConfig) -> Result<Self, UpstreamError> {
+        Self::with_upstreams_and_id_generator(
+            config.upstreams.clone(),
+            config.per_query_deadline,
+            Arc::new(MixedTransactionIdGenerator::seeded_from_environment()),
+        )
+    }
+
+    pub fn health_snapshots(&self) -> Vec<UpstreamHealthSnapshot> {
+        self.upstreams
+            .iter()
+            .zip(&self.health)
+            .map(|(upstream, health)| {
+                let health = health.lock().unwrap();
+                UpstreamHealthSnapshot {
+                    name: upstream.name.clone(),
+                    endpoint: upstream.endpoint,
+                    consecutive_failures: health.consecutive_failures,
+                    degraded: health.degraded,
+                }
+            })
+            .collect()
+    }
+
+    #[cfg(test)]
     async fn resolve_once(
         &self,
         request: UpstreamRequest,
     ) -> Result<UpstreamResponse, UpstreamError> {
+        self.resolve_attempt(&self.upstreams[0], request, self.upstreams[0].timeout)
+            .await
+    }
+
+    async fn resolve_attempt(
+        &self,
+        upstream: &UpstreamConfig,
+        request: UpstreamRequest,
+        attempt_timeout: Duration,
+    ) -> Result<UpstreamResponse, UpstreamError> {
+        let attempt_deadline = Instant::now() + attempt_timeout;
         let upstream_id = self.id_generator.next_id();
         let client_id = request.query.message.header.id;
         let mut upstream_query = request.query.message.original_bytes.clone();
         rewrite_response_id(&mut upstream_query, upstream_id)
             .map_err(|_| UpstreamError::MalformedResponse)?;
 
-        let socket = bind_ephemeral_for(self.upstream.endpoint).await?;
+        let socket = bind_ephemeral_for(upstream.endpoint).await?;
         socket
-            .send_to(&upstream_query, self.upstream.endpoint)
+            .send_to(&upstream_query, upstream.endpoint)
             .await
             .map_err(transport_error)?;
 
         let mut response_bytes = vec![0; 4096];
-        let (response_len, source) =
-            time::timeout(self.upstream.timeout, socket.recv_from(&mut response_bytes))
-                .await
-                .map_err(|_| UpstreamError::Timeout)?
-                .map_err(transport_error)?;
+        let (response_len, source) = time::timeout(
+            remaining_until(attempt_deadline)?,
+            socket.recv_from(&mut response_bytes),
+        )
+        .await
+        .map_err(|_| UpstreamError::Timeout)?
+        .map_err(transport_error)?;
         response_bytes.truncate(response_len);
 
-        validate_upstream_response_source(source, self.upstream.endpoint)?;
-        validate_upstream_response(&request, &response_bytes, upstream_id)?;
+        validate_upstream_response_source(source, upstream.endpoint)?;
+        if truncated_response_matches_request(&request, &response_bytes, upstream_id)? {
+            return resolve_tcp_fallback(
+                upstream,
+                &request,
+                &upstream_query,
+                upstream_id,
+                client_id,
+                attempt_deadline,
+            )
+            .await;
+        }
+        let response = validate_upstream_response(&request, &response_bytes, upstream_id)?;
+        if response.header.tc() {
+            return resolve_tcp_fallback(
+                upstream,
+                &request,
+                &upstream_query,
+                upstream_id,
+                client_id,
+                attempt_deadline,
+            )
+            .await;
+        }
         rewrite_response_id(&mut response_bytes, client_id)
             .map_err(|_| UpstreamError::MalformedResponse)?;
 
@@ -108,6 +256,217 @@ impl UdpUpstreamResolver {
             received_at: SystemTime::now(),
         })
     }
+
+    async fn resolve_with_failover(
+        &self,
+        request: UpstreamRequest,
+    ) -> Result<UpstreamResponse, UpstreamError> {
+        let deadline = Instant::now() + self.per_query_deadline;
+        let mut last_error = None;
+
+        for (index, upstream) in self.upstreams.iter().enumerate() {
+            let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
+                break;
+            };
+            if remaining.is_zero() {
+                break;
+            }
+
+            let attempt_timeout = remaining.min(upstream.timeout);
+            let result = self
+                .resolve_attempt(upstream, request.clone(), attempt_timeout)
+                .await;
+            match result {
+                Ok(response) => {
+                    self.mark_success(index);
+                    return Ok(response);
+                }
+                Err(error) => {
+                    self.mark_failure(index, &error);
+                    last_error = Some(error);
+                }
+            }
+        }
+
+        Err(last_error.unwrap_or(UpstreamError::Timeout))
+    }
+
+    fn mark_success(&self, index: usize) {
+        let mut health = self.health[index].lock().unwrap();
+        health.consecutive_failures = 0;
+        health.degraded = false;
+    }
+
+    fn mark_failure(&self, index: usize, error: &UpstreamError) {
+        if !matches!(
+            error,
+            UpstreamError::Timeout | UpstreamError::MalformedResponse
+        ) {
+            return;
+        }
+        let mut health = self.health[index].lock().unwrap();
+        health.consecutive_failures = health.consecutive_failures.saturating_add(1);
+        if health.consecutive_failures >= DEGRADED_FAILURE_THRESHOLD {
+            health.degraded = true;
+        }
+    }
+}
+
+async fn resolve_tcp_fallback(
+    upstream: &UpstreamConfig,
+    request: &UpstreamRequest,
+    upstream_query: &[u8],
+    upstream_id: u16,
+    client_id: u16,
+    attempt_deadline: Instant,
+) -> Result<UpstreamResponse, UpstreamError> {
+    let frame = encode_tcp_frame(upstream_query, MAX_TCP_MESSAGE_SIZE)
+        .map_err(|_| UpstreamError::MalformedResponse)?;
+    let mut stream = time::timeout(
+        remaining_until(attempt_deadline)?,
+        TcpStream::connect(upstream.endpoint),
+    )
+    .await
+    .map_err(|_| UpstreamError::Timeout)?
+    .map_err(transport_error)?;
+
+    time::timeout(remaining_until(attempt_deadline)?, stream.write_all(&frame))
+        .await
+        .map_err(|_| UpstreamError::Timeout)?
+        .map_err(transport_error)?;
+
+    let mut length_prefix = [0u8; 2];
+    time::timeout(
+        remaining_until(attempt_deadline)?,
+        stream.read_exact(&mut length_prefix),
+    )
+    .await
+    .map_err(|_| UpstreamError::Timeout)?
+    .map_err(transport_error)?;
+    let message_len = u16::from_be_bytes(length_prefix) as usize;
+    if message_len > MAX_TCP_MESSAGE_SIZE {
+        return Err(UpstreamError::MalformedResponse);
+    }
+
+    let mut response_bytes = vec![0; message_len];
+    time::timeout(
+        remaining_until(attempt_deadline)?,
+        stream.read_exact(&mut response_bytes),
+    )
+    .await
+    .map_err(|_| UpstreamError::Timeout)?
+    .map_err(transport_error)?;
+
+    validate_upstream_response(request, &response_bytes, upstream_id)?;
+    rewrite_response_id(&mut response_bytes, client_id)
+        .map_err(|_| UpstreamError::MalformedResponse)?;
+    Ok(UpstreamResponse {
+        bytes: response_bytes,
+        received_at: SystemTime::now(),
+    })
+}
+
+fn remaining_until(deadline: Instant) -> Result<Duration, UpstreamError> {
+    deadline
+        .checked_duration_since(Instant::now())
+        .filter(|remaining| !remaining.is_zero())
+        .ok_or(UpstreamError::Timeout)
+}
+
+fn truncated_response_matches_request(
+    request: &UpstreamRequest,
+    response_bytes: &[u8],
+    upstream_id: u16,
+) -> Result<bool, UpstreamError> {
+    let header = response_header_prefix(response_bytes)?;
+    if header.id != upstream_id {
+        return Err(UpstreamError::MalformedResponse);
+    }
+    if !header.qr {
+        return Err(UpstreamError::MalformedResponse);
+    }
+    if !header.tc {
+        return Ok(false);
+    }
+    if header.qd_count != 1 {
+        return Err(UpstreamError::QuestionMismatch);
+    }
+    validate_response_question_prefix(request, response_bytes)?;
+    Ok(true)
+}
+
+struct ResponseHeaderPrefix {
+    id: u16,
+    qr: bool,
+    tc: bool,
+    qd_count: u16,
+}
+
+fn response_header_prefix(response_bytes: &[u8]) -> Result<ResponseHeaderPrefix, UpstreamError> {
+    if response_bytes.len() < 12 {
+        return Err(UpstreamError::MalformedResponse);
+    }
+    let id = u16::from_be_bytes([response_bytes[0], response_bytes[1]]);
+    let flags = u16::from_be_bytes([response_bytes[2], response_bytes[3]]);
+    let qd_count = u16::from_be_bytes([response_bytes[4], response_bytes[5]]);
+    Ok(ResponseHeaderPrefix {
+        id,
+        qr: (flags & 0x8000) != 0,
+        tc: (flags & 0x0200) != 0,
+        qd_count,
+    })
+}
+
+fn validate_response_question_prefix(
+    request: &UpstreamRequest,
+    response_bytes: &[u8],
+) -> Result<(), UpstreamError> {
+    let question_end = question_end_offset(response_bytes)?;
+    let mut question_only = response_bytes[..question_end].to_vec();
+    question_only[6..12].fill(0);
+    let response = Message::parse(&question_only).map_err(|_| UpstreamError::MalformedResponse)?;
+    if response.questions.len() != 1 || response.questions[0] != request.query.message.questions[0]
+    {
+        return Err(UpstreamError::QuestionMismatch);
+    }
+    Ok(())
+}
+
+fn question_end_offset(response_bytes: &[u8]) -> Result<usize, UpstreamError> {
+    let mut offset = 12;
+    loop {
+        let label_len = *response_bytes
+            .get(offset)
+            .ok_or(UpstreamError::MalformedResponse)?;
+        if label_len & 0xc0 == 0xc0 {
+            response_bytes
+                .get(offset + 1)
+                .ok_or(UpstreamError::MalformedResponse)?;
+            offset += 2;
+            break;
+        }
+        if label_len & 0xc0 != 0 {
+            return Err(UpstreamError::MalformedResponse);
+        }
+        offset += 1;
+        if label_len == 0 {
+            break;
+        }
+        let end = offset
+            .checked_add(label_len as usize)
+            .ok_or(UpstreamError::MalformedResponse)?;
+        response_bytes
+            .get(offset..end)
+            .ok_or(UpstreamError::MalformedResponse)?;
+        offset = end;
+    }
+    let end = offset
+        .checked_add(4)
+        .ok_or(UpstreamError::MalformedResponse)?;
+    response_bytes
+        .get(offset..end)
+        .ok_or(UpstreamError::MalformedResponse)?;
+    Ok(end)
 }
 
 impl UpstreamResolver for UdpUpstreamResolver {
@@ -115,8 +474,14 @@ impl UpstreamResolver for UdpUpstreamResolver {
         &'a self,
         request: UpstreamRequest,
     ) -> crate::resolver::BoxFuture<'a, Result<UpstreamResponse, UpstreamError>> {
-        Box::pin(async move { self.resolve_once(request).await })
+        Box::pin(async move { self.resolve_with_failover(request).await })
     }
+}
+
+fn ordered_enabled_udp_upstreams(mut upstreams: Vec<UpstreamConfig>) -> Vec<UpstreamConfig> {
+    upstreams.retain(|upstream| upstream.enabled && upstream.protocol == UpstreamProtocol::Udp);
+    upstreams.sort_by_key(|upstream| upstream.priority);
+    upstreams
 }
 
 async fn bind_ephemeral_for(upstream: SocketAddr) -> Result<UdpSocket, UpstreamError> {
@@ -144,7 +509,7 @@ fn validate_upstream_response(
     request: &UpstreamRequest,
     response_bytes: &[u8],
     upstream_id: u16,
-) -> Result<(), UpstreamError> {
+) -> Result<Message, UpstreamError> {
     let response = Message::parse(response_bytes).map_err(|_| UpstreamError::MalformedResponse)?;
     if response.header.id != upstream_id {
         return Err(UpstreamError::MalformedResponse);
@@ -156,7 +521,7 @@ fn validate_upstream_response(
     {
         return Err(UpstreamError::QuestionMismatch);
     }
-    Ok(())
+    Ok(response)
 }
 
 fn transport_error(error: io::Error) -> UpstreamError {
@@ -166,8 +531,10 @@ fn transport_error(error: io::Error) -> UpstreamError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::VecDeque;
     use std::sync::Mutex;
     use std::time::Duration;
+    use tokio::net::TcpListener;
 
     use crate::config::UpstreamConfig;
     use crate::resolver::{DecodedQuery, QueryFeatures, QuestionKey};
@@ -177,6 +544,20 @@ mod tests {
     impl TransactionIdGenerator for FixedTransactionId {
         fn next_id(&self) -> u16 {
             self.0
+        }
+    }
+
+    struct SequenceTransactionIds(Mutex<VecDeque<u16>>);
+
+    impl SequenceTransactionIds {
+        fn new(ids: impl IntoIterator<Item = u16>) -> Self {
+            Self(Mutex::new(ids.into_iter().collect()))
+        }
+    }
+
+    impl TransactionIdGenerator for SequenceTransactionIds {
+        fn next_id(&self) -> u16 {
+            self.0.lock().unwrap().pop_front().unwrap()
         }
     }
 
@@ -205,14 +586,41 @@ mod tests {
         bytes
     }
 
+    fn nxdomain_response(id: u16, name: &str) -> Vec<u8> {
+        let mut bytes = a_response(id, name);
+        bytes[3] = (bytes[3] & 0xf0) | 3;
+        bytes
+    }
+
+    fn truncated_response(id: u16, name: &str) -> Vec<u8> {
+        let mut bytes = a_response(id, name);
+        bytes[2] |= 0x02;
+        bytes
+    }
+
+    fn incomplete_truncated_response(id: u16, name: &str) -> Vec<u8> {
+        let mut bytes = truncated_response(id, name);
+        bytes[6..8].copy_from_slice(&1u16.to_be_bytes());
+        bytes
+    }
+
     fn upstream_config(endpoint: SocketAddr) -> UpstreamConfig {
+        upstream_config_with("test", endpoint, 10, Duration::from_secs(1))
+    }
+
+    fn upstream_config_with(
+        name: &str,
+        endpoint: SocketAddr,
+        priority: u16,
+        timeout: Duration,
+    ) -> UpstreamConfig {
         UpstreamConfig {
-            name: "test".to_string(),
+            name: name.to_string(),
             endpoint,
             protocol: UpstreamProtocol::Udp,
             enabled: true,
-            priority: 10,
-            timeout: Duration::from_secs(1),
+            priority,
+            timeout,
         }
     }
 
@@ -225,6 +633,91 @@ mod tests {
                 message,
             },
         }
+    }
+
+    async fn read_tcp_query(stream: &mut TcpStream) -> Vec<u8> {
+        let mut length_prefix = [0u8; 2];
+        stream.read_exact(&mut length_prefix).await.unwrap();
+        let query_len = u16::from_be_bytes(length_prefix) as usize;
+        let mut query = vec![0u8; query_len];
+        stream.read_exact(&mut query).await.unwrap();
+        query
+    }
+
+    #[test]
+    fn mixed_transaction_ids_are_not_sequential() {
+        let generator = MixedTransactionIdGenerator::new(0x1234_5678_9abc_def0);
+        let first = generator.next_id();
+        let second = generator.next_id();
+        let third = generator.next_id();
+
+        assert_ne!(second, first.wrapping_add(1));
+        assert_ne!(third, second.wrapping_add(1));
+    }
+
+    #[test]
+    fn runtime_config_constructor_filters_and_orders_udp_upstreams() {
+        let primary: SocketAddr = "192.0.2.10:53".parse().unwrap();
+        let secondary: SocketAddr = "192.0.2.11:53".parse().unwrap();
+        let disabled: SocketAddr = "192.0.2.12:53".parse().unwrap();
+        let tcp_only: SocketAddr = "192.0.2.13:53".parse().unwrap();
+        let config = RuntimeConfig::new(
+            vec!["127.0.0.1:5300".parse().unwrap()],
+            vec![
+                upstream_config_with("secondary", secondary, 20, Duration::from_millis(500)),
+                UpstreamConfig {
+                    enabled: false,
+                    ..upstream_config_with("disabled", disabled, 5, Duration::from_millis(500))
+                },
+                UpstreamConfig {
+                    protocol: UpstreamProtocol::Tcp,
+                    ..upstream_config_with("tcp", tcp_only, 1, Duration::from_millis(500))
+                },
+                upstream_config_with("primary", primary, 10, Duration::from_millis(500)),
+            ],
+            Duration::from_secs(1),
+            1232,
+        )
+        .unwrap();
+
+        let resolver = UdpUpstreamResolver::from_runtime_config(&config).unwrap();
+        let health = resolver.health_snapshots();
+
+        assert_eq!(
+            health
+                .iter()
+                .map(|entry| entry.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["primary", "secondary"]
+        );
+        assert_eq!(health[0].endpoint, primary);
+        assert_eq!(health[1].endpoint, secondary);
+    }
+
+    #[test]
+    fn runtime_config_constructor_rejects_no_enabled_udp_upstreams() {
+        let config = RuntimeConfig::new(
+            vec!["127.0.0.1:5300".parse().unwrap()],
+            vec![UpstreamConfig {
+                protocol: UpstreamProtocol::Tcp,
+                ..upstream_config_with(
+                    "tcp-only",
+                    "192.0.2.53:53".parse().unwrap(),
+                    10,
+                    Duration::from_millis(500),
+                )
+            }],
+            Duration::from_secs(1),
+            1232,
+        )
+        .unwrap();
+
+        let error = match UdpUpstreamResolver::from_runtime_config(&config) {
+            Ok(_) => panic!("expected no enabled UDP upstreams"),
+            Err(error) => error,
+        };
+
+        assert_eq!(error, UpstreamError::NoUpstreamsAvailable);
     }
 
     #[tokio::test]
@@ -336,5 +829,433 @@ mod tests {
 
         upstream_task.await.unwrap();
         assert_eq!(error, UpstreamError::QuestionMismatch);
+    }
+
+    #[tokio::test]
+    async fn udp_upstream_accepts_matching_nxdomain_response() {
+        let upstream_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let upstream_addr = upstream_socket.local_addr().unwrap();
+        let upstream_task = tokio::spawn(async move {
+            let mut request = [0u8; 512];
+            let (_, source) = upstream_socket.recv_from(&mut request).await.unwrap();
+            upstream_socket
+                .send_to(&nxdomain_response(0xbeef, "missing.example"), source)
+                .await
+                .unwrap();
+        });
+        let resolver = UdpUpstreamResolver::with_id_generator(
+            upstream_config(upstream_addr),
+            Arc::new(FixedTransactionId(0xbeef)),
+        );
+
+        let response = resolver
+            .resolve_once(upstream_request(0x1234, "missing.example"))
+            .await
+            .unwrap();
+
+        upstream_task.await.unwrap();
+        assert_eq!(&response.bytes[0..2], &[0x12, 0x34]);
+        assert_eq!(response.bytes[3] & 0x0f, 3);
+    }
+
+    #[tokio::test]
+    async fn udp_upstream_falls_back_to_tcp_on_truncated_response() {
+        let tcp_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let upstream_addr = tcp_listener.local_addr().unwrap();
+        let udp_socket = UdpSocket::bind(upstream_addr).await.unwrap();
+        let seen_tcp_query = Arc::new(Mutex::new(Vec::new()));
+
+        let udp_task = tokio::spawn(async move {
+            let mut request = [0u8; 512];
+            let (_, source) = udp_socket.recv_from(&mut request).await.unwrap();
+            udp_socket
+                .send_to(&truncated_response(0xbeef, "example.com"), source)
+                .await
+                .unwrap();
+        });
+
+        let seen_tcp_query_task = seen_tcp_query.clone();
+        let tcp_task = tokio::spawn(async move {
+            let (mut stream, _) = tcp_listener.accept().await.unwrap();
+            let query = read_tcp_query(&mut stream).await;
+            seen_tcp_query_task
+                .lock()
+                .unwrap()
+                .extend_from_slice(&query);
+
+            let response = encode_tcp_frame(&a_response(0xbeef, "example.com"), 512).unwrap();
+            stream.write_all(&response).await.unwrap();
+        });
+
+        let resolver = UdpUpstreamResolver::with_id_generator(
+            upstream_config(upstream_addr),
+            Arc::new(FixedTransactionId(0xbeef)),
+        );
+
+        let response = resolver
+            .resolve(upstream_request(0x1234, "example.com"))
+            .await
+            .unwrap();
+
+        udp_task.await.unwrap();
+        tcp_task.await.unwrap();
+        assert_eq!(&seen_tcp_query.lock().unwrap()[0..2], &[0xbe, 0xef]);
+        assert_eq!(&response.bytes[0..2], &[0x12, 0x34]);
+        assert!(!Message::parse(&response.bytes).unwrap().header.tc());
+    }
+
+    #[tokio::test]
+    async fn udp_upstream_falls_back_to_tcp_when_truncated_udp_parse_fails() {
+        let tcp_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let upstream_addr = tcp_listener.local_addr().unwrap();
+        let udp_socket = UdpSocket::bind(upstream_addr).await.unwrap();
+
+        let udp_task = tokio::spawn(async move {
+            let mut request = [0u8; 512];
+            let (_, source) = udp_socket.recv_from(&mut request).await.unwrap();
+            udp_socket
+                .send_to(
+                    &incomplete_truncated_response(0xbeef, "example.com"),
+                    source,
+                )
+                .await
+                .unwrap();
+        });
+        let tcp_task = tokio::spawn(async move {
+            let (mut stream, _) = tcp_listener.accept().await.unwrap();
+            let _query = read_tcp_query(&mut stream).await;
+            let response = encode_tcp_frame(&a_response(0xbeef, "example.com"), 512).unwrap();
+            stream.write_all(&response).await.unwrap();
+        });
+
+        let resolver = UdpUpstreamResolver::with_id_generator(
+            upstream_config(upstream_addr),
+            Arc::new(FixedTransactionId(0xbeef)),
+        );
+
+        let response = resolver
+            .resolve(upstream_request(0x1234, "example.com"))
+            .await
+            .unwrap();
+
+        udp_task.await.unwrap();
+        tcp_task.await.unwrap();
+        assert_eq!(&response.bytes[0..2], &[0x12, 0x34]);
+        assert_eq!(response.bytes[3] & 0x0f, 0);
+    }
+
+    #[tokio::test]
+    async fn tcp_fallback_rejects_response_id_mismatch() {
+        let tcp_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let upstream_addr = tcp_listener.local_addr().unwrap();
+        let udp_socket = UdpSocket::bind(upstream_addr).await.unwrap();
+
+        let udp_task = tokio::spawn(async move {
+            let mut request = [0u8; 512];
+            let (_, source) = udp_socket.recv_from(&mut request).await.unwrap();
+            udp_socket
+                .send_to(&truncated_response(0xbeef, "example.com"), source)
+                .await
+                .unwrap();
+        });
+        let tcp_task = tokio::spawn(async move {
+            let (mut stream, _) = tcp_listener.accept().await.unwrap();
+            let _query = read_tcp_query(&mut stream).await;
+            let response = encode_tcp_frame(&a_response(0xabcd, "example.com"), 512).unwrap();
+            stream.write_all(&response).await.unwrap();
+        });
+        let resolver = UdpUpstreamResolver::with_id_generator(
+            upstream_config(upstream_addr),
+            Arc::new(FixedTransactionId(0xbeef)),
+        );
+
+        let error = resolver
+            .resolve(upstream_request(0x1234, "example.com"))
+            .await
+            .unwrap_err();
+
+        udp_task.await.unwrap();
+        tcp_task.await.unwrap();
+        assert_eq!(error, UpstreamError::MalformedResponse);
+    }
+
+    #[tokio::test]
+    async fn tcp_fallback_timeout_returns_timeout() {
+        let tcp_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let upstream_addr = tcp_listener.local_addr().unwrap();
+        let udp_socket = UdpSocket::bind(upstream_addr).await.unwrap();
+
+        let udp_task = tokio::spawn(async move {
+            let mut request = [0u8; 512];
+            let (_, source) = udp_socket.recv_from(&mut request).await.unwrap();
+            udp_socket
+                .send_to(&truncated_response(0xbeef, "example.com"), source)
+                .await
+                .unwrap();
+        });
+        let tcp_task = tokio::spawn(async move {
+            let (mut stream, _) = tcp_listener.accept().await.unwrap();
+            let _query = read_tcp_query(&mut stream).await;
+            time::sleep(Duration::from_millis(80)).await;
+        });
+        let resolver = UdpUpstreamResolver::with_upstreams_and_id_generator(
+            vec![upstream_config_with(
+                "primary",
+                upstream_addr,
+                10,
+                Duration::from_millis(25),
+            )],
+            Duration::from_millis(25),
+            Arc::new(FixedTransactionId(0xbeef)),
+        )
+        .unwrap();
+
+        let error = resolver
+            .resolve(upstream_request(0x1234, "example.com"))
+            .await
+            .unwrap_err();
+
+        udp_task.await.unwrap();
+        tcp_task.await.unwrap();
+        assert_eq!(error, UpstreamError::Timeout);
+    }
+
+    #[tokio::test]
+    async fn udp_upstream_fails_over_in_priority_order() {
+        let first_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let first_addr = first_socket.local_addr().unwrap();
+        let second_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let second_addr = second_socket.local_addr().unwrap();
+
+        let first_seen = Arc::new(Mutex::new(Vec::new()));
+        let first_seen_task = first_seen.clone();
+        let first_task = tokio::spawn(async move {
+            let mut request = [0u8; 512];
+            let (request_len, source) = first_socket.recv_from(&mut request).await.unwrap();
+            first_seen_task
+                .lock()
+                .unwrap()
+                .extend_from_slice(&request[..request_len]);
+            first_socket
+                .send_to(&a_response(0x9999, "example.com"), source)
+                .await
+                .unwrap();
+        });
+
+        let second_seen = Arc::new(Mutex::new(Vec::new()));
+        let second_seen_task = second_seen.clone();
+        let second_task = tokio::spawn(async move {
+            let mut request = [0u8; 512];
+            let (request_len, source) = second_socket.recv_from(&mut request).await.unwrap();
+            second_seen_task
+                .lock()
+                .unwrap()
+                .extend_from_slice(&request[..request_len]);
+            second_socket
+                .send_to(&a_response(0x2222, "example.com"), source)
+                .await
+                .unwrap();
+        });
+
+        let resolver = UdpUpstreamResolver::with_upstreams_and_id_generator(
+            vec![
+                upstream_config_with("secondary", second_addr, 20, Duration::from_secs(1)),
+                upstream_config_with("primary", first_addr, 10, Duration::from_secs(1)),
+            ],
+            Duration::from_secs(2),
+            Arc::new(SequenceTransactionIds::new([0x1111, 0x2222])),
+        )
+        .unwrap();
+
+        let response = resolver
+            .resolve(upstream_request(0x1234, "example.com"))
+            .await
+            .unwrap();
+
+        first_task.await.unwrap();
+        second_task.await.unwrap();
+        assert_eq!(&first_seen.lock().unwrap()[0..2], &[0x11, 0x11]);
+        assert_eq!(&second_seen.lock().unwrap()[0..2], &[0x22, 0x22]);
+        assert_eq!(&response.bytes[0..2], &[0x12, 0x34]);
+        let health = resolver.health_snapshots();
+        assert_eq!(health[0].name, "primary");
+        assert_eq!(health[0].consecutive_failures, 1);
+        assert!(!health[0].degraded);
+        assert_eq!(health[1].name, "secondary");
+        assert_eq!(health[1].consecutive_failures, 0);
+    }
+
+    #[tokio::test]
+    async fn udp_upstream_fails_over_after_question_mismatch() {
+        let first_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let first_addr = first_socket.local_addr().unwrap();
+        let second_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let second_addr = second_socket.local_addr().unwrap();
+
+        let first_task = tokio::spawn(async move {
+            let mut request = [0u8; 512];
+            let (_, source) = first_socket.recv_from(&mut request).await.unwrap();
+            first_socket
+                .send_to(&a_response(0x1111, "other.example"), source)
+                .await
+                .unwrap();
+        });
+        let second_task = tokio::spawn(async move {
+            let mut request = [0u8; 512];
+            let (_, source) = second_socket.recv_from(&mut request).await.unwrap();
+            second_socket
+                .send_to(&a_response(0x2222, "example.com"), source)
+                .await
+                .unwrap();
+        });
+
+        let resolver = UdpUpstreamResolver::with_upstreams_and_id_generator(
+            vec![
+                upstream_config_with("primary", first_addr, 10, Duration::from_secs(1)),
+                upstream_config_with("secondary", second_addr, 20, Duration::from_secs(1)),
+            ],
+            Duration::from_secs(2),
+            Arc::new(SequenceTransactionIds::new([0x1111, 0x2222])),
+        )
+        .unwrap();
+
+        let response = resolver
+            .resolve(upstream_request(0x1234, "example.com"))
+            .await
+            .unwrap();
+
+        first_task.await.unwrap();
+        second_task.await.unwrap();
+        assert_eq!(&response.bytes[0..2], &[0x12, 0x34]);
+        assert_eq!(response.bytes[3] & 0x0f, 0);
+        let health = resolver.health_snapshots();
+        assert_eq!(health[0].consecutive_failures, 0);
+        assert!(!health[0].degraded);
+    }
+
+    #[tokio::test]
+    async fn udp_upstream_deadline_bounds_failover_attempts() {
+        let first_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let first_addr = first_socket.local_addr().unwrap();
+        let second_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let second_addr = second_socket.local_addr().unwrap();
+        let first_task = tokio::spawn(async move {
+            let mut request = [0u8; 512];
+            let _ = first_socket.recv_from(&mut request).await.unwrap();
+        });
+
+        let resolver = UdpUpstreamResolver::with_upstreams_and_id_generator(
+            vec![
+                upstream_config_with("primary", first_addr, 10, Duration::from_millis(40)),
+                upstream_config_with("secondary", second_addr, 20, Duration::from_millis(40)),
+            ],
+            Duration::from_millis(40),
+            Arc::new(SequenceTransactionIds::new([0x1111, 0x2222])),
+        )
+        .unwrap();
+
+        let error = resolver
+            .resolve(upstream_request(0x1234, "example.com"))
+            .await
+            .unwrap_err();
+
+        first_task.await.unwrap();
+        let mut unexpected = [0u8; 512];
+        let second_receive = time::timeout(
+            Duration::from_millis(80),
+            second_socket.recv_from(&mut unexpected),
+        )
+        .await;
+        assert!(second_receive.is_err());
+        assert_eq!(error, UpstreamError::Timeout);
+    }
+
+    #[tokio::test]
+    async fn udp_upstream_tries_each_enabled_upstream_once_before_timeout() {
+        let first_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let first_addr = first_socket.local_addr().unwrap();
+        let second_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let second_addr = second_socket.local_addr().unwrap();
+        let first_task = tokio::spawn(async move {
+            let mut request = [0u8; 512];
+            let _ = first_socket.recv_from(&mut request).await.unwrap();
+        });
+        let second_task = tokio::spawn(async move {
+            let mut request = [0u8; 512];
+            let _ = second_socket.recv_from(&mut request).await.unwrap();
+        });
+        let resolver = UdpUpstreamResolver::with_upstreams_and_id_generator(
+            vec![
+                upstream_config_with("primary", first_addr, 10, Duration::from_millis(20)),
+                upstream_config_with("secondary", second_addr, 20, Duration::from_millis(20)),
+            ],
+            Duration::from_secs(1),
+            Arc::new(SequenceTransactionIds::new([0x1111, 0x2222, 0x3333])),
+        )
+        .unwrap();
+
+        let error = resolver
+            .resolve(upstream_request(0x1234, "example.com"))
+            .await
+            .unwrap_err();
+
+        first_task.await.unwrap();
+        second_task.await.unwrap();
+        assert_eq!(error, UpstreamError::Timeout);
+        let health = resolver.health_snapshots();
+        assert_eq!(health.len(), 2);
+        assert_eq!(health[0].consecutive_failures, 1);
+        assert_eq!(health[1].consecutive_failures, 1);
+    }
+
+    #[tokio::test]
+    async fn udp_upstream_marks_degraded_and_recovers_on_success() {
+        let upstream_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let upstream_addr = upstream_socket.local_addr().unwrap();
+        let upstream_task = tokio::spawn(async move {
+            let responses = [
+                a_response(0x9999, "example.com"),
+                a_response(0x9999, "example.com"),
+                a_response(0xbeef, "example.com"),
+            ];
+            for response in responses {
+                let mut request = [0u8; 512];
+                let (_, source) = upstream_socket.recv_from(&mut request).await.unwrap();
+                upstream_socket.send_to(&response, source).await.unwrap();
+            }
+        });
+        let resolver = UdpUpstreamResolver::with_id_generator(
+            upstream_config(upstream_addr),
+            Arc::new(FixedTransactionId(0xbeef)),
+        );
+
+        assert_eq!(
+            resolver
+                .resolve(upstream_request(0x1234, "example.com"))
+                .await
+                .unwrap_err(),
+            UpstreamError::MalformedResponse
+        );
+        assert_eq!(
+            resolver
+                .resolve(upstream_request(0x1234, "example.com"))
+                .await
+                .unwrap_err(),
+            UpstreamError::MalformedResponse
+        );
+        let degraded = resolver.health_snapshots();
+        assert_eq!(degraded[0].consecutive_failures, 2);
+        assert!(degraded[0].degraded);
+
+        let response = resolver
+            .resolve(upstream_request(0x1234, "example.com"))
+            .await
+            .unwrap();
+
+        upstream_task.await.unwrap();
+        assert_eq!(&response.bytes[0..2], &[0x12, 0x34]);
+        let recovered = resolver.health_snapshots();
+        assert_eq!(recovered[0].consecutive_failures, 0);
+        assert!(!recovered[0].degraded);
     }
 }

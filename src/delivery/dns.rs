@@ -224,13 +224,16 @@ mod tests {
 
         assert_eq!(source, server_addr);
         assert_eq!(&response[..response_len], &[0x12, 0x34, 0x81, 0x80]);
-        let upstream_requests = upstream.requests.lock().unwrap();
-        assert_eq!(upstream_requests.len(), 1);
-        assert_eq!(upstream_requests[0].query.question.qname, "example.com");
-        drop(upstream_requests);
-        let decisions = events.decisions.lock().unwrap();
-        assert_eq!(decisions.len(), 1);
-        assert_eq!(decisions[0].client_ip, client_addr.ip());
+        {
+            let upstream_requests = upstream.requests.lock().unwrap();
+            assert_eq!(upstream_requests.len(), 1);
+            assert_eq!(upstream_requests[0].query.question.qname, "example.com");
+        }
+        {
+            let decisions = events.decisions.lock().unwrap();
+            assert_eq!(decisions.len(), 1);
+            assert_eq!(decisions[0].client_ip, client_addr.ip());
+        }
 
         shutdown_tx.send(()).unwrap();
         server_task.await.unwrap().unwrap();

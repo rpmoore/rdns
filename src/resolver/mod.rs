@@ -725,4 +725,33 @@ mod tests {
             .unwrap()
             .contains(&ResolverMetric::UpstreamFailure));
     }
+
+    #[tokio::test]
+    async fn resolve_maps_no_upstreams_to_servfail() {
+        let upstream = Arc::new(StaticUpstream::new(Err(
+            UpstreamError::NoUpstreamsAvailable,
+        )));
+        let events = Arc::new(RecordingEvents::default());
+        let metrics = Arc::new(RecordingMetrics::default());
+        let service = resolve_service(upstream, events, metrics.clone());
+
+        let outcome = service
+            .resolve(ResolveRequest::new(
+                "192.0.2.10".parse().unwrap(),
+                SystemTime::UNIX_EPOCH,
+                a_query(0x1234, "example.com"),
+            ))
+            .await;
+
+        assert_eq!(
+            outcome.response_bytes[3] & 0x0f,
+            ResponseCode::ServFail as u8
+        );
+        assert_eq!(outcome.decision.kind, ResolveDecisionKind::UpstreamFailure);
+        assert!(metrics
+            .increments
+            .lock()
+            .unwrap()
+            .contains(&ResolverMetric::UpstreamFailure));
+    }
 }
