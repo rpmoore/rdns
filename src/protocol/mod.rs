@@ -14,9 +14,56 @@ pub enum DnsParseError {
     InvalidLabel,
     InvalidNamePointer,
     PointerLoop,
+    UnsupportedOpcode,
+    InvalidQuestionCount,
     InvalidUtf8Label,
     UnexpectedEof,
     MalformedRecord,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum QueryValidationError {
+    Parse(DnsParseError),
+    UnsupportedOpcode {
+        opcode: u8,
+    },
+    InvalidQuestionCount {
+        count: u16,
+    },
+    UnexpectedSectionRecords {
+        answers: u16,
+        authorities: u16,
+        additionals: u16,
+    },
+    NotQuery,
+}
+
+impl From<DnsParseError> for QueryValidationError {
+    fn from(value: DnsParseError) -> Self {
+        Self::Parse(value)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ResponseCode {
+    NoError = 0,
+    FormErr = 1,
+    ServFail = 2,
+    NxDomain = 3,
+    NotImp = 4,
+    Refused = 5,
+}
+
+impl QueryValidationError {
+    pub fn response_code(&self) -> ResponseCode {
+        match self {
+            Self::UnsupportedOpcode { .. } => ResponseCode::NotImp,
+            Self::Parse(_)
+            | Self::InvalidQuestionCount { .. }
+            | Self::UnexpectedSectionRecords { .. }
+            | Self::NotQuery => ResponseCode::FormErr,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -192,6 +239,44 @@ impl Message {
             additionals,
         })
     }
+
+    pub fn parse_standard_query(
+        dns_message: &[u8],
+    ) -> std::result::Result<Self, QueryValidationError> {
+        let header = parse_header(dns_message)?;
+        validate_standard_query_header(&header)?;
+        let message = Self::parse(dns_message)?;
+        Ok(message)
+    }
+
+    pub fn validate_standard_query(&self) -> std::result::Result<(), QueryValidationError> {
+        validate_standard_query_header(&self.header)
+    }
+}
+
+fn validate_standard_query_header(
+    header: &Header,
+) -> std::result::Result<(), QueryValidationError> {
+    if header.qr() {
+        return Err(QueryValidationError::NotQuery);
+    }
+    let opcode = header.opcode();
+    if opcode != 0 {
+        return Err(QueryValidationError::UnsupportedOpcode { opcode });
+    }
+    if header.qd_count != 1 {
+        return Err(QueryValidationError::InvalidQuestionCount {
+            count: header.qd_count,
+        });
+    }
+    if header.an_count != 0 || header.ns_count != 0 || header.ar_count != 0 {
+        return Err(QueryValidationError::UnexpectedSectionRecords {
+            answers: header.an_count,
+            authorities: header.ns_count,
+            additionals: header.ar_count,
+        });
+    }
+    Ok(())
 }
 
 #[derive(Default)]
@@ -836,6 +921,21 @@ mod tests {
         push_u16(out, ar);
     }
 
+    fn push_header_with_flags(out: &mut Vec<u8>, flags: u16, qd: u16, an: u16, ns: u16, ar: u16) {
+        push_u16(out, 0x1234);
+        push_u16(out, flags);
+        push_u16(out, qd);
+        push_u16(out, an);
+        push_u16(out, ns);
+        push_u16(out, ar);
+    }
+
+    fn push_question(out: &mut Vec<u8>, name: &str, qtype: u16, qclass: u16) {
+        push_name(out, name);
+        push_u16(out, qtype);
+        push_u16(out, qclass);
+    }
+
     fn push_record(out: &mut Vec<u8>, name: &str, rtype: u16, ttl: u32, rdata: &[u8]) {
         push_name(out, name);
         build_record_header(out, rtype, rdata.len() as u16, ttl);
@@ -869,6 +969,118 @@ mod tests {
         let name = parse_domain(&bytes, &mut offset).unwrap();
         assert_eq!(name, "example.com");
         assert_eq!(offset, pointer_offset + 2);
+    }
+
+    #[test]
+    fn parse_standard_query_accepts_one_question_query() {
+        let mut message = Vec::new();
+        push_header(&mut message, 1, 0, 0, 0);
+        push_question(&mut message, "example.com", 1, 1);
+
+        let parsed = Message::parse_standard_query(&message).unwrap();
+        assert_eq!(parsed.questions.len(), 1);
+        assert_eq!(parsed.questions[0].qname, "example.com");
+        assert!(parsed.header.rd());
+    }
+
+    #[test]
+    fn parse_standard_query_rejects_response_packet() {
+        let mut message = Vec::new();
+        push_header_with_flags(&mut message, 0x8100, 1, 0, 0, 0);
+        push_question(&mut message, "example.com", 1, 1);
+
+        assert_eq!(
+            Message::parse_standard_query(&message),
+            Err(QueryValidationError::NotQuery)
+        );
+    }
+
+    #[test]
+    fn parse_standard_query_rejects_unsupported_opcode() {
+        let mut message = Vec::new();
+        push_header_with_flags(&mut message, 0x0900, 1, 0, 0, 0);
+        push_question(&mut message, "example.com", 1, 1);
+
+        assert_eq!(
+            Message::parse_standard_query(&message),
+            Err(QueryValidationError::UnsupportedOpcode { opcode: 1 })
+        );
+    }
+
+    #[test]
+    fn query_validation_errors_map_to_response_codes() {
+        assert_eq!(
+            QueryValidationError::UnsupportedOpcode { opcode: 1 }.response_code(),
+            ResponseCode::NotImp
+        );
+        assert_eq!(
+            QueryValidationError::InvalidQuestionCount { count: 2 }.response_code(),
+            ResponseCode::FormErr
+        );
+        assert_eq!(
+            QueryValidationError::Parse(DnsParseError::UnexpectedEof).response_code(),
+            ResponseCode::FormErr
+        );
+    }
+
+    #[test]
+    fn parse_standard_query_rejects_zero_questions() {
+        let mut message = Vec::new();
+        push_header(&mut message, 0, 0, 0, 0);
+
+        assert_eq!(
+            Message::parse_standard_query(&message),
+            Err(QueryValidationError::InvalidQuestionCount { count: 0 })
+        );
+    }
+
+    #[test]
+    fn parse_standard_query_rejects_multiple_questions() {
+        let mut message = Vec::new();
+        push_header(&mut message, 2, 0, 0, 0);
+        push_question(&mut message, "example.com", 1, 1);
+        push_question(&mut message, "example.net", 1, 1);
+
+        assert_eq!(
+            Message::parse_standard_query(&message),
+            Err(QueryValidationError::InvalidQuestionCount { count: 2 })
+        );
+    }
+
+    #[test]
+    fn parse_standard_query_rejects_unexpected_section_records() {
+        let mut message = Vec::new();
+        push_header(&mut message, 1, 1, 0, 0);
+        push_question(&mut message, "example.com", 1, 1);
+
+        assert_eq!(
+            Message::parse_standard_query(&message),
+            Err(QueryValidationError::UnexpectedSectionRecords {
+                answers: 1,
+                authorities: 0,
+                additionals: 0
+            })
+        );
+    }
+
+    #[test]
+    fn parse_standard_query_validates_shape_before_body() {
+        let mut message = Vec::new();
+        push_header(&mut message, 2, 0, 0, 0);
+        push_name(&mut message, "example.com");
+
+        assert_eq!(
+            Message::parse_standard_query(&message),
+            Err(QueryValidationError::InvalidQuestionCount { count: 2 })
+        );
+    }
+
+    #[test]
+    fn parse_standard_query_preserves_parse_errors() {
+        assert_eq!(
+            Message::parse_standard_query(&[0; 11]),
+            Err(QueryValidationError::Parse(DnsParseError::UnexpectedEof))
+        );
     }
 
     #[test]
