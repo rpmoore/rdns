@@ -22,6 +22,7 @@ pub enum DnsParseError {
     InvalidUtf8Label,
     UnexpectedEof,
     MalformedRecord,
+    MessageTooShort,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -56,6 +57,12 @@ pub enum ResponseCode {
     NxDomain = 3,
     NotImp = 4,
     Refused = 5,
+}
+
+impl ResponseCode {
+    fn as_u8(self) -> u8 {
+        self as u8
+    }
 }
 
 impl QueryValidationError {
@@ -287,6 +294,177 @@ impl Message {
     pub fn response_exceeds_udp_payload(&self, response_len: usize, configured_max: usize) -> bool {
         response_len > self.effective_udp_payload_size(configured_max)
     }
+}
+
+pub fn build_formerr_response(request_id: u16) -> Vec<u8> {
+    build_header_only_response(request_id, false, ResponseCode::FormErr)
+}
+
+pub fn build_refused_response(request: &Message) -> Vec<u8> {
+    build_question_response(request, ResponseCode::Refused, &[])
+}
+
+pub fn build_nxdomain_response(request: &Message) -> Vec<u8> {
+    build_question_response(request, ResponseCode::NxDomain, &[])
+}
+
+pub fn build_nodata_response(request: &Message) -> Vec<u8> {
+    build_question_response(request, ResponseCode::NoError, &[])
+}
+
+pub fn build_a_block_response(request: &Message, ipv4: Ipv4Addr, ttl: u32) -> Vec<u8> {
+    let answer = SinkholeAnswer::A { address: ipv4, ttl };
+    build_question_response(request, ResponseCode::NoError, &[answer])
+}
+
+pub fn build_aaaa_block_response(request: &Message, ipv6: Ipv6Addr, ttl: u32) -> Vec<u8> {
+    let answer = SinkholeAnswer::Aaaa { address: ipv6, ttl };
+    build_question_response(request, ResponseCode::NoError, &[answer])
+}
+
+pub fn build_truncated_response(request: &Message) -> Vec<u8> {
+    let mut response = Vec::new();
+    write_response_header(
+        &mut response,
+        request.header.id,
+        request.header.rd(),
+        true,
+        ResponseCode::NoError,
+        0,
+        0,
+    );
+    response
+}
+
+pub fn rewrite_response_id(response_bytes: &mut [u8], request_id: u16) -> Result<()> {
+    if response_bytes.len() < 2 {
+        return Err(DnsParseError::MessageTooShort);
+    }
+    response_bytes[0..2].copy_from_slice(&request_id.to_be_bytes());
+    Ok(())
+}
+
+enum SinkholeAnswer {
+    A { address: Ipv4Addr, ttl: u32 },
+    Aaaa { address: Ipv6Addr, ttl: u32 },
+}
+
+fn build_header_only_response(
+    request_id: u16,
+    recursion_desired: bool,
+    rcode: ResponseCode,
+) -> Vec<u8> {
+    let mut response = Vec::new();
+    write_response_header(
+        &mut response,
+        request_id,
+        recursion_desired,
+        false,
+        rcode,
+        0,
+        0,
+    );
+    response
+}
+
+fn build_question_response(
+    request: &Message,
+    rcode: ResponseCode,
+    answers: &[SinkholeAnswer],
+) -> Vec<u8> {
+    let mut response = Vec::new();
+    let question_count = u16::from(!request.questions.is_empty());
+    write_response_header(
+        &mut response,
+        request.header.id,
+        request.header.rd(),
+        false,
+        rcode,
+        question_count,
+        answers.len() as u16,
+    );
+
+    if let Some(question) = request.questions.first() {
+        write_question(&mut response, question);
+        for answer in answers {
+            write_sinkhole_answer(&mut response, question, answer);
+        }
+    }
+
+    response
+}
+
+fn write_response_header(
+    out: &mut Vec<u8>,
+    id: u16,
+    recursion_desired: bool,
+    truncated: bool,
+    rcode: ResponseCode,
+    question_count: u16,
+    answer_count: u16,
+) {
+    write_u16(out, id);
+    let mut flags = 0x8000;
+    if recursion_desired {
+        flags |= 0x0100;
+    }
+    if truncated {
+        flags |= 0x0200;
+    }
+    flags |= 0x0080;
+    flags |= rcode.as_u8() as u16;
+    write_u16(out, flags);
+    write_u16(out, question_count);
+    write_u16(out, answer_count);
+    write_u16(out, 0);
+    write_u16(out, 0);
+}
+
+fn write_question(out: &mut Vec<u8>, question: &Question) {
+    write_name(out, &question.qname);
+    write_u16(out, question.qtype);
+    write_u16(out, question.qclass);
+}
+
+fn write_sinkhole_answer(out: &mut Vec<u8>, question: &Question, answer: &SinkholeAnswer) {
+    match answer {
+        SinkholeAnswer::A { address, ttl } => {
+            write_name(out, &question.qname);
+            write_u16(out, 1);
+            write_u16(out, question.qclass);
+            write_u32(out, *ttl);
+            write_u16(out, 4);
+            out.extend_from_slice(&address.octets());
+        }
+        SinkholeAnswer::Aaaa { address, ttl } => {
+            write_name(out, &question.qname);
+            write_u16(out, 28);
+            write_u16(out, question.qclass);
+            write_u32(out, *ttl);
+            write_u16(out, 16);
+            out.extend_from_slice(&address.octets());
+        }
+    }
+}
+
+fn write_name(out: &mut Vec<u8>, name: &str) {
+    if name.is_empty() {
+        out.push(0);
+        return;
+    }
+    for label in name.split('.') {
+        out.push(label.len() as u8);
+        out.extend_from_slice(label.as_bytes());
+    }
+    out.push(0);
+}
+
+fn write_u16(out: &mut Vec<u8>, value: u16) {
+    out.extend_from_slice(&value.to_be_bytes());
+}
+
+fn write_u32(out: &mut Vec<u8>, value: u32) {
+    out.extend_from_slice(&value.to_be_bytes());
 }
 
 fn validate_standard_query_header(
@@ -1297,6 +1475,105 @@ mod tests {
         assert_eq!(
             Message::parse_standard_query(&[0; 11]),
             Err(QueryValidationError::Parse(DnsParseError::UnexpectedEof))
+        );
+    }
+
+    #[test]
+    fn build_formerr_response_has_request_id_and_rcode() {
+        let response = build_formerr_response(0xbeef);
+        let parsed = Message::parse(&response).unwrap();
+
+        assert_eq!(parsed.header.id, 0xbeef);
+        assert!(parsed.header.qr());
+        assert_eq!(parsed.header.r_code(), ResponseCode::FormErr.as_u8());
+        assert!(parsed.questions.is_empty());
+        assert!(parsed.answers.is_empty());
+    }
+
+    #[test]
+    fn build_refused_nxdomain_and_nodata_responses_include_question() {
+        let mut request = Vec::new();
+        push_header(&mut request, 1, 0, 0, 0);
+        push_question(&mut request, "example.com", 1, 1);
+        let request = Message::parse_standard_query(&request).unwrap();
+
+        let refused = Message::parse(&build_refused_response(&request)).unwrap();
+        assert_eq!(refused.header.r_code(), ResponseCode::Refused.as_u8());
+        assert_eq!(refused.questions[0], request.questions[0]);
+        assert!(refused.answers.is_empty());
+
+        let nxdomain = Message::parse(&build_nxdomain_response(&request)).unwrap();
+        assert_eq!(nxdomain.header.r_code(), ResponseCode::NxDomain.as_u8());
+        assert_eq!(nxdomain.questions[0], request.questions[0]);
+
+        let nodata = Message::parse(&build_nodata_response(&request)).unwrap();
+        assert_eq!(nodata.header.r_code(), ResponseCode::NoError.as_u8());
+        assert!(nodata.answers.is_empty());
+    }
+
+    #[test]
+    fn build_sinkhole_a_response_serializes_answer() {
+        let mut request = Vec::new();
+        push_header(&mut request, 1, 0, 0, 0);
+        push_question(&mut request, "blocked.example", 1, 1);
+        let request = Message::parse_standard_query(&request).unwrap();
+
+        let response = Message::parse(&build_a_block_response(
+            &request,
+            Ipv4Addr::new(10, 0, 0, 1),
+            60,
+        ))
+        .unwrap();
+
+        assert_eq!(response.header.r_code(), ResponseCode::NoError.as_u8());
+        assert_eq!(response.answers.len(), 1);
+        assert_eq!(response.answers[0].name, "blocked.example");
+        assert_eq!(response.answers[0].ttl, 60);
+        assert_eq!(
+            response.answers[0].record,
+            RecordData::A(Ipv4Addr::new(10, 0, 0, 1))
+        );
+    }
+
+    #[test]
+    fn build_sinkhole_aaaa_response_serializes_answer() {
+        let mut request = Vec::new();
+        push_header(&mut request, 1, 0, 0, 0);
+        push_question(&mut request, "blocked.example", 28, 1);
+        let request = Message::parse_standard_query(&request).unwrap();
+        let sinkhole = Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1);
+
+        let response = Message::parse(&build_aaaa_block_response(&request, sinkhole, 30)).unwrap();
+
+        assert_eq!(response.header.r_code(), ResponseCode::NoError.as_u8());
+        assert_eq!(response.answers.len(), 1);
+        assert_eq!(response.answers[0].ttl, 30);
+        assert_eq!(response.answers[0].record, RecordData::AAAA(sinkhole));
+    }
+
+    #[test]
+    fn build_truncated_response_sets_tc_and_omits_sections() {
+        let mut request = Vec::new();
+        push_header(&mut request, 1, 0, 0, 0);
+        push_question(&mut request, "example.com", 1, 1);
+        let request = Message::parse_standard_query(&request).unwrap();
+
+        let response = Message::parse(&build_truncated_response(&request)).unwrap();
+
+        assert!(response.header.tc());
+        assert!(response.questions.is_empty());
+        assert!(response.answers.is_empty());
+    }
+
+    #[test]
+    fn rewrite_response_id_updates_first_two_bytes() {
+        let mut response = build_formerr_response(0x1111);
+        rewrite_response_id(&mut response, 0x2222).unwrap();
+
+        assert_eq!(Message::parse(&response).unwrap().header.id, 0x2222);
+        assert_eq!(
+            rewrite_response_id(&mut [0u8; 1], 0x3333),
+            Err(DnsParseError::MessageTooShort)
         );
     }
 
