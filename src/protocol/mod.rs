@@ -3,8 +3,11 @@ use std::net::{Ipv4Addr, Ipv6Addr};
 use std::str;
 
 const DNS_HEADER_LEN: usize = 12;
+pub const DNS_DEFAULT_UDP_PAYLOAD_SIZE: usize = 512;
 const MAX_LABEL_LEN: usize = 63;
 const MAX_NAME_LEN: usize = 255;
+const OPT_RECORD_TYPE: u16 = 41;
+const EDNS_DO_FLAG: u16 = 0x8000;
 
 pub type Result<T> = std::result::Result<T, DnsParseError>;
 
@@ -35,6 +38,7 @@ pub enum QueryValidationError {
         authorities: u16,
         additionals: u16,
     },
+    InvalidEdns,
     NotQuery,
 }
 
@@ -61,6 +65,7 @@ impl QueryValidationError {
             Self::Parse(_)
             | Self::InvalidQuestionCount { .. }
             | Self::UnexpectedSectionRecords { .. }
+            | Self::InvalidEdns
             | Self::NotQuery => ResponseCode::FormErr,
         }
     }
@@ -74,6 +79,7 @@ pub struct Message {
     pub answers: Vec<Record>,
     pub authorities: Vec<Record>,
     pub additionals: Vec<Record>,
+    pub edns: Option<EdnsInfo>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -121,6 +127,15 @@ pub struct Question {
     pub qname: String,
     pub qtype: u16,
     pub qclass: u16,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EdnsInfo {
+    pub udp_payload_size: u16,
+    pub extended_rcode: u8,
+    pub version: u8,
+    pub dnssec_ok: bool,
+    pub options: Vec<u8>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -204,6 +219,7 @@ pub enum RecordData {
         target: String,
     },
     TXT(String),
+    OPT(EdnsInfo),
     Unknown {
         rtype: u16,
         bytes: Vec<u8>,
@@ -229,6 +245,7 @@ impl Message {
         let answers = parse_records(dns_message, &mut offset, header.an_count, &mut context)?;
         let authorities = parse_records(dns_message, &mut offset, header.ns_count, &mut context)?;
         let additionals = parse_records(dns_message, &mut offset, header.ar_count, &mut context)?;
+        let edns = extract_edns_info(&additionals)?;
 
         Ok(Self {
             header,
@@ -237,6 +254,7 @@ impl Message {
             answers,
             authorities,
             additionals,
+            edns,
         })
     }
 
@@ -246,11 +264,28 @@ impl Message {
         let header = parse_header(dns_message)?;
         validate_standard_query_header(&header)?;
         let message = Self::parse(dns_message)?;
+        validate_standard_query_body(&message)?;
         Ok(message)
     }
 
     pub fn validate_standard_query(&self) -> std::result::Result<(), QueryValidationError> {
-        validate_standard_query_header(&self.header)
+        validate_standard_query_header(&self.header)?;
+        validate_standard_query_body(self)
+    }
+
+    pub fn effective_udp_payload_size(&self, configured_max: usize) -> usize {
+        let advertised = self
+            .edns
+            .as_ref()
+            .map(|edns| edns.udp_payload_size as usize)
+            .unwrap_or(DNS_DEFAULT_UDP_PAYLOAD_SIZE);
+        advertised
+            .max(DNS_DEFAULT_UDP_PAYLOAD_SIZE)
+            .min(configured_max)
+    }
+
+    pub fn response_exceeds_udp_payload(&self, response_len: usize, configured_max: usize) -> bool {
+        response_len > self.effective_udp_payload_size(configured_max)
     }
 }
 
@@ -269,7 +304,7 @@ fn validate_standard_query_header(
             count: header.qd_count,
         });
     }
-    if header.an_count != 0 || header.ns_count != 0 || header.ar_count != 0 {
+    if header.an_count != 0 || header.ns_count != 0 || header.ar_count > 1 {
         return Err(QueryValidationError::UnexpectedSectionRecords {
             answers: header.an_count,
             authorities: header.ns_count,
@@ -277,6 +312,36 @@ fn validate_standard_query_header(
         });
     }
     Ok(())
+}
+
+fn validate_standard_query_body(
+    message: &Message,
+) -> std::result::Result<(), QueryValidationError> {
+    if message.header.ar_count == 0 {
+        return Ok(());
+    }
+
+    if message.additionals.len() != 1 {
+        return Err(QueryValidationError::InvalidEdns);
+    }
+
+    match message.additionals[0].record {
+        RecordData::OPT(_) => Ok(()),
+        _ => Err(QueryValidationError::InvalidEdns),
+    }
+}
+
+fn extract_edns_info(records: &[Record]) -> Result<Option<EdnsInfo>> {
+    let mut edns = None;
+    for record in records {
+        if let RecordData::OPT(info) = &record.record {
+            if edns.is_some() {
+                return Err(DnsParseError::MalformedRecord);
+            }
+            edns = Some(info.clone());
+        }
+    }
+    Ok(edns)
 }
 
 #[derive(Default)]
@@ -409,6 +474,9 @@ fn parse_record(
     let rclass = reader.read_u16()?;
     let ttl = reader.read_u32()?;
     let rdlength = reader.read_u16()? as usize;
+    if rtype == OPT_RECORD_TYPE && !name.is_empty() {
+        return Err(DnsParseError::MalformedRecord);
+    }
     let rdata_offset = reader.position();
     let rdata_end = rdata_offset
         .checked_add(rdlength)
@@ -417,7 +485,15 @@ fn parse_record(
         .get(rdata_offset..rdata_end)
         .ok_or(DnsParseError::UnexpectedEof)?;
 
-    let record = parse_record_data(dns_message, rdata_offset, rtype, rdlength, context)?;
+    let record = parse_record_data(
+        dns_message,
+        rdata_offset,
+        rtype,
+        rclass,
+        ttl,
+        rdlength,
+        context,
+    )?;
     *offset = rdata_end;
     Ok(Record {
         name,
@@ -432,6 +508,8 @@ fn parse_record_data(
     dns_message: &[u8],
     offset: usize,
     rtype: u16,
+    rclass: u16,
+    ttl: u32,
     rdlength: usize,
     context: &mut ParseContext,
 ) -> Result<RecordData> {
@@ -457,6 +535,7 @@ fn parse_record_data(
         50 => parse_nsec3_record(dns_message, offset, end),
         51 => parse_nsec3param_record(dns_message, offset, end),
         257 => parse_caa_record(dns_message, offset, end),
+        OPT_RECORD_TYPE => parse_opt_record(dns_message, offset, end, rclass, ttl),
         _ => Ok(RecordData::Unknown {
             rtype,
             bytes: dns_message[offset..end].to_vec(),
@@ -768,6 +847,41 @@ fn parse_nsec3param_record(dns_message: &[u8], offset: usize, end: usize) -> Res
     })
 }
 
+fn parse_opt_record(
+    dns_message: &[u8],
+    offset: usize,
+    end: usize,
+    udp_payload_size: u16,
+    ttl: u32,
+) -> Result<RecordData> {
+    let extended_rcode = ((ttl >> 24) & 0xff) as u8;
+    let version = ((ttl >> 16) & 0xff) as u8;
+    let flags = (ttl & 0xffff) as u16;
+    let options = dns_message
+        .get(offset..end)
+        .ok_or(DnsParseError::UnexpectedEof)?
+        .to_vec();
+    validate_edns_options(&options)?;
+
+    Ok(RecordData::OPT(EdnsInfo {
+        udp_payload_size,
+        extended_rcode,
+        version,
+        dnssec_ok: (flags & EDNS_DO_FLAG) != 0,
+        options,
+    }))
+}
+
+fn validate_edns_options(options: &[u8]) -> Result<()> {
+    let mut reader = Reader::new(options, 0)?;
+    while reader.position() < options.len() {
+        reader.read_u16()?;
+        let option_len = reader.read_u16()? as usize;
+        reader.read_exact(option_len)?;
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 fn parse_domain(dns_message: &[u8], offset: &mut usize) -> Result<String> {
     parse_domain_with_context(dns_message, offset, None)
@@ -942,6 +1056,16 @@ mod tests {
         out.extend_from_slice(rdata);
     }
 
+    fn push_opt_record(out: &mut Vec<u8>, udp_payload_size: u16, dnssec_ok: bool, options: &[u8]) {
+        out.push(0);
+        push_u16(out, OPT_RECORD_TYPE);
+        push_u16(out, udp_payload_size);
+        let flags = if dnssec_ok { EDNS_DO_FLAG as u32 } else { 0 };
+        push_u32(out, flags);
+        push_u16(out, options.len() as u16);
+        out.extend_from_slice(options);
+    }
+
     fn parse_test_record(bytes: &[u8]) -> Record {
         let mut offset = 0;
         let mut context = ParseContext::default();
@@ -981,6 +1105,70 @@ mod tests {
         assert_eq!(parsed.questions.len(), 1);
         assert_eq!(parsed.questions[0].qname, "example.com");
         assert!(parsed.header.rd());
+    }
+
+    #[test]
+    fn parse_standard_query_accepts_single_edns_opt_additional() {
+        let mut message = Vec::new();
+        push_header(&mut message, 1, 0, 0, 1);
+        push_question(&mut message, "example.com", 1, 1);
+        push_opt_record(&mut message, 4096, true, &[0, 15, 0, 0]);
+
+        let parsed = Message::parse_standard_query(&message).unwrap();
+        assert_eq!(
+            parsed.edns,
+            Some(EdnsInfo {
+                udp_payload_size: 4096,
+                extended_rcode: 0,
+                version: 0,
+                dnssec_ok: true,
+                options: vec![0, 15, 0, 0],
+            })
+        );
+        assert_eq!(parsed.effective_udp_payload_size(1232), 1232);
+        assert!(parsed.response_exceeds_udp_payload(1233, 1232));
+        assert!(!parsed.response_exceeds_udp_payload(1232, 1232));
+    }
+
+    #[test]
+    fn udp_payload_defaults_to_512_without_edns() {
+        let mut message = Vec::new();
+        push_header(&mut message, 1, 0, 0, 0);
+        push_question(&mut message, "example.com", 1, 1);
+
+        let parsed = Message::parse_standard_query(&message).unwrap();
+        assert_eq!(
+            parsed.effective_udp_payload_size(1500),
+            DNS_DEFAULT_UDP_PAYLOAD_SIZE
+        );
+        assert_eq!(parsed.effective_udp_payload_size(400), 400);
+    }
+
+    #[test]
+    fn edns_udp_payload_below_default_is_treated_as_default() {
+        let mut message = Vec::new();
+        push_header(&mut message, 1, 0, 0, 1);
+        push_question(&mut message, "example.com", 1, 1);
+        push_opt_record(&mut message, 128, false, &[]);
+
+        let parsed = Message::parse_standard_query(&message).unwrap();
+        assert_eq!(
+            parsed.effective_udp_payload_size(1500),
+            DNS_DEFAULT_UDP_PAYLOAD_SIZE
+        );
+    }
+
+    #[test]
+    fn malformed_edns_option_returns_parse_error() {
+        let mut message = Vec::new();
+        push_header(&mut message, 1, 0, 0, 1);
+        push_question(&mut message, "example.com", 1, 1);
+        push_opt_record(&mut message, 1232, false, &[0, 15, 0, 4, 1, 2]);
+
+        assert_eq!(
+            Message::parse_standard_query(&message),
+            Err(QueryValidationError::Parse(DnsParseError::UnexpectedEof))
+        );
     }
 
     #[test]
@@ -1060,6 +1248,35 @@ mod tests {
                 authorities: 0,
                 additionals: 0
             })
+        );
+    }
+
+    #[test]
+    fn parse_standard_query_rejects_multiple_additionals_before_body() {
+        let mut message = Vec::new();
+        push_header(&mut message, 1, 0, 0, 2);
+        push_question(&mut message, "example.com", 1, 1);
+
+        assert_eq!(
+            Message::parse_standard_query(&message),
+            Err(QueryValidationError::UnexpectedSectionRecords {
+                answers: 0,
+                authorities: 0,
+                additionals: 2
+            })
+        );
+    }
+
+    #[test]
+    fn parse_standard_query_rejects_non_edns_additional() {
+        let mut message = Vec::new();
+        push_header(&mut message, 1, 0, 0, 1);
+        push_question(&mut message, "example.com", 1, 1);
+        push_record(&mut message, "example.com", 1, 300, &[1, 2, 3, 4]);
+
+        assert_eq!(
+            Message::parse_standard_query(&message),
+            Err(QueryValidationError::InvalidEdns)
         );
     }
 
