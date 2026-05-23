@@ -2,14 +2,20 @@
 
 ## Current State
 
-The repository is a small Rust crate named `rdns`.
+The repository is a Rust crate named `rdns` with phases 1 through 3 complete.
 
-- `src/dns.rs` contains a DNS wire-message parser with tests for domain-name parsing, common record types, and message sections.
-- `src/main.rs` is only a placeholder that constructs a 12-byte message.
-- `src/lib.rs` only exports the `dns` module.
+- `src/protocol/mod.rs` contains the safe DNS protocol core: checked parsing, structured parse errors, full-message compression handling, unknown-record support, EDNS visibility, UDP truncation helpers, response builders, transaction-ID rewrite helpers, and TCP framing helpers.
+- `src/resolver/mod.rs` contains the `ResolveQuery` application service, resolver ports, query decision metadata, in-memory TTL cache, cache key/value modeling, positive and negative TTL policy, safe cached-response template handling, cache bypass rules, single-flight miss coalescing, and cache metrics hooks.
+- `src/delivery/dns.rs` contains the Tokio UDP DNS listener adapter.
+- `src/delivery/upstream.rs` contains UDP upstream forwarding, fresh upstream transaction IDs, source/ID/question validation, priority-ordered failover, per-upstream timeouts, per-query deadlines, health snapshots, and TCP fallback for truncated upstream UDP responses.
+- `src/config/mod.rs` contains validated static runtime configuration for DNS listeners, upstream resolvers, timing bounds, and UDP payload limits.
+- `src/main.rs` starts the configured UDP DNS server with the development default runtime configuration and graceful shutdown handling.
+- `src/lib.rs` exports `config`, `delivery`, `protocol`, and `resolver`.
 - `Cargo.toml` currently depends only on `tokio`.
 
-There is no resolver runtime yet: no UDP/TCP listener, upstream forwarding, response serializer, cache, policy engine, persistence layer, blocklist updater, admin API, UI server, configuration loader, metrics, or query logging.
+The resolver can now accept UDP queries, forward them to configured upstreams, use TCP fallback for truncated upstream responses, cache eligible responses in memory, rewrite cached responses for the current request, and emit decision/metric hooks.
+
+Remaining major planned areas are local policy blocking, persistent/runtime-reloadable configuration, blocklist ingestion, admin API/UI, DNS TCP listener support for clients, and operational hardening.
 
 ## Target Capabilities
 
@@ -71,14 +77,13 @@ Infrastructure implementations should be injected behind traits:
 8. On cache miss, the resolver forwards to an upstream resolver, validates the response, caches it according to TTL policy, and returns it.
 9. The query decision is logged asynchronously.
 
-## Primary Risks In The Existing Code
+## Remaining Primary Risks
 
-- Parser functions use unchecked indexing and `unwrap`, so malformed packets can panic the resolver.
-- Unsupported record types call `unimplemented!`, which is not acceptable for network input.
-- DNS compression pointers are currently parsed against the slice passed into section parsing, but DNS compression offsets are relative to the full DNS message.
-- There is no response serializer or way to safely rewrite transaction IDs for cached responses.
-- The parser has no explicit error type, making protocol failures hard to map to DNS response codes.
-- No runtime boundary exists between parsing, policy, caching, forwarding, and persistence.
+- There is no policy engine yet, so local client/domain rules and known-malicious blocklist decisions are not enforced.
+- Configuration is static and in-memory; upstreams, settings, and future rules are not durable or reloadable at runtime.
+- There is no persistence layer, blocklist updater, admin API, UI server, structured metrics exporter, or durable query logging.
+- DNS TCP support exists for protocol framing and upstream fallback, but the resolver does not yet expose a client-facing TCP listener.
+- The cache is process-local and memory-only; entries are lost on restart and are intentionally conservative around unsupported DNS semantics.
 
 ## Plan Files
 
