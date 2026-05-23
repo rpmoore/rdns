@@ -98,6 +98,21 @@ impl CacheKey {
             effective_udp_payload_size,
         }
     }
+
+    pub fn from_query(
+        query: &DecodedQuery,
+        upstream_policy_variant: Option<String>,
+        configured_max_udp_payload_size: usize,
+    ) -> Self {
+        Self::new(
+            query.question.clone(),
+            query.features.clone(),
+            upstream_policy_variant,
+            query
+                .message
+                .effective_udp_payload_size(configured_max_udp_payload_size),
+        )
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -507,6 +522,34 @@ mod tests {
         bytes
     }
 
+    fn aaaa_query(id: u16, name: &str) -> Vec<u8> {
+        let mut bytes = a_query(id, name);
+        let qtype_offset = bytes.len() - 4;
+        bytes[qtype_offset..qtype_offset + 2].copy_from_slice(&28u16.to_be_bytes());
+        bytes
+    }
+
+    fn chaos_a_query(id: u16, name: &str) -> Vec<u8> {
+        let mut bytes = a_query(id, name);
+        let qclass_offset = bytes.len() - 2;
+        bytes[qclass_offset..].copy_from_slice(&3u16.to_be_bytes());
+        bytes
+    }
+
+    fn a_query_with_edns(id: u16, name: &str, udp_payload_size: u16, dnssec_ok: bool) -> Vec<u8> {
+        let mut bytes = a_query(id, name);
+        bytes[10..12].copy_from_slice(&1u16.to_be_bytes());
+        bytes.push(0);
+        bytes.extend_from_slice(&41u16.to_be_bytes());
+        bytes.extend_from_slice(&udp_payload_size.to_be_bytes());
+        bytes.push(0);
+        bytes.push(0);
+        let flags = if dnssec_ok { 0x8000u16 } else { 0 };
+        bytes.extend_from_slice(&flags.to_be_bytes());
+        bytes.extend_from_slice(&0u16.to_be_bytes());
+        bytes
+    }
+
     struct FixedClock(SystemTime);
 
     impl Clock for FixedClock {
@@ -632,6 +675,63 @@ mod tests {
         assert_eq!(entry.minimum_ttl, Duration::from_secs(30));
         assert_eq!(entry.negative_cache, None);
         assert_eq!(entry.ttl, Duration::from_secs(60));
+    }
+
+    #[test]
+    fn cache_key_from_query_includes_supported_semantics() {
+        let codec = StandardProtocolCodec::new(1232);
+        let query = codec
+            .decode_query(&a_query_with_edns(0x1234, "Example.COM", 4096, true))
+            .unwrap();
+
+        let key = CacheKey::from_query(&query, Some("primary".to_string()), 1232);
+
+        assert_eq!(key.question, QuestionKey::new("example.com", 1, 1));
+        assert_eq!(
+            key.features,
+            QueryFeatures {
+                dnssec_ok: true,
+                edns_udp_payload_size: Some(4096),
+            }
+        );
+        assert_eq!(key.upstream_policy_variant.as_deref(), Some("primary"));
+        assert_eq!(key.effective_udp_payload_size, 1232);
+    }
+
+    #[test]
+    fn cache_key_separates_question_type_class_policy_and_udp_size() {
+        let codec = StandardProtocolCodec::new(4096);
+        let a_in = codec
+            .decode_query(&a_query_with_edns(0x1000, "example.com", 512, false))
+            .unwrap();
+        let aaaa_in = codec
+            .decode_query(&aaaa_query(0x1000, "example.com"))
+            .unwrap();
+        let a_ch = codec
+            .decode_query(&chaos_a_query(0x1000, "example.com"))
+            .unwrap();
+        let a_in_larger_udp = codec
+            .decode_query(&a_query_with_edns(0x1000, "example.com", 1232, false))
+            .unwrap();
+
+        let base = CacheKey::from_query(&a_in, Some("primary".to_string()), 4096);
+
+        assert_ne!(
+            base,
+            CacheKey::from_query(&aaaa_in, Some("primary".to_string()), 4096)
+        );
+        assert_ne!(
+            base,
+            CacheKey::from_query(&a_ch, Some("primary".to_string()), 4096)
+        );
+        assert_ne!(
+            base,
+            CacheKey::from_query(&a_in, Some("secondary".to_string()), 4096)
+        );
+        assert_ne!(
+            base,
+            CacheKey::from_query(&a_in_larger_udp, Some("primary".to_string()), 4096)
+        );
     }
 
     #[tokio::test]
