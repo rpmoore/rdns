@@ -1,7 +1,8 @@
+use std::collections::{HashMap, VecDeque};
 use std::future::Future;
 use std::net::IpAddr;
 use std::pin::Pin;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime};
 
 use crate::protocol::{
@@ -457,6 +458,152 @@ pub trait DnsCache: Send + Sync {
     fn store<'a>(&'a self, entry: CacheStore) -> BoxFuture<'a, ()>;
 }
 
+pub struct InMemoryDnsCache {
+    max_entries: usize,
+    state: Mutex<InMemoryDnsCacheState>,
+}
+
+#[derive(Default)]
+struct InMemoryDnsCacheState {
+    entries: HashMap<CacheKey, InMemoryDnsCacheEntry>,
+    lru: VecDeque<(CacheKey, u64)>,
+    next_sequence: u64,
+}
+
+struct InMemoryDnsCacheEntry {
+    response: CachedResponse,
+    sequence: u64,
+}
+
+impl InMemoryDnsCache {
+    pub fn new(max_entries: usize) -> Self {
+        Self {
+            max_entries,
+            state: Mutex::new(InMemoryDnsCacheState::default()),
+        }
+    }
+
+    pub fn len(&self) -> usize {
+        self.state.lock().unwrap().entries.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    #[cfg(test)]
+    fn lru_len(&self) -> usize {
+        self.state.lock().unwrap().lru.len()
+    }
+
+    fn lookup_now(&self, request: &CacheLookupRequest) -> CacheLookup {
+        let mut state = self.state.lock().unwrap();
+        state.remove_expired(request.received_at);
+        state.compact_lru();
+
+        let Some(existing) = state.entries.get(&request.key) else {
+            return CacheLookup::Miss;
+        };
+
+        let response = existing.response.clone();
+        let sequence = state.next_sequence();
+        if let Some(existing) = state.entries.get_mut(&request.key) {
+            existing.sequence = sequence;
+        }
+        state.lru.push_back((request.key.clone(), sequence));
+        state.compact_lru();
+        CacheLookup::Hit(response)
+    }
+
+    fn store_now(&self, entry: CacheStore, now: SystemTime) {
+        let mut state = self.state.lock().unwrap();
+        if self.max_entries == 0 {
+            state.entries.clear();
+            state.lru.clear();
+            return;
+        }
+
+        state.remove_expired(now);
+        state.compact_lru();
+        let expires_at = now.checked_add(entry.ttl).unwrap_or(SystemTime::UNIX_EPOCH);
+        if expires_at <= now {
+            state.entries.remove(&entry.key);
+            state.compact_lru();
+            return;
+        }
+
+        let sequence = state.next_sequence();
+        let cached = CachedResponse {
+            response_template: entry.response_template,
+            response_code: entry.response_code,
+            minimum_ttl: entry.minimum_ttl,
+            negative_cache: entry.negative_cache,
+            stored_at: now,
+            expires_at,
+        };
+        state.entries.insert(
+            entry.key.clone(),
+            InMemoryDnsCacheEntry {
+                response: cached,
+                sequence,
+            },
+        );
+        state.lru.push_back((entry.key, sequence));
+        state.evict_to_bound(self.max_entries);
+    }
+}
+
+impl InMemoryDnsCacheState {
+    fn next_sequence(&mut self) -> u64 {
+        let sequence = self.next_sequence;
+        self.next_sequence = self.next_sequence.wrapping_add(1);
+        sequence
+    }
+
+    fn remove_expired(&mut self, now: SystemTime) {
+        self.entries
+            .retain(|_, entry| entry.response.expires_at > now);
+    }
+
+    fn compact_lru(&mut self) {
+        self.lru.retain(|(key, sequence)| {
+            self.entries
+                .get(key)
+                .map(|entry| entry.sequence == *sequence)
+                .unwrap_or(false)
+        });
+    }
+
+    fn evict_to_bound(&mut self, max_entries: usize) {
+        self.compact_lru();
+        while self.entries.len() > max_entries {
+            let Some((key, sequence)) = self.lru.pop_front() else {
+                break;
+            };
+            let should_remove = self
+                .entries
+                .get(&key)
+                .map(|entry| entry.sequence == sequence)
+                .unwrap_or(false);
+            if should_remove {
+                self.entries.remove(&key);
+            }
+        }
+    }
+}
+
+impl DnsCache for InMemoryDnsCache {
+    fn lookup<'a>(&'a self, request: &'a CacheLookupRequest) -> BoxFuture<'a, CacheLookup> {
+        Box::pin(async move { self.lookup_now(request) })
+    }
+
+    fn store<'a>(&'a self, entry: CacheStore) -> BoxFuture<'a, ()> {
+        Box::pin(async move {
+            self.store_now(entry, SystemTime::now());
+        })
+    }
+}
+
 pub trait UpstreamResolver: Send + Sync {
     fn resolve<'a>(
         &'a self,
@@ -675,6 +822,149 @@ mod tests {
         assert_eq!(entry.minimum_ttl, Duration::from_secs(30));
         assert_eq!(entry.negative_cache, None);
         assert_eq!(entry.ttl, Duration::from_secs(60));
+    }
+
+    fn cache_key(name: &str) -> CacheKey {
+        CacheKey::new(
+            QuestionKey::new(name, 1, 1),
+            QueryFeatures {
+                dnssec_ok: false,
+                edns_udp_payload_size: None,
+            },
+            Some("primary".to_string()),
+            512,
+        )
+    }
+
+    fn cache_store(key: CacheKey, ttl: Duration) -> CacheStore {
+        CacheStore {
+            key,
+            response_template: vec![0x12, 0x34, 0x81, 0x80],
+            response_code: ResponseCode::NoError,
+            minimum_ttl: ttl,
+            negative_cache: None,
+            ttl,
+        }
+    }
+
+    #[test]
+    fn in_memory_cache_returns_unexpired_entry() {
+        let cache = InMemoryDnsCache::new(16);
+        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(10);
+        let key = cache_key("example.com");
+
+        cache.store_now(cache_store(key.clone(), Duration::from_secs(30)), now);
+
+        let lookup = cache.lookup_now(&CacheLookupRequest {
+            key,
+            received_at: now + Duration::from_secs(5),
+        });
+        let CacheLookup::Hit(hit) = lookup else {
+            panic!("expected cache hit");
+        };
+        assert_eq!(hit.response_template, vec![0x12, 0x34, 0x81, 0x80]);
+        assert_eq!(hit.stored_at, now);
+        assert_eq!(hit.expires_at, now + Duration::from_secs(30));
+        assert_eq!(cache.len(), 1);
+    }
+
+    #[test]
+    fn in_memory_cache_expires_entries_on_lookup() {
+        let cache = InMemoryDnsCache::new(16);
+        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(10);
+        let key = cache_key("example.com");
+
+        cache.store_now(cache_store(key.clone(), Duration::from_secs(30)), now);
+
+        let lookup = cache.lookup_now(&CacheLookupRequest {
+            key,
+            received_at: now + Duration::from_secs(30),
+        });
+
+        assert_eq!(lookup, CacheLookup::Miss);
+        assert!(cache.is_empty());
+    }
+
+    #[test]
+    fn in_memory_cache_evicts_least_recently_used_entry_when_bounded() {
+        let cache = InMemoryDnsCache::new(2);
+        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(10);
+        let first = cache_key("first.example");
+        let second = cache_key("second.example");
+        let third = cache_key("third.example");
+        cache.store_now(cache_store(first.clone(), Duration::from_secs(60)), now);
+        cache.store_now(cache_store(second.clone(), Duration::from_secs(60)), now);
+        assert!(matches!(
+            cache.lookup_now(&CacheLookupRequest {
+                key: first.clone(),
+                received_at: now
+            }),
+            CacheLookup::Hit(_)
+        ));
+
+        cache.store_now(cache_store(third.clone(), Duration::from_secs(60)), now);
+
+        assert_eq!(cache.len(), 2);
+        assert!(matches!(
+            cache.lookup_now(&CacheLookupRequest {
+                key: first,
+                received_at: now
+            }),
+            CacheLookup::Hit(_)
+        ));
+        assert_eq!(
+            cache.lookup_now(&CacheLookupRequest {
+                key: second,
+                received_at: now
+            }),
+            CacheLookup::Miss
+        );
+        assert!(matches!(
+            cache.lookup_now(&CacheLookupRequest {
+                key: third,
+                received_at: now
+            }),
+            CacheLookup::Hit(_)
+        ));
+    }
+
+    #[test]
+    fn in_memory_cache_zero_capacity_stores_nothing() {
+        let cache = InMemoryDnsCache::new(0);
+        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(10);
+        let key = cache_key("example.com");
+
+        cache.store_now(cache_store(key.clone(), Duration::from_secs(30)), now);
+
+        assert_eq!(
+            cache.lookup_now(&CacheLookupRequest {
+                key,
+                received_at: now,
+            }),
+            CacheLookup::Miss
+        );
+        assert!(cache.is_empty());
+    }
+
+    #[test]
+    fn in_memory_cache_prunes_stale_lru_tokens_on_repeated_hits() {
+        let cache = InMemoryDnsCache::new(2);
+        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(10);
+        let key = cache_key("example.com");
+        cache.store_now(cache_store(key.clone(), Duration::from_secs(60)), now);
+
+        for _ in 0..100 {
+            assert!(matches!(
+                cache.lookup_now(&CacheLookupRequest {
+                    key: key.clone(),
+                    received_at: now,
+                }),
+                CacheLookup::Hit(_)
+            ));
+        }
+
+        assert_eq!(cache.len(), 1);
+        assert_eq!(cache.lru_len(), 1);
     }
 
     #[test]
