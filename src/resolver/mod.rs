@@ -5,6 +5,8 @@ use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime};
 
+use tokio::sync::Notify;
+
 use crate::protocol::{
     age_response_ttls, build_formerr_response, build_refused_response, build_servfail_response,
     cap_response_ttls, question_wire, rewrite_response_id, rewrite_response_request_fields,
@@ -416,6 +418,7 @@ pub struct ResolveQuery {
     protocol: Arc<dyn ProtocolCodec>,
     cache: Arc<dyn DnsCache>,
     ttl_policy: CacheTtlPolicy,
+    miss_coalescer: Arc<SingleFlightMisses>,
     upstream: Arc<dyn UpstreamResolver>,
     responses: Arc<dyn ResponseFactory>,
     clock: Arc<dyn Clock>,
@@ -458,6 +461,7 @@ impl ResolveQuery {
             protocol,
             cache,
             ttl_policy,
+            miss_coalescer: Arc::new(SingleFlightMisses::default()),
             upstream,
             responses,
             clock,
@@ -530,13 +534,101 @@ impl ResolveQuery {
             self.metrics.increment(ResolverMetric::CacheMiss);
         }
 
-        match self
-            .upstream
-            .resolve(UpstreamRequest {
-                query: decoded.clone(),
-            })
+        if cache_store_allowed {
+            match self.miss_coalescer.begin(cache_key.clone()) {
+                SingleFlightTicket::Leader { key, flight } => {
+                    let guard = SingleFlightLeader::new(
+                        Arc::clone(&self.miss_coalescer),
+                        key,
+                        Arc::clone(&flight),
+                    );
+                    let upstream_result = self
+                        .upstream
+                        .resolve(UpstreamRequest {
+                            query: decoded.clone(),
+                        })
+                        .await;
+                    let outcome = self
+                        .finish_upstream_result(
+                            started_at,
+                            &request,
+                            &decoded,
+                            question,
+                            cache_key,
+                            true,
+                            upstream_result.clone(),
+                        )
+                        .await;
+                    guard.complete(upstream_result);
+                    outcome
+                }
+                SingleFlightTicket::Follower { flight } => {
+                    let upstream_result = flight.wait().await;
+                    if let CacheLookup::Hit(cached) = self
+                        .cache
+                        .lookup(&CacheLookupRequest {
+                            key: cache_key.clone(),
+                            received_at: request.received_at.0,
+                        })
+                        .await
+                    {
+                        if let Ok(response_bytes) = self.protocol.serialize_cached_response(
+                            &decoded,
+                            &cached,
+                            request.received_at.0,
+                        ) {
+                            self.metrics.increment(ResolverMetric::CacheHit);
+                            let decision = ResolveDecision {
+                                client_ip: request.client_ip,
+                                question: Some(question),
+                                kind: ResolveDecisionKind::CacheHit,
+                            };
+                            return self.finish(started_at, decision, response_bytes).await;
+                        }
+                    }
+                    self.finish_upstream_result(
+                        started_at,
+                        &request,
+                        &decoded,
+                        question,
+                        cache_key,
+                        false,
+                        upstream_result,
+                    )
+                    .await
+                }
+            }
+        } else {
+            let upstream_result = self
+                .upstream
+                .resolve(UpstreamRequest {
+                    query: decoded.clone(),
+                })
+                .await;
+            self.finish_upstream_result(
+                started_at,
+                &request,
+                &decoded,
+                question,
+                cache_key,
+                false,
+                upstream_result,
+            )
             .await
-        {
+        }
+    }
+
+    async fn finish_upstream_result(
+        &self,
+        started_at: SystemTime,
+        request: &ResolveRequest,
+        decoded: &DecodedQuery,
+        question: QuestionKey,
+        cache_key: CacheKey,
+        cache_store_allowed: bool,
+        upstream_result: Result<UpstreamResponse, UpstreamError>,
+    ) -> ResolveOutcome {
+        match upstream_result {
             Ok(response) => {
                 self.metrics.increment(ResolverMetric::UpstreamSuccess);
                 let decision = ResolveDecision {
@@ -563,7 +655,7 @@ impl ResolveQuery {
                     if let Some(store) = self.cache_store_for_response(
                         cache_key,
                         response_bytes.clone(),
-                        &decoded,
+                        decoded,
                         request.received_at.0,
                     ) {
                         self.cache.store(store).await;
@@ -578,7 +670,7 @@ impl ResolveQuery {
                     question: Some(question),
                     kind: ResolveDecisionKind::UpstreamFailure,
                 };
-                let response_bytes = self.responses.servfail(Some(&decoded));
+                let response_bytes = self.responses.servfail(Some(decoded));
                 self.finish(started_at, decision, response_bytes).await
             }
         }
@@ -629,6 +721,113 @@ impl ResolveQuery {
         ResolveOutcome {
             response_bytes,
             decision,
+        }
+    }
+}
+
+#[derive(Default)]
+struct SingleFlightMisses {
+    flights: Mutex<HashMap<CacheKey, Arc<InFlightMiss>>>,
+}
+
+enum SingleFlightTicket {
+    Leader {
+        key: CacheKey,
+        flight: Arc<InFlightMiss>,
+    },
+    Follower {
+        flight: Arc<InFlightMiss>,
+    },
+}
+
+struct InFlightMiss {
+    result: Mutex<Option<Result<UpstreamResponse, UpstreamError>>>,
+    notify: Notify,
+}
+
+struct SingleFlightLeader {
+    coalescer: Arc<SingleFlightMisses>,
+    key: CacheKey,
+    flight: Arc<InFlightMiss>,
+    completed: bool,
+}
+
+impl SingleFlightMisses {
+    fn begin(&self, key: CacheKey) -> SingleFlightTicket {
+        let mut flights = self.flights.lock().unwrap();
+        if let Some(flight) = flights.get(&key) {
+            return SingleFlightTicket::Follower {
+                flight: Arc::clone(flight),
+            };
+        }
+        let flight = Arc::new(InFlightMiss {
+            result: Mutex::new(None),
+            notify: Notify::new(),
+        });
+        flights.insert(key.clone(), Arc::clone(&flight));
+        SingleFlightTicket::Leader { key, flight }
+    }
+
+    fn finish(
+        &self,
+        key: &CacheKey,
+        flight: &Arc<InFlightMiss>,
+        result: Result<UpstreamResponse, UpstreamError>,
+    ) {
+        *flight.result.lock().unwrap() = Some(result);
+        let mut flights = self.flights.lock().unwrap();
+        if flights
+            .get(key)
+            .map(|current| Arc::ptr_eq(current, flight))
+            .unwrap_or(false)
+        {
+            flights.remove(key);
+        }
+        drop(flights);
+        flight.notify.notify_waiters();
+    }
+}
+
+impl SingleFlightLeader {
+    fn new(coalescer: Arc<SingleFlightMisses>, key: CacheKey, flight: Arc<InFlightMiss>) -> Self {
+        Self {
+            coalescer,
+            key,
+            flight,
+            completed: false,
+        }
+    }
+
+    fn complete(mut self, result: Result<UpstreamResponse, UpstreamError>) {
+        self.coalescer.finish(&self.key, &self.flight, result);
+        self.completed = true;
+    }
+}
+
+impl Drop for SingleFlightLeader {
+    fn drop(&mut self) {
+        if self.completed {
+            return;
+        }
+        self.coalescer.finish(
+            &self.key,
+            &self.flight,
+            Err(UpstreamError::Transport(
+                "single-flight leader cancelled".to_string(),
+            )),
+        );
+    }
+}
+
+impl InFlightMiss {
+    async fn wait(&self) -> Result<UpstreamResponse, UpstreamError> {
+        loop {
+            let notified = self.notify.notified();
+            tokio::pin!(notified);
+            if let Some(result) = self.result.lock().unwrap().clone() {
+                return result;
+            }
+            notified.await;
         }
     }
 }
@@ -1149,6 +1348,45 @@ mod tests {
         }
     }
 
+    struct BlockingUpstream {
+        response: Result<UpstreamResponse, UpstreamError>,
+        requests: Mutex<Vec<UpstreamRequest>>,
+        release: Notify,
+    }
+
+    impl BlockingUpstream {
+        fn new(response: Result<UpstreamResponse, UpstreamError>) -> Self {
+            Self {
+                response,
+                requests: Mutex::new(Vec::new()),
+                release: Notify::new(),
+            }
+        }
+
+        async fn wait_for_requests(&self, expected: usize) {
+            for _ in 0..100 {
+                if self.requests.lock().unwrap().len() >= expected {
+                    return;
+                }
+                tokio::task::yield_now().await;
+            }
+            panic!("timed out waiting for {expected} upstream request(s)");
+        }
+    }
+
+    impl UpstreamResolver for BlockingUpstream {
+        fn resolve<'a>(
+            &'a self,
+            request: UpstreamRequest,
+        ) -> BoxFuture<'a, Result<UpstreamResponse, UpstreamError>> {
+            Box::pin(async move {
+                self.requests.lock().unwrap().push(request);
+                self.release.notified().await;
+                self.response.clone()
+            })
+        }
+    }
+
     struct RecordingCache {
         lookup: Mutex<CacheLookup>,
         lookups: Mutex<Vec<CacheLookupRequest>>,
@@ -1196,7 +1434,7 @@ mod tests {
     }
 
     fn resolve_service_with_cache(
-        upstream: Arc<StaticUpstream>,
+        upstream: Arc<dyn UpstreamResolver>,
         cache: Arc<dyn DnsCache>,
         events: Arc<RecordingEvents>,
         metrics: Arc<RecordingMetrics>,
@@ -2050,6 +2288,86 @@ mod tests {
         assert_eq!(outcome.decision.kind, ResolveDecisionKind::Allowed);
         assert_eq!(upstream.requests.lock().unwrap().len(), 1);
         assert_eq!(cache.stores.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn resolve_coalesces_duplicate_cache_misses() {
+        let cache = Arc::new(InMemoryDnsCache::new(16));
+        let upstream = Arc::new(BlockingUpstream::new(Ok(UpstreamResponse {
+            bytes: a_response_with_answer(0xaaaa, "example.com", 60),
+            received_at: SystemTime::UNIX_EPOCH,
+        })));
+        let events = Arc::new(RecordingEvents::default());
+        let metrics = Arc::new(RecordingMetrics::default());
+        let service = Arc::new(resolve_service_with_cache(
+            upstream.clone(),
+            cache,
+            events,
+            metrics,
+            1232,
+        ));
+        let first = {
+            let service = Arc::clone(&service);
+            tokio::spawn(async move {
+                service
+                    .resolve(ResolveRequest::new(
+                        "192.0.2.10".parse().unwrap(),
+                        SystemTime::UNIX_EPOCH,
+                        a_query(0x1111, "example.com"),
+                    ))
+                    .await
+            })
+        };
+        upstream.wait_for_requests(1).await;
+        let second = {
+            let service = Arc::clone(&service);
+            tokio::spawn(async move {
+                service
+                    .resolve(ResolveRequest::new(
+                        "192.0.2.11".parse().unwrap(),
+                        SystemTime::UNIX_EPOCH,
+                        a_query(0x2222, "example.com"),
+                    ))
+                    .await
+            })
+        };
+
+        tokio::task::yield_now().await;
+        assert_eq!(upstream.requests.lock().unwrap().len(), 1);
+        upstream.release.notify_waiters();
+        let first = first.await.unwrap();
+        let second = second.await.unwrap();
+
+        assert_eq!(upstream.requests.lock().unwrap().len(), 1);
+        assert_eq!(&first.response_bytes[0..2], &[0x11, 0x11]);
+        assert_eq!(&second.response_bytes[0..2], &[0x22, 0x22]);
+        assert_eq!(first.decision.kind, ResolveDecisionKind::Allowed);
+        assert_eq!(second.decision.kind, ResolveDecisionKind::CacheHit);
+    }
+
+    #[tokio::test]
+    async fn single_flight_leader_drop_wakes_followers_and_clears_key() {
+        let coalescer = Arc::new(SingleFlightMisses::default());
+        let key = cache_key("example.com");
+        let SingleFlightTicket::Leader { key, flight } = coalescer.begin(key.clone()) else {
+            panic!("first miss should lead the flight");
+        };
+        let guard = SingleFlightLeader::new(Arc::clone(&coalescer), key.clone(), flight);
+        let SingleFlightTicket::Follower { flight } = coalescer.begin(key.clone()) else {
+            panic!("duplicate miss should follow the flight");
+        };
+
+        drop(guard);
+
+        let result = tokio::time::timeout(Duration::from_secs(1), flight.wait())
+            .await
+            .expect("follower should wake after leader cancellation");
+        assert!(matches!(result, Err(UpstreamError::Transport(_))));
+        let SingleFlightTicket::Leader { key, flight } = coalescer.begin(key) else {
+            panic!("cancelled flight should be removed");
+        };
+        SingleFlightLeader::new(Arc::clone(&coalescer), key, flight)
+            .complete(Err(UpstreamError::Timeout));
     }
 
     #[tokio::test]
