@@ -2319,4 +2319,95 @@ mod tests {
             Err(DnsParseError::InvalidNamePointer)
         );
     }
+
+    #[test]
+    fn malformed_inputs_return_without_panicking() {
+        let mut corpus = vec![
+            Vec::new(),
+            vec![0],
+            vec![0; 11],
+            vec![0xff; 64],
+            vec![0x12, 0x34, 0x01, 0x00, 0, 1],
+            vec![0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0xc0, 0x00],
+            vec![0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 64],
+        ];
+
+        for len in 0..32 {
+            let mut bytes = Vec::with_capacity(len);
+            for value in 0..len {
+                bytes.push((value * 17) as u8);
+            }
+            corpus.push(bytes);
+        }
+
+        for bytes in corpus {
+            let result = std::panic::catch_unwind(|| Message::parse(&bytes));
+            assert!(result.is_ok(), "parser panicked for bytes: {bytes:?}");
+        }
+    }
+
+    #[test]
+    fn malformed_fixed_length_rdata_returns_error() {
+        let mut a_bytes = Vec::new();
+        push_name(&mut a_bytes, "example.com");
+        build_record_header(&mut a_bytes, 1, 3, 300);
+        a_bytes.extend_from_slice(&[1, 2, 3]);
+        let mut offset = 0;
+        let mut context = ParseContext::default();
+        assert_eq!(
+            parse_record(&a_bytes, &mut offset, &mut context),
+            Err(DnsParseError::MalformedRecord)
+        );
+
+        let mut aaaa_bytes = Vec::new();
+        push_name(&mut aaaa_bytes, "example.com");
+        build_record_header(&mut aaaa_bytes, 28, 15, 300);
+        aaaa_bytes.extend_from_slice(&[0; 15]);
+        let mut offset = 0;
+        let mut context = ParseContext::default();
+        assert_eq!(
+            parse_record(&aaaa_bytes, &mut offset, &mut context),
+            Err(DnsParseError::MalformedRecord)
+        );
+    }
+
+    #[test]
+    fn malformed_txt_and_caa_rdata_return_error() {
+        let mut txt_bytes = Vec::new();
+        push_name(&mut txt_bytes, "example.com");
+        build_record_header(&mut txt_bytes, 16, 3, 300);
+        txt_bytes.extend_from_slice(&[5, b'h', b'i']);
+        let mut offset = 0;
+        let mut context = ParseContext::default();
+        assert_eq!(
+            parse_record(&txt_bytes, &mut offset, &mut context),
+            Err(DnsParseError::UnexpectedEof)
+        );
+
+        let mut caa_bytes = Vec::new();
+        push_name(&mut caa_bytes, "example.com");
+        build_record_header(&mut caa_bytes, 257, 3, 300);
+        caa_bytes.extend_from_slice(&[0, 5, b'i']);
+        let mut offset = 0;
+        let mut context = ParseContext::default();
+        assert_eq!(
+            parse_record(&caa_bytes, &mut offset, &mut context),
+            Err(DnsParseError::UnexpectedEof)
+        );
+    }
+
+    #[test]
+    fn generated_response_size_can_be_checked_against_current_request_udp_limit() {
+        let mut request = Vec::new();
+        push_header(&mut request, 1, 0, 0, 1);
+        push_question(&mut request, "blocked.example", 1, 1);
+        push_opt_record(&mut request, 1232, false, &[]);
+        let request = Message::parse_standard_query(&request).unwrap();
+
+        let mut response = build_a_block_response(&request, Ipv4Addr::new(10, 0, 0, 1), 60);
+        response.resize(800, 0);
+        assert_eq!(request.effective_udp_payload_size(1500), 1232);
+        assert!(!request.response_exceeds_udp_payload(response.len(), 1500));
+        assert!(request.response_exceeds_udp_payload(response.len(), 700));
+    }
 }
