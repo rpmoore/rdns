@@ -7,8 +7,11 @@ use std::time::{Duration, SystemTime};
 
 use crate::protocol::{
     build_formerr_response, build_refused_response, build_servfail_response, rewrite_response_id,
-    Message, QueryValidationError, ResponseCode,
+    Message, QueryValidationError, RecordData, ResponseCode,
 };
+
+const MAX_FAILURE_CACHE_TTL: Duration = Duration::from_secs(5 * 60);
+const CNAME_RECORD_TYPE: u16 = 5;
 
 pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 
@@ -197,6 +200,161 @@ pub struct CacheStore {
     pub minimum_ttl: Duration,
     pub negative_cache: Option<NegativeCacheMetadata>,
     pub ttl: Duration,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CacheTtlPolicy {
+    pub max_positive_ttl: Duration,
+    pub min_positive_ttl: Option<Duration>,
+    pub max_negative_ttl: Duration,
+    pub min_negative_ttl: Option<Duration>,
+    pub failure_ttl: Option<Duration>,
+}
+
+impl CacheTtlPolicy {
+    pub fn new(
+        max_positive_ttl: Duration,
+        min_positive_ttl: Option<Duration>,
+        max_negative_ttl: Duration,
+        min_negative_ttl: Option<Duration>,
+        failure_ttl: Option<Duration>,
+    ) -> Self {
+        Self {
+            max_positive_ttl,
+            min_positive_ttl,
+            max_negative_ttl,
+            min_negative_ttl,
+            failure_ttl,
+        }
+    }
+
+    pub fn ttl_for_response(
+        &self,
+        response: &Message,
+    ) -> Option<(Duration, Option<NegativeCacheMetadata>)> {
+        let response_code = response_code(response)?;
+        if response_code == ResponseCode::ServFail {
+            return self
+                .failure_ttl
+                .map(|ttl| (ttl.min(MAX_FAILURE_CACHE_TTL), None));
+        }
+        if !is_cacheable_response_code(response_code) {
+            return None;
+        }
+
+        if !response.answers.is_empty() {
+            let answer_ttl = response.answers.iter().map(|record| record.ttl).min()?;
+            if let Some(metadata) = negative_ttl(response) {
+                let cname_chain_nodata = response_code == ResponseCode::NoError
+                    && question_type(response) != Some(CNAME_RECORD_TYPE)
+                    && !has_requested_answer(response);
+                if response_code == ResponseCode::NxDomain || cname_chain_nodata {
+                    let positive_ttl = apply_ttl_bounds(
+                        Duration::from_secs(u64::from(answer_ttl)),
+                        self.min_positive_ttl,
+                        self.max_positive_ttl,
+                    );
+                    let negative_ttl = apply_ttl_bounds(
+                        metadata.soa_minimum_ttl,
+                        self.min_negative_ttl,
+                        self.max_negative_ttl,
+                    );
+                    return Some((positive_ttl.min(negative_ttl), Some(metadata)));
+                }
+            }
+            return Some((
+                apply_ttl_bounds(
+                    Duration::from_secs(u64::from(answer_ttl)),
+                    self.min_positive_ttl,
+                    self.max_positive_ttl,
+                ),
+                None,
+            ));
+        }
+
+        if response_code == ResponseCode::NxDomain || response_code == ResponseCode::NoError {
+            return negative_ttl(response).map(|metadata| {
+                (
+                    apply_ttl_bounds(
+                        metadata.soa_minimum_ttl,
+                        self.min_negative_ttl,
+                        self.max_negative_ttl,
+                    ),
+                    Some(metadata),
+                )
+            });
+        }
+
+        None
+    }
+}
+
+impl Default for CacheTtlPolicy {
+    fn default() -> Self {
+        Self {
+            max_positive_ttl: Duration::from_secs(24 * 60 * 60),
+            min_positive_ttl: None,
+            max_negative_ttl: Duration::from_secs(60 * 60),
+            min_negative_ttl: None,
+            failure_ttl: None,
+        }
+    }
+}
+
+fn response_code(message: &Message) -> Option<ResponseCode> {
+    match message.header.r_code() {
+        0 => Some(ResponseCode::NoError),
+        1 => Some(ResponseCode::FormErr),
+        2 => Some(ResponseCode::ServFail),
+        3 => Some(ResponseCode::NxDomain),
+        4 => Some(ResponseCode::NotImp),
+        5 => Some(ResponseCode::Refused),
+        _ => None,
+    }
+}
+
+fn is_cacheable_response_code(response_code: ResponseCode) -> bool {
+    matches!(
+        response_code,
+        ResponseCode::NoError | ResponseCode::NxDomain
+    )
+}
+
+fn negative_ttl(response: &Message) -> Option<NegativeCacheMetadata> {
+    response.authorities.iter().find_map(|record| {
+        let RecordData::SOA { minimum, .. } = &record.record else {
+            return None;
+        };
+        let ttl = record.ttl.min(*minimum);
+        Some(NegativeCacheMetadata {
+            authority_name: record.name.clone(),
+            soa_minimum_ttl: Duration::from_secs(u64::from(ttl)),
+        })
+    })
+}
+
+fn has_requested_answer(message: &Message) -> bool {
+    let Some(qtype) = question_type(message) else {
+        return false;
+    };
+    message.answers.iter().any(|record| {
+        if record.rtype != qtype {
+            return false;
+        }
+        !matches!(record.record, RecordData::RRSIG { .. })
+    })
+}
+
+fn question_type(message: &Message) -> Option<u16> {
+    message.questions.first().map(|question| question.qtype)
+}
+
+fn apply_ttl_bounds(ttl: Duration, min_ttl: Option<Duration>, max_ttl: Duration) -> Duration {
+    let capped = ttl.min(max_ttl);
+    match min_ttl {
+        Some(min_ttl) => capped.max(min_ttl).min(max_ttl),
+        None => capped,
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -651,6 +809,8 @@ mod tests {
     use super::*;
     use std::sync::Mutex;
 
+    use crate::protocol::{Header, Question, Record};
+
     fn a_query(id: u16, name: &str) -> Vec<u8> {
         let mut bytes = Vec::new();
         bytes.extend_from_slice(&id.to_be_bytes());
@@ -845,6 +1005,311 @@ mod tests {
             negative_cache: None,
             ttl,
         }
+    }
+
+    fn response_message(
+        response_code: ResponseCode,
+        answers: Vec<Record>,
+        authorities: Vec<Record>,
+    ) -> Message {
+        Message {
+            header: Header {
+                id: 0x1234,
+                flags: 0x8000 | response_code as u16,
+                qd_count: 1,
+                an_count: answers.len() as u16,
+                ns_count: authorities.len() as u16,
+                ar_count: 0,
+            },
+            original_bytes: Vec::new(),
+            questions: vec![Question {
+                qname: "example.com".to_string(),
+                qtype: 1,
+                qclass: 1,
+            }],
+            answers,
+            authorities,
+            additionals: Vec::new(),
+            edns: None,
+        }
+    }
+
+    fn a_record(name: &str, ttl: u32) -> Record {
+        Record {
+            name: name.to_string(),
+            rtype: 1,
+            rclass: 1,
+            ttl,
+            record: RecordData::A("192.0.2.10".parse().unwrap()),
+        }
+    }
+
+    fn cname_record(name: &str, ttl: u32, target: &str) -> Record {
+        Record {
+            name: name.to_string(),
+            rtype: 5,
+            rclass: 1,
+            ttl,
+            record: RecordData::CNAME(target.to_string()),
+        }
+    }
+
+    fn rrsig_record(name: &str, ttl: u32, type_covered: u16) -> Record {
+        Record {
+            name: name.to_string(),
+            rtype: 46,
+            rclass: 1,
+            ttl,
+            record: RecordData::RRSIG {
+                type_covered,
+                algorithm: 8,
+                labels: 2,
+                original_ttl: ttl,
+                signature_expiration: 0,
+                signature_inception: 0,
+                key_tag: 0,
+                signer_name: "example.com".to_string(),
+                signature: Vec::new(),
+            },
+        }
+    }
+
+    fn soa_record(name: &str, ttl: u32, minimum: u32) -> Record {
+        Record {
+            name: name.to_string(),
+            rtype: 6,
+            rclass: 1,
+            ttl,
+            record: RecordData::SOA {
+                ttl,
+                rname: "hostmaster.example.com".to_string(),
+                mname: "ns.example.com".to_string(),
+                serial: 1,
+                refresh: 2,
+                retry: 3,
+                expire: 4,
+                minimum,
+            },
+        }
+    }
+
+    #[test]
+    fn ttl_policy_uses_minimum_answer_ttl_for_positive_response() {
+        let policy = CacheTtlPolicy::default();
+        let response = response_message(
+            ResponseCode::NoError,
+            vec![a_record("example.com", 120), a_record("example.com", 30)],
+            Vec::new(),
+        );
+
+        let (ttl, metadata) = policy.ttl_for_response(&response).unwrap();
+
+        assert_eq!(ttl, Duration::from_secs(30));
+        assert_eq!(metadata, None);
+    }
+
+    #[test]
+    fn ttl_policy_applies_positive_minimum_and_maximum_bounds() {
+        let policy = CacheTtlPolicy::new(
+            Duration::from_secs(60),
+            Some(Duration::from_secs(20)),
+            Duration::from_secs(60),
+            None,
+            None,
+        );
+
+        let high = response_message(
+            ResponseCode::NoError,
+            vec![a_record("example.com", 3600)],
+            Vec::new(),
+        );
+        let low = response_message(
+            ResponseCode::NoError,
+            vec![a_record("example.com", 5)],
+            Vec::new(),
+        );
+
+        assert_eq!(
+            policy.ttl_for_response(&high).unwrap().0,
+            Duration::from_secs(60)
+        );
+        assert_eq!(
+            policy.ttl_for_response(&low).unwrap().0,
+            Duration::from_secs(20)
+        );
+    }
+
+    #[test]
+    fn ttl_policy_uses_soa_ttl_for_negative_response() {
+        let policy = CacheTtlPolicy::default();
+        let response = response_message(
+            ResponseCode::NxDomain,
+            Vec::new(),
+            vec![soa_record("example.com", 90, 300)],
+        );
+
+        let (ttl, metadata) = policy.ttl_for_response(&response).unwrap();
+
+        assert_eq!(ttl, Duration::from_secs(90));
+        assert_eq!(
+            metadata,
+            Some(NegativeCacheMetadata {
+                authority_name: "example.com".to_string(),
+                soa_minimum_ttl: Duration::from_secs(90),
+            })
+        );
+    }
+
+    #[test]
+    fn ttl_policy_preserves_negative_metadata_for_nxdomain_with_cname_answer() {
+        let policy = CacheTtlPolicy::default();
+        let response = response_message(
+            ResponseCode::NxDomain,
+            vec![cname_record("www.example.com", 300, "missing.example.com")],
+            vec![soa_record("example.com", 60, 120)],
+        );
+
+        let (ttl, metadata) = policy.ttl_for_response(&response).unwrap();
+
+        assert_eq!(ttl, Duration::from_secs(60));
+        assert_eq!(
+            metadata,
+            Some(NegativeCacheMetadata {
+                authority_name: "example.com".to_string(),
+                soa_minimum_ttl: Duration::from_secs(60),
+            })
+        );
+    }
+
+    #[test]
+    fn ttl_policy_preserves_negative_metadata_for_nodata_with_cname_answer() {
+        let policy = CacheTtlPolicy::default();
+        let response = response_message(
+            ResponseCode::NoError,
+            vec![cname_record("www.example.com", 300, "target.example.com")],
+            vec![soa_record("example.com", 30, 120)],
+        );
+
+        let (ttl, metadata) = policy.ttl_for_response(&response).unwrap();
+
+        assert_eq!(ttl, Duration::from_secs(30));
+        assert_eq!(
+            metadata,
+            Some(NegativeCacheMetadata {
+                authority_name: "example.com".to_string(),
+                soa_minimum_ttl: Duration::from_secs(30),
+            })
+        );
+    }
+
+    #[test]
+    fn ttl_policy_preserves_negative_metadata_for_dnssec_signed_cname_nodata() {
+        let policy = CacheTtlPolicy::default();
+        let response = response_message(
+            ResponseCode::NoError,
+            vec![
+                cname_record("www.example.com", 300, "target.example.com"),
+                rrsig_record("www.example.com", 300, CNAME_RECORD_TYPE),
+            ],
+            vec![soa_record("example.com", 30, 120)],
+        );
+
+        let (ttl, metadata) = policy.ttl_for_response(&response).unwrap();
+
+        assert_eq!(ttl, Duration::from_secs(30));
+        assert_eq!(
+            metadata,
+            Some(NegativeCacheMetadata {
+                authority_name: "example.com".to_string(),
+                soa_minimum_ttl: Duration::from_secs(30),
+            })
+        );
+    }
+
+    #[test]
+    fn ttl_policy_keeps_direct_cname_answer_positive() {
+        let policy = CacheTtlPolicy::default();
+        let mut response = response_message(
+            ResponseCode::NoError,
+            vec![cname_record("www.example.com", 300, "target.example.com")],
+            vec![soa_record("example.com", 30, 120)],
+        );
+        response.questions[0].qtype = CNAME_RECORD_TYPE;
+
+        let (ttl, metadata) = policy.ttl_for_response(&response).unwrap();
+
+        assert_eq!(ttl, Duration::from_secs(300));
+        assert_eq!(metadata, None);
+    }
+
+    #[test]
+    fn ttl_policy_applies_negative_bounds_and_requires_soa() {
+        let policy = CacheTtlPolicy::new(
+            Duration::from_secs(60),
+            None,
+            Duration::from_secs(30),
+            Some(Duration::from_secs(10)),
+            None,
+        );
+        let high = response_message(
+            ResponseCode::NxDomain,
+            Vec::new(),
+            vec![soa_record("example.com", 120, 120)],
+        );
+        let low = response_message(
+            ResponseCode::NoError,
+            Vec::new(),
+            vec![soa_record("example.com", 5, 5)],
+        );
+        let no_soa = response_message(ResponseCode::NxDomain, Vec::new(), Vec::new());
+
+        assert_eq!(
+            policy.ttl_for_response(&high).unwrap().0,
+            Duration::from_secs(30)
+        );
+        assert_eq!(
+            policy.ttl_for_response(&low).unwrap().0,
+            Duration::from_secs(10)
+        );
+        assert_eq!(policy.ttl_for_response(&no_soa), None);
+    }
+
+    #[test]
+    fn ttl_policy_does_not_cache_failures_without_explicit_failure_ttl() {
+        let default_policy = CacheTtlPolicy::default();
+        let failure = response_message(ResponseCode::ServFail, Vec::new(), Vec::new());
+        let refused = response_message(ResponseCode::Refused, Vec::new(), Vec::new());
+        let failure_policy = CacheTtlPolicy::new(
+            Duration::from_secs(60),
+            None,
+            Duration::from_secs(60),
+            None,
+            Some(Duration::from_secs(2)),
+        );
+
+        assert_eq!(default_policy.ttl_for_response(&failure), None);
+        assert_eq!(default_policy.ttl_for_response(&refused), None);
+        assert_eq!(
+            failure_policy.ttl_for_response(&failure),
+            Some((Duration::from_secs(2), None))
+        );
+    }
+
+    #[test]
+    fn ttl_policy_caps_explicit_failure_ttl() {
+        let failure = response_message(ResponseCode::ServFail, Vec::new(), Vec::new());
+        let failure_policy = CacheTtlPolicy::new(
+            Duration::from_secs(60),
+            None,
+            Duration::from_secs(60),
+            None,
+            Some(Duration::from_secs(3600)),
+        );
+
+        assert_eq!(
+            failure_policy.ttl_for_response(&failure),
+            Some((MAX_FAILURE_CACHE_TTL, None))
+        );
     }
 
     #[test]
