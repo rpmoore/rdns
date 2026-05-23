@@ -6,10 +6,12 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime};
 
 use crate::protocol::{
-    build_formerr_response, build_refused_response, build_servfail_response, rewrite_response_id,
+    age_response_ttls, build_formerr_response, build_refused_response, build_servfail_response,
+    cap_response_ttls, question_wire, rewrite_response_id, rewrite_response_request_fields,
     Message, QueryValidationError, RecordData, ResponseCode,
 };
 
+const EDNS_DO_FLAG: u16 = 0x8000;
 const MAX_FAILURE_CACHE_TTL: Duration = Duration::from_secs(5 * 60);
 const CNAME_RECORD_TYPE: u16 = 5;
 
@@ -63,6 +65,7 @@ fn normalize_question_name(name: &str) -> String {
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct QueryFeatures {
+    pub recursion_desired: bool,
     pub dnssec_ok: bool,
     pub edns_udp_payload_size: Option<u16>,
 }
@@ -70,6 +73,7 @@ pub struct QueryFeatures {
 impl QueryFeatures {
     pub fn from_message(message: &Message) -> Self {
         Self {
+            recursion_desired: message.header.rd(),
             dnssec_ok: message
                 .edns
                 .as_ref()
@@ -83,6 +87,7 @@ impl QueryFeatures {
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct CacheKey {
     pub question: QuestionKey,
+    pub question_wire: Vec<u8>,
     pub features: QueryFeatures,
     pub upstream_policy_variant: Option<String>,
     pub effective_udp_payload_size: usize,
@@ -91,12 +96,14 @@ pub struct CacheKey {
 impl CacheKey {
     pub fn new(
         question: QuestionKey,
+        question_wire: Vec<u8>,
         features: QueryFeatures,
         upstream_policy_variant: Option<String>,
         effective_udp_payload_size: usize,
     ) -> Self {
         Self {
             question,
+            question_wire,
             features,
             upstream_policy_variant,
             effective_udp_payload_size,
@@ -110,6 +117,7 @@ impl CacheKey {
     ) -> Self {
         Self::new(
             query.question.clone(),
+            query.question_wire.clone(),
             query.features.clone(),
             upstream_policy_variant,
             query
@@ -129,16 +137,19 @@ pub struct CacheLookupRequest {
 pub struct DecodedQuery {
     pub message: Message,
     pub question: QuestionKey,
+    pub question_wire: Vec<u8>,
     pub features: QueryFeatures,
 }
 
 impl DecodedQuery {
     pub fn new(message: Message) -> Option<Self> {
         let question = QuestionKey::from_message(&message)?;
+        let question_wire = question_wire(&message.original_bytes).ok()?;
         let features = QueryFeatures::from_message(&message);
         Some(Self {
             message,
             question,
+            question_wire,
             features,
         })
     }
@@ -199,6 +210,7 @@ pub struct CacheStore {
     pub response_code: ResponseCode,
     pub minimum_ttl: Duration,
     pub negative_cache: Option<NegativeCacheMetadata>,
+    pub stored_at: SystemTime,
     pub ttl: Duration,
 }
 
@@ -402,6 +414,8 @@ pub struct ResolveOutcome {
 
 pub struct ResolveQuery {
     protocol: Arc<dyn ProtocolCodec>,
+    cache: Arc<dyn DnsCache>,
+    ttl_policy: CacheTtlPolicy,
     upstream: Arc<dyn UpstreamResolver>,
     responses: Arc<dyn ResponseFactory>,
     clock: Arc<dyn Clock>,
@@ -418,8 +432,32 @@ impl ResolveQuery {
         events: Arc<dyn QueryEventSink>,
         metrics: Arc<dyn MetricsSink>,
     ) -> Self {
+        Self::with_cache(
+            protocol,
+            Arc::new(NoopDnsCache),
+            CacheTtlPolicy::default(),
+            upstream,
+            responses,
+            clock,
+            events,
+            metrics,
+        )
+    }
+
+    pub fn with_cache(
+        protocol: Arc<dyn ProtocolCodec>,
+        cache: Arc<dyn DnsCache>,
+        ttl_policy: CacheTtlPolicy,
+        upstream: Arc<dyn UpstreamResolver>,
+        responses: Arc<dyn ResponseFactory>,
+        clock: Arc<dyn Clock>,
+        events: Arc<dyn QueryEventSink>,
+        metrics: Arc<dyn MetricsSink>,
+    ) -> Self {
         Self {
             protocol,
+            cache,
+            ttl_policy,
             upstream,
             responses,
             clock,
@@ -449,6 +487,49 @@ impl ResolveQuery {
 
         self.metrics.increment(ResolverMetric::QueryAllowed);
         let question = decoded.question.clone();
+        let cache_lookup_allowed = cache_supported(&decoded);
+        let cache_key = CacheKey::from_query(
+            &decoded,
+            None,
+            self.protocol.configured_max_udp_payload_size(),
+        );
+        let mut cache_store_allowed = cache_lookup_allowed;
+        if cache_lookup_allowed {
+            let lookup = self
+                .cache
+                .lookup(&CacheLookupRequest {
+                    key: cache_key.clone(),
+                    received_at: request.received_at.0,
+                })
+                .await;
+            cache_store_allowed = matches!(lookup, CacheLookup::Miss);
+            if let CacheLookup::Hit(cached) = lookup {
+                match self.protocol.serialize_cached_response(
+                    &decoded,
+                    &cached,
+                    request.received_at.0,
+                ) {
+                    Ok(response_bytes) => {
+                        self.metrics.increment(ResolverMetric::CacheHit);
+                        let decision = ResolveDecision {
+                            client_ip: request.client_ip,
+                            question: Some(question.clone()),
+                            kind: ResolveDecisionKind::CacheHit,
+                        };
+                        return self.finish(started_at, decision, response_bytes).await;
+                    }
+                    Err(_) => {
+                        self.metrics.increment(ResolverMetric::CacheMiss);
+                        cache_store_allowed = true;
+                    }
+                }
+            } else {
+                self.metrics.increment(ResolverMetric::CacheMiss);
+            }
+        } else {
+            self.metrics.increment(ResolverMetric::CacheMiss);
+        }
+
         match self
             .upstream
             .resolve(UpstreamRequest {
@@ -478,6 +559,16 @@ impl ResolveQuery {
                     let response_bytes = self.responses.servfail(Some(&decoded));
                     return self.finish(started_at, decision, response_bytes).await;
                 }
+                if cache_store_allowed {
+                    if let Some(store) = self.cache_store_for_response(
+                        cache_key,
+                        response_bytes.clone(),
+                        &decoded,
+                        request.received_at.0,
+                    ) {
+                        self.cache.store(store).await;
+                    }
+                }
                 self.finish(started_at, decision, response_bytes).await
             }
             Err(_) => {
@@ -491,6 +582,37 @@ impl ResolveQuery {
                 self.finish(started_at, decision, response_bytes).await
             }
         }
+    }
+
+    fn cache_store_for_response(
+        &self,
+        key: CacheKey,
+        mut response_template: Vec<u8>,
+        query: &DecodedQuery,
+        stored_at: SystemTime,
+    ) -> Option<CacheStore> {
+        let response = Message::parse(&response_template).ok()?;
+        if !response.header.qr()
+            || response.questions.len() != 1
+            || query.message.questions.len() != 1
+            || response.questions[0] != query.message.questions[0]
+        {
+            return None;
+        }
+        let response_code = response_code(&response)?;
+        let (ttl, negative_cache) = self.ttl_policy.ttl_for_response(&response)?;
+        self.protocol
+            .rewrite_response_id(&mut response_template, 0)
+            .ok()?;
+        Some(CacheStore {
+            key,
+            response_template,
+            response_code,
+            minimum_ttl: ttl,
+            negative_cache,
+            stored_at,
+            ttl,
+        })
     }
 
     async fn finish(
@@ -516,6 +638,23 @@ fn request_id_from_wire(bytes: &[u8]) -> Option<u16> {
     Some(u16::from_be_bytes([id[0], id[1]]))
 }
 
+fn cache_supported(query: &DecodedQuery) -> bool {
+    if query.message.header.ad() || query.message.header.cd() {
+        return false;
+    }
+    query
+        .message
+        .edns
+        .as_ref()
+        .map(|edns| {
+            edns.extended_rcode == 0
+                && edns.version == 0
+                && (edns.flags & !EDNS_DO_FLAG) == 0
+                && edns.options.is_empty()
+        })
+        .unwrap_or(true)
+}
+
 pub struct StandardProtocolCodec {
     configured_max_udp_payload_size: usize,
 }
@@ -534,6 +673,10 @@ impl ProtocolCodec for StandardProtocolCodec {
         DecodedQuery::new(message).ok_or(QueryValidationError::InvalidQuestionCount { count: 0 })
     }
 
+    fn configured_max_udp_payload_size(&self) -> usize {
+        self.configured_max_udp_payload_size
+    }
+
     fn rewrite_response_id(
         &self,
         response_bytes: &mut [u8],
@@ -546,9 +689,21 @@ impl ProtocolCodec for StandardProtocolCodec {
         &self,
         query: &DecodedQuery,
         cached: &CachedResponse,
+        now: SystemTime,
     ) -> crate::protocol::Result<Vec<u8>> {
         let mut response = cached.response_template.clone();
-        self.rewrite_response_id(&mut response, query.message.header.id)?;
+        if cached.expires_at <= now {
+            return Err(crate::protocol::DnsParseError::MalformedRecord);
+        }
+        rewrite_response_request_fields(&mut response, &query.message)?;
+        if let Ok(age) = now.duration_since(cached.stored_at) {
+            age_response_ttls(&mut response, age)?;
+        }
+        let remaining_ttl = cached
+            .expires_at
+            .duration_since(now)
+            .map_err(|_| crate::protocol::DnsParseError::MalformedRecord)?;
+        cap_response_ttls(&mut response, remaining_ttl)?;
         if query
             .message
             .response_exceeds_udp_payload(response.len(), self.configured_max_udp_payload_size)
@@ -593,6 +748,8 @@ fn build_header_only_protocol_error(request_id: u16, rcode: ResponseCode) -> Vec
 pub trait ProtocolCodec: Send + Sync {
     fn decode_query(&self, bytes: &[u8]) -> Result<DecodedQuery, QueryValidationError>;
 
+    fn configured_max_udp_payload_size(&self) -> usize;
+
     fn rewrite_response_id(
         &self,
         response_bytes: &mut [u8],
@@ -603,6 +760,7 @@ pub trait ProtocolCodec: Send + Sync {
         &self,
         query: &DecodedQuery,
         cached: &CachedResponse,
+        now: SystemTime,
     ) -> crate::protocol::Result<Vec<u8>>;
 }
 
@@ -614,6 +772,18 @@ pub trait DnsCache: Send + Sync {
     fn lookup<'a>(&'a self, request: &'a CacheLookupRequest) -> BoxFuture<'a, CacheLookup>;
 
     fn store<'a>(&'a self, entry: CacheStore) -> BoxFuture<'a, ()>;
+}
+
+pub struct NoopDnsCache;
+
+impl DnsCache for NoopDnsCache {
+    fn lookup<'a>(&'a self, _request: &'a CacheLookupRequest) -> BoxFuture<'a, CacheLookup> {
+        Box::pin(async { CacheLookup::Miss })
+    }
+
+    fn store<'a>(&'a self, _entry: CacheStore) -> BoxFuture<'a, ()> {
+        Box::pin(async {})
+    }
 }
 
 pub struct InMemoryDnsCache {
@@ -673,7 +843,7 @@ impl InMemoryDnsCache {
         CacheLookup::Hit(response)
     }
 
-    fn store_now(&self, entry: CacheStore, now: SystemTime) {
+    fn store_now(&self, entry: CacheStore) {
         let mut state = self.state.lock().unwrap();
         if self.max_entries == 0 {
             state.entries.clear();
@@ -681,6 +851,7 @@ impl InMemoryDnsCache {
             return;
         }
 
+        let now = entry.stored_at;
         state.remove_expired(now);
         state.compact_lru();
         let expires_at = now.checked_add(entry.ttl).unwrap_or(SystemTime::UNIX_EPOCH);
@@ -757,7 +928,7 @@ impl DnsCache for InMemoryDnsCache {
 
     fn store<'a>(&'a self, entry: CacheStore) -> BoxFuture<'a, ()> {
         Box::pin(async move {
-            self.store_now(entry, SystemTime::now());
+            self.store_now(entry);
         })
     }
 }
@@ -809,7 +980,7 @@ mod tests {
     use super::*;
     use std::sync::Mutex;
 
-    use crate::protocol::{Header, Question, Record};
+    use crate::protocol::{build_a_block_response, Header, Question, Record};
 
     fn a_query(id: u16, name: &str) -> Vec<u8> {
         let mut bytes = Vec::new();
@@ -829,6 +1000,19 @@ mod tests {
         bytes
     }
 
+    fn a_query_without_rd(id: u16, name: &str) -> Vec<u8> {
+        let mut bytes = a_query(id, name);
+        bytes[2..4].copy_from_slice(&0u16.to_be_bytes());
+        bytes
+    }
+
+    fn a_query_with_checking_disabled(id: u16, name: &str) -> Vec<u8> {
+        let mut bytes = a_query(id, name);
+        let flags = u16::from_be_bytes([bytes[2], bytes[3]]) | 0x0010;
+        bytes[2..4].copy_from_slice(&flags.to_be_bytes());
+        bytes
+    }
+
     fn aaaa_query(id: u16, name: &str) -> Vec<u8> {
         let mut bytes = a_query(id, name);
         let qtype_offset = bytes.len() - 4;
@@ -844,16 +1028,61 @@ mod tests {
     }
 
     fn a_query_with_edns(id: u16, name: &str, udp_payload_size: u16, dnssec_ok: bool) -> Vec<u8> {
+        a_query_with_edns_options(id, name, udp_payload_size, dnssec_ok, &[])
+    }
+
+    fn a_query_with_edns_options(
+        id: u16,
+        name: &str,
+        udp_payload_size: u16,
+        dnssec_ok: bool,
+        options: &[u8],
+    ) -> Vec<u8> {
+        a_query_with_edns_details(id, name, udp_payload_size, dnssec_ok, 0, 0, options)
+    }
+
+    fn a_query_with_edns_details(
+        id: u16,
+        name: &str,
+        udp_payload_size: u16,
+        dnssec_ok: bool,
+        extended_rcode: u8,
+        version: u8,
+        options: &[u8],
+    ) -> Vec<u8> {
+        a_query_with_edns_flags(
+            id,
+            name,
+            udp_payload_size,
+            dnssec_ok,
+            extended_rcode,
+            version,
+            0,
+            options,
+        )
+    }
+
+    fn a_query_with_edns_flags(
+        id: u16,
+        name: &str,
+        udp_payload_size: u16,
+        dnssec_ok: bool,
+        extended_rcode: u8,
+        version: u8,
+        extra_flags: u16,
+        options: &[u8],
+    ) -> Vec<u8> {
         let mut bytes = a_query(id, name);
         bytes[10..12].copy_from_slice(&1u16.to_be_bytes());
         bytes.push(0);
         bytes.extend_from_slice(&41u16.to_be_bytes());
         bytes.extend_from_slice(&udp_payload_size.to_be_bytes());
-        bytes.push(0);
-        bytes.push(0);
-        let flags = if dnssec_ok { 0x8000u16 } else { 0 };
+        bytes.push(extended_rcode);
+        bytes.push(version);
+        let flags = if dnssec_ok { EDNS_DO_FLAG } else { 0 } | extra_flags;
         bytes.extend_from_slice(&flags.to_be_bytes());
-        bytes.extend_from_slice(&0u16.to_be_bytes());
+        bytes.extend_from_slice(&(options.len() as u16).to_be_bytes());
+        bytes.extend_from_slice(options);
         bytes
     }
 
@@ -920,6 +1149,37 @@ mod tests {
         }
     }
 
+    struct RecordingCache {
+        lookup: Mutex<CacheLookup>,
+        lookups: Mutex<Vec<CacheLookupRequest>>,
+        stores: Mutex<Vec<CacheStore>>,
+    }
+
+    impl RecordingCache {
+        fn with_lookup(lookup: CacheLookup) -> Self {
+            Self {
+                lookup: Mutex::new(lookup),
+                lookups: Mutex::new(Vec::new()),
+                stores: Mutex::new(Vec::new()),
+            }
+        }
+    }
+
+    impl DnsCache for RecordingCache {
+        fn lookup<'a>(&'a self, request: &'a CacheLookupRequest) -> BoxFuture<'a, CacheLookup> {
+            Box::pin(async move {
+                self.lookups.lock().unwrap().push(request.clone());
+                self.lookup.lock().unwrap().clone()
+            })
+        }
+
+        fn store<'a>(&'a self, entry: CacheStore) -> BoxFuture<'a, ()> {
+            Box::pin(async move {
+                self.stores.lock().unwrap().push(entry);
+            })
+        }
+    }
+
     fn resolve_service(
         upstream: Arc<StaticUpstream>,
         events: Arc<RecordingEvents>,
@@ -933,6 +1193,38 @@ mod tests {
             events,
             metrics,
         )
+    }
+
+    fn resolve_service_with_cache(
+        upstream: Arc<StaticUpstream>,
+        cache: Arc<dyn DnsCache>,
+        events: Arc<RecordingEvents>,
+        metrics: Arc<RecordingMetrics>,
+        max_udp_payload_size: usize,
+    ) -> ResolveQuery {
+        ResolveQuery::with_cache(
+            Arc::new(StandardProtocolCodec::new(max_udp_payload_size)),
+            cache,
+            CacheTtlPolicy::default(),
+            upstream,
+            Arc::new(BasicResponseFactory),
+            Arc::new(FixedClock(SystemTime::UNIX_EPOCH)),
+            events,
+            metrics,
+        )
+    }
+
+    fn a_response_with_answer(id: u16, name: &str, ttl: u32) -> Vec<u8> {
+        let query = Message::parse_standard_query(&a_query(id, name)).unwrap();
+        build_a_block_response(&query, "192.0.2.10".parse().unwrap(), ttl)
+    }
+
+    fn multi_question_a_response_with_answer(id: u16, name: &str, ttl: u32) -> Vec<u8> {
+        let query = a_query(id, name);
+        let mut response = a_response_with_answer(id, name, ttl);
+        response[4..6].copy_from_slice(&2u16.to_be_bytes());
+        response.splice(query.len()..query.len(), query[12..].iter().copied());
+        response
     }
 
     #[test]
@@ -957,7 +1249,9 @@ mod tests {
         let entry = CacheStore {
             key: CacheKey::new(
                 question,
+                question_wire(&aaaa_query(0x1000, "example.com")).unwrap(),
                 QueryFeatures {
+                    recursion_desired: true,
                     dnssec_ok: false,
                     edns_udp_payload_size: None,
                 },
@@ -968,6 +1262,7 @@ mod tests {
             response_code: ResponseCode::NoError,
             minimum_ttl: Duration::from_secs(30),
             negative_cache: None,
+            stored_at: SystemTime::UNIX_EPOCH,
             ttl: Duration::from_secs(60),
         };
 
@@ -987,7 +1282,9 @@ mod tests {
     fn cache_key(name: &str) -> CacheKey {
         CacheKey::new(
             QuestionKey::new(name, 1, 1),
+            question_wire(&a_query(0x1000, name)).unwrap(),
             QueryFeatures {
+                recursion_desired: true,
                 dnssec_ok: false,
                 edns_udp_payload_size: None,
             },
@@ -996,13 +1293,14 @@ mod tests {
         )
     }
 
-    fn cache_store(key: CacheKey, ttl: Duration) -> CacheStore {
+    fn cache_store_at(key: CacheKey, ttl: Duration, stored_at: SystemTime) -> CacheStore {
         CacheStore {
             key,
             response_template: vec![0x12, 0x34, 0x81, 0x80],
             response_code: ResponseCode::NoError,
             minimum_ttl: ttl,
             negative_cache: None,
+            stored_at,
             ttl,
         }
     }
@@ -1318,7 +1616,7 @@ mod tests {
         let now = SystemTime::UNIX_EPOCH + Duration::from_secs(10);
         let key = cache_key("example.com");
 
-        cache.store_now(cache_store(key.clone(), Duration::from_secs(30)), now);
+        cache.store_now(cache_store_at(key.clone(), Duration::from_secs(30), now));
 
         let lookup = cache.lookup_now(&CacheLookupRequest {
             key,
@@ -1339,7 +1637,7 @@ mod tests {
         let now = SystemTime::UNIX_EPOCH + Duration::from_secs(10);
         let key = cache_key("example.com");
 
-        cache.store_now(cache_store(key.clone(), Duration::from_secs(30)), now);
+        cache.store_now(cache_store_at(key.clone(), Duration::from_secs(30), now));
 
         let lookup = cache.lookup_now(&CacheLookupRequest {
             key,
@@ -1357,8 +1655,8 @@ mod tests {
         let first = cache_key("first.example");
         let second = cache_key("second.example");
         let third = cache_key("third.example");
-        cache.store_now(cache_store(first.clone(), Duration::from_secs(60)), now);
-        cache.store_now(cache_store(second.clone(), Duration::from_secs(60)), now);
+        cache.store_now(cache_store_at(first.clone(), Duration::from_secs(60), now));
+        cache.store_now(cache_store_at(second.clone(), Duration::from_secs(60), now));
         assert!(matches!(
             cache.lookup_now(&CacheLookupRequest {
                 key: first.clone(),
@@ -1367,7 +1665,7 @@ mod tests {
             CacheLookup::Hit(_)
         ));
 
-        cache.store_now(cache_store(third.clone(), Duration::from_secs(60)), now);
+        cache.store_now(cache_store_at(third.clone(), Duration::from_secs(60), now));
 
         assert_eq!(cache.len(), 2);
         assert!(matches!(
@@ -1399,7 +1697,7 @@ mod tests {
         let now = SystemTime::UNIX_EPOCH + Duration::from_secs(10);
         let key = cache_key("example.com");
 
-        cache.store_now(cache_store(key.clone(), Duration::from_secs(30)), now);
+        cache.store_now(cache_store_at(key.clone(), Duration::from_secs(30), now));
 
         assert_eq!(
             cache.lookup_now(&CacheLookupRequest {
@@ -1416,7 +1714,7 @@ mod tests {
         let cache = InMemoryDnsCache::new(2);
         let now = SystemTime::UNIX_EPOCH + Duration::from_secs(10);
         let key = cache_key("example.com");
-        cache.store_now(cache_store(key.clone(), Duration::from_secs(60)), now);
+        cache.store_now(cache_store_at(key.clone(), Duration::from_secs(60), now));
 
         for _ in 0..100 {
             assert!(matches!(
@@ -1445,6 +1743,7 @@ mod tests {
         assert_eq!(
             key.features,
             QueryFeatures {
+                recursion_desired: true,
                 dnssec_ok: true,
                 edns_udp_payload_size: Some(4096),
             }
@@ -1489,6 +1788,33 @@ mod tests {
         );
     }
 
+    #[test]
+    fn cache_key_separates_exact_wire_question_casing_for_templates() {
+        let codec = StandardProtocolCodec::new(1232);
+        let lower = codec.decode_query(&a_query(0x1000, "example.com")).unwrap();
+        let mixed = codec.decode_query(&a_query(0x1000, "Example.COM")).unwrap();
+
+        assert_eq!(lower.question, mixed.question);
+        assert_ne!(
+            CacheKey::from_query(&lower, None, 1232),
+            CacheKey::from_query(&mixed, None, 1232)
+        );
+    }
+
+    #[test]
+    fn cache_key_separates_recursion_desired_header_flag() {
+        let codec = StandardProtocolCodec::new(1232);
+        let recursive = codec.decode_query(&a_query(0x1000, "example.com")).unwrap();
+        let non_recursive = codec
+            .decode_query(&a_query_without_rd(0x1000, "example.com"))
+            .unwrap();
+
+        assert_ne!(
+            CacheKey::from_query(&recursive, None, 1232),
+            CacheKey::from_query(&non_recursive, None, 1232)
+        );
+    }
+
     #[tokio::test]
     async fn resolve_forwards_valid_query_to_upstream() {
         let response = vec![0xab, 0xcd, 0x81, 0x80];
@@ -1519,6 +1845,357 @@ mod tests {
             .lock()
             .unwrap()
             .contains(&ResolverMetric::UpstreamSuccess));
+    }
+
+    #[tokio::test]
+    async fn resolve_returns_cached_template_with_current_request_id() {
+        let cache = Arc::new(InMemoryDnsCache::new(16));
+        let cached_query = StandardProtocolCodec::new(1232)
+            .decode_query(&a_query(0xaaaa, "example.com"))
+            .unwrap();
+        cache.store_now(CacheStore {
+            key: CacheKey::from_query(&cached_query, None, 1232),
+            response_template: a_response_with_answer(0, "example.com", 60),
+            response_code: ResponseCode::NoError,
+            minimum_ttl: Duration::from_secs(60),
+            negative_cache: None,
+            stored_at: SystemTime::UNIX_EPOCH,
+            ttl: Duration::from_secs(60),
+        });
+        let upstream = Arc::new(StaticUpstream::new(Err(UpstreamError::Timeout)));
+        let events = Arc::new(RecordingEvents::default());
+        let metrics = Arc::new(RecordingMetrics::default());
+        let service =
+            resolve_service_with_cache(upstream.clone(), cache, events, metrics.clone(), 1232);
+
+        let outcome = service
+            .resolve(ResolveRequest::new(
+                "192.0.2.10".parse().unwrap(),
+                SystemTime::UNIX_EPOCH,
+                a_query(0x2222, "example.com"),
+            ))
+            .await;
+
+        assert_eq!(&outcome.response_bytes[0..2], &[0x22, 0x22]);
+        assert_eq!(outcome.decision.kind, ResolveDecisionKind::CacheHit);
+        assert!(upstream.requests.lock().unwrap().is_empty());
+        assert!(metrics
+            .increments
+            .lock()
+            .unwrap()
+            .contains(&ResolverMetric::CacheHit));
+    }
+
+    #[tokio::test]
+    async fn resolve_rewrites_cached_response_rd_flag_for_current_request() {
+        let cache = Arc::new(InMemoryDnsCache::new(16));
+        let cached_query = StandardProtocolCodec::new(1232)
+            .decode_query(&a_query_without_rd(0xaaaa, "example.com"))
+            .unwrap();
+        cache.store_now(CacheStore {
+            key: CacheKey::from_query(&cached_query, None, 1232),
+            response_template: a_response_with_answer(0, "example.com", 60),
+            response_code: ResponseCode::NoError,
+            minimum_ttl: Duration::from_secs(60),
+            negative_cache: None,
+            stored_at: SystemTime::UNIX_EPOCH,
+            ttl: Duration::from_secs(60),
+        });
+        let upstream = Arc::new(StaticUpstream::new(Err(UpstreamError::Timeout)));
+        let events = Arc::new(RecordingEvents::default());
+        let metrics = Arc::new(RecordingMetrics::default());
+        let service = resolve_service_with_cache(upstream, cache, events, metrics, 1232);
+
+        let outcome = service
+            .resolve(ResolveRequest::new(
+                "192.0.2.10".parse().unwrap(),
+                SystemTime::UNIX_EPOCH,
+                a_query_without_rd(0x2222, "example.com"),
+            ))
+            .await;
+
+        assert_eq!(&outcome.response_bytes[0..2], &[0x22, 0x22]);
+        assert_eq!(outcome.response_bytes[2] & 0x01, 0);
+        assert_eq!(outcome.decision.kind, ResolveDecisionKind::CacheHit);
+    }
+
+    #[tokio::test]
+    async fn resolve_ages_cached_response_ttls_for_current_request_time() {
+        let cache = Arc::new(InMemoryDnsCache::new(16));
+        let cached_query = StandardProtocolCodec::new(1232)
+            .decode_query(&a_query(0xaaaa, "example.com"))
+            .unwrap();
+        cache.store_now(CacheStore {
+            key: CacheKey::from_query(&cached_query, None, 1232),
+            response_template: a_response_with_answer(0, "example.com", 60),
+            response_code: ResponseCode::NoError,
+            minimum_ttl: Duration::from_secs(60),
+            negative_cache: None,
+            stored_at: SystemTime::UNIX_EPOCH,
+            ttl: Duration::from_secs(60),
+        });
+        let upstream = Arc::new(StaticUpstream::new(Err(UpstreamError::Timeout)));
+        let events = Arc::new(RecordingEvents::default());
+        let metrics = Arc::new(RecordingMetrics::default());
+        let service = resolve_service_with_cache(upstream, cache, events, metrics, 1232);
+
+        let outcome = service
+            .resolve(ResolveRequest::new(
+                "192.0.2.10".parse().unwrap(),
+                SystemTime::UNIX_EPOCH + Duration::from_secs(25),
+                a_query(0x2222, "example.com"),
+            ))
+            .await;
+
+        let parsed = Message::parse(&outcome.response_bytes).unwrap();
+        assert_eq!(parsed.answers[0].ttl, 35);
+        assert_eq!(outcome.decision.kind, ResolveDecisionKind::CacheHit);
+    }
+
+    #[tokio::test]
+    async fn resolve_caps_cached_response_ttls_to_remaining_cache_lifetime() {
+        let cache = Arc::new(InMemoryDnsCache::new(16));
+        let cached_query = StandardProtocolCodec::new(1232)
+            .decode_query(&a_query(0xaaaa, "example.com"))
+            .unwrap();
+        cache.store_now(CacheStore {
+            key: CacheKey::from_query(&cached_query, None, 1232),
+            response_template: a_response_with_answer(0, "example.com", 3600),
+            response_code: ResponseCode::NoError,
+            minimum_ttl: Duration::from_secs(60),
+            negative_cache: None,
+            stored_at: SystemTime::UNIX_EPOCH,
+            ttl: Duration::from_secs(60),
+        });
+        let upstream = Arc::new(StaticUpstream::new(Err(UpstreamError::Timeout)));
+        let events = Arc::new(RecordingEvents::default());
+        let metrics = Arc::new(RecordingMetrics::default());
+        let service = resolve_service_with_cache(upstream, cache, events, metrics, 1232);
+
+        let outcome = service
+            .resolve(ResolveRequest::new(
+                "192.0.2.10".parse().unwrap(),
+                SystemTime::UNIX_EPOCH + Duration::from_secs(25),
+                a_query(0x2222, "example.com"),
+            ))
+            .await;
+
+        let parsed = Message::parse(&outcome.response_bytes).unwrap();
+        assert_eq!(parsed.answers[0].ttl, 35);
+        assert_eq!(outcome.decision.kind, ResolveDecisionKind::CacheHit);
+    }
+
+    #[tokio::test]
+    async fn resolve_truncates_oversized_cached_response_for_current_request() {
+        let mut oversized_response = a_response_with_answer(0, "example.com", 60);
+        oversized_response.extend(std::iter::repeat(0).take(700));
+        let cached = CachedResponse {
+            response_template: oversized_response,
+            response_code: ResponseCode::NoError,
+            minimum_ttl: Duration::from_secs(60),
+            negative_cache: None,
+            stored_at: SystemTime::UNIX_EPOCH,
+            expires_at: SystemTime::UNIX_EPOCH + Duration::from_secs(60),
+        };
+        let cache = Arc::new(RecordingCache::with_lookup(CacheLookup::Hit(cached)));
+        let upstream = Arc::new(StaticUpstream::new(Err(UpstreamError::Timeout)));
+        let events = Arc::new(RecordingEvents::default());
+        let metrics = Arc::new(RecordingMetrics::default());
+        let service =
+            resolve_service_with_cache(upstream.clone(), cache, events, metrics.clone(), 512);
+
+        let outcome = service
+            .resolve(ResolveRequest::new(
+                "192.0.2.10".parse().unwrap(),
+                SystemTime::UNIX_EPOCH,
+                a_query(0x3333, "example.com"),
+            ))
+            .await;
+
+        assert_eq!(&outcome.response_bytes[0..2], &[0x33, 0x33]);
+        assert_ne!(outcome.response_bytes[2] & 0x02, 0);
+        assert_eq!(outcome.response_bytes.len(), 12);
+        assert_eq!(outcome.decision.kind, ResolveDecisionKind::CacheHit);
+        assert!(upstream.requests.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn resolve_treats_expired_cache_backend_hit_as_miss() {
+        let cached = CachedResponse {
+            response_template: a_response_with_answer(0, "example.com", 60),
+            response_code: ResponseCode::NoError,
+            minimum_ttl: Duration::from_secs(60),
+            negative_cache: None,
+            stored_at: SystemTime::UNIX_EPOCH,
+            expires_at: SystemTime::UNIX_EPOCH + Duration::from_secs(30),
+        };
+        let cache = Arc::new(RecordingCache::with_lookup(CacheLookup::Hit(cached)));
+        let upstream = Arc::new(StaticUpstream::new(Ok(UpstreamResponse {
+            bytes: a_response_with_answer(0x8888, "example.com", 60),
+            received_at: SystemTime::UNIX_EPOCH,
+        })));
+        let events = Arc::new(RecordingEvents::default());
+        let metrics = Arc::new(RecordingMetrics::default());
+        let service =
+            resolve_service_with_cache(upstream.clone(), cache.clone(), events, metrics, 1232);
+
+        let outcome = service
+            .resolve(ResolveRequest::new(
+                "192.0.2.10".parse().unwrap(),
+                SystemTime::UNIX_EPOCH + Duration::from_secs(31),
+                a_query(0x8888, "example.com"),
+            ))
+            .await;
+
+        assert_eq!(outcome.decision.kind, ResolveDecisionKind::Allowed);
+        assert_eq!(upstream.requests.lock().unwrap().len(), 1);
+        assert_eq!(cache.stores.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn resolve_stores_upstream_response_as_neutral_id_template() {
+        let cache = Arc::new(RecordingCache::with_lookup(CacheLookup::Miss));
+        let upstream = Arc::new(StaticUpstream::new(Ok(UpstreamResponse {
+            bytes: a_response_with_answer(0xbeef, "example.com", 45),
+            received_at: SystemTime::UNIX_EPOCH,
+        })));
+        let events = Arc::new(RecordingEvents::default());
+        let metrics = Arc::new(RecordingMetrics::default());
+        let service =
+            resolve_service_with_cache(upstream, cache.clone(), events, metrics.clone(), 1232);
+        let request_time = SystemTime::UNIX_EPOCH + Duration::from_secs(123);
+
+        let outcome = service
+            .resolve(ResolveRequest::new(
+                "192.0.2.10".parse().unwrap(),
+                request_time,
+                a_query(0x4444, "example.com"),
+            ))
+            .await;
+
+        assert_eq!(&outcome.response_bytes[0..2], &[0x44, 0x44]);
+        let stores = cache.stores.lock().unwrap();
+        assert_eq!(stores.len(), 1);
+        assert_eq!(&stores[0].response_template[0..2], &[0, 0]);
+        assert_eq!(stores[0].response_code, ResponseCode::NoError);
+        assert_eq!(stores[0].ttl, Duration::from_secs(45));
+        assert_eq!(stores[0].stored_at, request_time);
+        assert_eq!(
+            stores[0].key.question,
+            QuestionKey::new("example.com", 1, 1)
+        );
+    }
+
+    #[tokio::test]
+    async fn resolve_does_not_store_malformed_or_question_mismatched_upstream_response() {
+        for response in [
+            vec![0x12],
+            a_response_with_answer(0x5555, "other.example", 60),
+            a_response_with_answer(0x5555, "Example.COM", 60),
+            multi_question_a_response_with_answer(0x5555, "example.com", 60),
+        ] {
+            let cache = Arc::new(RecordingCache::with_lookup(CacheLookup::Miss));
+            let upstream = Arc::new(StaticUpstream::new(Ok(UpstreamResponse {
+                bytes: response,
+                received_at: SystemTime::UNIX_EPOCH,
+            })));
+            let events = Arc::new(RecordingEvents::default());
+            let metrics = Arc::new(RecordingMetrics::default());
+            let service =
+                resolve_service_with_cache(upstream, cache.clone(), events, metrics, 1232);
+
+            let _ = service
+                .resolve(ResolveRequest::new(
+                    "192.0.2.10".parse().unwrap(),
+                    SystemTime::UNIX_EPOCH,
+                    a_query(0x5555, "example.com"),
+                ))
+                .await;
+
+            assert!(cache.stores.lock().unwrap().is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn resolve_does_not_store_after_cache_bypass_or_unavailable() {
+        for lookup in [
+            CacheLookup::Bypass(CacheBypassReason::UnsupportedQueryFeature),
+            CacheLookup::Unavailable,
+        ] {
+            let cache = Arc::new(RecordingCache::with_lookup(lookup));
+            let upstream = Arc::new(StaticUpstream::new(Ok(UpstreamResponse {
+                bytes: a_response_with_answer(0x6666, "example.com", 60),
+                received_at: SystemTime::UNIX_EPOCH,
+            })));
+            let events = Arc::new(RecordingEvents::default());
+            let metrics = Arc::new(RecordingMetrics::default());
+            let service =
+                resolve_service_with_cache(upstream, cache.clone(), events, metrics, 1232);
+
+            let _ = service
+                .resolve(ResolveRequest::new(
+                    "192.0.2.10".parse().unwrap(),
+                    SystemTime::UNIX_EPOCH,
+                    a_query(0x6666, "example.com"),
+                ))
+                .await;
+
+            assert!(cache.stores.lock().unwrap().is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn resolve_bypasses_cache_for_unsupported_edns_options() {
+        let cache = Arc::new(RecordingCache::with_lookup(CacheLookup::Miss));
+        let upstream = Arc::new(StaticUpstream::new(Ok(UpstreamResponse {
+            bytes: a_response_with_answer(0x7777, "example.com", 60),
+            received_at: SystemTime::UNIX_EPOCH,
+        })));
+        let events = Arc::new(RecordingEvents::default());
+        let metrics = Arc::new(RecordingMetrics::default());
+        let service = resolve_service_with_cache(upstream, cache.clone(), events, metrics, 1232);
+        let edns_cookie = [0u8, 10, 0, 2, 0xaa, 0xbb];
+
+        let _ = service
+            .resolve(ResolveRequest::new(
+                "192.0.2.10".parse().unwrap(),
+                SystemTime::UNIX_EPOCH,
+                a_query_with_edns_options(0x7777, "example.com", 1232, false, &edns_cookie),
+            ))
+            .await;
+
+        assert!(cache.lookups.lock().unwrap().is_empty());
+        assert!(cache.stores.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn resolve_bypasses_cache_for_unsupported_flags_and_edns_version() {
+        for request in [
+            a_query_with_checking_disabled(0x7777, "example.com"),
+            a_query_with_edns_details(0x7777, "example.com", 1232, false, 0, 1, &[]),
+            a_query_with_edns_flags(0x7777, "example.com", 1232, false, 0, 0, 0x4000, &[]),
+        ] {
+            let cache = Arc::new(RecordingCache::with_lookup(CacheLookup::Miss));
+            let upstream = Arc::new(StaticUpstream::new(Ok(UpstreamResponse {
+                bytes: a_response_with_answer(0x7777, "example.com", 60),
+                received_at: SystemTime::UNIX_EPOCH,
+            })));
+            let events = Arc::new(RecordingEvents::default());
+            let metrics = Arc::new(RecordingMetrics::default());
+            let service =
+                resolve_service_with_cache(upstream, cache.clone(), events, metrics, 1232);
+
+            let _ = service
+                .resolve(ResolveRequest::new(
+                    "192.0.2.10".parse().unwrap(),
+                    SystemTime::UNIX_EPOCH,
+                    request,
+                ))
+                .await;
+
+            assert!(cache.lookups.lock().unwrap().is_empty());
+            assert!(cache.stores.lock().unwrap().is_empty());
+        }
     }
 
     #[tokio::test]

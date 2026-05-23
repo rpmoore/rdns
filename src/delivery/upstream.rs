@@ -537,7 +537,7 @@ mod tests {
     use tokio::net::TcpListener;
 
     use crate::config::UpstreamConfig;
-    use crate::resolver::{DecodedQuery, QueryFeatures, QuestionKey};
+    use crate::resolver::DecodedQuery;
 
     struct FixedTransactionId(u16);
 
@@ -626,13 +626,8 @@ mod tests {
 
     fn upstream_request(id: u16, name: &str) -> UpstreamRequest {
         let message = Message::parse_standard_query(&a_query(id, name)).unwrap();
-        UpstreamRequest {
-            query: DecodedQuery {
-                question: QuestionKey::from_message(&message).unwrap(),
-                features: QueryFeatures::from_message(&message),
-                message,
-            },
-        }
+        let query = DecodedQuery::new(message).unwrap();
+        UpstreamRequest { query }
     }
 
     async fn read_tcp_query(stream: &mut TcpStream) -> Vec<u8> {

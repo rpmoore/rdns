@@ -1,6 +1,7 @@
 use std::collections::HashSet;
 use std::net::{Ipv4Addr, Ipv6Addr};
 use std::str;
+use std::time::Duration;
 
 const DNS_HEADER_LEN: usize = 12;
 pub const DNS_DEFAULT_UDP_PAYLOAD_SIZE: usize = 512;
@@ -136,6 +137,14 @@ impl Header {
         (self.flags & 0x0080) != 0
     }
 
+    pub fn ad(&self) -> bool {
+        (self.flags & 0x0020) != 0
+    }
+
+    pub fn cd(&self) -> bool {
+        (self.flags & 0x0010) != 0
+    }
+
     pub fn r_code(&self) -> u8 {
         (self.flags & 0x000f) as u8
     }
@@ -153,6 +162,7 @@ pub struct EdnsInfo {
     pub udp_payload_size: u16,
     pub extended_rcode: u8,
     pub version: u8,
+    pub flags: u16,
     pub dnssec_ok: bool,
     pub options: Vec<u8>,
 }
@@ -361,6 +371,73 @@ pub fn rewrite_response_id(response_bytes: &mut [u8], request_id: u16) -> Result
     }
     response_bytes[0..2].copy_from_slice(&request_id.to_be_bytes());
     Ok(())
+}
+
+pub fn rewrite_response_request_fields(response_bytes: &mut [u8], request: &Message) -> Result<()> {
+    rewrite_response_id(response_bytes, request.header.id)?;
+    if response_bytes.len() < 4 {
+        return Err(DnsParseError::MessageTooShort);
+    }
+
+    let mut flags = u16::from_be_bytes([response_bytes[2], response_bytes[3]]);
+    if request.header.rd() {
+        flags |= 0x0100;
+    } else {
+        flags &= !0x0100;
+    }
+    response_bytes[2..4].copy_from_slice(&flags.to_be_bytes());
+    Ok(())
+}
+
+pub fn age_response_ttls(response_bytes: &mut [u8], age: Duration) -> Result<()> {
+    let header = parse_header(response_bytes)?;
+    let age_secs = age.as_secs().min(u64::from(u32::MAX)) as u32;
+    let mut offset = DNS_HEADER_LEN;
+    skip_questions(response_bytes, &mut offset, header.qd_count)?;
+    adjust_record_ttls(response_bytes, &mut offset, header.an_count, age_secs, None)?;
+    adjust_record_ttls(response_bytes, &mut offset, header.ns_count, age_secs, None)?;
+    adjust_record_ttls(response_bytes, &mut offset, header.ar_count, age_secs, None)?;
+    Ok(())
+}
+
+pub fn cap_response_ttls(response_bytes: &mut [u8], max_ttl: Duration) -> Result<()> {
+    let header = parse_header(response_bytes)?;
+    let max_ttl_secs = max_ttl.as_secs().min(u64::from(u32::MAX)) as u32;
+    let mut offset = DNS_HEADER_LEN;
+    skip_questions(response_bytes, &mut offset, header.qd_count)?;
+    adjust_record_ttls(
+        response_bytes,
+        &mut offset,
+        header.an_count,
+        0,
+        Some(max_ttl_secs),
+    )?;
+    adjust_record_ttls(
+        response_bytes,
+        &mut offset,
+        header.ns_count,
+        0,
+        Some(max_ttl_secs),
+    )?;
+    adjust_record_ttls(
+        response_bytes,
+        &mut offset,
+        header.ar_count,
+        0,
+        Some(max_ttl_secs),
+    )?;
+    Ok(())
+}
+
+pub fn question_wire(dns_message: &[u8]) -> Result<Vec<u8>> {
+    let header = parse_header(dns_message)?;
+    if header.qd_count != 1 {
+        return Err(DnsParseError::InvalidQuestionCount);
+    }
+    let mut offset = DNS_HEADER_LEN;
+    let start = offset;
+    skip_questions(dns_message, &mut offset, 1)?;
+    Ok(dns_message[start..offset].to_vec())
 }
 
 pub fn encode_tcp_frame(message: &[u8], max_size: usize) -> Result<Vec<u8>> {
@@ -704,6 +781,51 @@ fn parse_records(
         records.push(parse_record(dns_message, offset, context)?);
     }
     Ok(records)
+}
+
+fn skip_questions(dns_message: &[u8], offset: &mut usize, question_count: u16) -> Result<()> {
+    for _ in 0..question_count {
+        parse_domain_with_context(dns_message, offset, None)?;
+        let mut reader = Reader::new(dns_message, *offset)?;
+        reader.read_u16()?;
+        reader.read_u16()?;
+        *offset = reader.position();
+    }
+    Ok(())
+}
+
+fn adjust_record_ttls(
+    dns_message: &mut [u8],
+    offset: &mut usize,
+    record_count: u16,
+    age_secs: u32,
+    max_ttl_secs: Option<u32>,
+) -> Result<()> {
+    for _ in 0..record_count {
+        parse_domain_with_context(dns_message, offset, None)?;
+        let mut reader = Reader::new(dns_message, *offset)?;
+        let rtype = reader.read_u16()?;
+        reader.read_u16()?;
+        let ttl_offset = reader.position();
+        let ttl = reader.read_u32()?;
+        let rdlength = reader.read_u16()? as usize;
+        let rdata_end = reader
+            .position()
+            .checked_add(rdlength)
+            .ok_or(DnsParseError::MalformedRecord)?;
+        dns_message
+            .get(reader.position()..rdata_end)
+            .ok_or(DnsParseError::UnexpectedEof)?;
+        if rtype != OPT_RECORD_TYPE {
+            let mut adjusted_ttl = ttl.saturating_sub(age_secs);
+            if let Some(max_ttl_secs) = max_ttl_secs {
+                adjusted_ttl = adjusted_ttl.min(max_ttl_secs);
+            }
+            dns_message[ttl_offset..ttl_offset + 4].copy_from_slice(&adjusted_ttl.to_be_bytes());
+        }
+        *offset = rdata_end;
+    }
+    Ok(())
 }
 
 fn parse_record(
@@ -1110,6 +1232,7 @@ fn parse_opt_record(
         udp_payload_size,
         extended_rcode,
         version,
+        flags,
         dnssec_ok: (flags & EDNS_DO_FLAG) != 0,
         options,
     }))
@@ -1364,6 +1487,7 @@ mod tests {
                 udp_payload_size: 4096,
                 extended_rcode: 0,
                 version: 0,
+                flags: EDNS_DO_FLAG,
                 dnssec_ok: true,
                 options: vec![0, 15, 0, 0],
             })
