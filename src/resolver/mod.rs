@@ -179,6 +179,7 @@ pub enum BlockReason {
 pub enum CacheLookup {
     Hit(CachedResponse),
     Miss,
+    Expired,
     Bypass(CacheBypassReason),
     Unavailable,
 }
@@ -506,31 +507,54 @@ impl ResolveQuery {
                     received_at: request.received_at.0,
                 })
                 .await;
-            cache_store_allowed = matches!(lookup, CacheLookup::Miss);
-            if let CacheLookup::Hit(cached) = lookup {
-                match self.protocol.serialize_cached_response(
-                    &decoded,
-                    &cached,
-                    request.received_at.0,
-                ) {
-                    Ok(response_bytes) => {
-                        self.metrics.increment(ResolverMetric::CacheHit);
-                        let decision = ResolveDecision {
-                            client_ip: request.client_ip,
-                            question: Some(question.clone()),
-                            kind: ResolveDecisionKind::CacheHit,
-                        };
-                        return self.finish(started_at, decision, response_bytes).await;
+            cache_store_allowed = matches!(lookup, CacheLookup::Miss | CacheLookup::Expired);
+            match lookup {
+                CacheLookup::Hit(cached) => {
+                    if cached.expires_at <= request.received_at.0 {
+                        self.metrics.increment(ResolverMetric::CacheExpired);
                     }
-                    Err(_) => {
-                        self.metrics.increment(ResolverMetric::CacheMiss);
-                        cache_store_allowed = true;
+                    match self.protocol.serialize_cached_response(
+                        &decoded,
+                        &cached,
+                        request.received_at.0,
+                    ) {
+                        Ok(response_bytes) => {
+                            self.metrics.increment(ResolverMetric::CacheHit);
+                            if response_is_truncated(&response_bytes) {
+                                self.metrics
+                                    .increment(ResolverMetric::CacheResponseTruncated);
+                            }
+                            let decision = ResolveDecision {
+                                client_ip: request.client_ip,
+                                question: Some(question.clone()),
+                                kind: ResolveDecisionKind::CacheHit,
+                            };
+                            return self.finish(started_at, decision, response_bytes).await;
+                        }
+                        Err(_) => {
+                            self.metrics.increment(ResolverMetric::CacheMiss);
+                            cache_store_allowed = true;
+                        }
                     }
                 }
-            } else {
-                self.metrics.increment(ResolverMetric::CacheMiss);
+                CacheLookup::Miss => {
+                    self.metrics.increment(ResolverMetric::CacheMiss);
+                }
+                CacheLookup::Expired => {
+                    self.metrics.increment(ResolverMetric::CacheExpired);
+                    self.metrics.increment(ResolverMetric::CacheMiss);
+                }
+                CacheLookup::Bypass(_) => {
+                    self.metrics.increment(ResolverMetric::CacheBypass);
+                    self.metrics.increment(ResolverMetric::CacheMiss);
+                }
+                CacheLookup::Unavailable => {
+                    self.metrics.increment(ResolverMetric::CacheUnavailable);
+                    self.metrics.increment(ResolverMetric::CacheMiss);
+                }
             }
         } else {
+            self.metrics.increment(ResolverMetric::CacheBypass);
             self.metrics.increment(ResolverMetric::CacheMiss);
         }
 
@@ -563,6 +587,7 @@ impl ResolveQuery {
                     outcome
                 }
                 SingleFlightTicket::Follower { flight } => {
+                    self.metrics.increment(ResolverMetric::CacheCoalescedMiss);
                     let upstream_result = flight.wait().await;
                     if let CacheLookup::Hit(cached) = self
                         .cache
@@ -572,12 +597,18 @@ impl ResolveQuery {
                         })
                         .await
                     {
+                        if cached.expires_at <= request.received_at.0 {
+                            self.metrics.increment(ResolverMetric::CacheExpired);
+                        }
                         if let Ok(response_bytes) = self.protocol.serialize_cached_response(
                             &decoded,
                             &cached,
                             request.received_at.0,
                         ) {
-                            self.metrics.increment(ResolverMetric::CacheHit);
+                            if response_is_truncated(&response_bytes) {
+                                self.metrics
+                                    .increment(ResolverMetric::CacheResponseTruncated);
+                            }
                             let decision = ResolveDecision {
                                 client_ip: request.client_ip,
                                 question: Some(question),
@@ -658,7 +689,13 @@ impl ResolveQuery {
                         decoded,
                         request.received_at.0,
                     ) {
+                        if store.negative_cache.is_some() {
+                            self.metrics.increment(ResolverMetric::CacheNegativeStore);
+                        }
+                        self.metrics.increment(ResolverMetric::CacheStore);
                         self.cache.store(store).await;
+                    } else {
+                        self.metrics.increment(ResolverMetric::CacheStoreSkipped);
                     }
                 }
                 self.finish(started_at, decision, response_bytes).await
@@ -835,6 +872,13 @@ impl InFlightMiss {
 fn request_id_from_wire(bytes: &[u8]) -> Option<u16> {
     let id = bytes.get(0..2)?;
     Some(u16::from_be_bytes([id[0], id[1]]))
+}
+
+fn response_is_truncated(bytes: &[u8]) -> bool {
+    bytes
+        .get(2)
+        .map(|flags| (flags & 0x02) != 0)
+        .unwrap_or(false)
 }
 
 fn cache_supported(query: &DecodedQuery) -> bool {
@@ -1025,6 +1069,18 @@ impl InMemoryDnsCache {
 
     fn lookup_now(&self, request: &CacheLookupRequest) -> CacheLookup {
         let mut state = self.state.lock().unwrap();
+        if state
+            .entries
+            .get(&request.key)
+            .map(|entry| entry.response.expires_at <= request.received_at)
+            .unwrap_or(false)
+        {
+            state.entries.remove(&request.key);
+            state.remove_expired(request.received_at);
+            state.compact_lru();
+            return CacheLookup::Expired;
+        }
+
         state.remove_expired(request.received_at);
         state.compact_lru();
 
@@ -1168,6 +1224,14 @@ pub enum ResolverMetric {
     QueryBlocked,
     CacheHit,
     CacheMiss,
+    CacheExpired,
+    CacheBypass,
+    CacheUnavailable,
+    CacheStore,
+    CacheStoreSkipped,
+    CacheNegativeStore,
+    CacheResponseTruncated,
+    CacheCoalescedMiss,
     UpstreamSuccess,
     UpstreamFailure,
     QueryDuration,
@@ -1322,6 +1386,17 @@ mod tests {
         }
     }
 
+    impl RecordingMetrics {
+        fn count(&self, metric: ResolverMetric) -> usize {
+            self.increments
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|increment| **increment == metric)
+                .count()
+        }
+    }
+
     struct StaticUpstream {
         response: Result<UpstreamResponse, UpstreamError>,
         requests: Mutex<Vec<UpstreamRequest>>,
@@ -1462,6 +1537,45 @@ mod tests {
         let mut response = a_response_with_answer(id, name, ttl);
         response[4..6].copy_from_slice(&2u16.to_be_bytes());
         response.splice(query.len()..query.len(), query[12..].iter().copied());
+        response
+    }
+
+    fn nxdomain_response_with_soa(id: u16, name: &str, ttl: u32, minimum: u32) -> Vec<u8> {
+        let mut response = Vec::new();
+        response.extend_from_slice(&id.to_be_bytes());
+        response.extend_from_slice(&0x8183u16.to_be_bytes());
+        response.extend_from_slice(&1u16.to_be_bytes());
+        response.extend_from_slice(&0u16.to_be_bytes());
+        response.extend_from_slice(&1u16.to_be_bytes());
+        response.extend_from_slice(&0u16.to_be_bytes());
+        for label in name.split('.') {
+            response.push(label.len() as u8);
+            response.extend_from_slice(label.as_bytes());
+        }
+        response.push(0);
+        response.extend_from_slice(&1u16.to_be_bytes());
+        response.extend_from_slice(&1u16.to_be_bytes());
+        response.extend_from_slice(&0xc00cu16.to_be_bytes());
+        response.extend_from_slice(&6u16.to_be_bytes());
+        response.extend_from_slice(&1u16.to_be_bytes());
+        response.extend_from_slice(&ttl.to_be_bytes());
+
+        let mut rdata = Vec::new();
+        for label in ["ns", "example", "com"] {
+            rdata.push(label.len() as u8);
+            rdata.extend_from_slice(label.as_bytes());
+        }
+        rdata.push(0);
+        for label in ["hostmaster", "example", "com"] {
+            rdata.push(label.len() as u8);
+            rdata.extend_from_slice(label.as_bytes());
+        }
+        rdata.push(0);
+        for value in [1, 2, 3, 4, minimum] {
+            rdata.extend_from_slice(&value.to_be_bytes());
+        }
+        response.extend_from_slice(&(rdata.len() as u16).to_be_bytes());
+        response.extend_from_slice(&rdata);
         response
     }
 
@@ -1874,15 +1988,17 @@ mod tests {
         let cache = InMemoryDnsCache::new(16);
         let now = SystemTime::UNIX_EPOCH + Duration::from_secs(10);
         let key = cache_key("example.com");
+        let other = cache_key("other.example");
 
         cache.store_now(cache_store_at(key.clone(), Duration::from_secs(30), now));
+        cache.store_now(cache_store_at(other, Duration::from_secs(20), now));
 
         let lookup = cache.lookup_now(&CacheLookupRequest {
             key,
             received_at: now + Duration::from_secs(30),
         });
 
-        assert_eq!(lookup, CacheLookup::Miss);
+        assert_eq!(lookup, CacheLookup::Expired);
         assert!(cache.is_empty());
     }
 
@@ -2117,11 +2233,8 @@ mod tests {
         assert_eq!(&outcome.response_bytes[0..2], &[0x22, 0x22]);
         assert_eq!(outcome.decision.kind, ResolveDecisionKind::CacheHit);
         assert!(upstream.requests.lock().unwrap().is_empty());
-        assert!(metrics
-            .increments
-            .lock()
-            .unwrap()
-            .contains(&ResolverMetric::CacheHit));
+        assert_eq!(metrics.count(ResolverMetric::CacheHit), 1);
+        assert_eq!(metrics.count(ResolverMetric::CacheMiss), 0);
     }
 
     #[tokio::test]
@@ -2255,6 +2368,8 @@ mod tests {
         assert_eq!(outcome.response_bytes.len(), 12);
         assert_eq!(outcome.decision.kind, ResolveDecisionKind::CacheHit);
         assert!(upstream.requests.lock().unwrap().is_empty());
+        assert_eq!(metrics.count(ResolverMetric::CacheResponseTruncated), 1);
+        assert_eq!(metrics.count(ResolverMetric::CacheHit), 1);
     }
 
     #[tokio::test]
@@ -2274,8 +2389,13 @@ mod tests {
         })));
         let events = Arc::new(RecordingEvents::default());
         let metrics = Arc::new(RecordingMetrics::default());
-        let service =
-            resolve_service_with_cache(upstream.clone(), cache.clone(), events, metrics, 1232);
+        let service = resolve_service_with_cache(
+            upstream.clone(),
+            cache.clone(),
+            events,
+            metrics.clone(),
+            1232,
+        );
 
         let outcome = service
             .resolve(ResolveRequest::new(
@@ -2288,6 +2408,9 @@ mod tests {
         assert_eq!(outcome.decision.kind, ResolveDecisionKind::Allowed);
         assert_eq!(upstream.requests.lock().unwrap().len(), 1);
         assert_eq!(cache.stores.lock().unwrap().len(), 1);
+        assert_eq!(metrics.count(ResolverMetric::CacheExpired), 1);
+        assert_eq!(metrics.count(ResolverMetric::CacheMiss), 1);
+        assert_eq!(metrics.count(ResolverMetric::CacheStore), 1);
     }
 
     #[tokio::test]
@@ -2303,7 +2426,7 @@ mod tests {
             upstream.clone(),
             cache,
             events,
-            metrics,
+            metrics.clone(),
             1232,
         ));
         let first = {
@@ -2343,6 +2466,9 @@ mod tests {
         assert_eq!(&second.response_bytes[0..2], &[0x22, 0x22]);
         assert_eq!(first.decision.kind, ResolveDecisionKind::Allowed);
         assert_eq!(second.decision.kind, ResolveDecisionKind::CacheHit);
+        assert_eq!(metrics.count(ResolverMetric::CacheCoalescedMiss), 1);
+        assert_eq!(metrics.count(ResolverMetric::CacheHit), 0);
+        assert_eq!(metrics.count(ResolverMetric::CacheMiss), 2);
     }
 
     #[tokio::test]
@@ -2402,15 +2528,57 @@ mod tests {
             stores[0].key.question,
             QuestionKey::new("example.com", 1, 1)
         );
+        drop(stores);
+        assert_eq!(metrics.count(ResolverMetric::CacheMiss), 1);
+        assert_eq!(metrics.count(ResolverMetric::CacheStore), 1);
+    }
+
+    #[tokio::test]
+    async fn resolve_records_negative_cache_store_metrics() {
+        let cache = Arc::new(RecordingCache::with_lookup(CacheLookup::Miss));
+        let upstream = Arc::new(StaticUpstream::new(Ok(UpstreamResponse {
+            bytes: nxdomain_response_with_soa(0xabcd, "example.com", 30, 120),
+            received_at: SystemTime::UNIX_EPOCH,
+        })));
+        let events = Arc::new(RecordingEvents::default());
+        let metrics = Arc::new(RecordingMetrics::default());
+        let service =
+            resolve_service_with_cache(upstream, cache.clone(), events, metrics.clone(), 1232);
+
+        let outcome = service
+            .resolve(ResolveRequest::new(
+                "192.0.2.10".parse().unwrap(),
+                SystemTime::UNIX_EPOCH,
+                a_query(0xabcd, "example.com"),
+            ))
+            .await;
+
+        assert_eq!(outcome.decision.kind, ResolveDecisionKind::Allowed);
+        let stores = cache.stores.lock().unwrap();
+        assert_eq!(stores.len(), 1);
+        assert_eq!(stores[0].response_code, ResponseCode::NxDomain);
+        assert_eq!(
+            stores[0].negative_cache,
+            Some(NegativeCacheMetadata {
+                authority_name: "example.com".to_string(),
+                soa_minimum_ttl: Duration::from_secs(30),
+            })
+        );
+        drop(stores);
+        assert_eq!(metrics.count(ResolverMetric::CacheStore), 1);
+        assert_eq!(metrics.count(ResolverMetric::CacheNegativeStore), 1);
     }
 
     #[tokio::test]
     async fn resolve_does_not_store_malformed_or_question_mismatched_upstream_response() {
-        for response in [
-            vec![0x12],
-            a_response_with_answer(0x5555, "other.example", 60),
-            a_response_with_answer(0x5555, "Example.COM", 60),
-            multi_question_a_response_with_answer(0x5555, "example.com", 60),
+        for (response, skipped_store_count) in [
+            (vec![0x12], 0),
+            (a_response_with_answer(0x5555, "other.example", 60), 1),
+            (a_response_with_answer(0x5555, "Example.COM", 60), 1),
+            (
+                multi_question_a_response_with_answer(0x5555, "example.com", 60),
+                1,
+            ),
         ] {
             let cache = Arc::new(RecordingCache::with_lookup(CacheLookup::Miss));
             let upstream = Arc::new(StaticUpstream::new(Ok(UpstreamResponse {
@@ -2420,7 +2588,7 @@ mod tests {
             let events = Arc::new(RecordingEvents::default());
             let metrics = Arc::new(RecordingMetrics::default());
             let service =
-                resolve_service_with_cache(upstream, cache.clone(), events, metrics, 1232);
+                resolve_service_with_cache(upstream, cache.clone(), events, metrics.clone(), 1232);
 
             let _ = service
                 .resolve(ResolveRequest::new(
@@ -2431,14 +2599,21 @@ mod tests {
                 .await;
 
             assert!(cache.stores.lock().unwrap().is_empty());
+            assert_eq!(
+                metrics.count(ResolverMetric::CacheStoreSkipped),
+                skipped_store_count
+            );
         }
     }
 
     #[tokio::test]
     async fn resolve_does_not_store_after_cache_bypass_or_unavailable() {
-        for lookup in [
-            CacheLookup::Bypass(CacheBypassReason::UnsupportedQueryFeature),
-            CacheLookup::Unavailable,
+        for (lookup, metric) in [
+            (
+                CacheLookup::Bypass(CacheBypassReason::UnsupportedQueryFeature),
+                ResolverMetric::CacheBypass,
+            ),
+            (CacheLookup::Unavailable, ResolverMetric::CacheUnavailable),
         ] {
             let cache = Arc::new(RecordingCache::with_lookup(lookup));
             let upstream = Arc::new(StaticUpstream::new(Ok(UpstreamResponse {
@@ -2448,7 +2623,7 @@ mod tests {
             let events = Arc::new(RecordingEvents::default());
             let metrics = Arc::new(RecordingMetrics::default());
             let service =
-                resolve_service_with_cache(upstream, cache.clone(), events, metrics, 1232);
+                resolve_service_with_cache(upstream, cache.clone(), events, metrics.clone(), 1232);
 
             let _ = service
                 .resolve(ResolveRequest::new(
@@ -2459,6 +2634,8 @@ mod tests {
                 .await;
 
             assert!(cache.stores.lock().unwrap().is_empty());
+            assert_eq!(metrics.count(metric), 1);
+            assert_eq!(metrics.count(ResolverMetric::CacheMiss), 1);
         }
     }
 
@@ -2471,7 +2648,8 @@ mod tests {
         })));
         let events = Arc::new(RecordingEvents::default());
         let metrics = Arc::new(RecordingMetrics::default());
-        let service = resolve_service_with_cache(upstream, cache.clone(), events, metrics, 1232);
+        let service =
+            resolve_service_with_cache(upstream, cache.clone(), events, metrics.clone(), 1232);
         let edns_cookie = [0u8, 10, 0, 2, 0xaa, 0xbb];
 
         let _ = service
@@ -2484,6 +2662,8 @@ mod tests {
 
         assert!(cache.lookups.lock().unwrap().is_empty());
         assert!(cache.stores.lock().unwrap().is_empty());
+        assert_eq!(metrics.count(ResolverMetric::CacheBypass), 1);
+        assert_eq!(metrics.count(ResolverMetric::CacheMiss), 1);
     }
 
     #[tokio::test]
