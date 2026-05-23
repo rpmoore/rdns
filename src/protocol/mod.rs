@@ -312,6 +312,13 @@ pub fn build_formerr_response(request_id: u16) -> Vec<u8> {
     build_header_only_response(request_id, false, ResponseCode::FormErr)
 }
 
+pub fn build_servfail_response(request: Option<&Message>, request_id: Option<u16>) -> Vec<u8> {
+    match request {
+        Some(request) => build_question_response(request, ResponseCode::ServFail, &[]),
+        None => build_header_only_response(request_id.unwrap_or(0), false, ResponseCode::ServFail),
+    }
+}
+
 pub fn build_refused_response(request: &Message) -> Vec<u8> {
     build_question_response(request, ResponseCode::Refused, &[])
 }
@@ -1544,6 +1551,34 @@ mod tests {
         assert_eq!(parsed.header.id, 0xbeef);
         assert!(parsed.header.qr());
         assert_eq!(parsed.header.r_code(), ResponseCode::FormErr.as_u8());
+        assert!(parsed.questions.is_empty());
+        assert!(parsed.answers.is_empty());
+    }
+
+    #[test]
+    fn build_servfail_response_with_request_preserves_question_and_rd() {
+        let mut request = Vec::new();
+        push_header(&mut request, 1, 0, 0, 0);
+        request[0..2].copy_from_slice(&0xbeefu16.to_be_bytes());
+        push_question(&mut request, "example.com", 1, 1);
+        let request = Message::parse_standard_query(&request).unwrap();
+
+        let response = Message::parse(&build_servfail_response(Some(&request), None)).unwrap();
+
+        assert_eq!(response.header.id, 0xbeef);
+        assert!(response.header.rd());
+        assert_eq!(response.header.r_code(), ResponseCode::ServFail.as_u8());
+        assert_eq!(response.questions[0], request.questions[0]);
+        assert!(response.answers.is_empty());
+    }
+
+    #[test]
+    fn build_servfail_response_without_request_uses_supplied_id() {
+        let response = build_servfail_response(None, Some(0x1234));
+        let parsed = Message::parse(&response).unwrap();
+
+        assert_eq!(parsed.header.id, 0x1234);
+        assert_eq!(parsed.header.r_code(), ResponseCode::ServFail.as_u8());
         assert!(parsed.questions.is_empty());
         assert!(parsed.answers.is_empty());
     }
