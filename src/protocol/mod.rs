@@ -176,11 +176,12 @@ impl Message {
     pub fn parse(dns_message: &[u8]) -> Result<Self> {
         let header = parse_header(dns_message)?;
         let mut offset = DNS_HEADER_LEN;
+        let mut context = ParseContext::default();
 
-        let questions = parse_questions(dns_message, &mut offset, header.qd_count)?;
-        let answers = parse_records(dns_message, &mut offset, header.an_count)?;
-        let authorities = parse_records(dns_message, &mut offset, header.ns_count)?;
-        let additionals = parse_records(dns_message, &mut offset, header.ar_count)?;
+        let questions = parse_questions(dns_message, &mut offset, header.qd_count, &mut context)?;
+        let answers = parse_records(dns_message, &mut offset, header.an_count, &mut context)?;
+        let authorities = parse_records(dns_message, &mut offset, header.ns_count, &mut context)?;
+        let additionals = parse_records(dns_message, &mut offset, header.ar_count, &mut context)?;
 
         Ok(Self {
             header,
@@ -191,6 +192,11 @@ impl Message {
             additionals,
         })
     }
+}
+
+#[derive(Default)]
+struct ParseContext {
+    valid_name_offsets: HashSet<usize>,
 }
 
 impl TryFrom<&[u8]> for Message {
@@ -268,16 +274,21 @@ fn parse_questions(
     dns_message: &[u8],
     offset: &mut usize,
     question_count: u16,
+    context: &mut ParseContext,
 ) -> Result<Vec<Question>> {
     let mut questions = Vec::with_capacity(question_count as usize);
     for _ in 0..question_count {
-        questions.push(parse_question(dns_message, offset)?);
+        questions.push(parse_question(dns_message, offset, context)?);
     }
     Ok(questions)
 }
 
-fn parse_question(dns_message: &[u8], offset: &mut usize) -> Result<Question> {
-    let qname = parse_domain(dns_message, offset)?;
+fn parse_question(
+    dns_message: &[u8],
+    offset: &mut usize,
+    context: &mut ParseContext,
+) -> Result<Question> {
+    let qname = parse_domain_with_context(dns_message, offset, Some(context))?;
     let mut reader = Reader::new(dns_message, *offset)?;
     let qtype = reader.read_u16()?;
     let qclass = reader.read_u16()?;
@@ -289,16 +300,25 @@ fn parse_question(dns_message: &[u8], offset: &mut usize) -> Result<Question> {
     })
 }
 
-fn parse_records(dns_message: &[u8], offset: &mut usize, record_count: u16) -> Result<Vec<Record>> {
+fn parse_records(
+    dns_message: &[u8],
+    offset: &mut usize,
+    record_count: u16,
+    context: &mut ParseContext,
+) -> Result<Vec<Record>> {
     let mut records = Vec::with_capacity(record_count as usize);
     for _ in 0..record_count {
-        records.push(parse_record(dns_message, offset)?);
+        records.push(parse_record(dns_message, offset, context)?);
     }
     Ok(records)
 }
 
-fn parse_record(dns_message: &[u8], offset: &mut usize) -> Result<Record> {
-    let name = parse_domain(dns_message, offset)?;
+fn parse_record(
+    dns_message: &[u8],
+    offset: &mut usize,
+    context: &mut ParseContext,
+) -> Result<Record> {
+    let name = parse_domain_with_context(dns_message, offset, Some(context))?;
     let mut reader = Reader::new(dns_message, *offset)?;
     let rtype = reader.read_u16()?;
     let rclass = reader.read_u16()?;
@@ -312,7 +332,7 @@ fn parse_record(dns_message: &[u8], offset: &mut usize) -> Result<Record> {
         .get(rdata_offset..rdata_end)
         .ok_or(DnsParseError::UnexpectedEof)?;
 
-    let record = parse_record_data(dns_message, rdata_offset, rtype, rdlength)?;
+    let record = parse_record_data(dns_message, rdata_offset, rtype, rdlength, context)?;
     *offset = rdata_end;
     Ok(Record {
         name,
@@ -328,25 +348,26 @@ fn parse_record_data(
     offset: usize,
     rtype: u16,
     rdlength: usize,
+    context: &mut ParseContext,
 ) -> Result<RecordData> {
     let end = offset
         .checked_add(rdlength)
         .ok_or(DnsParseError::MalformedRecord)?;
     match rtype {
         1 => parse_a_record(dns_message, offset, end),
-        2 => parse_name_record(dns_message, offset, end).map(RecordData::NS),
-        5 => parse_name_record(dns_message, offset, end).map(RecordData::CNAME),
-        6 => parse_soa_record(dns_message, offset, end),
-        12 => parse_name_record(dns_message, offset, end).map(RecordData::PTR),
-        15 => parse_mx_record(dns_message, offset, end),
+        2 => parse_name_record(dns_message, offset, end, context).map(RecordData::NS),
+        5 => parse_name_record(dns_message, offset, end, context).map(RecordData::CNAME),
+        6 => parse_soa_record(dns_message, offset, end, context),
+        12 => parse_name_record(dns_message, offset, end, context).map(RecordData::PTR),
+        15 => parse_mx_record(dns_message, offset, end, context),
         16 => parse_txt_record(dns_message, offset, end),
-        17 => parse_rp_record(dns_message, offset, end),
+        17 => parse_rp_record(dns_message, offset, end, context),
         28 => parse_aaaa_record(dns_message, offset, end),
-        33 => parse_srv_record(dns_message, offset, end),
+        33 => parse_srv_record(dns_message, offset, end, context),
         37 => parse_cert_record(dns_message, offset, end),
         43 => parse_ds_record(dns_message, offset, end),
-        46 => parse_rrsig_record(dns_message, offset, end),
-        47 => parse_nsec_record(dns_message, offset, end),
+        46 => parse_rrsig_record(dns_message, offset, end, context),
+        47 => parse_nsec_record(dns_message, offset, end, context),
         48 => parse_dnskey_record(dns_message, offset, end),
         50 => parse_nsec3_record(dns_message, offset, end),
         51 => parse_nsec3param_record(dns_message, offset, end),
@@ -377,20 +398,30 @@ fn parse_aaaa_record(dns_message: &[u8], offset: usize, end: usize) -> Result<Re
     Ok(RecordData::AAAA(Ipv6Addr::from(octets)))
 }
 
-fn parse_name_record(dns_message: &[u8], offset: usize, end: usize) -> Result<String> {
+fn parse_name_record(
+    dns_message: &[u8],
+    offset: usize,
+    end: usize,
+    context: &mut ParseContext,
+) -> Result<String> {
     let mut cursor = offset;
-    let name = parse_domain(dns_message, &mut cursor)?;
+    let name = parse_domain_with_context(dns_message, &mut cursor, Some(context))?;
     if cursor != end {
         return Err(DnsParseError::MalformedRecord);
     }
     Ok(name)
 }
 
-fn parse_mx_record(dns_message: &[u8], offset: usize, end: usize) -> Result<RecordData> {
+fn parse_mx_record(
+    dns_message: &[u8],
+    offset: usize,
+    end: usize,
+    context: &mut ParseContext,
+) -> Result<RecordData> {
     let mut reader = Reader::new(dns_message, offset)?;
     let preference = reader.read_u16()?;
     let mut cursor = reader.position();
-    let exchange = parse_domain(dns_message, &mut cursor)?;
+    let exchange = parse_domain_with_context(dns_message, &mut cursor, Some(context))?;
     if cursor != end {
         return Err(DnsParseError::MalformedRecord);
     }
@@ -400,13 +431,18 @@ fn parse_mx_record(dns_message: &[u8], offset: usize, end: usize) -> Result<Reco
     })
 }
 
-fn parse_srv_record(dns_message: &[u8], offset: usize, end: usize) -> Result<RecordData> {
+fn parse_srv_record(
+    dns_message: &[u8],
+    offset: usize,
+    end: usize,
+    context: &mut ParseContext,
+) -> Result<RecordData> {
     let mut reader = Reader::new(dns_message, offset)?;
     let priority = reader.read_u16()?;
     let weight = reader.read_u16()?;
     let port = reader.read_u16()?;
     let mut cursor = reader.position();
-    let target = parse_domain(dns_message, &mut cursor)?;
+    let target = parse_domain_with_context(dns_message, &mut cursor, Some(context))?;
     if cursor != end {
         return Err(DnsParseError::MalformedRecord);
     }
@@ -441,10 +477,15 @@ fn parse_txt_record(dns_message: &[u8], offset: usize, end: usize) -> Result<Rec
     Ok(RecordData::TXT(text))
 }
 
-fn parse_soa_record(dns_message: &[u8], offset: usize, end: usize) -> Result<RecordData> {
+fn parse_soa_record(
+    dns_message: &[u8],
+    offset: usize,
+    end: usize,
+    context: &mut ParseContext,
+) -> Result<RecordData> {
     let mut cursor = offset;
-    let mname = parse_domain(dns_message, &mut cursor)?;
-    let rname = parse_domain(dns_message, &mut cursor)?;
+    let mname = parse_domain_with_context(dns_message, &mut cursor, Some(context))?;
+    let rname = parse_domain_with_context(dns_message, &mut cursor, Some(context))?;
     let mut reader = Reader::new(dns_message, cursor)?;
     let serial = reader.read_u32()?;
     let refresh = reader.read_u32()?;
@@ -466,10 +507,15 @@ fn parse_soa_record(dns_message: &[u8], offset: usize, end: usize) -> Result<Rec
     })
 }
 
-fn parse_rp_record(dns_message: &[u8], offset: usize, end: usize) -> Result<RecordData> {
+fn parse_rp_record(
+    dns_message: &[u8],
+    offset: usize,
+    end: usize,
+    context: &mut ParseContext,
+) -> Result<RecordData> {
     let mut cursor = offset;
-    let mboxdname = parse_domain(dns_message, &mut cursor)?;
-    let txtdname = parse_domain(dns_message, &mut cursor)?;
+    let mboxdname = parse_domain_with_context(dns_message, &mut cursor, Some(context))?;
+    let txtdname = parse_domain_with_context(dns_message, &mut cursor, Some(context))?;
     if cursor != end {
         return Err(DnsParseError::MalformedRecord);
     }
@@ -550,7 +596,12 @@ fn parse_ds_record(dns_message: &[u8], offset: usize, end: usize) -> Result<Reco
     })
 }
 
-fn parse_rrsig_record(dns_message: &[u8], offset: usize, end: usize) -> Result<RecordData> {
+fn parse_rrsig_record(
+    dns_message: &[u8],
+    offset: usize,
+    end: usize,
+    context: &mut ParseContext,
+) -> Result<RecordData> {
     let mut reader = Reader::new(dns_message, offset)?;
     let type_covered = reader.read_u16()?;
     let algorithm = reader.read_u8()?;
@@ -560,7 +611,7 @@ fn parse_rrsig_record(dns_message: &[u8], offset: usize, end: usize) -> Result<R
     let signature_inception = reader.read_u32()?;
     let key_tag = reader.read_u16()?;
     let mut cursor = reader.position();
-    let signer_name = parse_domain(dns_message, &mut cursor)?;
+    let signer_name = parse_domain_with_context(dns_message, &mut cursor, Some(context))?;
     if cursor > end {
         return Err(DnsParseError::MalformedRecord);
     }
@@ -578,9 +629,14 @@ fn parse_rrsig_record(dns_message: &[u8], offset: usize, end: usize) -> Result<R
     })
 }
 
-fn parse_nsec_record(dns_message: &[u8], offset: usize, end: usize) -> Result<RecordData> {
+fn parse_nsec_record(
+    dns_message: &[u8],
+    offset: usize,
+    end: usize,
+    context: &mut ParseContext,
+) -> Result<RecordData> {
     let mut cursor = offset;
-    let next_domain = parse_domain(dns_message, &mut cursor)?;
+    let next_domain = parse_domain_with_context(dns_message, &mut cursor, Some(context))?;
     if cursor > end {
         return Err(DnsParseError::MalformedRecord);
     }
@@ -627,7 +683,16 @@ fn parse_nsec3param_record(dns_message: &[u8], offset: usize, end: usize) -> Res
     })
 }
 
+#[cfg(test)]
 fn parse_domain(dns_message: &[u8], offset: &mut usize) -> Result<String> {
+    parse_domain_with_context(dns_message, offset, None)
+}
+
+fn parse_domain_with_context(
+    dns_message: &[u8],
+    offset: &mut usize,
+    mut context: Option<&mut ParseContext>,
+) -> Result<String> {
     let mut labels = Vec::new();
     let mut cursor = *offset;
     let mut consumed_offset = None;
@@ -639,11 +704,15 @@ fn parse_domain(dns_message: &[u8], offset: &mut usize) -> Result<String> {
             return Err(DnsParseError::PointerLoop);
         }
 
-        let length = *dns_message
+        let length_octet = *dns_message
             .get(cursor)
-            .ok_or(DnsParseError::UnexpectedEof)? as usize;
-        match length & 0b1100_0000 {
+            .ok_or(DnsParseError::UnexpectedEof)?;
+        let length = length_octet as usize;
+        match length_octet & 0b1100_0000 {
             0b0000_0000 => {
+                if let Some(context) = context.as_deref_mut() {
+                    context.valid_name_offsets.insert(cursor);
+                }
                 cursor += 1;
                 if length == 0 {
                     if consumed_offset.is_none() {
@@ -674,12 +743,14 @@ fn parse_domain(dns_message: &[u8], offset: &mut usize) -> Result<String> {
                 cursor = label_end;
             }
             0b1100_0000 => {
-                let next = *dns_message
-                    .get(cursor + 1)
-                    .ok_or(DnsParseError::UnexpectedEof)? as usize;
-                let pointer_offset = ((length & 0b0011_1111) << 8) | next;
-                if pointer_offset >= cursor || pointer_offset >= dns_message.len() {
-                    return Err(DnsParseError::InvalidNamePointer);
+                let pointer_offset = decode_compression_pointer(
+                    dns_message,
+                    cursor,
+                    length_octet,
+                    context.as_deref(),
+                )?;
+                if let Some(context) = context.as_deref_mut() {
+                    context.valid_name_offsets.insert(cursor);
                 }
                 if consumed_offset.is_none() {
                     consumed_offset = Some(cursor + 2);
@@ -692,6 +763,27 @@ fn parse_domain(dns_message: &[u8], offset: &mut usize) -> Result<String> {
 
     *offset = consumed_offset.ok_or(DnsParseError::UnexpectedEof)?;
     Ok(labels.join("."))
+}
+
+fn decode_compression_pointer(
+    dns_message: &[u8],
+    cursor: usize,
+    first_octet: u8,
+    context: Option<&ParseContext>,
+) -> Result<usize> {
+    let second_octet = *dns_message
+        .get(cursor + 1)
+        .ok_or(DnsParseError::UnexpectedEof)? as usize;
+    let pointer_offset = (((first_octet & 0b0011_1111) as usize) << 8) | second_octet;
+    if pointer_offset >= cursor || pointer_offset >= dns_message.len() {
+        return Err(DnsParseError::InvalidNamePointer);
+    }
+    if let Some(context) = context {
+        if !context.valid_name_offsets.contains(&pointer_offset) {
+            return Err(DnsParseError::InvalidNamePointer);
+        }
+    }
+    Ok(pointer_offset)
 }
 
 fn to_hex(bytes: &[u8]) -> String {
@@ -752,7 +844,8 @@ mod tests {
 
     fn parse_test_record(bytes: &[u8]) -> Record {
         let mut offset = 0;
-        parse_record(bytes, &mut offset).unwrap()
+        let mut context = ParseContext::default();
+        parse_record(bytes, &mut offset, &mut context).unwrap()
     }
 
     #[test]
@@ -776,6 +869,135 @@ mod tests {
         let name = parse_domain(&bytes, &mut offset).unwrap();
         assert_eq!(name, "example.com");
         assert_eq!(offset, pointer_offset + 2);
+    }
+
+    #[test]
+    fn parse_message_compression_uses_full_message_offsets() {
+        let mut message = Vec::new();
+        push_header(&mut message, 1, 1, 0, 0);
+        let question_name_offset = message.len();
+        push_name(&mut message, "example.com");
+        push_u16(&mut message, 1);
+        push_u16(&mut message, 1);
+
+        push_pointer(&mut message, question_name_offset);
+        build_record_header(&mut message, 5, 2, 300);
+        push_pointer(&mut message, question_name_offset);
+
+        let parsed = Message::parse(&message).unwrap();
+        assert_eq!(parsed.answers[0].name, "example.com");
+        assert_eq!(
+            parsed.answers[0].record,
+            RecordData::CNAME("example.com".to_string())
+        );
+    }
+
+    #[test]
+    fn parse_message_allows_pointer_to_prior_compressed_name() {
+        let mut message = Vec::new();
+        push_header(&mut message, 1, 2, 0, 0);
+        let question_name_offset = message.len();
+        push_name(&mut message, "example.com");
+        push_u16(&mut message, 1);
+        push_u16(&mut message, 1);
+
+        let first_answer_name_offset = message.len();
+        push_pointer(&mut message, question_name_offset);
+        build_record_header(&mut message, 1, 4, 300);
+        message.extend_from_slice(&[1, 2, 3, 4]);
+
+        push_pointer(&mut message, first_answer_name_offset);
+        build_record_header(&mut message, 1, 4, 300);
+        message.extend_from_slice(&[5, 6, 7, 8]);
+
+        let parsed = Message::parse(&message).unwrap();
+        assert_eq!(parsed.answers[0].name, "example.com");
+        assert_eq!(parsed.answers[1].name, "example.com");
+    }
+
+    #[test]
+    fn message_rejects_pointer_to_header_bytes() {
+        let mut message = Vec::new();
+        push_header(&mut message, 1, 1, 0, 0);
+        push_name(&mut message, "example.com");
+        push_u16(&mut message, 1);
+        push_u16(&mut message, 1);
+
+        push_pointer(&mut message, 0);
+        build_record_header(&mut message, 1, 4, 300);
+        message.extend_from_slice(&[1, 2, 3, 4]);
+
+        assert_eq!(
+            Message::parse(&message),
+            Err(DnsParseError::InvalidNamePointer)
+        );
+    }
+
+    #[test]
+    fn message_rejects_pointer_to_middle_of_label() {
+        let mut message = Vec::new();
+        push_header(&mut message, 1, 1, 0, 0);
+        let question_name_offset = message.len();
+        push_name(&mut message, "example.com");
+        push_u16(&mut message, 1);
+        push_u16(&mut message, 1);
+
+        push_pointer(&mut message, question_name_offset + 1);
+        build_record_header(&mut message, 1, 4, 300);
+        message.extend_from_slice(&[1, 2, 3, 4]);
+
+        assert_eq!(
+            Message::parse(&message),
+            Err(DnsParseError::InvalidNamePointer)
+        );
+    }
+
+    #[test]
+    fn domain_accepts_max_label_and_name_lengths() {
+        let label63 = "a".repeat(63);
+        let label61 = "b".repeat(61);
+        let mut bytes = Vec::new();
+        for label in [&label63, &label63, &label63, &label61] {
+            bytes.push(label.len() as u8);
+            bytes.extend_from_slice(label.as_bytes());
+        }
+        bytes.push(0);
+
+        let mut offset = 0;
+        let parsed = parse_domain(&bytes, &mut offset).unwrap();
+        assert_eq!(offset, bytes.len());
+        assert_eq!(parsed, format!("{label63}.{label63}.{label63}.{label61}"));
+    }
+
+    #[test]
+    fn domain_rejects_label_over_sixty_three_bytes() {
+        let mut bytes = Vec::new();
+        bytes.push(64);
+        bytes.extend_from_slice(&[b'a'; 64]);
+        bytes.push(0);
+
+        let mut offset = 0;
+        assert_eq!(
+            parse_domain(&bytes, &mut offset),
+            Err(DnsParseError::InvalidLabel)
+        );
+    }
+
+    #[test]
+    fn domain_rejects_name_over_two_hundred_fifty_five_bytes() {
+        let label63 = [b'a'; 63];
+        let mut bytes = Vec::new();
+        for _ in 0..4 {
+            bytes.push(63);
+            bytes.extend_from_slice(&label63);
+        }
+        bytes.push(0);
+
+        let mut offset = 0;
+        assert_eq!(
+            parse_domain(&bytes, &mut offset),
+            Err(DnsParseError::InvalidLabel)
+        );
     }
 
     #[test]
@@ -1110,7 +1332,9 @@ mod tests {
         message.extend_from_slice(&rdata);
 
         let mut offset = record_offset;
-        let record = parse_record(&message, &mut offset).unwrap();
+        let mut context = ParseContext::default();
+        context.valid_name_offsets.insert(0);
+        let record = parse_record(&message, &mut offset, &mut context).unwrap();
         assert_eq!(record.record, RecordData::CNAME("example.com".to_string()));
     }
 
@@ -1179,8 +1403,9 @@ mod tests {
         bytes.extend_from_slice(&[1, 2, 3]);
 
         let mut offset = 0;
+        let mut context = ParseContext::default();
         assert_eq!(
-            parse_record(&bytes, &mut offset),
+            parse_record(&bytes, &mut offset, &mut context),
             Err(DnsParseError::UnexpectedEof)
         );
     }
@@ -1196,8 +1421,9 @@ mod tests {
         bytes.extend_from_slice(&rdata);
 
         let mut offset = 0;
+        let mut context = ParseContext::default();
         assert_eq!(
-            parse_record(&bytes, &mut offset),
+            parse_record(&bytes, &mut offset, &mut context),
             Err(DnsParseError::MalformedRecord)
         );
     }
@@ -1211,8 +1437,9 @@ mod tests {
         bytes.extend_from_slice(&rdata);
 
         let mut offset = 0;
+        let mut context = ParseContext::default();
         assert_eq!(
-            parse_record(&bytes, &mut offset),
+            parse_record(&bytes, &mut offset, &mut context),
             Err(DnsParseError::MalformedRecord)
         );
     }
@@ -1224,6 +1451,16 @@ mod tests {
         assert_eq!(
             parse_domain(&bytes, &mut offset),
             Err(DnsParseError::InvalidNamePointer)
+        );
+    }
+
+    #[test]
+    fn backward_pointer_loop_returns_error() {
+        let bytes = [1, b'a', 0xc0, 0x00];
+        let mut offset = 0;
+        assert_eq!(
+            parse_domain(&bytes, &mut offset),
+            Err(DnsParseError::PointerLoop)
         );
     }
 
