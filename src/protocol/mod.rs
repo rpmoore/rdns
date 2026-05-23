@@ -23,6 +23,7 @@ pub enum DnsParseError {
     UnexpectedEof,
     MalformedRecord,
     MessageTooShort,
+    TcpFrameTooLarge { size: usize, max_size: usize },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -76,6 +77,17 @@ impl QueryValidationError {
             | Self::NotQuery => ResponseCode::FormErr,
         }
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TcpFrameDecodeStatus {
+    Complete {
+        message_len: usize,
+        required_total_len: usize,
+    },
+    NeedMore {
+        required_total_len: usize,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -341,6 +353,52 @@ pub fn rewrite_response_id(response_bytes: &mut [u8], request_id: u16) -> Result
         return Err(DnsParseError::MessageTooShort);
     }
     response_bytes[0..2].copy_from_slice(&request_id.to_be_bytes());
+    Ok(())
+}
+
+pub fn encode_tcp_frame(message: &[u8], max_size: usize) -> Result<Vec<u8>> {
+    validate_tcp_message_size(message.len(), max_size)?;
+    let mut frame = Vec::with_capacity(message.len() + 2);
+    write_u16(&mut frame, message.len() as u16);
+    frame.extend_from_slice(message);
+    Ok(frame)
+}
+
+pub fn decode_tcp_frame(frame: &[u8], max_size: usize) -> Result<TcpFrameDecodeStatus> {
+    if frame.len() < 2 {
+        return Ok(TcpFrameDecodeStatus::NeedMore {
+            required_total_len: 2,
+        });
+    }
+
+    let message_len = u16::from_be_bytes([frame[0], frame[1]]) as usize;
+    validate_tcp_message_size(message_len, max_size)?;
+    let consumed_len = message_len + 2;
+    if frame.len() < consumed_len {
+        return Ok(TcpFrameDecodeStatus::NeedMore {
+            required_total_len: consumed_len,
+        });
+    }
+
+    Ok(TcpFrameDecodeStatus::Complete {
+        message_len,
+        required_total_len: consumed_len,
+    })
+}
+
+pub fn tcp_frame_payload(frame: &[u8], max_size: usize) -> Result<Option<&[u8]>> {
+    match decode_tcp_frame(frame, max_size)? {
+        TcpFrameDecodeStatus::Complete {
+            required_total_len, ..
+        } => Ok(Some(&frame[2..required_total_len])),
+        TcpFrameDecodeStatus::NeedMore { .. } => Ok(None),
+    }
+}
+
+fn validate_tcp_message_size(size: usize, max_size: usize) -> Result<()> {
+    if size > u16::MAX as usize || size > max_size {
+        return Err(DnsParseError::TcpFrameTooLarge { size, max_size });
+    }
     Ok(())
 }
 
@@ -1574,6 +1632,78 @@ mod tests {
         assert_eq!(
             rewrite_response_id(&mut [0u8; 1], 0x3333),
             Err(DnsParseError::MessageTooShort)
+        );
+    }
+
+    #[test]
+    fn tcp_frame_encode_prefixes_message_length() {
+        let message = [1, 2, 3, 4];
+        let frame = encode_tcp_frame(&message, 512).unwrap();
+
+        assert_eq!(frame, vec![0, 4, 1, 2, 3, 4]);
+    }
+
+    #[test]
+    fn tcp_frame_encode_rejects_oversized_message() {
+        let message = [0u8; 5];
+
+        assert_eq!(
+            encode_tcp_frame(&message, 4),
+            Err(DnsParseError::TcpFrameTooLarge {
+                size: 5,
+                max_size: 4
+            })
+        );
+    }
+
+    #[test]
+    fn tcp_frame_decode_reports_needed_bytes_for_short_prefix() {
+        assert_eq!(
+            decode_tcp_frame(&[0], 512),
+            Ok(TcpFrameDecodeStatus::NeedMore {
+                required_total_len: 2
+            })
+        );
+    }
+
+    #[test]
+    fn tcp_frame_decode_reports_needed_bytes_for_partial_payload() {
+        assert_eq!(
+            decode_tcp_frame(&[0, 4, 1, 2], 512),
+            Ok(TcpFrameDecodeStatus::NeedMore {
+                required_total_len: 6
+            })
+        );
+    }
+
+    #[test]
+    fn tcp_frame_decode_reports_complete_frame() {
+        assert_eq!(
+            decode_tcp_frame(&[0, 4, 1, 2, 3, 4, 9], 512),
+            Ok(TcpFrameDecodeStatus::Complete {
+                message_len: 4,
+                required_total_len: 6
+            })
+        );
+    }
+
+    #[test]
+    fn tcp_frame_decode_rejects_oversized_frame() {
+        assert_eq!(
+            decode_tcp_frame(&[0, 5, 1, 2, 3, 4, 5], 4),
+            Err(DnsParseError::TcpFrameTooLarge {
+                size: 5,
+                max_size: 4
+            })
+        );
+    }
+
+    #[test]
+    fn tcp_frame_payload_returns_complete_payload_only() {
+        assert_eq!(tcp_frame_payload(&[0, 3, 7, 8], 512), Ok(None));
+        assert_eq!(
+            tcp_frame_payload(&[0, 3, 7, 8, 9, 10], 512),
+            Ok(Some(&[7, 8, 9][..]))
         );
     }
 
