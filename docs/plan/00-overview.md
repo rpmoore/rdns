@@ -22,12 +22,14 @@ Remaining major planned areas are local policy blocking, persistent/runtime-relo
 The finished application should run as an intermediate DNS resolver for a local network.
 
 - Accept DNS queries from LAN clients over UDP and later TCP.
-- Cache upstream DNS responses to reduce local lookup latency.
+- Cache DNS responses to reduce local lookup latency.
+- Let an administrator choose whether allowed cache misses are resolved by forwarding to configured upstream recursive resolvers or by performing iterative recursive resolution locally.
 - Block domains known to be malicious using configured external blocklist sources.
 - Block configured client IP addresses from resolving selected domains.
+- Record DNS lookup events by observed client/source so administrators can review suspicious lookup patterns and investigate possible command-and-control behavior.
 - Let an administrator configure upstream resolvers such as Cloudflare, Google, or local upstreams.
 - Let an administrator manage client/domain rules and blocklist sources through a UI.
-- Expose operational status for cache behavior, upstream health, blocklist freshness, and query decisions.
+- Expose operational status for cache behavior, upstream health, blocklist freshness, query decisions, suspicious lookup flags, and query-event pipeline health.
 
 ## Architectural Direction
 
@@ -36,7 +38,9 @@ Use a modular monolith first. The application has several clear domains, but the
 Recommended module shape:
 
 - `protocol`: DNS packet parsing, validation, serialization, and response construction.
-- `resolver`: request orchestration, upstream selection, cache lookup, cache population, and response decisions.
+- `resolver`: request orchestration, resolution-strategy selection, cache lookup, cache population, and response decisions.
+- `recursive`: iterative DNS recursion, root hints, delegation walking, authority selection, bailiwick validation, glue handling, and recursion-specific cache support.
+- `events`: query-event schema, non-blocking event ingestion, in-memory review models, and advisory suspicious-lookup classification.
 - `policy`: domain normalization, local rules, malicious-domain matching, and block actions.
 - `blocklist`: external source fetching, parsing, normalization, deduplication, and atomic activation.
 - `config`: runtime settings, upstream resolver configuration, and reload semantics.
@@ -55,7 +59,7 @@ The dependency direction should be:
 
 Infrastructure implementations should be injected behind traits:
 
-- `UpstreamResolver`
+- `ResolutionBackend`
 - `DnsCache`
 - `PolicyRepository`
 - `BlocklistRepository`
@@ -63,6 +67,8 @@ Infrastructure implementations should be injected behind traits:
 - `BlocklistFetcher`
 - `Clock`
 - `QueryEventSink`
+- `QueryEventStore`
+- `SuspiciousLookupClassifier`
 - `MetricsSink`
 
 ## Core Runtime Flow
@@ -74,12 +80,16 @@ Infrastructure implementations should be injected behind traits:
 5. If blocked, `resolver` chooses the configured block mode and asks `protocol` to serialize that response.
 6. If allowed, `resolver` checks the cache.
 7. On cache hit, the resolver rewrites the response transaction ID and returns it.
-8. On cache miss, the resolver forwards to an upstream resolver, validates the response, caches it according to TTL policy, and returns it.
-9. The query decision is logged asynchronously.
+8. On cache miss, the resolver calls the configured `ResolutionBackend`. The backend either forwards to configured upstream resolvers or performs local iterative recursion.
+9. `resolver` validates the backend response, applies response-aware policy checks, caches it according to TTL policy, and returns it.
+10. The query decision is emitted as a structured event through a non-blocking sink.
+11. The query-event pipeline stores a bounded review model and applies advisory suspicious-lookup classification without blocking DNS responses.
 
 ## Remaining Primary Risks
 
 - There is no policy engine yet, so local client/domain rules and known-malicious blocklist decisions are not enforced.
+- Query-event review is currently limited to the in-process decision hooks; there is no bounded review store, source-centric view, suspicious classifier, or durable query-event history yet.
+- Recursive resolution is not implemented yet; the current runtime can only forward cache misses to configured upstream recursive resolvers.
 - Configuration is static and in-memory; upstreams, settings, and future rules are not durable or reloadable at runtime.
 - There is no persistence layer, blocklist updater, admin API, UI server, structured metrics exporter, or durable query logging.
 - DNS TCP support exists for protocol framing and upstream fallback, but the resolver does not yet expose a client-facing TCP listener.
@@ -105,7 +115,9 @@ An independent review called out these concerns, which are incorporated in the d
 - Block response behavior must be explicit because `REFUSED`, `NXDOMAIN`, `NODATA`, and sinkhole answers have different client and caching effects.
 - Client identity should be modeled separately from transport source IP so future DHCP, labels, groups, and IPv6 behavior can be added without rewriting resolver policy.
 - Upstream timeout, retry, failover, health, and TCP fallback behavior must be deterministic.
+- Resolution mode must be selected through configuration and hidden behind a resolver backend port so DNS delivery adapters and `ResolveQuery` do not branch on forwarding versus recursion.
 - Runtime settings and policy data need immutable snapshots so DNS queries never observe partially updated configuration or blocklists.
+- Query-event logging must be non-blocking, bounded, privacy-aware, and source-centric so it can support compromised-host investigation without making DNS availability depend on logging storage.
 - Blocklist ingestion deserves its own workflow because fetching, parsing, validation, rollback, scheduling, and activation are separate from request-time policy.
 - Admin UI defaults must be secure: no unauthenticated mutation endpoints and no public bind by default.
 

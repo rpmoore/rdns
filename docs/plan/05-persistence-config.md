@@ -27,6 +27,19 @@ Use migrations from the beginning so schema changes stay controlled.
 - `value_json`
 - `updated_at`
 
+Resolution-mode settings should include:
+
+- `resolution.mode`: `forward` or `recursive`.
+- `resolution.forward.upstream_policy`: ordered failover initially.
+- `resolution.recursive.root_hints_source`: bundled, file, or database-managed root hints.
+- `resolution.recursive.max_depth`
+- `resolution.recursive.max_cname_restarts`
+- `resolution.recursive.per_authority_timeout_ms`
+- `resolution.recursive.allowed_transports`
+- `resolution.recursive.dnssec_validation_mode`: initially `disabled` unless trust-anchor validation is implemented.
+- `resolution.recursive.dname_policy`: initially `defer` unless DNAME synthesis and cache rules are implemented.
+- `resolution.cache_namespace_generation`
+
 `upstream_resolvers`
 
 - `id`
@@ -95,15 +108,33 @@ Use migrations from the beginning so schema changes stay controlled.
 `query_events`
 
 - `id`
+- `schema_version`
+- `sequence`
 - `timestamp`
+- `observed_source_ip`
+- `observed_source_port`
+- `transport`
+- `listener`
 - `client_ip`
+- `client_identity_id`
+- `client_identity_labels_json`
+- `client_identity_generation`
 - `domain`
+- `original_domain`
 - `qtype`
+- `qclass`
+- `terminal_outcome`
+- `local_response_code`
 - `decision`
 - `reason`
+- `backend_mode`
+- `backend_generation`
 - `upstream_id`
 - `cache_status`
+- `classifier_findings_json`
 - `latency_ms`
+- `sampled`
+- `dropped_before_store`
 
 Suggested indices:
 
@@ -113,7 +144,12 @@ Suggested indices:
 - `active_blocklist_generations(source_id)`
 - `query_events(timestamp)`
 - `query_events(client_ip, timestamp)`
+- `query_events(observed_source_ip, timestamp)`
+- `query_events(observed_source_ip, sampled, timestamp)`
 - `query_events(domain, timestamp)`
+- `query_events(terminal_outcome, timestamp)`
+
+If classifier findings are stored separately later, add indices for suspicious findings by source, reason, severity, and timestamp. Until then, keep `classifier_findings_json` compact and query summaries through maintained read models rather than full JSON scans.
 
 ## Repository Ports
 
@@ -129,6 +165,9 @@ Examples:
 
 - `load_resolver_settings()`
 - `replace_upstreams(upstreams)`
+- `replace_resolution_mode(settings)`
+- `load_root_hints()`
+- `publish_backend_snapshot(snapshot)`
 - `load_policy_snapshot()`
 - `activate_blocklist_generation(source_id, generation_id)`
 - `append_query_events(events)`
@@ -149,6 +188,7 @@ This avoids partially applied settings while keeping DNS request handling fast.
 Implementation shape:
 
 - Use `Arc<RuntimeConfig>` for resolver settings.
+- Use an atomic `Arc<BackendSnapshot>` or equivalent handle for resolution backend, backend health state, and cache namespace.
 - Use `Arc<PolicySnapshot>` for local rules and active blocklist domains.
 - Publish new snapshots only after database transactions commit.
 - Include a generation/version number in snapshots for logs and debugging.
@@ -156,7 +196,12 @@ Implementation shape:
 
 Configuration validation must enforce invariants before a snapshot can be published:
 
-- At least one enabled upstream resolver is required unless degraded/no-upstream mode is explicitly configured.
+- In `forward` mode, at least one enabled upstream resolver is required unless degraded/no-upstream mode is explicitly configured.
+- In `recursive` mode, root hints must be present and valid, recursion limits must be bounded, and outbound transport/timeouts must be configured.
+- Resolution mode changes must build the new `ResolutionBackend` successfully before publishing the runtime snapshot.
+- Resolution mode, upstream-set, root-hints, DNSSEC-validation, and other answer-affecting setting changes must advance the cache namespace or explicitly flush affected response-template and recursive-internal caches.
+- `recursive` mode with DNSSEC validation disabled must clear `AD` and report validation-disabled status; enabling validation requires trust-anchor configuration and validation tests.
+- DNAME handling must remain conservative until DNAME synthesis, loop detection, and cache safety are implemented.
 - DNS listen addresses and admin listen addresses must be valid and must not conflict.
 - Upstream timeout, per-query deadline, cache size, TTL caps, and retention settings must be within bounded ranges.
 - Sinkhole addresses must be configured before `Sinkhole` block mode can be enabled.
@@ -185,6 +230,7 @@ Add retention controls early:
 
 - Query-event retention days.
 - Query-event maximum row count.
+- Query-event maximum retained sources/domains in summary tables.
 - Maximum blocklist generations retained per source.
 - Optional cache size limit.
 - Maintenance task for deleting expired operational data.
@@ -198,8 +244,10 @@ Query logging must not block DNS responses when SQLite is slow or unavailable.
 
 - Send query events through a bounded asynchronous queue or dedicated writer task.
 - Define overflow behavior: drop newest, drop oldest, or sample, and emit metrics for dropped events.
+- Preserve the non-blocking hot-path contract introduced by the in-memory event pipeline; SQLite writes must consume from the event processor, not from `ResolveQuery` directly.
 - Keep enough synchronous metadata for resolver metrics even if durable query logging is disabled or backpressured.
 - Admin UI query history should show when logs are sampled or dropped so operators do not mistake it for complete history.
+- Suspicious classifier findings persisted with events must include classifier version, config generation, reason, severity/score, evaluated window, and structured details.
 
 ## SQLite Async Strategy
 
@@ -227,6 +275,7 @@ Startup behavior must be explicit:
 - Migration tests from empty database.
 - Repository integration tests using temporary SQLite databases.
 - Atomic rule update and reload tests.
+- Resolution-mode validation and reload tests for forward and recursive settings.
 - Failed blocklist update keeps prior active generation.
 - Query-event retention cleanup.
 - Concurrent readers during config reload.

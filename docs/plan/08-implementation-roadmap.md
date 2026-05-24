@@ -56,7 +56,7 @@ Reviewer concern gates:
 - Upstream behavior must be deterministic for timeout, malformed response, question mismatch, `NXDOMAIN`, and all-upstreams-failed cases.
 - Resolver forwarding must not hang beyond the configured per-query deadline.
 - Truncated UDP upstream responses must either trigger TCP fallback or return a documented conservative failure until TCP fallback is implemented.
-- `ResolveQuery` must delegate upstream behavior through an `UpstreamResolver` or `UpstreamDnsClient` port.
+- `ResolveQuery` must delegate forwarding behavior through a backend port rather than implementing upstream I/O directly.
 - Upstream responses must be accepted only when source endpoint, transaction ID, and question match the active upstream attempt.
 
 Exit criteria:
@@ -96,7 +96,81 @@ Exit criteria:
 - Concurrent duplicate misses produce one upstream request.
 - Cached response uses the current request transaction ID.
 
-## Milestone 4: Local Policy Blocking
+## Milestone 4: Query Event Pipeline And In-Memory Review Model
+
+Goal: record every client query terminal outcome through a non-blocking event pipeline and provide bounded in-memory source-centric review models for suspicious lookup investigation.
+
+Tasks:
+
+- Define a minimal stable `QueryEventV1` schema with schema version, sequence number, timestamp, observed source endpoint, original and normalized question, qtype/qclass, terminal outcome, local DNS response code, cache result, latency, and advisory classifier findings.
+- Split event taxonomy into separate fields for terminal outcome, DNS response code, policy decision, cache result, backend result, and classifier findings so allowed, blocked, failed, and suspicious-but-allowed events are not conflated.
+- Change or wrap `QueryEventSink` so recording is best-effort and non-blocking on the DNS hot path.
+- Add bounded event ingestion with explicit overflow behavior: disabled, drop newest, drop oldest, sample, or accept.
+- Add metrics for accepted, dropped, sampled, and disabled query events by reason.
+- Add a bounded in-memory query-event store and source-centric read models for recent events, suspicious events, per-observed-source history, per-source suspicious summary, domain history, and top suspicious observed sources/domains.
+- Model source as an observed endpoint, not a guaranteed machine identity; support optional later `ClientIdentitySnapshot`.
+- Add an advisory `SuspiciousLookupClassifier` port with explainable, versioned findings and initial non-blocking heuristics over retained in-memory events.
+- Keep real query-history API/UI access out of this milestone except for tests or local-only diagnostics; authenticated admin access is added later.
+
+Reviewer concern gates:
+
+- Query event recording must never block DNS responses on queue capacity, storage, classification, or read-model updates.
+- The event schema must avoid null-heavy future fields; backend, policy, blocklist, response-inspection, and richer classifier data should be optional extension structs added by later milestones.
+- Source review must use observed source endpoint terminology until a real client identity snapshot exists.
+- Suspicious classifier findings must be advisory and explainable, with classifier version, config generation, reason, severity/score, evaluated window, and structured details.
+- Query-event retention and read-model bounds must be explicit.
+- Event logs are sensitive and must not be exposed through unauthenticated UI/API routes.
+
+Exit criteria:
+
+- Every client query terminal outcome emits a `QueryEventV1` or increments a dropped/disabled metric.
+- A slow or failing event processor/store does not delay DNS responses.
+- In-memory read models can return recent events, suspicious events, and per-observed-source history within configured bounds.
+- Classifier tests cover reason details, threshold boundaries, cold start, dropped/sampled events, and advisory suspicious-but-allowed events.
+- Tests cover disabled logging, overflow behavior, retention eviction, source filtering, schema versioning, processor failure isolation, and dropped-event summary indicators.
+
+## Milestone 5: Configurable Resolution Strategy And Recursive Resolver
+
+Goal: allow configuration to choose between forwarding cache misses to upstream recursive resolvers or performing local iterative recursive resolution.
+
+Tasks:
+
+- Rename or generalize the `UpstreamResolver` port to a `ResolutionBackend` that returns the same response shape to `ResolveQuery` regardless of strategy.
+- Add runtime configuration for `resolution.mode = forward | recursive`.
+- Add an atomic `BackendSnapshot` or `BackendHandle` that pairs runtime settings generation, selected backend, backend health state, and cache namespace before durable config reload exists.
+- Move the current upstream-forwarding implementation behind `ForwardingResolutionBackend`.
+- Add a backend factory that validates the active runtime snapshot and injects the selected backend into `ResolveQuery`.
+- Add backend cache namespaces so forward-mode, recursive-mode, and changed backend configurations cannot reuse incompatible cached responses.
+- Add root-hints configuration and validation for recursive mode.
+- Implement `RecursiveResolutionBackend` with iterative root-to-authority lookup, bounded depth, bounded CNAME restarts, per-authority timeouts, deterministic authority failover, and explicit `SERVFAIL` failure modes. Defer DNAME with conservative failure unless DNAME synthesis and loop/cache rules are implemented.
+- Add bailiwick validation before trusting referral glue or additional-section records.
+- Add recursive authority transport validation: fresh transaction ID per attempt, source endpoint/question validation, EDNS payload bounds, UDP truncation-to-TCP fallback, per-attempt timeout, and per-query deadline.
+- Clear `AD` and report DNSSEC validation disabled until local trust-anchor validation exists; include DNSSEC flags and validation mode in cache keys.
+- Make backend responses structured enough for safe policy and cache decisions: RRset provenance, credibility, canonical chain, negative metadata, source credibility, and explicit cache directives.
+- Add recursion-internal RRset, delegation, glue, and negative caches without weakening the existing exact-question response-template cache.
+- Add backend-mode metadata to query events, status, health checks, and metrics.
+
+Reviewer concern gates:
+
+- `ResolveQuery` and DNS delivery adapters must not branch on forward versus recursive mode.
+- Runtime settings generation, selected backend, backend health, and cache namespace must be atomically consistent for each query.
+- Forward mode must preserve the existing upstream validation, timeout, failover, TCP fallback, and cache behavior.
+- Recursive mode must enforce bounded recursion depth, bounded CNAME restarts, query deadlines, and deterministic failure behavior.
+- Recursive mode must not trust out-of-bailiwick glue or promote unrelated additional records into reusable answers.
+- Recursive mode must validate authoritative transport responses and retry truncated UDP responses over TCP when allowed.
+- DNSSEC validation must not be implied unless trust-anchor validation is explicitly implemented.
+- Configuration reload must build and validate the new backend before publishing it.
+
+Exit criteria:
+
+- A config-only mode switch selects forward or recursive resolution without changing DNS listener or `ResolveQuery` calling code.
+- Cache entries are isolated by backend namespace or flushed on answer-affecting backend changes.
+- Forward-mode integration tests still pass unchanged except for renamed port types.
+- Recursive-mode integration tests resolve through fake root, TLD, and authoritative servers.
+- Recursive-mode tests cover referral loops, CNAME loops, DNAME deferral, lame delegations, out-of-bailiwick glue rejection, truncated authoritative responses, DNSSEC flag handling while validation is disabled, timeout/deadline handling, and negative answers.
+- Status and query events identify which backend handled a query.
+
+## Milestone 6: Local Policy Blocking
 
 Goal: block configured clients from resolving configured domains.
 
@@ -124,7 +198,7 @@ Exit criteria:
 - Policy decisions include reason codes.
 - Block response mode is visible in config and covered by tests.
 
-## Milestone 5: SQLite Persistence And Runtime Config
+## Milestone 7: SQLite Persistence And Runtime Config
 
 Goal: make upstreams, settings, and rules durable.
 
@@ -135,8 +209,9 @@ Tasks:
 - Add immutable runtime config snapshot.
 - Add atomic config reload.
 - Add query-event persistence with retention.
+- Persist query-event schema version, observed source endpoint, terminal outcome taxonomy, cache/backend/policy metadata extensions when available, and classifier findings.
 - Add SQLite async strategy: `sqlx` pool or `rusqlite` behind `spawn_blocking` or a dedicated DB task.
-- Add indices and maintenance hooks for query events and blocklist tables.
+- Add indices and maintenance hooks for query events, observed-source history, suspicious summaries, and blocklist tables.
 - Add bounded asynchronous query-event writing with explicit drop/sampling metrics.
 - Enforce configuration invariants before publishing runtime snapshots.
 
@@ -145,6 +220,7 @@ Reviewer concern gates:
 - DNS hot path must not perform direct database reads.
 - Admin writes must commit before publishing a new `Arc<RuntimeConfig>` or `Arc<PolicySnapshot>`.
 - Query-event and blocklist storage must have retention limits.
+- Durable query logging must preserve the non-blocking event pipeline contract and surface dropped/sampled indicators to query-review consumers.
 - Migration or required settings load failure must prevent DNS listener startup unless degraded startup is explicitly configured.
 - Slow or unavailable SQLite query logging must not block DNS responses.
 - Invalid settings must not be persisted or published as active snapshots.
@@ -156,7 +232,7 @@ Exit criteria:
 - Queries continue during config reload.
 - Retention cleanup keeps configured limits.
 
-## Milestone 6: External Blocklist Ingestion
+## Milestone 8: External Blocklist Ingestion
 
 Goal: ingest known-malicious-domain lists and block matches.
 
@@ -187,7 +263,7 @@ Exit criteria:
 - Matching malicious domains are blocked with source attribution.
 - Guardrail failures are visible to the admin API/UI.
 
-## Milestone 7: Admin API
+## Milestone 9: Admin API
 
 Goal: provide an authenticated API for resolver administration.
 
@@ -196,7 +272,7 @@ Tasks:
 - Add HTTP server.
 - Add first-run setup, authentication, and session handling.
 - Add CSRF protection for browser mutating requests.
-- Implement settings, upstreams, rules, blocklist sources, refresh, status, and query-events endpoints.
+- Implement settings, resolution mode, upstreams, rules, blocklist sources, refresh, status, query-events, suspicious-event, and source-detail endpoints.
 - Add validation and error response model.
 
 Reviewer concern gates:
@@ -206,23 +282,25 @@ Reviewer concern gates:
 - Passwords must be hashed; sessions must expire.
 - Mutating browser requests must require CSRF protection.
 - No unauthenticated mutation endpoint is allowed.
-- API validation must prevent changes that would break runtime invariants, such as deleting the last upstream or enabling sinkhole mode without sinkhole addresses.
+- No unauthenticated query-history, suspicious-lookup, source-detail, or export endpoint is allowed.
+- API validation must prevent changes that would break runtime invariants, such as deleting the last forward-mode upstream, enabling recursive mode without valid root hints, or enabling sinkhole mode without sinkhole addresses.
 
 Exit criteria:
 
-- Admin can manage upstreams, rules, settings, and blocklist sources through API calls.
+- Admin can manage resolution mode, upstreams, rules, settings, and blocklist sources through API calls.
+- Admin can review suspicious lookup findings and retained query history by observed source through authenticated API calls.
 - Mutating calls require authentication and CSRF protection.
 - API tests cover validation and reload behavior.
 - First-run setup and unauthenticated mutation rejection are tested.
 
-## Milestone 8: Admin UI
+## Milestone 10: Admin UI
 
 Goal: provide a usable browser interface for the admin API.
 
 Tasks:
 
 - Build static UI served by the admin server.
-- Add screens for status, upstreams, rules, blocklists, query events, and settings.
+- Add screens for status, resolution mode, upstreams, rules, blocklists, query events, suspicious lookup review, observed-source detail, and settings.
 - Add forms with client-side validation matching server validation where practical.
 - Add status indicators for upstreams and blocklist freshness.
 
@@ -230,6 +308,7 @@ Reviewer concern gates:
 
 - UI must expose the operational implications of IP-based client identity.
 - UI must show block response mode and reason codes for blocked queries.
+- UI must make suspicious lookup review source-centric, distinguish advisory findings from policy blocks, and show classifier reasons, severity, evaluated windows, and dropped/sampled indicators.
 - UI must show blocklist guardrail failures and previous-good status.
 - UI must not imply settings are active until the API confirms persistence and snapshot reload.
 
@@ -237,9 +316,10 @@ Exit criteria:
 
 - Admin can complete core configuration tasks without direct database or config-file edits.
 - UI shows why recent queries were blocked or allowed.
+- UI lets an authenticated administrator view all retained requests by observed source and quickly identify suspicious sources/domains.
 - UI smoke test loads primary screens.
 
-## Milestone 9: TCP And Operational Hardening
+## Milestone 11: TCP And Operational Hardening
 
 Goal: prepare for always-on LAN use.
 
