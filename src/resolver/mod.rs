@@ -410,6 +410,55 @@ pub struct ResolveDecision {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct QueryEventV1 {
+    pub schema_version: u8,
+    pub sequence: u64,
+    pub timestamp: SystemTime,
+    pub observed_source_ip: IpAddr,
+    pub original_question: Option<QuestionKey>,
+    pub normalized_question: Option<QuestionKey>,
+    pub terminal_outcome: ResolveDecisionKind,
+    pub response_code: Option<ResponseCode>,
+    pub cache_result: Option<QueryEventCacheResult>,
+    pub latency: Option<Duration>,
+}
+
+impl QueryEventV1 {
+    pub const SCHEMA_VERSION: u8 = 1;
+
+    pub fn from_decision(
+        sequence: u64,
+        timestamp: SystemTime,
+        decision: &ResolveDecision,
+        response_code: Option<ResponseCode>,
+        cache_result: Option<QueryEventCacheResult>,
+        latency: Option<Duration>,
+    ) -> Self {
+        Self {
+            schema_version: Self::SCHEMA_VERSION,
+            sequence,
+            timestamp,
+            observed_source_ip: decision.client_ip,
+            original_question: decision.question.clone(),
+            normalized_question: decision.question.clone(),
+            terminal_outcome: decision.kind.clone(),
+            response_code,
+            cache_result,
+            latency,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum QueryEventCacheResult {
+    Hit,
+    Miss,
+    Expired,
+    Bypass,
+    Unavailable,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ResolveOutcome {
     pub response_bytes: Vec<u8>,
     pub decision: ResolveDecision,
@@ -1960,6 +2009,35 @@ mod tests {
             failure_policy.ttl_for_response(&failure),
             Some((MAX_FAILURE_CACHE_TTL, None))
         );
+    }
+
+    #[test]
+    fn query_event_v1_uses_schema_and_decision_fields() {
+        let decision = ResolveDecision {
+            client_ip: "192.0.2.10".parse().unwrap(),
+            question: Some(QuestionKey::new("Example.COM.", 1, 1)),
+            kind: ResolveDecisionKind::CacheHit,
+        };
+        let timestamp = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000);
+        let event = QueryEventV1::from_decision(
+            7,
+            timestamp,
+            &decision,
+            Some(ResponseCode::NoError),
+            Some(QueryEventCacheResult::Hit),
+            Some(Duration::from_millis(12)),
+        );
+
+        assert_eq!(event.schema_version, QueryEventV1::SCHEMA_VERSION);
+        assert_eq!(event.sequence, 7);
+        assert_eq!(event.timestamp, timestamp);
+        assert_eq!(event.observed_source_ip, decision.client_ip);
+        assert_eq!(event.original_question, decision.question);
+        assert_eq!(event.normalized_question, decision.question);
+        assert_eq!(event.terminal_outcome, ResolveDecisionKind::CacheHit);
+        assert_eq!(event.response_code, Some(ResponseCode::NoError));
+        assert_eq!(event.cache_result, Some(QueryEventCacheResult::Hit));
+        assert_eq!(event.latency, Some(Duration::from_millis(12)));
     }
 
     #[test]
