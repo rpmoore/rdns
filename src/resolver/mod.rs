@@ -1,7 +1,8 @@
 use std::collections::{HashMap, VecDeque};
 use std::future::Future;
-use std::net::IpAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::pin::Pin;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime};
 
@@ -25,6 +26,9 @@ pub struct ReceivedAt(pub SystemTime);
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ResolveRequest {
     pub client_ip: IpAddr,
+    pub client_port: Option<u16>,
+    pub transport: QueryTransport,
+    pub listener: Option<SocketAddr>,
     pub received_at: ReceivedAt,
     pub bytes: Vec<u8>,
 }
@@ -33,10 +37,35 @@ impl ResolveRequest {
     pub fn new(client_ip: IpAddr, received_at: SystemTime, bytes: Vec<u8>) -> Self {
         Self {
             client_ip,
+            client_port: None,
+            transport: QueryTransport::Udp,
+            listener: None,
             received_at: ReceivedAt(received_at),
             bytes,
         }
     }
+
+    pub fn from_udp(
+        source: SocketAddr,
+        listener: Option<SocketAddr>,
+        received_at: SystemTime,
+        bytes: Vec<u8>,
+    ) -> Self {
+        Self {
+            client_ip: source.ip(),
+            client_port: Some(source.port()),
+            transport: QueryTransport::Udp,
+            listener,
+            received_at: ReceivedAt(received_at),
+            bytes,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum QueryTransport {
+    Udp,
+    Tcp,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -409,43 +438,139 @@ pub struct ResolveDecision {
     pub kind: ResolveDecisionKind,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum QueryTerminalOutcome {
+    AllowedFromBackend,
+    AllowedFromCache,
+    Blocked,
+    ProtocolError,
+    BackendFailure,
+    DroppedBeforeResolution,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct QueryQuestion {
+    pub qname: String,
+    pub qtype: u16,
+    pub qclass: u16,
+}
+
+impl QueryQuestion {
+    pub fn original_from_message(message: &Message) -> Option<Self> {
+        let question = message.questions.first()?;
+        Some(Self {
+            qname: question.qname.clone(),
+            qtype: question.qtype,
+            qclass: question.qclass,
+        })
+    }
+
+    pub fn normalized_from_key(question: &QuestionKey) -> Self {
+        Self {
+            qname: question.qname.clone(),
+            qtype: question.qtype,
+            qclass: question.qclass,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClassifierFinding {
+    pub classifier_version: String,
+    pub config_generation: u64,
+    pub reason: SuspiciousLookupReason,
+    pub severity: SuspiciousSeverity,
+    pub score: u16,
+    pub evaluated_window: Duration,
+    pub details: Vec<(String, String)>,
+    pub baseline_incomplete: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum SuspiciousLookupReason {
+    NxDomainBurst,
+    ServFailBurst,
+    HighEntropyName,
+    RepeatedTxtLookup,
+    RareDomain,
+    SuspiciousTld,
+    SuspiciousDomain,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum SuspiciousSeverity {
+    Low,
+    Medium,
+    High,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct QueryEventV1 {
     pub schema_version: u8,
     pub sequence: u64,
     pub timestamp: SystemTime,
     pub observed_source_ip: IpAddr,
-    pub original_question: Option<QuestionKey>,
-    pub normalized_question: Option<QuestionKey>,
-    pub terminal_outcome: ResolveDecisionKind,
+    pub observed_source_port: Option<u16>,
+    pub transport: QueryTransport,
+    pub listener: Option<SocketAddr>,
+    pub original_question: Option<QueryQuestion>,
+    pub normalized_question: Option<QueryQuestion>,
+    pub qtype: Option<u16>,
+    pub qclass: Option<u16>,
+    pub terminal_outcome: QueryTerminalOutcome,
     pub response_code: Option<ResponseCode>,
     pub cache_result: Option<QueryEventCacheResult>,
     pub latency: Option<Duration>,
+    pub classifier_findings: Vec<ClassifierFinding>,
 }
 
 impl QueryEventV1 {
     pub const SCHEMA_VERSION: u8 = 1;
 
-    pub fn from_decision(
+    pub fn from_resolution(
         sequence: u64,
         timestamp: SystemTime,
+        request: &ResolveRequest,
         decision: &ResolveDecision,
+        original_question: Option<QueryQuestion>,
         response_code: Option<ResponseCode>,
         cache_result: Option<QueryEventCacheResult>,
         latency: Option<Duration>,
+        classifier_findings: Vec<ClassifierFinding>,
     ) -> Self {
+        let normalized_question = decision
+            .question
+            .as_ref()
+            .map(QueryQuestion::normalized_from_key);
         Self {
             schema_version: Self::SCHEMA_VERSION,
             sequence,
             timestamp,
             observed_source_ip: decision.client_ip,
-            original_question: decision.question.clone(),
-            normalized_question: decision.question.clone(),
-            terminal_outcome: decision.kind.clone(),
+            observed_source_port: request.client_port,
+            transport: request.transport,
+            listener: request.listener,
+            qtype: normalized_question.as_ref().map(|question| question.qtype),
+            qclass: normalized_question.as_ref().map(|question| question.qclass),
+            original_question,
+            normalized_question,
+            terminal_outcome: terminal_outcome_from_decision(&decision.kind),
             response_code,
             cache_result,
             latency,
+            classifier_findings,
         }
+    }
+}
+
+fn terminal_outcome_from_decision(kind: &ResolveDecisionKind) -> QueryTerminalOutcome {
+    match kind {
+        ResolveDecisionKind::Allowed => QueryTerminalOutcome::AllowedFromBackend,
+        ResolveDecisionKind::Blocked(_) => QueryTerminalOutcome::Blocked,
+        ResolveDecisionKind::CacheHit => QueryTerminalOutcome::AllowedFromCache,
+        ResolveDecisionKind::CacheMiss => QueryTerminalOutcome::AllowedFromBackend,
+        ResolveDecisionKind::ProtocolError(_) => QueryTerminalOutcome::ProtocolError,
+        ResolveDecisionKind::UpstreamFailure => QueryTerminalOutcome::BackendFailure,
     }
 }
 
@@ -456,6 +581,93 @@ pub enum QueryEventCacheResult {
     Expired,
     Bypass,
     Unavailable,
+    NotApplicable,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum QueryEventRecordResult {
+    Accepted,
+    Disabled,
+    DroppedNewest,
+    DroppedOldest,
+    SampledOut,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum QueryEventOverflowPolicy {
+    DropNewest,
+    DropOldest,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct QueryEventStoreConfig {
+    pub max_retained_events: usize,
+    pub max_indexed_sources: usize,
+    pub max_indexed_domains: usize,
+    pub retention: Option<Duration>,
+    pub overflow_policy: QueryEventOverflowPolicy,
+    pub sample_every: Option<u64>,
+    pub enabled: bool,
+}
+
+impl Default for QueryEventStoreConfig {
+    fn default() -> Self {
+        Self {
+            max_retained_events: 1024,
+            max_indexed_sources: 256,
+            max_indexed_domains: 512,
+            retention: None,
+            overflow_policy: QueryEventOverflowPolicy::DropOldest,
+            sample_every: None,
+            enabled: true,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct QueryEventStoreStats {
+    pub accepted: u64,
+    pub disabled: u64,
+    pub dropped_newest: u64,
+    pub dropped_oldest: u64,
+    pub sampled_out: u64,
+    pub retention_evicted: u64,
+    pub source_index_truncated: bool,
+    pub domain_index_truncated: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SourceSuspiciousSummary {
+    pub observed_source_ip: IpAddr,
+    pub suspicious_events: usize,
+    pub findings: usize,
+    pub approximate: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SuspiciousRank {
+    pub key: String,
+    pub suspicious_events: usize,
+    pub findings: usize,
+    pub approximate: bool,
+}
+
+pub trait QueryEventReadModel: Send + Sync {
+    fn recent_events(&self, limit: usize) -> Vec<QueryEventV1>;
+
+    fn suspicious_events(&self, limit: usize) -> Vec<QueryEventV1>;
+
+    fn source_history(&self, source_ip: IpAddr, limit: usize) -> Vec<QueryEventV1>;
+
+    fn source_suspicious_summary(&self, source_ip: IpAddr) -> SourceSuspiciousSummary;
+
+    fn domain_history(&self, normalized_domain: &str, limit: usize) -> Vec<QueryEventV1>;
+
+    fn top_suspicious_sources(&self, limit: usize) -> Vec<SuspiciousRank>;
+
+    fn top_suspicious_domains(&self, limit: usize) -> Vec<SuspiciousRank>;
+
+    fn stats(&self) -> QueryEventStoreStats;
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -474,6 +686,7 @@ pub struct ResolveQuery {
     clock: Arc<dyn Clock>,
     events: Arc<dyn QueryEventSink>,
     metrics: Arc<dyn MetricsSink>,
+    next_event_sequence: AtomicU64,
 }
 
 impl ResolveQuery {
@@ -517,6 +730,7 @@ impl ResolveQuery {
             clock,
             events,
             metrics,
+            next_event_sequence: AtomicU64::new(0),
         }
     }
 
@@ -535,7 +749,16 @@ impl ResolveQuery {
                     kind: ResolveDecisionKind::ProtocolError(error.response_code()),
                 };
                 let response_bytes = self.responses.protocol_error(request_id, &error);
-                return self.finish(started_at, decision, response_bytes).await;
+                return self
+                    .finish(
+                        started_at,
+                        &request,
+                        decision,
+                        None,
+                        Some(QueryEventCacheResult::NotApplicable),
+                        response_bytes,
+                    )
+                    .await;
             }
         };
 
@@ -548,6 +771,11 @@ impl ResolveQuery {
             self.protocol.configured_max_udp_payload_size(),
         );
         let mut cache_store_allowed = cache_lookup_allowed;
+        let mut event_cache_result = if cache_lookup_allowed {
+            Some(QueryEventCacheResult::Miss)
+        } else {
+            Some(QueryEventCacheResult::Bypass)
+        };
         if cache_lookup_allowed {
             let lookup = self
                 .cache
@@ -578,28 +806,42 @@ impl ResolveQuery {
                                 question: Some(question.clone()),
                                 kind: ResolveDecisionKind::CacheHit,
                             };
-                            return self.finish(started_at, decision, response_bytes).await;
+                            return self
+                                .finish(
+                                    started_at,
+                                    &request,
+                                    decision,
+                                    QueryQuestion::original_from_message(&decoded.message),
+                                    Some(QueryEventCacheResult::Hit),
+                                    response_bytes,
+                                )
+                                .await;
                         }
                         Err(_) => {
                             self.metrics.increment(ResolverMetric::CacheMiss);
                             cache_store_allowed = true;
+                            event_cache_result = Some(QueryEventCacheResult::Miss);
                         }
                     }
                 }
                 CacheLookup::Miss => {
                     self.metrics.increment(ResolverMetric::CacheMiss);
+                    event_cache_result = Some(QueryEventCacheResult::Miss);
                 }
                 CacheLookup::Expired => {
                     self.metrics.increment(ResolverMetric::CacheExpired);
                     self.metrics.increment(ResolverMetric::CacheMiss);
+                    event_cache_result = Some(QueryEventCacheResult::Expired);
                 }
                 CacheLookup::Bypass(_) => {
                     self.metrics.increment(ResolverMetric::CacheBypass);
                     self.metrics.increment(ResolverMetric::CacheMiss);
+                    event_cache_result = Some(QueryEventCacheResult::Bypass);
                 }
                 CacheLookup::Unavailable => {
                     self.metrics.increment(ResolverMetric::CacheUnavailable);
                     self.metrics.increment(ResolverMetric::CacheMiss);
+                    event_cache_result = Some(QueryEventCacheResult::Unavailable);
                 }
             }
         } else {
@@ -629,6 +871,7 @@ impl ResolveQuery {
                             question,
                             cache_key,
                             true,
+                            event_cache_result,
                             upstream_result.clone(),
                         )
                         .await;
@@ -663,7 +906,16 @@ impl ResolveQuery {
                                 question: Some(question),
                                 kind: ResolveDecisionKind::CacheHit,
                             };
-                            return self.finish(started_at, decision, response_bytes).await;
+                            return self
+                                .finish(
+                                    started_at,
+                                    &request,
+                                    decision,
+                                    QueryQuestion::original_from_message(&decoded.message),
+                                    Some(QueryEventCacheResult::Hit),
+                                    response_bytes,
+                                )
+                                .await;
                         }
                     }
                     self.finish_upstream_result(
@@ -673,6 +925,7 @@ impl ResolveQuery {
                         question,
                         cache_key,
                         false,
+                        event_cache_result,
                         upstream_result,
                     )
                     .await
@@ -692,6 +945,7 @@ impl ResolveQuery {
                 question,
                 cache_key,
                 false,
+                event_cache_result,
                 upstream_result,
             )
             .await
@@ -706,6 +960,7 @@ impl ResolveQuery {
         question: QuestionKey,
         cache_key: CacheKey,
         cache_store_allowed: bool,
+        cache_result: Option<QueryEventCacheResult>,
         upstream_result: Result<UpstreamResponse, UpstreamError>,
     ) -> ResolveOutcome {
         match upstream_result {
@@ -729,7 +984,16 @@ impl ResolveQuery {
                         kind: ResolveDecisionKind::UpstreamFailure,
                     };
                     let response_bytes = self.responses.servfail(Some(&decoded));
-                    return self.finish(started_at, decision, response_bytes).await;
+                    return self
+                        .finish(
+                            started_at,
+                            request,
+                            decision,
+                            QueryQuestion::original_from_message(&decoded.message),
+                            cache_result,
+                            response_bytes,
+                        )
+                        .await;
                 }
                 if cache_store_allowed {
                     if let Some(store) = self.cache_store_for_response(
@@ -747,7 +1011,15 @@ impl ResolveQuery {
                         self.metrics.increment(ResolverMetric::CacheStoreSkipped);
                     }
                 }
-                self.finish(started_at, decision, response_bytes).await
+                self.finish(
+                    started_at,
+                    request,
+                    decision,
+                    QueryQuestion::original_from_message(&decoded.message),
+                    cache_result,
+                    response_bytes,
+                )
+                .await
             }
             Err(_) => {
                 self.metrics.increment(ResolverMetric::UpstreamFailure);
@@ -757,7 +1029,15 @@ impl ResolveQuery {
                     kind: ResolveDecisionKind::UpstreamFailure,
                 };
                 let response_bytes = self.responses.servfail(Some(decoded));
-                self.finish(started_at, decision, response_bytes).await
+                self.finish(
+                    started_at,
+                    request,
+                    decision,
+                    QueryQuestion::original_from_message(&decoded.message),
+                    cache_result,
+                    response_bytes,
+                )
+                .await
             }
         }
     }
@@ -796,11 +1076,47 @@ impl ResolveQuery {
     async fn finish(
         &self,
         started_at: SystemTime,
+        request: &ResolveRequest,
         decision: ResolveDecision,
+        original_question: Option<QueryQuestion>,
+        cache_result: Option<QueryEventCacheResult>,
         response_bytes: Vec<u8>,
     ) -> ResolveOutcome {
-        self.events.record(decision.clone()).await;
-        if let Ok(duration) = self.clock.now().duration_since(started_at) {
+        let finished_at = self.clock.now();
+        let latency = finished_at.duration_since(started_at).ok();
+        let response_code = response_code_from_wire(&response_bytes);
+        let sequence = self.next_event_sequence.fetch_add(1, Ordering::Relaxed);
+        let event = QueryEventV1::from_resolution(
+            sequence,
+            finished_at,
+            request,
+            &decision,
+            original_question,
+            response_code,
+            cache_result,
+            latency,
+            Vec::new(),
+        );
+        match self.events.try_record(event) {
+            QueryEventRecordResult::Accepted => {
+                self.metrics.increment(ResolverMetric::QueryEventAccepted);
+            }
+            QueryEventRecordResult::Disabled => {
+                self.metrics.increment(ResolverMetric::QueryEventDisabled);
+            }
+            QueryEventRecordResult::DroppedNewest => {
+                self.metrics
+                    .increment(ResolverMetric::QueryEventDroppedNewest);
+            }
+            QueryEventRecordResult::DroppedOldest => {
+                self.metrics
+                    .increment(ResolverMetric::QueryEventDroppedOldest);
+            }
+            QueryEventRecordResult::SampledOut => {
+                self.metrics.increment(ResolverMetric::QueryEventSampledOut);
+            }
+        }
+        if let Some(duration) = latency {
             self.metrics
                 .observe_duration(ResolverMetric::QueryDuration, duration);
         }
@@ -928,6 +1244,19 @@ fn response_is_truncated(bytes: &[u8]) -> bool {
         .get(2)
         .map(|flags| (flags & 0x02) != 0)
         .unwrap_or(false)
+}
+
+fn response_code_from_wire(bytes: &[u8]) -> Option<ResponseCode> {
+    let rcode = bytes.get(3).map(|flags| flags & 0x0f)?;
+    match rcode {
+        0 => Some(ResponseCode::NoError),
+        1 => Some(ResponseCode::FormErr),
+        2 => Some(ResponseCode::ServFail),
+        3 => Some(ResponseCode::NxDomain),
+        4 => Some(ResponseCode::NotImp),
+        5 => Some(ResponseCode::Refused),
+        _ => None,
+    }
 }
 
 fn cache_supported(query: &DecodedQuery) -> bool {
@@ -1237,6 +1566,492 @@ impl DnsCache for InMemoryDnsCache {
     }
 }
 
+pub struct InMemoryQueryEventStore {
+    config: QueryEventStoreConfig,
+    state: Mutex<InMemoryQueryEventStoreState>,
+}
+
+#[derive(Default)]
+struct InMemoryQueryEventStoreState {
+    events: VecDeque<QueryEventV1>,
+    indexed_sources: Vec<IpAddr>,
+    indexed_domains: Vec<String>,
+    stats: QueryEventStoreStats,
+    accepted_attempts: u64,
+}
+
+impl InMemoryQueryEventStore {
+    pub fn new(config: QueryEventStoreConfig) -> Self {
+        Self {
+            config,
+            state: Mutex::new(InMemoryQueryEventStoreState::default()),
+        }
+    }
+
+    fn prune_retention_locked(&self, state: &mut InMemoryQueryEventStoreState, now: SystemTime) {
+        let Some(retention) = self.config.retention else {
+            return;
+        };
+        while state
+            .events
+            .front()
+            .and_then(|event| now.duration_since(event.timestamp).ok())
+            .map(|age| age > retention)
+            .unwrap_or(false)
+        {
+            state.events.pop_front();
+            state.stats.retention_evicted = state.stats.retention_evicted.saturating_add(1);
+        }
+    }
+
+    fn ordered_tail(events: impl Iterator<Item = QueryEventV1>, limit: usize) -> Vec<QueryEventV1> {
+        let mut events: Vec<_> = events.collect();
+        events.sort_by_key(|event| (event.timestamp, event.sequence));
+        events.into_iter().rev().take(limit).collect()
+    }
+
+    fn domain_from_event(event: &QueryEventV1) -> Option<&str> {
+        event
+            .normalized_question
+            .as_ref()
+            .map(|question| question.qname.as_str())
+    }
+
+    fn has_findings(event: &QueryEventV1) -> bool {
+        !event.classifier_findings.is_empty()
+    }
+}
+
+impl QueryEventSink for InMemoryQueryEventStore {
+    fn try_record(&self, event: QueryEventV1) -> QueryEventRecordResult {
+        let mut state = self.state.lock().unwrap();
+        if !self.config.enabled {
+            state.stats.disabled = state.stats.disabled.saturating_add(1);
+            return QueryEventRecordResult::Disabled;
+        }
+        state.accepted_attempts = state.accepted_attempts.saturating_add(1);
+        if let Some(sample_every) = self.config.sample_every {
+            if sample_every > 1 && state.accepted_attempts % sample_every != 0 {
+                state.stats.sampled_out = state.stats.sampled_out.saturating_add(1);
+                return QueryEventRecordResult::SampledOut;
+            }
+        }
+
+        self.prune_retention_locked(&mut state, event.timestamp);
+        if self.config.max_retained_events == 0 {
+            state.stats.dropped_newest = state.stats.dropped_newest.saturating_add(1);
+            return QueryEventRecordResult::DroppedNewest;
+        }
+        if state.events.len() >= self.config.max_retained_events {
+            match self.config.overflow_policy {
+                QueryEventOverflowPolicy::DropNewest => {
+                    state.stats.dropped_newest = state.stats.dropped_newest.saturating_add(1);
+                    return QueryEventRecordResult::DroppedNewest;
+                }
+                QueryEventOverflowPolicy::DropOldest => {
+                    state.events.pop_front();
+                    state.stats.dropped_oldest = state.stats.dropped_oldest.saturating_add(1);
+                }
+            }
+        }
+        let source_ip = event.observed_source_ip;
+        let domain = Self::domain_from_event(&event).map(str::to_string);
+        state.events.push_back(event);
+        if !state.indexed_sources.contains(&source_ip) {
+            if state.indexed_sources.len() < self.config.max_indexed_sources {
+                state.indexed_sources.push(source_ip);
+            } else {
+                state.stats.source_index_truncated = true;
+            }
+        }
+        if let Some(domain) = domain {
+            if !state
+                .indexed_domains
+                .iter()
+                .any(|indexed| indexed == &domain)
+            {
+                if state.indexed_domains.len() < self.config.max_indexed_domains {
+                    state.indexed_domains.push(domain);
+                } else {
+                    state.stats.domain_index_truncated = true;
+                }
+            }
+        }
+        state.stats.accepted = state.stats.accepted.saturating_add(1);
+        QueryEventRecordResult::Accepted
+    }
+}
+
+impl QueryEventReadModel for InMemoryQueryEventStore {
+    fn recent_events(&self, limit: usize) -> Vec<QueryEventV1> {
+        let state = self.state.lock().unwrap();
+        Self::ordered_tail(state.events.iter().cloned(), limit)
+    }
+
+    fn suspicious_events(&self, limit: usize) -> Vec<QueryEventV1> {
+        let state = self.state.lock().unwrap();
+        Self::ordered_tail(
+            state
+                .events
+                .iter()
+                .filter(|event| Self::has_findings(event))
+                .cloned(),
+            limit,
+        )
+    }
+
+    fn source_history(&self, source_ip: IpAddr, limit: usize) -> Vec<QueryEventV1> {
+        let state = self.state.lock().unwrap();
+        if !state.indexed_sources.contains(&source_ip) {
+            return Vec::new();
+        }
+        Self::ordered_tail(
+            state
+                .events
+                .iter()
+                .filter(|event| event.observed_source_ip == source_ip)
+                .cloned(),
+            limit,
+        )
+    }
+
+    fn source_suspicious_summary(&self, source_ip: IpAddr) -> SourceSuspiciousSummary {
+        let state = self.state.lock().unwrap();
+        if !state.indexed_sources.contains(&source_ip) {
+            return SourceSuspiciousSummary {
+                observed_source_ip: source_ip,
+                suspicious_events: 0,
+                findings: 0,
+                approximate: true,
+            };
+        }
+        let mut suspicious_events = 0;
+        let mut findings = 0;
+        for event in state
+            .events
+            .iter()
+            .filter(|event| event.observed_source_ip == source_ip)
+        {
+            if Self::has_findings(event) {
+                suspicious_events += 1;
+                findings += event.classifier_findings.len();
+            }
+        }
+        SourceSuspiciousSummary {
+            observed_source_ip: source_ip,
+            suspicious_events,
+            findings,
+            approximate: state.stats.dropped_newest > 0
+                || state.stats.dropped_oldest > 0
+                || state.stats.sampled_out > 0
+                || state.stats.retention_evicted > 0
+                || state.stats.source_index_truncated,
+        }
+    }
+
+    fn domain_history(&self, normalized_domain: &str, limit: usize) -> Vec<QueryEventV1> {
+        let normalized_domain = normalize_question_name(normalized_domain);
+        let state = self.state.lock().unwrap();
+        if !state
+            .indexed_domains
+            .iter()
+            .any(|indexed| indexed == &normalized_domain)
+        {
+            return Vec::new();
+        }
+        Self::ordered_tail(
+            state
+                .events
+                .iter()
+                .filter(|event| Self::domain_from_event(event) == Some(normalized_domain.as_str()))
+                .cloned(),
+            limit,
+        )
+    }
+
+    fn top_suspicious_sources(&self, limit: usize) -> Vec<SuspiciousRank> {
+        let state = self.state.lock().unwrap();
+        let mut by_source: HashMap<IpAddr, (usize, usize)> = HashMap::new();
+        for event in state
+            .events
+            .iter()
+            .filter(|event| Self::has_findings(event))
+        {
+            if !state.indexed_sources.contains(&event.observed_source_ip) {
+                continue;
+            }
+            let entry = by_source.entry(event.observed_source_ip).or_insert((0, 0));
+            entry.0 += 1;
+            entry.1 += event.classifier_findings.len();
+        }
+        let approximate = state.stats.dropped_newest > 0
+            || state.stats.dropped_oldest > 0
+            || state.stats.sampled_out > 0
+            || state.stats.retention_evicted > 0
+            || state.stats.source_index_truncated;
+        let mut ranks: Vec<_> = by_source
+            .into_iter()
+            .map(|(source, (suspicious_events, findings))| SuspiciousRank {
+                key: source.to_string(),
+                suspicious_events,
+                findings,
+                approximate,
+            })
+            .collect();
+        ranks.sort_by(|left, right| {
+            right
+                .findings
+                .cmp(&left.findings)
+                .then_with(|| right.suspicious_events.cmp(&left.suspicious_events))
+                .then_with(|| left.key.cmp(&right.key))
+        });
+        ranks.truncate(limit);
+        ranks
+    }
+
+    fn top_suspicious_domains(&self, limit: usize) -> Vec<SuspiciousRank> {
+        let state = self.state.lock().unwrap();
+        let mut by_domain: HashMap<String, (usize, usize)> = HashMap::new();
+        for event in state
+            .events
+            .iter()
+            .filter(|event| Self::has_findings(event))
+        {
+            let Some(domain) = Self::domain_from_event(event) else {
+                continue;
+            };
+            if !state
+                .indexed_domains
+                .iter()
+                .any(|indexed| indexed == domain)
+            {
+                continue;
+            }
+            let entry = by_domain.entry(domain.to_string()).or_insert((0, 0));
+            entry.0 += 1;
+            entry.1 += event.classifier_findings.len();
+        }
+        let approximate = state.stats.dropped_newest > 0
+            || state.stats.dropped_oldest > 0
+            || state.stats.sampled_out > 0
+            || state.stats.retention_evicted > 0
+            || state.stats.domain_index_truncated;
+        let mut ranks: Vec<_> = by_domain
+            .into_iter()
+            .map(|(key, (suspicious_events, findings))| SuspiciousRank {
+                key,
+                suspicious_events,
+                findings,
+                approximate,
+            })
+            .collect();
+        ranks.sort_by(|left, right| {
+            right
+                .findings
+                .cmp(&left.findings)
+                .then_with(|| right.suspicious_events.cmp(&left.suspicious_events))
+                .then_with(|| left.key.cmp(&right.key))
+        });
+        ranks.truncate(limit);
+        ranks
+    }
+
+    fn stats(&self) -> QueryEventStoreStats {
+        self.state.lock().unwrap().stats
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct SuspiciousLookupClassifierConfig {
+    pub version: String,
+    pub config_generation: u64,
+    pub evaluated_window: Duration,
+    pub nxdomain_burst_threshold: usize,
+    pub servfail_burst_threshold: usize,
+    pub repeated_txt_threshold: usize,
+    pub high_entropy_threshold: f64,
+    pub suspicious_tlds: Vec<String>,
+    pub suspicious_domains: Vec<String>,
+}
+
+impl Default for SuspiciousLookupClassifierConfig {
+    fn default() -> Self {
+        Self {
+            version: "in-memory-v1".to_string(),
+            config_generation: 0,
+            evaluated_window: Duration::from_secs(5 * 60),
+            nxdomain_burst_threshold: 10,
+            servfail_burst_threshold: 5,
+            repeated_txt_threshold: 5,
+            high_entropy_threshold: 3.8,
+            suspicious_tlds: Vec::new(),
+            suspicious_domains: Vec::new(),
+        }
+    }
+}
+
+pub struct InMemorySuspiciousLookupClassifier {
+    config: SuspiciousLookupClassifierConfig,
+    history: Mutex<VecDeque<QueryEventV1>>,
+}
+
+impl InMemorySuspiciousLookupClassifier {
+    pub fn new(config: SuspiciousLookupClassifierConfig) -> Self {
+        Self {
+            config,
+            history: Mutex::new(VecDeque::new()),
+        }
+    }
+
+    fn finding(
+        &self,
+        reason: SuspiciousLookupReason,
+        severity: SuspiciousSeverity,
+        score: u16,
+        details: Vec<(String, String)>,
+    ) -> ClassifierFinding {
+        ClassifierFinding {
+            classifier_version: self.config.version.clone(),
+            config_generation: self.config.config_generation,
+            reason,
+            severity,
+            score,
+            evaluated_window: self.config.evaluated_window,
+            details,
+            baseline_incomplete: true,
+        }
+    }
+
+    fn prune_history(&self, history: &mut VecDeque<QueryEventV1>, now: SystemTime) {
+        while history
+            .front()
+            .and_then(|event| now.duration_since(event.timestamp).ok())
+            .map(|age| age > self.config.evaluated_window)
+            .unwrap_or(false)
+        {
+            history.pop_front();
+        }
+    }
+
+    fn matching_recent_count(
+        &self,
+        history: &VecDeque<QueryEventV1>,
+        event: &QueryEventV1,
+        predicate: impl Fn(&QueryEventV1) -> bool,
+    ) -> usize {
+        history
+            .iter()
+            .filter(|candidate| candidate.observed_source_ip == event.observed_source_ip)
+            .filter(|candidate| predicate(candidate))
+            .count()
+            + usize::from(predicate(event))
+    }
+}
+
+impl SuspiciousLookupClassifier for InMemorySuspiciousLookupClassifier {
+    fn classify(&self, event: &QueryEventV1) -> Vec<ClassifierFinding> {
+        let mut findings = Vec::new();
+        let domain = event
+            .normalized_question
+            .as_ref()
+            .map(|question| question.qname.as_str());
+        if let Some(domain) = domain {
+            let leftmost = domain.split('.').next().unwrap_or(domain);
+            let entropy = shannon_entropy(leftmost);
+            if leftmost.len() >= 16 && entropy >= self.config.high_entropy_threshold {
+                findings.push(self.finding(
+                    SuspiciousLookupReason::HighEntropyName,
+                    SuspiciousSeverity::Medium,
+                    (entropy * 100.0).round() as u16,
+                    vec![
+                        ("label".to_string(), leftmost.to_string()),
+                        ("entropy".to_string(), format!("{entropy:.2}")),
+                    ],
+                ));
+            }
+            if self
+                .config
+                .suspicious_tlds
+                .iter()
+                .any(|tld| domain.ends_with(&format!(".{}", normalize_question_name(tld))))
+            {
+                findings.push(self.finding(
+                    SuspiciousLookupReason::SuspiciousTld,
+                    SuspiciousSeverity::High,
+                    900,
+                    vec![("domain".to_string(), domain.to_string())],
+                ));
+            }
+            if self.config.suspicious_domains.iter().any(|selector| {
+                let selector = normalize_question_name(selector);
+                domain == selector || domain.ends_with(&format!(".{selector}"))
+            }) {
+                findings.push(self.finding(
+                    SuspiciousLookupReason::SuspiciousDomain,
+                    SuspiciousSeverity::High,
+                    950,
+                    vec![("domain".to_string(), domain.to_string())],
+                ));
+            }
+        }
+
+        let mut history = self.history.lock().unwrap();
+        self.prune_history(&mut history, event.timestamp);
+        let nxdomain_count = self.matching_recent_count(&history, event, |candidate| {
+            candidate.response_code == Some(ResponseCode::NxDomain)
+        });
+        if nxdomain_count >= self.config.nxdomain_burst_threshold {
+            findings.push(self.finding(
+                SuspiciousLookupReason::NxDomainBurst,
+                SuspiciousSeverity::Medium,
+                nxdomain_count.min(u16::MAX as usize) as u16,
+                vec![("count".to_string(), nxdomain_count.to_string())],
+            ));
+        }
+        let servfail_count = self.matching_recent_count(&history, event, |candidate| {
+            candidate.response_code == Some(ResponseCode::ServFail)
+        });
+        if servfail_count >= self.config.servfail_burst_threshold {
+            findings.push(self.finding(
+                SuspiciousLookupReason::ServFailBurst,
+                SuspiciousSeverity::Medium,
+                servfail_count.min(u16::MAX as usize) as u16,
+                vec![("count".to_string(), servfail_count.to_string())],
+            ));
+        }
+        let txt_count =
+            self.matching_recent_count(&history, event, |candidate| candidate.qtype == Some(16));
+        if txt_count >= self.config.repeated_txt_threshold {
+            findings.push(self.finding(
+                SuspiciousLookupReason::RepeatedTxtLookup,
+                SuspiciousSeverity::Low,
+                txt_count.min(u16::MAX as usize) as u16,
+                vec![("count".to_string(), txt_count.to_string())],
+            ));
+        }
+        history.push_back(event.clone());
+        findings
+    }
+}
+
+fn shannon_entropy(value: &str) -> f64 {
+    if value.is_empty() {
+        return 0.0;
+    }
+    let mut counts = HashMap::<u8, usize>::new();
+    for byte in value.bytes() {
+        *counts.entry(byte).or_insert(0) += 1;
+    }
+    let len = value.len() as f64;
+    counts
+        .values()
+        .map(|count| {
+            let p = *count as f64 / len;
+            -p * p.log2()
+        })
+        .sum()
+}
+
 pub trait UpstreamResolver: Send + Sync {
     fn resolve<'a>(
         &'a self,
@@ -1257,7 +2072,27 @@ pub trait Clock: Send + Sync {
 }
 
 pub trait QueryEventSink: Send + Sync {
-    fn record<'a>(&'a self, decision: ResolveDecision) -> BoxFuture<'a, ()>;
+    fn try_record(&self, event: QueryEventV1) -> QueryEventRecordResult;
+}
+
+pub struct DisabledQueryEventSink;
+
+impl QueryEventSink for DisabledQueryEventSink {
+    fn try_record(&self, _event: QueryEventV1) -> QueryEventRecordResult {
+        QueryEventRecordResult::Disabled
+    }
+}
+
+pub trait SuspiciousLookupClassifier: Send + Sync {
+    fn classify(&self, event: &QueryEventV1) -> Vec<ClassifierFinding>;
+}
+
+pub struct NoopSuspiciousLookupClassifier;
+
+impl SuspiciousLookupClassifier for NoopSuspiciousLookupClassifier {
+    fn classify(&self, _event: &QueryEventV1) -> Vec<ClassifierFinding> {
+        Vec::new()
+    }
 }
 
 pub trait MetricsSink: Send + Sync {
@@ -1285,6 +2120,11 @@ pub enum ResolverMetric {
     UpstreamFailure,
     QueryDuration,
     ProtocolError,
+    QueryEventAccepted,
+    QueryEventDisabled,
+    QueryEventDroppedNewest,
+    QueryEventDroppedOldest,
+    QueryEventSampledOut,
 }
 
 #[cfg(test)]
@@ -1408,14 +2248,13 @@ mod tests {
 
     #[derive(Default)]
     struct RecordingEvents {
-        decisions: Mutex<Vec<ResolveDecision>>,
+        events: Mutex<Vec<QueryEventV1>>,
     }
 
     impl QueryEventSink for RecordingEvents {
-        fn record<'a>(&'a self, decision: ResolveDecision) -> BoxFuture<'a, ()> {
-            Box::pin(async move {
-                self.decisions.lock().unwrap().push(decision);
-            })
+        fn try_record(&self, event: QueryEventV1) -> QueryEventRecordResult {
+            self.events.lock().unwrap().push(event);
+            QueryEventRecordResult::Accepted
         }
     }
 
@@ -1443,6 +2282,41 @@ mod tests {
                 .iter()
                 .filter(|increment| **increment == metric)
                 .count()
+        }
+    }
+
+    fn query_event(
+        sequence: u64,
+        source: IpAddr,
+        domain: &str,
+        qtype: u16,
+        response_code: ResponseCode,
+    ) -> QueryEventV1 {
+        QueryEventV1 {
+            schema_version: QueryEventV1::SCHEMA_VERSION,
+            sequence,
+            timestamp: SystemTime::UNIX_EPOCH + Duration::from_secs(sequence),
+            observed_source_ip: source,
+            observed_source_port: Some(5353),
+            transport: QueryTransport::Udp,
+            listener: None,
+            original_question: Some(QueryQuestion {
+                qname: domain.to_string(),
+                qtype,
+                qclass: 1,
+            }),
+            normalized_question: Some(QueryQuestion {
+                qname: normalize_question_name(domain),
+                qtype,
+                qclass: 1,
+            }),
+            qtype: Some(qtype),
+            qclass: Some(1),
+            terminal_outcome: QueryTerminalOutcome::AllowedFromBackend,
+            response_code: Some(response_code),
+            cache_result: Some(QueryEventCacheResult::Miss),
+            latency: Some(Duration::from_millis(1)),
+            classifier_findings: Vec::new(),
         }
     }
 
@@ -2019,25 +2893,321 @@ mod tests {
             kind: ResolveDecisionKind::CacheHit,
         };
         let timestamp = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000);
-        let event = QueryEventV1::from_decision(
+        let request = ResolveRequest::new(
+            "192.0.2.10".parse().unwrap(),
+            timestamp,
+            a_query(0x1234, "Example.COM"),
+        );
+        let event = QueryEventV1::from_resolution(
             7,
             timestamp,
+            &request,
             &decision,
+            Some(QueryQuestion {
+                qname: "Example.COM".to_string(),
+                qtype: 1,
+                qclass: 1,
+            }),
             Some(ResponseCode::NoError),
             Some(QueryEventCacheResult::Hit),
             Some(Duration::from_millis(12)),
+            Vec::new(),
         );
 
         assert_eq!(event.schema_version, QueryEventV1::SCHEMA_VERSION);
         assert_eq!(event.sequence, 7);
         assert_eq!(event.timestamp, timestamp);
         assert_eq!(event.observed_source_ip, decision.client_ip);
-        assert_eq!(event.original_question, decision.question);
-        assert_eq!(event.normalized_question, decision.question);
-        assert_eq!(event.terminal_outcome, ResolveDecisionKind::CacheHit);
+        assert_eq!(
+            event.original_question.as_ref().unwrap().qname,
+            "Example.COM"
+        );
+        assert_eq!(
+            event.normalized_question.as_ref().unwrap().qname,
+            "example.com"
+        );
+        assert_eq!(event.qtype, Some(1));
+        assert_eq!(event.qclass, Some(1));
+        assert_eq!(
+            event.terminal_outcome,
+            QueryTerminalOutcome::AllowedFromCache
+        );
         assert_eq!(event.response_code, Some(ResponseCode::NoError));
         assert_eq!(event.cache_result, Some(QueryEventCacheResult::Hit));
         assert_eq!(event.latency, Some(Duration::from_millis(12)));
+    }
+
+    #[test]
+    fn in_memory_query_event_store_applies_drop_oldest_and_read_models() {
+        let store = InMemoryQueryEventStore::new(QueryEventStoreConfig {
+            max_retained_events: 2,
+            max_indexed_sources: 8,
+            max_indexed_domains: 8,
+            retention: None,
+            overflow_policy: QueryEventOverflowPolicy::DropOldest,
+            sample_every: None,
+            enabled: true,
+        });
+        let source: IpAddr = "192.0.2.10".parse().unwrap();
+        let other_source: IpAddr = "192.0.2.11".parse().unwrap();
+        assert_eq!(
+            store.try_record(query_event(
+                1,
+                source,
+                "one.example",
+                1,
+                ResponseCode::NoError
+            )),
+            QueryEventRecordResult::Accepted
+        );
+        assert_eq!(
+            store.try_record(query_event(
+                2,
+                source,
+                "two.example",
+                1,
+                ResponseCode::NoError
+            )),
+            QueryEventRecordResult::Accepted
+        );
+        let mut suspicious = query_event(3, other_source, "bad.example", 1, ResponseCode::NxDomain);
+        suspicious.classifier_findings.push(ClassifierFinding {
+            classifier_version: "test".to_string(),
+            config_generation: 0,
+            reason: SuspiciousLookupReason::SuspiciousDomain,
+            severity: SuspiciousSeverity::High,
+            score: 100,
+            evaluated_window: Duration::from_secs(60),
+            details: Vec::new(),
+            baseline_incomplete: false,
+        });
+        assert_eq!(
+            store.try_record(suspicious),
+            QueryEventRecordResult::Accepted
+        );
+
+        let recent = store.recent_events(10);
+        assert_eq!(recent.len(), 2);
+        assert_eq!(recent[0].sequence, 3);
+        assert_eq!(recent[1].sequence, 2);
+        assert_eq!(store.stats().dropped_oldest, 1);
+        assert_eq!(store.source_history(source, 10).len(), 1);
+        assert_eq!(store.domain_history("bad.example", 10).len(), 1);
+        assert_eq!(store.suspicious_events(10).len(), 1);
+        assert_eq!(
+            store.top_suspicious_sources(10)[0].key,
+            other_source.to_string()
+        );
+        assert_eq!(store.top_suspicious_domains(10)[0].key, "bad.example");
+    }
+
+    #[test]
+    fn in_memory_query_event_store_caps_source_and_domain_indexes() {
+        let store = InMemoryQueryEventStore::new(QueryEventStoreConfig {
+            max_retained_events: 8,
+            max_indexed_sources: 1,
+            max_indexed_domains: 1,
+            retention: None,
+            overflow_policy: QueryEventOverflowPolicy::DropOldest,
+            sample_every: None,
+            enabled: true,
+        });
+        let first: IpAddr = "192.0.2.10".parse().unwrap();
+        let second: IpAddr = "192.0.2.11".parse().unwrap();
+        assert_eq!(
+            store.try_record(query_event(
+                1,
+                first,
+                "first.example",
+                1,
+                ResponseCode::NoError
+            )),
+            QueryEventRecordResult::Accepted
+        );
+        assert_eq!(
+            store.try_record(query_event(
+                2,
+                second,
+                "second.example",
+                1,
+                ResponseCode::NoError
+            )),
+            QueryEventRecordResult::Accepted
+        );
+
+        assert_eq!(store.source_history(first, 10).len(), 1);
+        assert!(store.source_history(second, 10).is_empty());
+        assert_eq!(store.domain_history("first.example", 10).len(), 1);
+        assert!(store.domain_history("second.example", 10).is_empty());
+        assert!(store.stats().source_index_truncated);
+        assert!(store.stats().domain_index_truncated);
+    }
+
+    #[test]
+    fn in_memory_query_event_store_supports_disabled_drop_newest_sample_and_retention() {
+        let disabled = InMemoryQueryEventStore::new(QueryEventStoreConfig {
+            enabled: false,
+            ..QueryEventStoreConfig::default()
+        });
+        assert_eq!(
+            disabled.try_record(query_event(
+                1,
+                "192.0.2.10".parse().unwrap(),
+                "example.com",
+                1,
+                ResponseCode::NoError,
+            )),
+            QueryEventRecordResult::Disabled
+        );
+
+        let drop_newest = InMemoryQueryEventStore::new(QueryEventStoreConfig {
+            max_retained_events: 1,
+            overflow_policy: QueryEventOverflowPolicy::DropNewest,
+            ..QueryEventStoreConfig::default()
+        });
+        let source: IpAddr = "192.0.2.10".parse().unwrap();
+        assert_eq!(
+            drop_newest.try_record(query_event(
+                1,
+                source,
+                "one.example",
+                1,
+                ResponseCode::NoError
+            )),
+            QueryEventRecordResult::Accepted
+        );
+        assert_eq!(
+            drop_newest.try_record(query_event(
+                2,
+                source,
+                "two.example",
+                1,
+                ResponseCode::NoError
+            )),
+            QueryEventRecordResult::DroppedNewest
+        );
+        assert_eq!(drop_newest.recent_events(10)[0].sequence, 1);
+
+        let sampled = InMemoryQueryEventStore::new(QueryEventStoreConfig {
+            sample_every: Some(2),
+            ..QueryEventStoreConfig::default()
+        });
+        assert_eq!(
+            sampled.try_record(query_event(
+                1,
+                source,
+                "one.example",
+                1,
+                ResponseCode::NoError
+            )),
+            QueryEventRecordResult::SampledOut
+        );
+        assert_eq!(
+            sampled.try_record(query_event(
+                2,
+                source,
+                "two.example",
+                1,
+                ResponseCode::NoError
+            )),
+            QueryEventRecordResult::Accepted
+        );
+
+        let retained = InMemoryQueryEventStore::new(QueryEventStoreConfig {
+            retention: Some(Duration::from_secs(1)),
+            ..QueryEventStoreConfig::default()
+        });
+        assert_eq!(
+            retained.try_record(query_event(
+                1,
+                source,
+                "old.example",
+                1,
+                ResponseCode::NoError
+            )),
+            QueryEventRecordResult::Accepted
+        );
+        assert_eq!(
+            retained.try_record(query_event(
+                4,
+                source,
+                "new.example",
+                1,
+                ResponseCode::NoError
+            )),
+            QueryEventRecordResult::Accepted
+        );
+        assert_eq!(retained.recent_events(10).len(), 1);
+        assert_eq!(retained.stats().retention_evicted, 1);
+    }
+
+    #[test]
+    fn suspicious_classifier_emits_explainable_threshold_findings() {
+        let classifier =
+            InMemorySuspiciousLookupClassifier::new(SuspiciousLookupClassifierConfig {
+                nxdomain_burst_threshold: 2,
+                repeated_txt_threshold: 2,
+                suspicious_tlds: vec!["bad".to_string()],
+                suspicious_domains: vec!["known.example".to_string()],
+                ..SuspiciousLookupClassifierConfig::default()
+            });
+        let source: IpAddr = "192.0.2.10".parse().unwrap();
+
+        assert!(classifier
+            .classify(&query_event(
+                1,
+                source,
+                "missing-one.example",
+                1,
+                ResponseCode::NxDomain
+            ))
+            .is_empty());
+        let burst = classifier.classify(&query_event(
+            2,
+            source,
+            "missing-two.example",
+            1,
+            ResponseCode::NxDomain,
+        ));
+        assert!(burst
+            .iter()
+            .any(|finding| finding.reason == SuspiciousLookupReason::NxDomainBurst));
+
+        let _ = classifier.classify(&query_event(
+            3,
+            source,
+            "txt-one.example",
+            16,
+            ResponseCode::NoError,
+        ));
+        let configured = classifier.classify(&query_event(
+            4,
+            source,
+            "host.known.example",
+            16,
+            ResponseCode::NoError,
+        ));
+        assert!(configured
+            .iter()
+            .any(|finding| finding.reason == SuspiciousLookupReason::SuspiciousDomain));
+        assert!(configured
+            .iter()
+            .any(|finding| finding.reason == SuspiciousLookupReason::RepeatedTxtLookup));
+
+        let entropy = classifier.classify(&query_event(
+            5,
+            source,
+            "a8xq9m2p7z4v6n1c.bad",
+            1,
+            ResponseCode::NoError,
+        ));
+        assert!(entropy
+            .iter()
+            .any(|finding| finding.reason == SuspiciousLookupReason::SuspiciousTld));
+        assert!(entropy
+            .iter()
+            .any(|finding| finding.reason == SuspiciousLookupReason::HighEntropyName));
+        assert!(entropy.iter().all(|finding| finding.baseline_incomplete));
     }
 
     #[test]
@@ -2271,7 +3441,7 @@ mod tests {
         assert_eq!(outcome.decision.question.unwrap().qname, "example.com");
         assert_eq!(outcome.decision.kind, ResolveDecisionKind::Allowed);
         assert_eq!(upstream.requests.lock().unwrap().len(), 1);
-        assert_eq!(events.decisions.lock().unwrap().len(), 1);
+        assert_eq!(events.events.lock().unwrap().len(), 1);
         assert!(metrics
             .increments
             .lock()
@@ -2799,7 +3969,7 @@ mod tests {
             ResolveDecisionKind::ProtocolError(ResponseCode::FormErr)
         );
         assert!(upstream.requests.lock().unwrap().is_empty());
-        assert_eq!(events.decisions.lock().unwrap().len(), 1);
+        assert_eq!(events.events.lock().unwrap().len(), 1);
         assert!(metrics
             .increments
             .lock()

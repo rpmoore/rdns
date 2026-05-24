@@ -6,7 +6,7 @@ use rdns::config::RuntimeConfig;
 use rdns::delivery::dns::UdpDnsServer;
 use rdns::delivery::upstream::UdpUpstreamResolver;
 use rdns::resolver::{
-    BasicResponseFactory, BoxFuture, Clock, MetricsSink, QueryEventSink, ResolveDecision,
+    BasicResponseFactory, Clock, MetricsSink, QueryEventRecordResult, QueryEventSink, QueryEventV1,
     ResolveQuery, ResolverMetric, StandardProtocolCodec,
 };
 use tokio::task::JoinSet;
@@ -96,10 +96,9 @@ impl Clock for SystemClock {
 struct StdoutEvents;
 
 impl QueryEventSink for StdoutEvents {
-    fn record<'a>(&'a self, decision: ResolveDecision) -> BoxFuture<'a, ()> {
-        Box::pin(async move {
-            println!("{decision:?}");
-        })
+    fn try_record(&self, event: QueryEventV1) -> QueryEventRecordResult {
+        println!("{event:?}");
+        QueryEventRecordResult::Accepted
     }
 }
 

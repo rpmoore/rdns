@@ -7,7 +7,7 @@ use rdns::delivery::dns::UdpDnsServer;
 use rdns::delivery::upstream::UdpUpstreamResolver;
 use rdns::protocol::encode_tcp_frame;
 use rdns::resolver::{
-    BasicResponseFactory, BoxFuture, Clock, MetricsSink, QueryEventSink, ResolveDecision,
+    BasicResponseFactory, Clock, MetricsSink, QueryEventRecordResult, QueryEventSink, QueryEventV1,
     ResolveQuery, ResolverMetric, StandardProtocolCodec,
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -24,8 +24,8 @@ impl Clock for FixedClock {
 struct NoopEvents;
 
 impl QueryEventSink for NoopEvents {
-    fn record<'a>(&'a self, _decision: ResolveDecision) -> BoxFuture<'a, ()> {
-        Box::pin(async {})
+    fn try_record(&self, _event: QueryEventV1) -> QueryEventRecordResult {
+        QueryEventRecordResult::Accepted
     }
 }
 
