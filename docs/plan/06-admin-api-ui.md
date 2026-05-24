@@ -25,17 +25,25 @@ Initial endpoints:
 - `DELETE /api/blocklist-sources/{id}`
 - `POST /api/blocklist-sources/{id}/refresh`
 - `GET /api/query-events`
+- `GET /api/query-events/suspicious`
+- `GET /api/query-events/sources`
+- `GET /api/query-events/sources/{source_id}`
 - `GET /api/metrics/summary`
 
 Use typed request/response structs and validate at the API boundary before invoking application services.
 
 API validation must preserve runtime invariants:
 
-- Do not allow deleting or disabling the last usable upstream unless a documented degraded mode is enabled.
+- Do not allow deleting or disabling the last usable upstream while `forward` mode is active unless a documented degraded mode is enabled.
+- Do not allow enabling `recursive` mode unless root hints and recursion bounds are valid.
+- Show resolution-mode changes as pending until persistence, backend construction, and snapshot reload all succeed.
+- Show DNSSEC validation status explicitly; while validation is disabled, the UI must not imply recursive mode validates DNSSEC.
+- Show cache namespace/generation changes or cache flushes caused by resolution-mode, upstream, root-hints, or DNSSEC-setting changes.
 - Do not allow unsafe listen-address changes without successful persistence and snapshot reload.
 - Do not allow `Sinkhole` mode without valid sinkhole addresses for the affected query families.
 - Validate blocklist source URLs with the same safety rules used by the fetcher.
 - Return typed validation errors that the UI can display without implying the change was applied.
+- Query-event and suspicious-lookup APIs must require authentication and should audit export/copy actions because DNS history is sensitive.
 
 ## Authentication And Safety
 
@@ -66,17 +74,30 @@ Bootstrap requirement:
 `Status`
 
 - Resolver health.
+- Active resolution mode.
+- Active backend generation/cache namespace.
 - Listening addresses.
 - Upstream health.
+- Recursive root-hint status and recent authority failure summary when recursive mode is active.
+- Recursive DNSSEC validation status.
 - Cache hit rate.
 - Blocklist freshness.
 - Recent query decisions.
+- Query-event pipeline health, dropped/sampled event counts, and current suspicious source count.
 
 `Upstreams`
 
 - Add, edit, enable, disable, reorder upstream resolvers.
 - Validate IP/host, port, protocol, timeout.
 - Test upstream reachability.
+- Make clear that upstreams are used by forward mode and not by pure recursive mode.
+
+`Resolution`
+
+- Choose `forward` or `recursive` mode.
+- Configure forward-mode upstream behavior.
+- Configure recursive root hints, recursion limits, and authority timeouts.
+- Validate the new backend before applying it as active.
 
 `Rules`
 
@@ -95,16 +116,33 @@ Bootstrap requirement:
 `Queries`
 
 - Search recent query events.
-- Filter by client, domain, decision, cache status, and time.
+- Filter by observed source, domain, terminal outcome, DNS response code, policy decision, cache status, suspicious flag/reason, qtype, and time.
 - Show why a query was blocked or allowed.
+- Distinguish `AllowedFromBackend` from `AllowedFromCache`.
+- Show dropped/sampled indicators so operators understand when summaries are incomplete.
+
+`Suspicious Lookups`
+
+- Show suspicious events grouped by observed source.
+- Show classifier reason, severity/score, evaluated window, classifier version, and whether the finding was advisory or policy-blocked.
+- Link from a suspicious finding to the source detail and surrounding query timeline.
+- Make clear that observed source IP may not be a stable machine identity until client identity labels are configured.
+
+`Source Detail`
+
+- Show all retained requests for one observed source.
+- Show suspicious timeline, top queried domains, blocked/allowed breakdown, qtype distribution, NXDOMAIN/SERVFAIL bursts, repeated TXT lookups, and known-bad/blocklist attribution when available.
+- Show any `ClientIdentitySnapshot` labels and generation when policy identity support exists.
 
 `Settings`
 
 - DNS listen addresses.
 - Admin listen address.
+- Resolution mode.
 - Cache TTL caps and size.
 - Block response mode.
 - Query-log retention.
+- Query-event logging mode, overflow behavior, in-memory retention limits, classifier enablement, and classifier thresholds.
 
 ## Delivery Implementation
 
@@ -121,6 +159,8 @@ The UI can start as static HTML/CSS/JavaScript served by the Rust admin server. 
 - API validation tests.
 - Auth and CSRF tests.
 - Settings update reload test.
+- Query-event filtering and source-detail authorization tests.
+- Suspicious lookup API tests for advisory findings, dropped/sampled indicators, and export audit logging.
 - Blocklist refresh endpoint starts an update without blocking the HTTP request indefinitely.
 - UI smoke test for loading the primary screens.
 - First-run setup cannot be skipped.
