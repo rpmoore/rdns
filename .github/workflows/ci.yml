@@ -44,7 +44,7 @@ jobs:
           tool: cargo-deny
 
       - name: Run cargo-deny
-        run: cargo deny check --locked
+        run: cargo deny check
 
       - name: Install cargo-audit
         uses: taiki-e/install-action@v2
