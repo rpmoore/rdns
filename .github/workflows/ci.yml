@@ -11,8 +11,8 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  checks:
-    name: Quality and security checks
+  unit-tests:
+    name: Unit tests
     runs-on: ubuntu-latest
     permissions:
       contents: read
