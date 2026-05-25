@@ -1,0 +1,6 @@
+[licenses]
+# Keep policy explicit; allow common permissive licenses used by our deps.
+allow = [
+    "Apache-2.0",
+    "MIT",
+]
