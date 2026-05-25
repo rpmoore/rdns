@@ -497,6 +497,7 @@ impl ResolveQuery {
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn with_cache(
         protocol: Arc<dyn ProtocolCodec>,
         cache: Arc<dyn DnsCache>,
@@ -698,6 +699,7 @@ impl ResolveQuery {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn finish_upstream_result(
         &self,
         started_at: SystemTime,
@@ -728,7 +730,7 @@ impl ResolveQuery {
                         question: Some(decoded.question.clone()),
                         kind: ResolveDecisionKind::UpstreamFailure,
                     };
-                    let response_bytes = self.responses.servfail(Some(&decoded));
+                    let response_bytes = self.responses.servfail(Some(decoded));
                     return self.finish(started_at, decision, response_bytes).await;
                 }
                 if cache_store_allowed {
@@ -1374,6 +1376,7 @@ mod tests {
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn a_query_with_edns_flags(
         id: u16,
         name: &str,
@@ -2417,7 +2420,7 @@ mod tests {
     #[tokio::test]
     async fn resolve_truncates_oversized_cached_response_for_current_request() {
         let mut oversized_response = a_response_with_answer(0, "example.com", 60);
-        oversized_response.extend(std::iter::repeat(0).take(700));
+        oversized_response.extend(std::iter::repeat_n(0, 700));
         let cached = CachedResponse {
             response_template: oversized_response,
             response_code: ResponseCode::NoError,
