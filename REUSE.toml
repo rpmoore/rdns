@@ -1,0 +1,20 @@
+version = 1
+
+[[annotations]]
+path = [
+    ".agents/**",
+    ".github/**",
+    ".gitignore",
+    "Cargo.lock",
+    "Cargo.toml",
+    "LICENSE",
+    "README.md",
+    "deny.toml",
+    "docs/**",
+    "scripts/**",
+    "src/**",
+    "tests/**",
+]
+precedence = "override"
+SPDX-FileCopyrightText = "2023 Ryan Moore"
+SPDX-License-Identifier = "Apache-2.0"
