@@ -2,6 +2,15 @@
 
 This checklist turns the plan in [`docs/plan`](plan/00-overview.md) into iterative implementation work. Each step links back to the plan section it implements and should be completed with tests appropriate to the risk in that step.
 
+## Cross-Phase Latency Requirements
+
+Apply latency requirements in every phase, not only after Phase 4.
+
+1. Define or reaffirm the latency and throughput budgets affected by the phase before phase completion.
+2. Measure and record DNS hot-path (query processing critical path) p50/p95/p99 latency impact during phase validation, even when the phase focuses on correctness or feature wiring.
+3. Add and validate latency gates for new paths introduced by the phase (for example query-event queueing, persistence, ingestion, API, or UI-backed operations).
+4. Do not close a phase if measured latency regresses beyond documented budgets unless the budget update is explicitly approved and recorded.
+
 ## Phase 1: Safe DNS Protocol Core
 
 1. Create the protocol module boundary.
