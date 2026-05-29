@@ -5,9 +5,9 @@
 Apply latency requirements in every milestone, not only after Milestone 4.
 
 - Define or reaffirm the relevant latency and throughput budgets affected by the milestone before implementation work is marked complete.
-- Measure and record p50/p95/p99 query latency impact for the DNS hot path in milestone validation, even when the milestone is not primarily performance-focused.
+- Measure and record p50/p95/p99 query latency impact for the DNS hot path (query processing critical path) in milestone validation, even when the milestone is not primarily performance-focused.
 - Add milestone-specific latency gates for newly introduced paths (for example queueing, persistence, admin, or ingestion paths) as those paths are added.
-- Do not mark a milestone complete when measured latency regresses beyond the documented budgets without an explicit approved budget update.
+- Do not mark a milestone complete when measured latency regresses beyond the documented budgets unless the budget change is explicitly recorded in planning artifacts.
 
 ## Milestone 1: Safe DNS Protocol Core
 
