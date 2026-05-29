@@ -17,9 +17,8 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
 use opentelemetry::metrics::{Counter, Histogram, MeterProvider};
-use opentelemetry_otlp::{MetricExporter, WithExportConfig};
+use opentelemetry_otlp::MetricExporter;
 use opentelemetry_sdk::metrics::{PeriodicReader, SdkMeterProvider};
-use opentelemetry_sdk::runtime::Tokio;
 use rdns::config::RuntimeConfig;
 use rdns::delivery::dns::UdpDnsServer;
 use rdns::delivery::upstream::UdpUpstreamResolver;
@@ -160,10 +159,10 @@ impl OpenTelemetryMetrics {
         let exporter = MetricExporter::builder()
             .with_tonic()
             .build()
-            .map_err(|error| error.to_string())?;
-        let reader = PeriodicReader::builder(exporter, Tokio).build();
+            .map_err(|error| format!("failed to build OTLP metrics exporter: {error}"))?;
+        let reader = PeriodicReader::builder(exporter).build();
         let provider = SdkMeterProvider::builder().with_reader(reader).build();
-        let meter = provider.meter("rdns.metrics");
+        let meter = provider.meter("rdns.resolver");
 
         Ok(Self {
             _provider: provider,
@@ -178,7 +177,9 @@ impl OpenTelemetryMetrics {
             cache_store_total: meter.u64_counter("cache_store_total").build(),
             cache_store_skipped_total: meter.u64_counter("cache_store_skipped_total").build(),
             cache_negative_store_total: meter.u64_counter("cache_negative_store_total").build(),
-            cache_response_truncated_total: meter.u64_counter("cache_response_truncated_total").build(),
+            cache_response_truncated_total: meter
+                .u64_counter("cache_response_truncated_total")
+                .build(),
             cache_coalesced_miss_total: meter.u64_counter("cache_coalesced_miss_total").build(),
             upstream_success_total: meter.u64_counter("upstream_success_total").build(),
             upstream_failure_total: meter.u64_counter("upstream_failure_total").build(),
@@ -202,7 +203,9 @@ impl MetricsSink for OpenTelemetryMetrics {
             ResolverMetric::CacheStore => self.cache_store_total.add(1, &[]),
             ResolverMetric::CacheStoreSkipped => self.cache_store_skipped_total.add(1, &[]),
             ResolverMetric::CacheNegativeStore => self.cache_negative_store_total.add(1, &[]),
-            ResolverMetric::CacheResponseTruncated => self.cache_response_truncated_total.add(1, &[]),
+            ResolverMetric::CacheResponseTruncated => {
+                self.cache_response_truncated_total.add(1, &[])
+            }
             ResolverMetric::CacheCoalescedMiss => self.cache_coalesced_miss_total.add(1, &[]),
             ResolverMetric::UpstreamSuccess => self.upstream_success_total.add(1, &[]),
             ResolverMetric::UpstreamFailure => self.upstream_failure_total.add(1, &[]),
