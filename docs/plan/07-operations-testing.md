@@ -4,6 +4,16 @@
 
 The resolver will sit on the critical path for local network name resolution. Operational behavior should be explicit from the first usable milestone.
 
+## Performance Budgets
+
+Define and version explicit throughput and latency budgets before query-event pipeline rollout so later milestones can prove no DNS hot-path regressions.
+
+Track at least:
+
+- End-to-end DNS query latency percentiles (p50, p95, p99) under representative steady-state and burst load profiles.
+- Throughput targets under representative steady-state and burst load profiles.
+- Query-event pipeline enqueue latency, queue wait time, and drop/sampled-rate budgets under expected and overload conditions.
+
 ## Logging
 
 Use structured logs.
@@ -46,6 +56,8 @@ Track:
 - Admin mutations by action type.
 - Query log sampling/drop counts if sampling is enabled.
 - Query-event pipeline queue depth and processor errors.
+- Query-event pipeline queue wait latency.
+- Query-event pipeline stage latency (enqueue, classify, store, read-model update).
 - Suspicious lookup findings by reason and severity.
 - Suspicious observed source count.
 
@@ -111,6 +123,8 @@ Integration tests:
 - Query-event hot-path tests proving slow processors/stores do not delay DNS responses.
 - In-memory query-review tests for per-observed-source history, suspicious summaries, retention eviction, ordering by timestamp plus sequence, disabled logging, and overflow indicators.
 - Suspicious classifier tests for versioned findings, threshold boundaries, cold starts, retained-window limitations, sampled/dropped events, and advisory suspicious-but-allowed events.
+- Performance-gate tests that compare current DNS hot-path latency/throughput against recorded Milestone 2/3 baselines.
+- Event-pipeline load tests for representative steady-state throughput, burst pressure, slow/failing processors, and high-cardinality source/domain patterns.
 - Blocklist fetcher rejects unsafe schemes, excessive redirects, and local/private-address targets by default.
 - EDNS UDP-size behavior and truncated-response behavior.
 - DNSSEC `AD`, `DO`, and `CD` behavior while validation is disabled.

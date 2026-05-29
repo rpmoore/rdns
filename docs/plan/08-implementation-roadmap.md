@@ -50,6 +50,8 @@ Tasks:
 - Generate fresh randomized upstream transaction IDs and validate upstream source address on replies.
 - Add static configuration for listen address and upstreams.
 - Add graceful shutdown.
+- Define baseline forwarding-path throughput and latency budgets (including p50/p95/p99 latency targets) for future milestone regression checks.
+- Record baseline forwarding-path performance under representative steady-state and burst load profiles.
 
 Reviewer concern gates:
 
@@ -58,6 +60,7 @@ Reviewer concern gates:
 - Truncated UDP upstream responses must either trigger TCP fallback or return a documented conservative failure until TCP fallback is implemented.
 - `ResolveQuery` must delegate forwarding behavior through a backend port rather than implementing upstream I/O directly.
 - Upstream responses must be accepted only when source endpoint, transaction ID, and question match the active upstream attempt.
+- Baseline forwarding-path throughput and latency budgets must be measured and recorded before adding query-event pipeline load.
 
 Exit criteria:
 
@@ -65,6 +68,7 @@ Exit criteria:
 - Upstream timeout returns `SERVFAIL`.
 - Integration test covers fake upstream forwarding.
 - Integration test covers upstream failover.
+- Baseline forwarding-path throughput and latency benchmark evidence is captured for later milestones.
 
 ## Milestone 3: In-Memory Cache
 
@@ -80,6 +84,7 @@ Tasks:
 - Add single-flight miss handling.
 - Add cache metrics.
 - Keep cache poisoning boundaries explicit: do not use unrelated additional records for other questions until bailiwick rules are implemented.
+- Capture cache-hit and cache-miss latency/throughput baselines and compare against Milestone 2 forwarding-path budgets.
 
 Reviewer concern gates:
 
@@ -88,6 +93,7 @@ Reviewer concern gates:
 - Positive TTL must derive from answer TTLs, and negative TTL must derive from SOA metadata.
 - Upstream timeouts must not be cached. `SERVFAIL` caching requires an explicit short failure-cache setting.
 - Cached responses must be reserialized for the current client's UDP size and request context.
+- Cache integration must not regress Milestone 2 forwarding-path throughput and latency budgets beyond defined regression budgets.
 
 Exit criteria:
 
@@ -95,6 +101,7 @@ Exit criteria:
 - Expired entries are not returned.
 - Concurrent duplicate misses produce one upstream request.
 - Cached response uses the current request transaction ID.
+- Cache-hit and cache-miss performance baselines are recorded and linked to Milestone 2 budgets.
 
 ## Milestone 4: Query Event Pipeline And In-Memory Review Model
 
@@ -107,10 +114,14 @@ Tasks:
 - Change or wrap `QueryEventSink` so recording is best-effort and non-blocking on the DNS hot path.
 - Add bounded event ingestion with explicit overflow behavior: disabled, drop newest, drop oldest, sample, or accept.
 - Add metrics for accepted, dropped, sampled, and disabled query events by reason.
+- Define explicit event-pipeline performance budgets for enqueue latency, queue depth/wait bounds, and acceptable drop/sampled rates under load.
+- Add queue and stage-latency telemetry (enqueue wait, classifier processing, store write, read-model update) with percentile histograms.
+- Define worker concurrency, batching, and backoff controls for classifier/store/read-model processors.
 - Add a bounded in-memory query-event store and source-centric read models for recent events, suspicious events, per-observed-source history, per-source suspicious summary, domain history, and top suspicious observed sources/domains.
 - Model source as an observed endpoint, not a guaranteed machine identity; support optional later `ClientIdentitySnapshot`.
 - Add an advisory `SuspiciousLookupClassifier` port with explainable, versioned findings and initial non-blocking heuristics over retained in-memory events.
 - Keep real query-history API/UI access out of this milestone except for tests or local-only diagnostics; authenticated admin access is added later.
+- Add load and stress tests covering sustained throughput, burst ingestion, slow/failing processors, and high-cardinality observed-source/domain patterns.
 
 Reviewer concern gates:
 
@@ -120,6 +131,8 @@ Reviewer concern gates:
 - Suspicious classifier findings must be advisory and explainable, with classifier version, config generation, reason, severity/score, evaluated window, and structured details.
 - Query-event retention and read-model bounds must be explicit.
 - Event logs are sensitive and must not be exposed through unauthenticated UI/API routes.
+- Event-pipeline performance budgets must be enforced without regressing Milestone 2 and Milestone 3 DNS hot-path budgets beyond defined regression budgets.
+- Queue wait/depth and stage-latency telemetry must be sufficient to diagnose throughput bottlenecks and latency spikes.
 
 Exit criteria:
 
@@ -128,6 +141,8 @@ Exit criteria:
 - In-memory read models can return recent events, suspicious events, and per-observed-source history within configured bounds.
 - Classifier tests cover reason details, threshold boundaries, cold start, dropped/sampled events, and advisory suspicious-but-allowed events.
 - Tests cover disabled logging, overflow behavior, retention eviction, source filtering, schema versioning, processor failure isolation, and dropped-event summary indicators.
+- Performance tests demonstrate event-pipeline throughput and latency budgets are met under representative steady-state and burst load profiles.
+- Queue wait/depth and stage-latency metrics are emitted and validated in tests.
 
 ## Milestone 5: Configurable Resolution Strategy And Recursive Resolver
 
