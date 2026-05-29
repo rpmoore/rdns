@@ -26,6 +26,14 @@ module ownership.
    finding.
 5. Return the refined plan, plus unresolved tradeoffs and test strategy.
 
+## Plan Maintenance Requirements
+
+- Treat plans in `docs/plan` (the plans directory, sometimes referenced as
+  `docs/plans`) as living documents that must be updated whenever requirements
+  change.
+- When requirements change, generate a remediation file that lists the concrete
+  steps required to bring the existing plan current with the new requirements.
+
 If subagents are unavailable or current runtime policy does not allow spawning
 one, stop and ask the user to explicitly allow an independent reviewer agent.
 Do not present a final architecture plan without an independent review pass.
