@@ -77,8 +77,13 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
       - name: Install Vigolium
-        run: curl -fsSL https://vigolium.com/install.sh | bash
+        run: npm install --global @vigolium/vigolium
 
       - name: Run Vigolium scan
         if: env.VIGOLIUM_TARGET_URL != ''
@@ -90,6 +95,7 @@ jobs:
         with:
           name: vigolium-scan-results
           path: vigolium-results.jsonl
+          retention-days: 7
 
       - name: Skip scan when VIGOLIUM_TARGET_URL is not configured
         if: env.VIGOLIUM_TARGET_URL == ''
