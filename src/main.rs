@@ -16,6 +16,10 @@ use std::io;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
+use opentelemetry::metrics::{Counter, Histogram, MeterProvider};
+use opentelemetry_otlp::{MetricExporter, WithExportConfig};
+use opentelemetry_sdk::metrics::{PeriodicReader, SdkMeterProvider};
+use opentelemetry_sdk::runtime::Tokio;
 use rdns::config::RuntimeConfig;
 use rdns::delivery::dns::UdpDnsServer;
 use rdns::delivery::upstream::UdpUpstreamResolver;
@@ -41,7 +45,12 @@ async fn main() -> io::Result<()> {
         Arc::new(BasicResponseFactory),
         Arc::new(SystemClock),
         Arc::new(StdoutEvents),
-        Arc::new(NoopMetrics),
+        OpenTelemetryMetrics::new()
+            .map(|metrics| Arc::new(metrics) as Arc<dyn MetricsSink>)
+            .unwrap_or_else(|error| {
+                eprintln!("failed to initialize OpenTelemetry metrics exporter: {error}");
+                Arc::new(NoopMetrics)
+            }),
     ));
 
     let servers = UdpDnsServer::bind_configured(&config, resolver).await?;
@@ -123,4 +132,89 @@ impl MetricsSink for NoopMetrics {
     fn increment(&self, _metric: ResolverMetric) {}
 
     fn observe_duration(&self, _metric: ResolverMetric, _duration: Duration) {}
+}
+
+struct OpenTelemetryMetrics {
+    _provider: SdkMeterProvider,
+    query_received_total: Counter<u64>,
+    query_allowed_total: Counter<u64>,
+    query_blocked_total: Counter<u64>,
+    cache_hit_total: Counter<u64>,
+    cache_miss_total: Counter<u64>,
+    cache_expired_total: Counter<u64>,
+    cache_bypass_total: Counter<u64>,
+    cache_unavailable_total: Counter<u64>,
+    cache_store_total: Counter<u64>,
+    cache_store_skipped_total: Counter<u64>,
+    cache_negative_store_total: Counter<u64>,
+    cache_response_truncated_total: Counter<u64>,
+    cache_coalesced_miss_total: Counter<u64>,
+    upstream_success_total: Counter<u64>,
+    upstream_failure_total: Counter<u64>,
+    protocol_error_total: Counter<u64>,
+    query_duration_seconds: Histogram<f64>,
+}
+
+impl OpenTelemetryMetrics {
+    fn new() -> Result<Self, String> {
+        let exporter = MetricExporter::builder()
+            .with_tonic()
+            .build()
+            .map_err(|error| error.to_string())?;
+        let reader = PeriodicReader::builder(exporter, Tokio).build();
+        let provider = SdkMeterProvider::builder().with_reader(reader).build();
+        let meter = provider.meter("rdns.metrics");
+
+        Ok(Self {
+            _provider: provider,
+            query_received_total: meter.u64_counter("query_received_total").build(),
+            query_allowed_total: meter.u64_counter("query_allowed_total").build(),
+            query_blocked_total: meter.u64_counter("query_blocked_total").build(),
+            cache_hit_total: meter.u64_counter("cache_hit_total").build(),
+            cache_miss_total: meter.u64_counter("cache_miss_total").build(),
+            cache_expired_total: meter.u64_counter("cache_expired_total").build(),
+            cache_bypass_total: meter.u64_counter("cache_bypass_total").build(),
+            cache_unavailable_total: meter.u64_counter("cache_unavailable_total").build(),
+            cache_store_total: meter.u64_counter("cache_store_total").build(),
+            cache_store_skipped_total: meter.u64_counter("cache_store_skipped_total").build(),
+            cache_negative_store_total: meter.u64_counter("cache_negative_store_total").build(),
+            cache_response_truncated_total: meter.u64_counter("cache_response_truncated_total").build(),
+            cache_coalesced_miss_total: meter.u64_counter("cache_coalesced_miss_total").build(),
+            upstream_success_total: meter.u64_counter("upstream_success_total").build(),
+            upstream_failure_total: meter.u64_counter("upstream_failure_total").build(),
+            protocol_error_total: meter.u64_counter("protocol_error_total").build(),
+            query_duration_seconds: meter.f64_histogram("query_duration_seconds").build(),
+        })
+    }
+}
+
+impl MetricsSink for OpenTelemetryMetrics {
+    fn increment(&self, metric: ResolverMetric) {
+        match metric {
+            ResolverMetric::QueryReceived => self.query_received_total.add(1, &[]),
+            ResolverMetric::QueryAllowed => self.query_allowed_total.add(1, &[]),
+            ResolverMetric::QueryBlocked => self.query_blocked_total.add(1, &[]),
+            ResolverMetric::CacheHit => self.cache_hit_total.add(1, &[]),
+            ResolverMetric::CacheMiss => self.cache_miss_total.add(1, &[]),
+            ResolverMetric::CacheExpired => self.cache_expired_total.add(1, &[]),
+            ResolverMetric::CacheBypass => self.cache_bypass_total.add(1, &[]),
+            ResolverMetric::CacheUnavailable => self.cache_unavailable_total.add(1, &[]),
+            ResolverMetric::CacheStore => self.cache_store_total.add(1, &[]),
+            ResolverMetric::CacheStoreSkipped => self.cache_store_skipped_total.add(1, &[]),
+            ResolverMetric::CacheNegativeStore => self.cache_negative_store_total.add(1, &[]),
+            ResolverMetric::CacheResponseTruncated => self.cache_response_truncated_total.add(1, &[]),
+            ResolverMetric::CacheCoalescedMiss => self.cache_coalesced_miss_total.add(1, &[]),
+            ResolverMetric::UpstreamSuccess => self.upstream_success_total.add(1, &[]),
+            ResolverMetric::UpstreamFailure => self.upstream_failure_total.add(1, &[]),
+            ResolverMetric::ProtocolError => self.protocol_error_total.add(1, &[]),
+            ResolverMetric::QueryDuration => {}
+        }
+    }
+
+    fn observe_duration(&self, metric: ResolverMetric, duration: Duration) {
+        if metric == ResolverMetric::QueryDuration {
+            self.query_duration_seconds
+                .record(duration.as_secs_f64(), &[]);
+        }
+    }
 }
