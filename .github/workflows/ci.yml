@@ -96,7 +96,3 @@ jobs:
           name: vigolium-scan-results
           path: vigolium-results.jsonl
           retention-days: 7
-
-      - name: Skip scan when VIGOLIUM_TARGET_URL is not configured
-        if: env.VIGOLIUM_TARGET_URL == ''
-        run: echo "Skipping Vigolium scan because VIGOLIUM_TARGET_URL secret is not configured."
