@@ -64,3 +64,33 @@ jobs:
 
       - name: Run unit tests
         run: cargo test --locked
+
+  vigolium-scan:
+    name: Vigolium security scan
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    env:
+      VIGOLIUM_TARGET_URL: ${{ secrets.VIGOLIUM_TARGET_URL }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Vigolium
+        run: curl -fsSL https://vigolium.com/install.sh | bash
+
+      - name: Run Vigolium scan
+        if: env.VIGOLIUM_TARGET_URL != ''
+        run: vigolium scan -t "$VIGOLIUM_TARGET_URL" --strategy lite --format jsonl -o vigolium-results.jsonl
+
+      - name: Upload Vigolium scan results
+        if: env.VIGOLIUM_TARGET_URL != ''
+        uses: actions/upload-artifact@v4
+        with:
+          name: vigolium-scan-results
+          path: vigolium-results.jsonl
+
+      - name: Skip scan when VIGOLIUM_TARGET_URL is not configured
+        if: env.VIGOLIUM_TARGET_URL == ''
+        run: echo "Skipping Vigolium scan because VIGOLIUM_TARGET_URL secret is not configured."
