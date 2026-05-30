@@ -23,6 +23,35 @@ use tokio::net::UdpSocket;
 use crate::config::RuntimeConfig;
 use crate::resolver::{ResolveQuery, ResolveRequest};
 
+/// Bind a UDP socket for the DNS listener.
+///
+/// On Linux, `SO_REUSEPORT` is set so that multiple processes or tasks can each
+/// bind their own socket to the same address and the kernel distributes incoming
+/// datagrams across them, enabling true parallel receive.
+///
+/// On macOS and other platforms, `SO_REUSEPORT` does not provide kernel-level
+/// UDP load-balancing, so we fall back to a standard `tokio::net::UdpSocket`
+/// bind which is the performant approach on those systems.
+#[cfg(target_os = "linux")]
+async fn bind_listener_socket(address: SocketAddr) -> io::Result<UdpSocket> {
+    use socket2::{Domain, Protocol, Socket, Type};
+    let socket = Socket::new(
+        Domain::for_address(address),
+        Type::DGRAM,
+        Some(Protocol::UDP),
+    )?;
+    socket.set_reuse_port(true)?;
+    socket.set_nonblocking(true)?;
+    socket.bind(&address.into())?;
+    let std_socket: std::net::UdpSocket = socket.into();
+    UdpSocket::from_std(std_socket)
+}
+
+#[cfg(not(target_os = "linux"))]
+async fn bind_listener_socket(address: SocketAddr) -> io::Result<UdpSocket> {
+    UdpSocket::bind(address).await
+}
+
 pub struct UdpDnsServer {
     socket: UdpSocket,
     resolver: Arc<ResolveQuery>,
@@ -43,7 +72,7 @@ impl UdpDnsServer {
         resolver: Arc<ResolveQuery>,
         max_request_size: usize,
     ) -> io::Result<Self> {
-        let socket = UdpSocket::bind(address).await?;
+        let socket = bind_listener_socket(address).await?;
         Ok(Self::new(socket, resolver, max_request_size))
     }
 

@@ -506,6 +506,7 @@ dependencies = [
  "opentelemetry",
  "opentelemetry-otlp",
  "opentelemetry_sdk",
+ "socket2",
  "tokio",
 ]
 
