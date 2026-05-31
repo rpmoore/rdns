@@ -6,6 +6,8 @@ The policy domain decides whether a client may resolve a domain. It combines loc
 
 It should not fetch blocklists, write SQLite rows directly, parse DNS packets, or build DNS response bytes.
 
+Local DNS entries are administrator-managed generated answers, not policy allow rules. They reuse policy domain normalization and selector value objects, but deny rules and known-malicious-domain policy must still run before a local entry can answer a query.
+
 ## Policy Inputs
 
 - Client IP address.
@@ -46,9 +48,10 @@ Recommended decision order:
 1. Malformed DNS request is handled by the protocol layer before policy.
 2. Local client/domain deny rules.
 3. Known-malicious-domain blocklist.
-4. Allow.
+4. Local DNS entry answer if an enabled exact entry exists.
+5. Allow cache/backend resolution.
 
-Local rules should take precedence because they are explicit administrator intent. If allowlist behavior is later added, define it carefully because it can bypass security blocklists.
+Local deny rules should take precedence because they are explicit administrator intent. Local DNS entries should not bypass local deny rules or known-malicious blocklists. If allowlist behavior is later added, define it carefully because it can bypass security blocklists.
 
 ## Response-Aware Policy
 
@@ -94,6 +97,32 @@ Rules should include:
 - Created/updated metadata.
 
 Start with deny-only rules. Allow rules can be added later if there is a clear UI and precedence model.
+
+## Local DNS Entries
+
+Local DNS entries should support administrator-defined exact-name answers for LAN hosts.
+
+Initial fields:
+
+- Exact normalized domain name.
+- One or more IPv4 addresses for `A` answers.
+- One or more IPv6 addresses for `AAAA` answers.
+- TTL.
+- Enabled flag.
+- Optional description.
+- Created/updated metadata.
+
+Guardrails:
+
+- Support exact names only in the first version.
+- Validate IPv4 addresses only for `A` answers and IPv6 addresses only for `AAAA` answers.
+- Prefer private, link-local, loopback, or otherwise explicitly local-use addresses; require an explicit acknowledgement before accepting public/routable addresses.
+- Allow `.local` names but surface a warning because many clients reserve `.local` for mDNS and may not send those queries to this resolver consistently.
+- Do not treat local entries as allowlist rules. They are evaluated only after deny and malicious-domain policy allows the request.
+- Return generated DNS responses from structured entry data. Do not reuse sinkhole configuration or upstream cache entries for local host answers.
+- If a local name exists but the requested qtype has no configured local answer, return `NODATA` instead of falling through to upstream resolution.
+
+Defer wildcard entries, subtree zones, CNAME aliases, TXT/MX/SRV records, and reverse PTR generation until they have explicit precedence, validation, and UI requirements.
 
 ## Known-Malicious Domain Blocklists
 
@@ -144,8 +173,13 @@ Unit tests:
 
 - Domain normalization and validation.
 - Exact vs subtree matching.
+- Local DNS entry exact-name matching and no wildcard/subtree behavior.
+- Local DNS entry address-family and TTL validation.
+- `.local` entries are accepted with warning metadata.
 - CIDR and exact-client matching.
 - Local rule precedence over malicious blocklist.
+- Deny and malicious-domain policy precedence over local DNS entries.
+- Local DNS entry `NODATA` behavior for known names without the requested address family.
 - Reason codes and source IDs.
 - Block response mode selection.
 - Known-malicious match on upstream CNAME target blocks the response and prevents allowed caching.

@@ -66,6 +66,24 @@ Resolution-mode settings should include:
 - `created_at`
 - `updated_at`
 
+`local_dns_entries`
+
+- `id`
+- `domain`
+- `enabled`
+- `ttl_seconds`
+- `description`
+- `warning_acknowledgements_json`
+- `created_at`
+- `updated_at`
+
+`local_dns_entry_addresses`
+
+- `entry_id`
+- `address_family`
+- `address`
+- `created_at`
+
 `blocklist_sources`
 
 - `id`
@@ -140,6 +158,8 @@ Suggested indices:
 
 - `client_domain_rules(enabled, client_selector_type, client_selector_value)`
 - `client_domain_rules(enabled, domain_selector_type, domain_selector_value)`
+- `local_dns_entries(enabled, domain)`
+- `local_dns_entry_addresses(entry_id, address_family)`
 - `blocklist_domains(domain)`
 - `active_blocklist_generations(source_id)`
 - `query_events(timestamp)`
@@ -156,6 +176,7 @@ If classifier findings are stored separately later, add indices for suspicious f
 - `SettingsRepository`
 - `UpstreamRepository`
 - `RuleRepository`
+- `LocalDnsEntryRepository`
 - `BlocklistRepository`
 - `QueryEventRepository`
 
@@ -167,6 +188,8 @@ Examples:
 - `replace_upstreams(upstreams)`
 - `replace_resolution_mode(settings)`
 - `load_root_hints()`
+- `load_local_dns_entries()`
+- `replace_local_dns_entries(entries)`
 - `publish_backend_snapshot(snapshot)`
 - `load_policy_snapshot()`
 - `activate_blocklist_generation(source_id, generation_id)`
@@ -190,6 +213,7 @@ Implementation shape:
 - Use `Arc<RuntimeConfig>` for resolver settings.
 - Use an atomic `Arc<BackendSnapshot>` or equivalent handle for resolution backend, backend health state, and cache namespace.
 - Use `Arc<PolicySnapshot>` for local rules and active blocklist domains.
+- Use an immutable local DNS entry snapshot, or include local entries in the policy snapshot, so exact local answers are generationed and hot-path lookups never read the database.
 - Publish new snapshots only after database transactions commit.
 - Include a generation/version number in snapshots for logs and debugging.
 - Avoid direct database reads on the DNS hot path.
@@ -206,6 +230,10 @@ Configuration validation must enforce invariants before a snapshot can be publis
 - Upstream timeout, per-query deadline, cache size, TTL caps, and retention settings must be within bounded ranges.
 - Sinkhole addresses must be configured before `Sinkhole` block mode can be enabled.
 - IPv4 and IPv6 settings should be validated separately so an IPv4-only sinkhole is not used for AAAA responses.
+- Local DNS entries must use valid normalized exact domain names, bounded TTLs, and address-family-correct IP values.
+- Local DNS entries under `.local` are allowed only with warning metadata surfaced to the administrator because of mDNS conflicts.
+- Local DNS entries that target public/routable addresses require explicit acknowledgement; private/LAN targets are the safe default.
+- Local DNS entry changes must advance an answer-affecting generation or flush affected exact-question cache entries before the new snapshot becomes active.
 - Blocklist source URLs must pass fetcher safety validation before being saved as enabled.
 
 ## Blocklist Update Transactions

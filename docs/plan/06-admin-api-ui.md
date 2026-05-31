@@ -19,6 +19,10 @@ Initial endpoints:
 - `POST /api/rules`
 - `PUT /api/rules/{id}`
 - `DELETE /api/rules/{id}`
+- `GET /api/local-dns-entries`
+- `POST /api/local-dns-entries`
+- `PUT /api/local-dns-entries/{id}`
+- `DELETE /api/local-dns-entries/{id}`
 - `GET /api/blocklist-sources`
 - `POST /api/blocklist-sources`
 - `PUT /api/blocklist-sources/{id}`
@@ -41,6 +45,8 @@ API validation must preserve runtime invariants:
 - Show cache namespace/generation changes or cache flushes caused by resolution-mode, upstream, root-hints, or DNSSEC-setting changes.
 - Do not allow unsafe listen-address changes without successful persistence and snapshot reload.
 - Do not allow `Sinkhole` mode without valid sinkhole addresses for the affected query families.
+- Validate local DNS entry names, TTLs, address families, `.local` warning acknowledgements, and public-address acknowledgements before persistence.
+- Show local DNS entry changes as pending until persistence, cache invalidation or namespace advancement, and snapshot reload succeed.
 - Validate blocklist source URLs with the same safety rules used by the fetcher.
 - Return typed validation errors that the UI can display without implying the change was applied.
 - Query-event and suspicious-lookup APIs must require authentication and should audit export/copy actions because DNS history is sensitive.
@@ -106,6 +112,15 @@ Bootstrap requirement:
 - Support exact and subtree domain selectors.
 - Show match examples so administrators can verify intent.
 
+`Local DNS`
+
+- Add, edit, enable, disable, and delete exact local DNS entries.
+- Support `A` and `AAAA` address lists with TTL and description fields.
+- Show generated-answer behavior clearly, including that local entries are evaluated after deny/blocklist policy and before cache/upstream resolution.
+- Warn when an entry uses `.local` because mDNS behavior may prevent some clients from querying this resolver.
+- Warn and require explicit acknowledgement before saving public/routable target addresses.
+- Show match examples and the resulting `NODATA` behavior when a known local name is queried for an unconfigured address family.
+
 `Blocklists`
 
 - Add, edit, enable, disable external blocklist sources.
@@ -141,6 +156,7 @@ Bootstrap requirement:
 - Resolution mode.
 - Cache TTL caps and size.
 - Block response mode.
+- Local DNS entry defaults, including default TTL and public-address acknowledgement policy.
 - Query-log retention.
 - Query-event logging mode, overflow behavior, in-memory retention limits, classifier enablement, and classifier thresholds.
 
@@ -160,6 +176,7 @@ The UI can start as static HTML/CSS/JavaScript served by the Rust admin server. 
 - Auth and CSRF tests.
 - Settings update reload test.
 - Query-event filtering and source-detail authorization tests.
+- Local DNS entry API validation, warning acknowledgement, reload, and cache-invalidation tests.
 - Suspicious lookup API tests for advisory findings, dropped/sampled indicators, and export audit logging.
 - Blocklist refresh endpoint starts an update without blocking the HTTP request indefinitely.
 - UI smoke test for loading the primary screens.

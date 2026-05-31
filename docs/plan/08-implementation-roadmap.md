@@ -194,9 +194,9 @@ Exit criteria:
 - Recursive-mode tests cover referral loops, CNAME loops, DNAME deferral, lame delegations, out-of-bailiwick glue rejection, truncated authoritative responses, DNSSEC flag handling while validation is disabled, timeout/deadline handling, and negative answers.
 - Status and query events identify which backend handled a query.
 
-## Milestone 6: Local Policy Blocking
+## Milestone 6: Local Policy And Local DNS Entries
 
-Goal: block configured clients from resolving configured domains.
+Goal: block configured clients from resolving configured domains and answer administrator-defined local hostnames.
 
 Tasks:
 
@@ -204,6 +204,9 @@ Tasks:
 - Add client selector model for exact IP and CIDR.
 - Add `ClientIdentity` and `PolicyEngine`.
 - Add blocked response mode configuration.
+- Add exact local DNS entries for generated `A` and `AAAA` answers.
+- Add local-entry precedence after deny/blocklist policy and before cache/backend resolution.
+- Add local-entry guardrails for `.local` warning metadata, public-address acknowledgement, bounded TTLs, address-family validation, and generated `NODATA`.
 - Add response-aware known-malicious checks for CNAME targets and answer owner names.
 - Add static or file-backed rule loading before SQLite if needed for fast iteration.
 
@@ -213,23 +216,30 @@ Reviewer concern gates:
 - Selectors must distinguish exact-domain and subtree-domain matching; suffix bugs such as matching `badexample.com` for `example.com` must be tested.
 - Source IP must be modeled as an initial client identity strategy, not assumed to be the only future identity.
 - Block response mode must be explicit for local rules and known-malicious blocks.
+- Local DNS entries must not bypass deny rules or known-malicious blocklists.
+- Local DNS entries must be exact-name only, generated from structured `A`/`AAAA` records, and must not reuse sinkhole or upstream cache behavior.
+- `.local` entries must be allowed with explicit operator-facing warnings about mDNS conflicts.
+- Local-entry changes must invalidate affected cached answers or advance an answer-affecting generation.
 - Known-malicious policy must define how CNAME targets in upstream responses are handled.
 
 Exit criteria:
 
 - A configured client/domain rule blocks matching queries.
+- A configured local DNS entry answers matching allowed `A`/`AAAA` queries without contacting cache or backend resolution.
 - Non-matching clients and domains are allowed.
 - Policy decisions include reason codes.
 - Block response mode is visible in config and covered by tests.
+- Local DNS entry decisions include entry/generation metadata and are covered by precedence, validation, `.local`, `NODATA`, and cache-invalidation tests.
 
 ## Milestone 7: SQLite Persistence And Runtime Config
 
-Goal: make upstreams, settings, and rules durable.
+Goal: make upstreams, settings, rules, and local DNS entries durable.
 
 Tasks:
 
 - Add SQLite dependency and migration runner.
 - Implement repositories for settings, upstreams, and rules.
+- Implement repositories for local DNS entries and their configured addresses.
 - Add immutable runtime config snapshot.
 - Add atomic config reload.
 - Add query-event persistence with retention.
@@ -252,6 +262,7 @@ Reviewer concern gates:
 Exit criteria:
 
 - Restart preserves upstreams and rules.
+- Restart preserves local DNS entries.
 - Admin/application services can update settings transactionally.
 - Queries continue during config reload.
 - Retention cleanup keeps configured limits.
@@ -296,7 +307,7 @@ Tasks:
 - Add HTTP server.
 - Add first-run setup, authentication, and session handling.
 - Add CSRF protection for browser mutating requests.
-- Implement settings, resolution mode, upstreams, rules, blocklist sources, refresh, status, query-events, suspicious-event, and source-detail endpoints.
+- Implement settings, resolution mode, upstreams, rules, local DNS entries, blocklist sources, refresh, status, query-events, suspicious-event, and source-detail endpoints.
 - Add validation and error response model.
 
 Reviewer concern gates:
@@ -308,10 +319,12 @@ Reviewer concern gates:
 - No unauthenticated mutation endpoint is allowed.
 - No unauthenticated query-history, suspicious-lookup, source-detail, or export endpoint is allowed.
 - API validation must prevent changes that would break runtime invariants, such as deleting the last forward-mode upstream, enabling recursive mode without valid root hints, or enabling sinkhole mode without sinkhole addresses.
+- API validation must reject invalid local DNS entries and require explicit acknowledgement for `.local` and public-address guardrails.
 
 Exit criteria:
 
 - Admin can manage resolution mode, upstreams, rules, settings, and blocklist sources through API calls.
+- Admin can manage local DNS entries through API calls.
 - Admin can review suspicious lookup findings and retained query history by observed source through authenticated API calls.
 - Mutating calls require authentication and CSRF protection.
 - API tests cover validation and reload behavior.
@@ -324,7 +337,7 @@ Goal: provide a usable browser interface for the admin API.
 Tasks:
 
 - Build static UI served by the admin server.
-- Add screens for status, resolution mode, upstreams, rules, blocklists, query events, suspicious lookup review, observed-source detail, and settings.
+- Add screens for status, resolution mode, upstreams, rules, local DNS entries, blocklists, query events, suspicious lookup review, observed-source detail, and settings.
 - Add forms with client-side validation matching server validation where practical.
 - Add status indicators for upstreams and blocklist freshness.
 
@@ -332,6 +345,7 @@ Reviewer concern gates:
 
 - UI must expose the operational implications of IP-based client identity.
 - UI must show block response mode and reason codes for blocked queries.
+- UI must expose local DNS entry warnings for `.local`, public-address targets, and generated `NODATA` behavior.
 - UI must make suspicious lookup review source-centric, distinguish advisory findings from policy blocks, and show classifier reasons, severity, evaluated windows, and dropped/sampled indicators.
 - UI must show blocklist guardrail failures and previous-good status.
 - UI must not imply settings are active until the API confirms persistence and snapshot reload.
