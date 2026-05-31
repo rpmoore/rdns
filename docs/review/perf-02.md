@@ -31,7 +31,7 @@ Capture current opportunities to reduce memory copies while processing DNS reque
 
 - File: `src/delivery/upstream.rs`
 - Location: `resolve_with_failover`
-- Current behavior: `resolve_attempt(upstream, request.clone(), attempt_timeout)`
+- Current behavior: `self.resolve_attempt(upstream, request.clone(), attempt_timeout)`
 - Impact: `UpstreamRequest` contains `DecodedQuery`, so retry/failover duplicates already-parsed request state and owned buffers.
 
 ### 5. Truncated-response question validation copies the response prefix
