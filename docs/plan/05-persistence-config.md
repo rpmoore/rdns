@@ -76,6 +76,11 @@ Resolution-mode settings should include:
 - `warning_acknowledgements_json`
 - `created_at`
 - `updated_at`
+- Constraints:
+  - `PRIMARY KEY (id)`
+  - `domain NOT NULL`
+  - `enabled NOT NULL`
+  - `UNIQUE (domain)` for exact-name v1 behavior
 
 `local_dns_entry_addresses`
 
@@ -83,6 +88,12 @@ Resolution-mode settings should include:
 - `address_family`
 - `address`
 - `created_at`
+- Constraints:
+  - `entry_id NOT NULL`
+  - `address_family NOT NULL`
+  - `address NOT NULL`
+  - `FOREIGN KEY (entry_id) REFERENCES local_dns_entries(id) ON DELETE CASCADE`
+  - `UNIQUE (entry_id, address_family, address)`
 
 `blocklist_sources`
 
@@ -213,7 +224,7 @@ Implementation shape:
 - Use `Arc<RuntimeConfig>` for resolver settings.
 - Use an atomic `Arc<BackendSnapshot>` or equivalent handle for resolution backend, backend health state, and cache namespace.
 - Use `Arc<PolicySnapshot>` for local rules and active blocklist domains.
-- Use an immutable local DNS entry snapshot, or include local entries in the policy snapshot, so exact local answers are generationed and hot-path lookups never read the database.
+- Use an immutable local DNS entry snapshot, or include local entries in the policy snapshot, so exact local answers are generation-tracked and hot-path lookups never read the database.
 - Publish new snapshots only after database transactions commit.
 - Include a generation/version number in snapshots for logs and debugging.
 - Avoid direct database reads on the DNS hot path.

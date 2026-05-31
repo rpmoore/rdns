@@ -120,7 +120,7 @@ Guardrails:
 - Allow `.local` names but surface a warning because many clients reserve `.local` for mDNS and may not send those queries to this resolver consistently.
 - Do not treat local entries as allowlist rules. They are evaluated only after deny and malicious-domain policy allows the request.
 - Return generated DNS responses from structured entry data. Do not reuse sinkhole configuration or upstream cache entries for local host answers.
-- If a local name exists but the requested qtype has no configured local answer, return `NODATA` instead of falling through to upstream resolution.
+- If a local name exists and the requested qtype is `A` or `AAAA` but that address family is not configured, return `NODATA` instead of falling through to upstream resolution.
 
 Defer wildcard entries, subtree zones, CNAME aliases, TXT/MX/SRV records, and reverse PTR generation until they have explicit precedence, validation, and UI requirements.
 

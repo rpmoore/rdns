@@ -61,10 +61,10 @@ Initial behavior:
 - Generate responses from structured entry data, not from cached upstream packets or sinkhole policy.
 - Run deny rules and known-malicious blocklists before local entry lookup, so local entries do not act as a hidden allowlist.
 - Skip upstream/backend resolution when an enabled local entry matches.
-- Return `NODATA` for a known local name when the qtype is supported by DNS but no matching local address family is configured.
+- Return `NODATA` for a known local name only when the query type is `A` or `AAAA` and that specific family is not configured for the matched entry.
 - Defer PTR/reverse DNS, wildcard names, subtree zones, CNAME, TXT, MX, SRV, and local authoritative-zone behavior until explicitly designed.
 
-Local-entry snapshots must be immutable and generationed. The DNS hot path should read only an in-memory snapshot, never SQLite directly. Updating, disabling, or deleting a local entry must flush affected cache keys or advance an answer-affecting cache namespace so stale upstream answers cannot mask current local administrator intent.
+Local-entry snapshots must be immutable and generation-tracked. The DNS hot path should read only an in-memory snapshot, never SQLite directly. Updating, disabling, or deleting a local entry must flush affected cache keys or advance an answer-affecting cache namespace so stale upstream answers cannot mask current local administrator intent.
 
 Query events for generated local answers should record a local-entry outcome with entry id, snapshot generation, matched normalized name, returned address family, and TTL.
 

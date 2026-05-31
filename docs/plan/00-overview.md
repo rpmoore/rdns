@@ -26,7 +26,7 @@ The finished application should run as an intermediate DNS resolver for a local 
 - Let an administrator choose whether allowed cache misses are resolved by forwarding to configured upstream recursive resolvers or by performing iterative recursive resolution locally.
 - Block domains known to be malicious using configured external blocklist sources.
 - Block configured client IP addresses from resolving selected domains.
-- Let an administrator define exact local DNS entries, such as `dev1.local`, that return configured LAN IP addresses without contacting upstream resolvers.
+- Let an administrator define exact local DNS entries, such as `dev1.local`, that return configured target IP addresses without contacting upstream resolvers; targets are typically LAN addresses, while public/routable targets require explicit acknowledgement and guardrails.
 - Record DNS lookup events by observed client/source so administrators can review suspicious lookup patterns and investigate possible command-and-control behavior.
 - Let an administrator configure upstream resolvers such as Cloudflare, Google, or local upstreams.
 - Let an administrator manage client/domain rules and blocklist sources through a UI.

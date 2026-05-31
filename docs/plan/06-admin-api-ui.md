@@ -36,6 +36,8 @@ Initial endpoints:
 
 Use typed request/response structs and validate at the API boundary before invoking application services.
 
+For local DNS entries, `POST` creates a full `LocalDnsEntry` resource and `PUT /api/local-dns-entries/{id}` replaces the full resource, including `domain`, `enabled`, `ttl_seconds`, `addresses`, `description`, and required warning acknowledgements. Enable and disable flows use the same `PUT` endpoint by changing the `enabled` boolean; no partial `PATCH` or dedicated enable/disable endpoint is required in the first API version. Responses should return the saved resource plus validation or warning metadata so the UI can show whether `.local` and public-address acknowledgements were required.
+
 API validation must preserve runtime invariants:
 
 - Do not allow deleting or disabling the last usable upstream while `forward` mode is active unless a documented degraded mode is enabled.
