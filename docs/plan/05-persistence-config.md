@@ -94,6 +94,7 @@ Resolution-mode settings should include:
   - `address NOT NULL`
   - `FOREIGN KEY (entry_id) REFERENCES local_dns_entries(id) ON DELETE CASCADE`
   - `UNIQUE (entry_id, address_family, address)`
+  - SQLite connections must enable `PRAGMA foreign_keys = ON` so cascade deletes are enforced.
 
 `blocklist_sources`
 
