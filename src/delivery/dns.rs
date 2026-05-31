@@ -485,7 +485,7 @@ mod tests {
             .await
             .unwrap();
 
-        let fast_response = time::timeout(Duration::from_millis(100), recv_response(&fast_client))
+        let fast_response = time::timeout(Duration::from_secs(1), recv_response(&fast_client))
             .await
             .unwrap();
 

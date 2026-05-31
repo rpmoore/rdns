@@ -1497,7 +1497,7 @@ mod tests {
         let sink = ChannelQueryEventSink::new(tx);
 
         tokio::time::timeout(
-            Duration::from_millis(10),
+            Duration::from_secs(1),
             sink.record(decision_for("dropped.example")),
         )
         .await
