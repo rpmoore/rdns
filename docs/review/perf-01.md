@@ -98,12 +98,12 @@ maintain randomized source ports per query.
 
 **Solutions:**
 
-- A pool of N pre-bound sockets (where N matches the number of Tokio worker
-  threads) with random selection, preserving port diversity while amortizing
-  syscall overhead.
-- Transaction-ID-based multiplexing on a shared socket with randomized source
-  ports is the approach real resolvers use, but requires significantly more
-  demuxing logic.
+- If pooling is used, keep a sufficiently large, rotating set of bound sockets and
+  choose among them randomly; a small per-worker pool reduces source-port entropy
+  to the pool size and should be treated as a security tradeoff.
+- Transaction-ID-based multiplexing on a shared socket amortizes syscalls, but it
+  does not preserve source-port randomization because all queries share one local
+  port; pair it with multiple bound sockets if RFC 5452 entropy is required.
 
 **Tradeoffs:** Socket pooling adds lifecycle complexity. A shared socket becomes
 a single contention point unless carefully sharded.
