@@ -29,6 +29,7 @@ use crate::protocol::{encode_tcp_frame, rewrite_response_id, Message};
 use crate::resolver::{UpstreamError, UpstreamRequest, UpstreamResolver, UpstreamResponse};
 
 const DEGRADED_FAILURE_THRESHOLD: u32 = 2;
+const DEGRADED_RETRY_AFTER: Duration = Duration::from_secs(30);
 const SPLITMIX_INCREMENT: u64 = 0x9e37_79b9_7f4a_7c15;
 const MAX_TCP_MESSAGE_SIZE: usize = u16::MAX as usize;
 
@@ -119,6 +120,7 @@ pub struct UpstreamHealthSnapshot {
 struct UpstreamHealth {
     consecutive_failures: u32,
     degraded: bool,
+    retry_after: Option<Instant>,
 }
 
 impl UdpUpstreamResolver {
@@ -278,7 +280,7 @@ impl UdpUpstreamResolver {
         let deadline = Instant::now() + self.per_query_deadline;
         let mut last_error = None;
 
-        for index in self.attempt_order() {
+        for index in self.attempt_order(Instant::now()) {
             let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
                 break;
             };
@@ -306,11 +308,11 @@ impl UdpUpstreamResolver {
         Err(last_error.unwrap_or(UpstreamError::Timeout))
     }
 
-    fn attempt_order(&self) -> Vec<usize> {
+    fn attempt_order(&self, now: Instant) -> Vec<usize> {
         let mut healthy = Vec::with_capacity(self.upstreams.len());
         let mut degraded = Vec::new();
         for (index, health) in self.health.iter().enumerate() {
-            if health.lock().unwrap().degraded {
+            if health.lock().unwrap().is_degraded(now) {
                 degraded.push(index);
             } else {
                 healthy.push(index);
@@ -324,6 +326,7 @@ impl UdpUpstreamResolver {
         let mut health = self.health[index].lock().unwrap();
         health.consecutive_failures = 0;
         health.degraded = false;
+        health.retry_after = None;
     }
 
     fn mark_failure(&self, index: usize, error: &UpstreamError) {
@@ -337,7 +340,18 @@ impl UdpUpstreamResolver {
         health.consecutive_failures = health.consecutive_failures.saturating_add(1);
         if health.consecutive_failures >= DEGRADED_FAILURE_THRESHOLD {
             health.degraded = true;
+            health.retry_after = Some(Instant::now() + DEGRADED_RETRY_AFTER);
         }
+    }
+}
+
+impl UpstreamHealth {
+    fn is_degraded(&self, now: Instant) -> bool {
+        self.degraded
+            && self
+                .retry_after
+                .map(|retry_after| retry_after > now)
+                .unwrap_or(true)
     }
 }
 
@@ -1345,12 +1359,17 @@ mod tests {
         resolver.mark_failure(0, &UpstreamError::Timeout);
         resolver.mark_failure(0, &UpstreamError::Timeout);
 
-        assert_eq!(resolver.attempt_order(), vec![1, 0]);
+        let now = Instant::now();
+        assert_eq!(resolver.attempt_order(now), vec![1, 0]);
+        assert_eq!(
+            resolver.attempt_order(now + DEGRADED_RETRY_AFTER + Duration::from_secs(1)),
+            vec![0, 1]
+        );
         resolver.mark_success(0);
 
         let health = resolver.health_snapshots();
         assert_eq!(health[0].name, "primary");
         assert!(!health[0].degraded);
-        assert_eq!(resolver.attempt_order(), vec![0, 1]);
+        assert_eq!(resolver.attempt_order(Instant::now()), vec![0, 1]);
     }
 }

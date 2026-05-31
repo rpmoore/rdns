@@ -121,9 +121,16 @@ async fn main() -> io::Result<()> {
         }
     }
 
-    event_drain
-        .await
-        .map_err(|error| io::Error::other(format!("query event drain task failed: {error}")))?;
+    event_drain.abort();
+    match event_drain.await {
+        Ok(()) => {}
+        Err(error) if error.is_cancelled() => {}
+        Err(error) => {
+            return Err(io::Error::other(format!(
+                "query event drain task failed: {error}"
+            )));
+        }
+    }
 
     Ok(())
 }

@@ -1199,6 +1199,10 @@ impl InMemoryDnsCache {
             state.maybe_compact_lru(self.max_entries);
             return;
         }
+        if state.entries.len() >= self.max_entries {
+            state.remove_expired(now);
+            state.compact_lru();
+        }
 
         let sequence = state.next_sequence();
         let cached = CachedResponse {
@@ -2209,6 +2213,47 @@ mod tests {
             cache.lookup_now(&CacheLookupRequest {
                 key: third,
                 received_at: now
+            }),
+            CacheLookup::Hit(_)
+        ));
+    }
+
+    #[test]
+    fn in_memory_cache_prunes_expired_entries_before_eviction() {
+        let cache = InMemoryDnsCache::new(2);
+        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(10);
+        let later = now + Duration::from_secs(10);
+        let first = cache_key("first.example");
+        let expired = cache_key("expired.example");
+        let third = cache_key("third.example");
+        cache.store_now(cache_store_at(first.clone(), Duration::from_secs(60), now));
+        cache.store_now(cache_store_at(expired.clone(), Duration::from_secs(5), now));
+
+        cache.store_now(cache_store_at(
+            third.clone(),
+            Duration::from_secs(60),
+            later,
+        ));
+
+        assert_eq!(cache.len(), 2);
+        assert!(matches!(
+            cache.lookup_now(&CacheLookupRequest {
+                key: first,
+                received_at: later
+            }),
+            CacheLookup::Hit(_)
+        ));
+        assert_eq!(
+            cache.lookup_now(&CacheLookupRequest {
+                key: expired,
+                received_at: later
+            }),
+            CacheLookup::Miss
+        );
+        assert!(matches!(
+            cache.lookup_now(&CacheLookupRequest {
+                key: third,
+                received_at: later
             }),
             CacheLookup::Hit(_)
         ));
