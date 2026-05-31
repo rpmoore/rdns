@@ -73,14 +73,14 @@ Resolution-mode settings should include:
 - `enabled`
 - `ttl_seconds`
 - `description`
-- `warning_acknowledgements_json`
+- `target_acknowledgements_json`
 - `created_at`
 - `updated_at`
 - Constraints:
   - `PRIMARY KEY (id)`
-  - `domain NOT NULL`
+  - `domain NOT NULL`, stored as canonical lowercase ASCII/Punycode without trailing dot
   - `enabled NOT NULL`
-  - `UNIQUE (domain)` for exact-name v1 behavior
+  - Unique index on `lower(domain)` for exact-name v1 behavior, so SQLite cannot persist case variants such as `Dev1.Local` and `dev1.local` as separate entries
 
 `local_dns_entry_addresses`
 
@@ -169,7 +169,7 @@ Suggested indices:
 
 - `client_domain_rules(enabled, client_selector_type, client_selector_value)`
 - `client_domain_rules(enabled, domain_selector_type, domain_selector_value)`
-- Unique exact-name constraint or index on `local_dns_entries(domain)`, plus lookup support for enabled entries by domain.
+- Unique exact-name index on `lower(local_dns_entries.domain)`, plus lookup support for enabled entries by canonical domain.
 - `local_dns_entry_addresses(entry_id, address_family)`
 - `blocklist_domains(domain)`
 - `active_blocklist_generations(source_id)`
@@ -298,6 +298,8 @@ Options:
 - `rusqlite` isolated behind `spawn_blocking` or a dedicated database task.
 
 Do not perform blocking SQLite work on Tokio async worker threads. Repository traits should hide this choice from application services.
+
+SQLite foreign-key enforcement must be enabled for every database connection, for example with `PRAGMA foreign_keys = ON` or the equivalent pool/ORM setting. The `local_dns_entry_addresses.entry_id` cascade and duplicate-address constraints rely on that enforcement to avoid orphaned rows after entry deletion.
 
 ## Startup And Migration Failure
 

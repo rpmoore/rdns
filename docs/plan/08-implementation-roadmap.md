@@ -319,7 +319,7 @@ Reviewer concern gates:
 - No unauthenticated mutation endpoint is allowed.
 - No unauthenticated query-history, suspicious-lookup, source-detail, or export endpoint is allowed.
 - API validation must prevent changes that would break runtime invariants, such as deleting the last forward-mode upstream, enabling recursive mode without valid root hints, or enabling sinkhole mode without sinkhole addresses.
-- API validation must reject invalid local DNS entries and require explicit acknowledgement for `.local` and public-address guardrails.
+- API validation must reject invalid local DNS entries, surface `.local` warning metadata, and require explicit acknowledgement for public/routable target addresses.
 
 Exit criteria:
 

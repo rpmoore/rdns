@@ -36,7 +36,7 @@ Initial endpoints:
 
 Use typed request/response structs and validate at the API boundary before invoking application services.
 
-For local DNS entries, `POST` creates a full `LocalDnsEntry` resource and `PUT /api/local-dns-entries/{id}` replaces the full resource, including `domain`, `enabled`, `ttl_seconds`, `addresses`, `description`, and required warning acknowledgements. Enable and disable flows use the same `PUT` endpoint by changing the `enabled` boolean; no partial `PATCH` or dedicated enable/disable endpoint is required in the first API version. Responses should return the saved resource plus validation or warning metadata so the UI can show whether `.local` and public-address acknowledgements were required.
+For local DNS entries, `POST` creates a full `LocalDnsEntry` resource and `PUT /api/local-dns-entries/{id}` replaces the full resource, including `domain`, `enabled`, `ttl_seconds`, `addresses`, `description`, warning metadata, and required target acknowledgements. Enable and disable flows use the same `PUT` endpoint by changing the `enabled` boolean; no partial `PATCH` or dedicated enable/disable endpoint is required in the first API version. Responses should return the saved resource plus validation or warning metadata so the UI can show `.local` warnings and whether public-address acknowledgements were required.
 
 API validation must preserve runtime invariants:
 
@@ -47,7 +47,7 @@ API validation must preserve runtime invariants:
 - Show cache namespace/generation changes or cache flushes caused by resolution-mode, upstream, root-hints, or DNSSEC-setting changes.
 - Do not allow unsafe listen-address changes without successful persistence and snapshot reload.
 - Do not allow `Sinkhole` mode without valid sinkhole addresses for the affected query families.
-- Validate local DNS entry names, TTLs, address families, `.local` warning acknowledgements, and public-address acknowledgements before persistence.
+- Validate local DNS entry names, TTLs, address families, `.local` warning metadata, and public-address acknowledgements before persistence.
 - Show local DNS entry changes as pending until persistence, cache invalidation or namespace advancement, and snapshot reload succeed.
 - Validate blocklist source URLs with the same safety rules used by the fetcher.
 - Return typed validation errors that the UI can display without implying the change was applied.
@@ -178,7 +178,7 @@ The UI can start as static HTML/CSS/JavaScript served by the Rust admin server. 
 - Auth and CSRF tests.
 - Settings update reload test.
 - Query-event filtering and source-detail authorization tests.
-- Local DNS entry API validation, warning acknowledgement, reload, and cache-invalidation tests.
+- Local DNS entry API validation, warning metadata, public-address acknowledgement, reload, and cache-invalidation tests.
 - Suspicious lookup API tests for advisory findings, dropped/sampled indicators, and export audit logging.
 - Blocklist refresh endpoint starts an update without blocking the HTTP request indefinitely.
 - UI smoke test for loading the primary screens.

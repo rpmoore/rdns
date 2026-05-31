@@ -319,7 +319,7 @@ Apply latency requirements in every phase, not only after Phase 4.
 
 73. Implement local DNS entry endpoints.
     - Implements: [API Scope](plan/06-admin-api-ui.md#api-scope), [Local DNS UI](plan/06-admin-api-ui.md#ui-screens), [Local DNS Entries](plan/03-policy-blocking.md#local-dns-entries).
-    - Support create, update, delete, enable, and disable flows for exact `A`/`AAAA` local DNS entries with TTL validation, `.local` warning acknowledgement, public-address acknowledgement, cache invalidation, and typed validation errors.
+    - Support create, update, delete, enable, and disable flows for exact `A`/`AAAA` local DNS entries with TTL validation, `.local` warning metadata, public-address acknowledgement, cache invalidation, and typed validation errors.
 
 74. Implement blocklist source and refresh endpoints.
     - Implements: [API Scope](plan/06-admin-api-ui.md#api-scope), [Blocklist Scheduling](plan/04-blocklist-ingestion.md#scheduling), [Manual refresh roadmap task](plan/08-implementation-roadmap.md#milestone-8-external-blocklist-ingestion).
