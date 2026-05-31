@@ -64,3 +64,7 @@ jobs:
 
       - name: Run unit tests
         run: cargo test --locked
+
+      - name: Run optional live DNS tests
+        continue-on-error: true
+        run: cargo test --locked --test live_dns -- --ignored
