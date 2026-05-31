@@ -23,10 +23,14 @@ use rdns::config::RuntimeConfig;
 use rdns::delivery::dns::UdpDnsServer;
 use rdns::delivery::upstream::UdpUpstreamResolver;
 use rdns::resolver::{
-    BasicResponseFactory, BoxFuture, Clock, MetricsSink, QueryEventSink, ResolveDecision,
-    ResolveQuery, ResolverMetric, StandardProtocolCodec,
+    BasicResponseFactory, BoxFuture, CacheTtlPolicy, ChannelQueryEventSink, Clock,
+    InMemoryDnsCache, MetricsSink, QueryEventSink, ResolveDecision, ResolveQuery, ResolverMetric,
+    StandardProtocolCodec,
 };
 use tokio::task::JoinSet;
+
+const DEFAULT_CACHE_ENTRIES: usize = 10_000;
+const QUERY_EVENT_QUEUE_CAPACITY: usize = 1024;
 
 #[tokio::main]
 async fn main() -> io::Result<()> {
@@ -35,15 +39,28 @@ async fn main() -> io::Result<()> {
         .validate()
         .map_err(|error| io::Error::other(format!("invalid runtime config: {error:?}")))?;
 
-    let resolver = Arc::new(ResolveQuery::new(
+    let stdout_events = Arc::new(StdoutEvents);
+    let (event_tx, mut event_rx) = tokio::sync::mpsc::channel(QUERY_EVENT_QUEUE_CAPACITY);
+    let event_drain = {
+        let stdout_events = Arc::clone(&stdout_events);
+        tokio::spawn(async move {
+            while let Some(decision) = event_rx.recv().await {
+                stdout_events.record(decision).await;
+            }
+        })
+    };
+
+    let resolver = Arc::new(ResolveQuery::with_cache(
         Arc::new(StandardProtocolCodec::new(config.max_udp_payload_size)),
+        Arc::new(InMemoryDnsCache::new(DEFAULT_CACHE_ENTRIES)),
+        CacheTtlPolicy::default(),
         Arc::new(
             UdpUpstreamResolver::from_runtime_config(&config)
                 .map_err(|error| io::Error::other(format!("invalid upstream config: {error:?}")))?,
         ),
         Arc::new(BasicResponseFactory),
         Arc::new(SystemClock),
-        Arc::new(StdoutEvents),
+        Arc::new(ChannelQueryEventSink::new(event_tx)),
         OpenTelemetryMetrics::new()
             .map(|metrics| Arc::new(metrics) as Arc<dyn MetricsSink>)
             .unwrap_or_else(|error| {
@@ -103,6 +120,10 @@ async fn main() -> io::Result<()> {
             }
         }
     }
+
+    event_drain
+        .await
+        .map_err(|error| io::Error::other(format!("query event drain task failed: {error}")))?;
 
     Ok(())
 }

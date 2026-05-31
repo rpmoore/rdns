@@ -19,9 +19,13 @@ use std::sync::Arc;
 use std::time::SystemTime;
 
 use tokio::net::UdpSocket;
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
+use tokio::task::JoinSet;
 
 use crate::config::RuntimeConfig;
 use crate::resolver::{ResolveQuery, ResolveRequest};
+
+const DEFAULT_MAX_IN_FLIGHT_REQUESTS: usize = 1024;
 
 /// Bind a UDP socket for the DNS listener.
 ///
@@ -53,17 +57,33 @@ async fn bind_listener_socket(address: SocketAddr) -> io::Result<UdpSocket> {
 }
 
 pub struct UdpDnsServer {
-    socket: UdpSocket,
+    socket: Arc<UdpSocket>,
     resolver: Arc<ResolveQuery>,
     max_request_size: usize,
+    max_in_flight_requests: usize,
 }
 
 impl UdpDnsServer {
     pub fn new(socket: UdpSocket, resolver: Arc<ResolveQuery>, max_request_size: usize) -> Self {
-        Self {
+        Self::with_max_in_flight_requests(
             socket,
             resolver,
             max_request_size,
+            DEFAULT_MAX_IN_FLIGHT_REQUESTS,
+        )
+    }
+
+    pub fn with_max_in_flight_requests(
+        socket: UdpSocket,
+        resolver: Arc<ResolveQuery>,
+        max_request_size: usize,
+        max_in_flight_requests: usize,
+    ) -> Self {
+        Self {
+            socket: Arc::new(socket),
+            resolver,
+            max_request_size,
+            max_in_flight_requests,
         }
     }
 
@@ -97,32 +117,99 @@ impl UdpDnsServer {
         S: Future<Output = ()>,
     {
         tokio::pin!(shutdown);
+        let semaphore = Arc::new(Semaphore::new(self.max_in_flight_requests));
+        let mut tasks = JoinSet::new();
         loop {
-            tokio::select! {
-                _ = &mut shutdown => return Ok(()),
-                result = self.handle_next_datagram() => result?,
+            if tasks.is_empty() {
+                tokio::select! {
+                    _ = &mut shutdown => break,
+                    result = self.receive_permitted_datagram(semaphore.clone()) => {
+                        if let Some(datagram) = result? {
+                            self.spawn_datagram_task(datagram, &mut tasks);
+                        } else {
+                            break;
+                        }
+                    }
+                }
+            } else {
+                tokio::select! {
+                    _ = &mut shutdown => break,
+                    result = self.receive_permitted_datagram(semaphore.clone()) => {
+                        if let Some(datagram) = result? {
+                            self.spawn_datagram_task(datagram, &mut tasks);
+                        } else {
+                            break;
+                        }
+                    }
+                    result = tasks.join_next() => {
+                        if let Some(result) = result {
+                            task_result_to_io(result)??;
+                        }
+                    }
+                }
             }
         }
+
+        while let Some(result) = tasks.join_next().await {
+            task_result_to_io(result)??;
+        }
+        Ok(())
     }
 
-    async fn handle_next_datagram(&self) -> io::Result<()> {
+    async fn receive_permitted_datagram(
+        &self,
+        semaphore: Arc<Semaphore>,
+    ) -> io::Result<Option<ReceivedDatagram>> {
+        let permit = match semaphore.acquire_owned().await {
+            Ok(permit) => permit,
+            Err(_) => return Ok(None),
+        };
         let mut request_bytes = vec![0; self.max_request_size];
         let (request_len, source) = self.socket.recv_from(&mut request_bytes).await?;
         request_bytes.truncate(request_len);
-
-        let outcome = self
-            .resolver
-            .resolve(ResolveRequest::new(
-                source.ip(),
-                SystemTime::now(),
-                request_bytes,
-            ))
-            .await;
-        self.socket
-            .send_to(&outcome.response_bytes, source)
-            .await
-            .map(|_| ())
+        Ok(Some(ReceivedDatagram {
+            permit,
+            request_bytes,
+            source,
+        }))
     }
+
+    fn spawn_datagram_task(&self, datagram: ReceivedDatagram, tasks: &mut JoinSet<io::Result<()>>) {
+        let socket = Arc::clone(&self.socket);
+        let resolver = Arc::clone(&self.resolver);
+        tasks.spawn(async move { handle_datagram(socket, resolver, datagram).await });
+    }
+}
+
+struct ReceivedDatagram {
+    permit: OwnedSemaphorePermit,
+    request_bytes: Vec<u8>,
+    source: SocketAddr,
+}
+
+async fn handle_datagram(
+    socket: Arc<UdpSocket>,
+    resolver: Arc<ResolveQuery>,
+    datagram: ReceivedDatagram,
+) -> io::Result<()> {
+    let _permit = datagram.permit;
+    let outcome = resolver
+        .resolve(ResolveRequest::new(
+            datagram.source.ip(),
+            SystemTime::now(),
+            datagram.request_bytes,
+        ))
+        .await;
+    socket
+        .send_to(&outcome.response_bytes, datagram.source)
+        .await
+        .map(|_| ())
+}
+
+fn task_result_to_io(
+    result: Result<io::Result<()>, tokio::task::JoinError>,
+) -> io::Result<io::Result<()>> {
+    result.map_err(|error| io::Error::other(format!("DNS request task failed: {error}")))
 }
 
 #[cfg(test)]
@@ -131,6 +218,9 @@ mod tests {
     use std::pin::Pin;
     use std::sync::Mutex;
     use std::time::Duration;
+
+    use tokio::sync::Notify;
+    use tokio::time;
 
     use crate::resolver::{
         BasicResponseFactory, BoxFuture, Clock, MetricsSink, QueryEventSink, ResolveDecision,
@@ -213,6 +303,46 @@ mod tests {
         }
     }
 
+    struct DelayedFirstUpstream {
+        first_started: Notify,
+        first_release: Notify,
+        requests: Mutex<usize>,
+    }
+
+    impl DelayedFirstUpstream {
+        fn new() -> Self {
+            Self {
+                first_started: Notify::new(),
+                first_release: Notify::new(),
+                requests: Mutex::new(0),
+            }
+        }
+    }
+
+    impl UpstreamResolver for DelayedFirstUpstream {
+        fn resolve<'a>(
+            &'a self,
+            _request: UpstreamRequest,
+        ) -> Pin<Box<dyn Future<Output = Result<UpstreamResponse, UpstreamError>> + Send + 'a>>
+        {
+            Box::pin(async move {
+                let request_number = {
+                    let mut requests = self.requests.lock().unwrap();
+                    *requests += 1;
+                    *requests
+                };
+                if request_number == 1 {
+                    self.first_started.notify_waiters();
+                    self.first_release.notified().await;
+                }
+                Ok(UpstreamResponse {
+                    bytes: vec![0, 0, 0x81, 0x80],
+                    received_at: SystemTime::UNIX_EPOCH,
+                })
+            })
+        }
+    }
+
     fn resolve_service(
         upstream: Arc<StaticUpstream>,
         events: Arc<RecordingEvents>,
@@ -232,6 +362,12 @@ mod tests {
         let address = socket.local_addr().unwrap();
         assert!(address.port() > 1024);
         address
+    }
+
+    async fn recv_response(client: &UdpSocket) -> Vec<u8> {
+        let mut response = [0u8; 64];
+        let (response_len, _) = client.recv_from(&mut response).await.unwrap();
+        response[..response_len].to_vec()
     }
 
     #[tokio::test]
@@ -310,5 +446,92 @@ mod tests {
         assert_eq!(servers.len(), 2);
         assert_eq!(servers[0].local_addr().unwrap(), first_address);
         assert_eq!(servers[1].local_addr().unwrap(), second_address);
+    }
+
+    #[tokio::test]
+    async fn udp_server_handles_next_datagram_while_first_request_is_in_flight() {
+        let upstream = Arc::new(DelayedFirstUpstream::new());
+        let resolver = Arc::new(ResolveQuery::new(
+            Arc::new(StandardProtocolCodec::new(1232)),
+            upstream.clone(),
+            Arc::new(BasicResponseFactory),
+            Arc::new(FixedClock(SystemTime::UNIX_EPOCH)),
+            Arc::new(RecordingEvents::default()),
+            Arc::new(NoopMetrics),
+        ));
+        let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let server = UdpDnsServer::with_max_in_flight_requests(socket, resolver, 1232, 2);
+        let server_addr = server.local_addr().unwrap();
+        let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
+        let server_task = tokio::spawn(async move {
+            server
+                .serve_until(async {
+                    let _ = shutdown_rx.await;
+                })
+                .await
+        });
+
+        let slow_client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let first_started = upstream.first_started.notified();
+        slow_client
+            .send_to(&a_query(0x1111, "slow.example"), server_addr)
+            .await
+            .unwrap();
+        first_started.await;
+
+        let fast_client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        fast_client
+            .send_to(&a_query(0x2222, "fast.example"), server_addr)
+            .await
+            .unwrap();
+
+        let fast_response = time::timeout(Duration::from_millis(100), recv_response(&fast_client))
+            .await
+            .unwrap();
+
+        assert_eq!(&fast_response[0..2], &[0x22, 0x22]);
+        upstream.first_release.notify_waiters();
+        assert_eq!(&recv_response(&slow_client).await[0..2], &[0x11, 0x11]);
+        shutdown_tx.send(()).unwrap();
+        server_task.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn udp_server_drains_in_flight_request_after_shutdown() {
+        let upstream = Arc::new(DelayedFirstUpstream::new());
+        let resolver = Arc::new(ResolveQuery::new(
+            Arc::new(StandardProtocolCodec::new(1232)),
+            upstream.clone(),
+            Arc::new(BasicResponseFactory),
+            Arc::new(FixedClock(SystemTime::UNIX_EPOCH)),
+            Arc::new(RecordingEvents::default()),
+            Arc::new(NoopMetrics),
+        ));
+        let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let server = UdpDnsServer::with_max_in_flight_requests(socket, resolver, 1232, 2);
+        let server_addr = server.local_addr().unwrap();
+        let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
+        let mut server_task = tokio::spawn(async move {
+            server
+                .serve_until(async {
+                    let _ = shutdown_rx.await;
+                })
+                .await
+        });
+
+        let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let first_started = upstream.first_started.notified();
+        client
+            .send_to(&a_query(0x3333, "slow.example"), server_addr)
+            .await
+            .unwrap();
+        first_started.await;
+        shutdown_tx.send(()).unwrap();
+
+        assert!(time::timeout(Duration::from_millis(50), &mut server_task)
+            .await
+            .is_err());
+        upstream.first_release.notify_waiters();
+        server_task.await.unwrap().unwrap();
     }
 }
