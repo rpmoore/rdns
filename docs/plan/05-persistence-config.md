@@ -169,7 +169,7 @@ Suggested indices:
 
 - `client_domain_rules(enabled, client_selector_type, client_selector_value)`
 - `client_domain_rules(enabled, domain_selector_type, domain_selector_value)`
-- `local_dns_entries(enabled, domain)`
+- Unique exact-name constraint or index on `local_dns_entries(domain)`, plus lookup support for enabled entries by domain.
 - `local_dns_entry_addresses(entry_id, address_family)`
 - `blocklist_domains(domain)`
 - `active_blocklist_generations(source_id)`
