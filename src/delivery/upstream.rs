@@ -29,6 +29,7 @@ use crate::protocol::{encode_tcp_frame, rewrite_response_id, Message};
 use crate::resolver::{UpstreamError, UpstreamRequest, UpstreamResolver, UpstreamResponse};
 
 const DEGRADED_FAILURE_THRESHOLD: u32 = 2;
+const DEGRADED_RETRY_AFTER: Duration = Duration::from_secs(30);
 const SPLITMIX_INCREMENT: u64 = 0x9e37_79b9_7f4a_7c15;
 const MAX_TCP_MESSAGE_SIZE: usize = u16::MAX as usize;
 
@@ -119,6 +120,7 @@ pub struct UpstreamHealthSnapshot {
 struct UpstreamHealth {
     consecutive_failures: u32,
     degraded: bool,
+    retry_after: Option<Instant>,
 }
 
 impl UdpUpstreamResolver {
@@ -278,7 +280,7 @@ impl UdpUpstreamResolver {
         let deadline = Instant::now() + self.per_query_deadline;
         let mut last_error = None;
 
-        for (index, upstream) in self.upstreams.iter().enumerate() {
+        for index in self.attempt_order(Instant::now()) {
             let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
                 break;
             };
@@ -286,6 +288,7 @@ impl UdpUpstreamResolver {
                 break;
             }
 
+            let upstream = &self.upstreams[index];
             let attempt_timeout = remaining.min(upstream.timeout);
             let result = self
                 .resolve_attempt(upstream, request.clone(), attempt_timeout)
@@ -305,10 +308,25 @@ impl UdpUpstreamResolver {
         Err(last_error.unwrap_or(UpstreamError::Timeout))
     }
 
+    fn attempt_order(&self, now: Instant) -> Vec<usize> {
+        let mut healthy = Vec::with_capacity(self.upstreams.len());
+        let mut degraded = Vec::new();
+        for (index, health) in self.health.iter().enumerate() {
+            if health.lock().unwrap().is_degraded(now) {
+                degraded.push(index);
+            } else {
+                healthy.push(index);
+            }
+        }
+        healthy.extend(degraded);
+        healthy
+    }
+
     fn mark_success(&self, index: usize) {
         let mut health = self.health[index].lock().unwrap();
         health.consecutive_failures = 0;
         health.degraded = false;
+        health.retry_after = None;
     }
 
     fn mark_failure(&self, index: usize, error: &UpstreamError) {
@@ -322,7 +340,18 @@ impl UdpUpstreamResolver {
         health.consecutive_failures = health.consecutive_failures.saturating_add(1);
         if health.consecutive_failures >= DEGRADED_FAILURE_THRESHOLD {
             health.degraded = true;
+            health.retry_after = Some(Instant::now() + DEGRADED_RETRY_AFTER);
         }
+    }
+}
+
+impl UpstreamHealth {
+    fn is_degraded(&self, now: Instant) -> bool {
+        self.degraded
+            && self
+                .retry_after
+                .map(|retry_after| retry_after > now)
+                .unwrap_or(true)
     }
 }
 
@@ -1266,5 +1295,81 @@ mod tests {
         let recovered = resolver.health_snapshots();
         assert_eq!(recovered[0].consecutive_failures, 0);
         assert!(!recovered[0].degraded);
+    }
+
+    #[tokio::test]
+    async fn udp_upstream_moves_degraded_primary_after_healthy_secondary() {
+        let primary_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let primary_addr = primary_socket.local_addr().unwrap();
+        let secondary_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let secondary_addr = secondary_socket.local_addr().unwrap();
+        let secondary_task = tokio::spawn(async move {
+            let mut request = [0u8; 512];
+            let (_, source) = secondary_socket.recv_from(&mut request).await.unwrap();
+            let upstream_id = u16::from_be_bytes([request[0], request[1]]);
+            secondary_socket
+                .send_to(&a_response(upstream_id, "example.com"), source)
+                .await
+                .unwrap();
+        });
+        let resolver = UdpUpstreamResolver::with_upstreams_and_id_generator(
+            vec![
+                upstream_config_with("primary", primary_addr, 10, Duration::from_millis(50)),
+                upstream_config_with("secondary", secondary_addr, 20, Duration::from_millis(50)),
+            ],
+            Duration::from_millis(150),
+            Arc::new(SequenceTransactionIds::new([0x2222])),
+        )
+        .unwrap();
+        resolver.mark_failure(0, &UpstreamError::Timeout);
+        resolver.mark_failure(0, &UpstreamError::Timeout);
+
+        let response = resolver
+            .resolve(upstream_request(0x1234, "example.com"))
+            .await
+            .unwrap();
+
+        secondary_task.await.unwrap();
+        assert_eq!(&response.bytes[0..2], &[0x12, 0x34]);
+        let mut unexpected = [0u8; 512];
+        let primary_receive = time::timeout(
+            Duration::from_millis(80),
+            primary_socket.recv_from(&mut unexpected),
+        )
+        .await;
+        assert!(primary_receive.is_err());
+        let health = resolver.health_snapshots();
+        assert!(health[0].degraded);
+        assert!(!health[1].degraded);
+    }
+
+    #[test]
+    fn udp_upstream_attempt_order_preserves_original_indices() {
+        let primary: SocketAddr = "192.0.2.10:53".parse().unwrap();
+        let secondary: SocketAddr = "192.0.2.11:53".parse().unwrap();
+        let resolver = UdpUpstreamResolver::with_upstreams_and_id_generator(
+            vec![
+                upstream_config_with("secondary", secondary, 20, Duration::from_millis(50)),
+                upstream_config_with("primary", primary, 10, Duration::from_millis(50)),
+            ],
+            Duration::from_millis(150),
+            Arc::new(SequenceTransactionIds::new([0x1111])),
+        )
+        .unwrap();
+        resolver.mark_failure(0, &UpstreamError::Timeout);
+        resolver.mark_failure(0, &UpstreamError::Timeout);
+
+        let now = Instant::now();
+        assert_eq!(resolver.attempt_order(now), vec![1, 0]);
+        assert_eq!(
+            resolver.attempt_order(now + DEGRADED_RETRY_AFTER + Duration::from_secs(1)),
+            vec![0, 1]
+        );
+        resolver.mark_success(0);
+
+        let health = resolver.health_snapshots();
+        assert_eq!(health[0].name, "primary");
+        assert!(!health[0].degraded);
+        assert_eq!(resolver.attempt_order(Instant::now()), vec![0, 1]);
     }
 }
