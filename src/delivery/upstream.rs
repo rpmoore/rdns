@@ -123,6 +123,13 @@ struct UpstreamHealth {
     retry_after: Option<Instant>,
 }
 
+#[derive(Clone, Copy)]
+struct UpstreamAttempt {
+    upstream_id: u16,
+    client_id: u16,
+    deadline: Instant,
+}
+
 impl UdpUpstreamResolver {
     pub fn new(upstream: UpstreamConfig) -> Self {
         Self::with_id_generator(
@@ -224,10 +231,12 @@ impl UdpUpstreamResolver {
         upstream_query: &mut [u8],
         attempt_timeout: Duration,
     ) -> Result<UpstreamResponse, UpstreamError> {
-        let attempt_deadline = Instant::now() + attempt_timeout;
-        let upstream_id = self.id_generator.next_id();
-        let client_id = request.query.message.header.id;
-        rewrite_response_id(upstream_query, upstream_id)
+        let attempt = UpstreamAttempt {
+            upstream_id: self.id_generator.next_id(),
+            client_id: request.query.message.header.id,
+            deadline: Instant::now() + attempt_timeout,
+        };
+        rewrite_response_id(upstream_query, attempt.upstream_id)
             .map_err(|_| UpstreamError::MalformedResponse)?;
 
         let socket = bind_ephemeral_for(upstream.endpoint).await?;
@@ -238,7 +247,7 @@ impl UdpUpstreamResolver {
 
         let mut response_bytes = vec![0; 4096];
         let (response_len, source) = time::timeout(
-            remaining_until(attempt_deadline)?,
+            remaining_until(attempt.deadline)?,
             socket.recv_from(&mut response_bytes),
         )
         .await
@@ -247,30 +256,18 @@ impl UdpUpstreamResolver {
         response_bytes.truncate(response_len);
 
         validate_upstream_response_source(source, upstream.endpoint)?;
-        if truncated_response_matches_request(request, &response_bytes, upstream_id)? {
-            return resolve_tcp_fallback(
-                upstream,
-                request,
-                upstream_query,
-                upstream_id,
-                client_id,
-                attempt_deadline,
-            )
-            .await;
+        if truncated_response_matches_request(request, &response_bytes, attempt.upstream_id)? {
+            return self
+                .resolve_tcp_fallback(upstream, request, upstream_query, attempt)
+                .await;
         }
-        let response = validate_upstream_response(request, &response_bytes, upstream_id)?;
+        let response = validate_upstream_response(request, &response_bytes, attempt.upstream_id)?;
         if response.header.tc() {
-            return resolve_tcp_fallback(
-                upstream,
-                request,
-                upstream_query,
-                upstream_id,
-                client_id,
-                attempt_deadline,
-            )
-            .await;
+            return self
+                .resolve_tcp_fallback(upstream, request, upstream_query, attempt)
+                .await;
         }
-        rewrite_response_id(&mut response_bytes, client_id)
+        rewrite_response_id(&mut response_bytes, attempt.client_id)
             .map_err(|_| UpstreamError::MalformedResponse)?;
 
         Ok(UpstreamResponse {
@@ -313,6 +310,24 @@ impl UdpUpstreamResolver {
         }
 
         Err(last_error.unwrap_or(UpstreamError::Timeout))
+    }
+
+    async fn resolve_tcp_fallback(
+        &self,
+        upstream: &UpstreamConfig,
+        request: &UpstreamRequest,
+        upstream_query: &[u8],
+        attempt: UpstreamAttempt,
+    ) -> Result<UpstreamResponse, UpstreamError> {
+        resolve_tcp_fallback(
+            upstream,
+            request,
+            upstream_query,
+            attempt.upstream_id,
+            attempt.client_id,
+            attempt.deadline,
+        )
+        .await
     }
 
     fn attempt_order(&self, now: Instant) -> Vec<usize> {

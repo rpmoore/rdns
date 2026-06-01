@@ -480,6 +480,12 @@ pub struct ResolveOutcome {
     pub decision: ResolveDecision,
 }
 
+struct CacheProbe {
+    key: Option<CacheKey>,
+    hit: Option<Vec<u8>>,
+    store_allowed: bool,
+}
+
 pub struct ResolveQuery {
     protocol: Arc<dyn ProtocolCodec>,
     cache: Arc<dyn DnsCache>,
@@ -559,157 +565,79 @@ impl ResolveQuery {
 
         self.metrics.increment(ResolverMetric::QueryAllowed);
         let question = decoded.question.clone();
-        let mut cache_store_allowed = false;
-        let cache_key = if cache_supported(&decoded) {
-            let cache_key = CacheKey::from_query(
-                &decoded,
-                None,
-                self.protocol.configured_max_udp_payload_size(),
-            );
-            let lookup = self
-                .cache
-                .lookup(&CacheLookupRequest {
-                    key: cache_key.clone(),
-                    received_at: request.received_at.0,
-                })
-                .await;
-            cache_store_allowed = matches!(lookup, CacheLookup::Miss | CacheLookup::Expired);
-            match lookup {
-                CacheLookup::Hit(cached) => {
-                    if cached.expires_at <= request.received_at.0 {
-                        self.metrics.increment(ResolverMetric::CacheExpired);
-                    }
-                    match self.protocol.serialize_cached_response(
-                        &decoded,
-                        &cached,
-                        request.received_at.0,
-                    ) {
-                        Ok(response_bytes) => {
-                            self.metrics.increment(ResolverMetric::CacheHit);
-                            if response_is_truncated(&response_bytes) {
-                                self.metrics
-                                    .increment(ResolverMetric::CacheResponseTruncated);
-                            }
-                            let decision = ResolveDecision {
-                                client_ip: request.client_ip,
-                                question: Some(question.clone()),
-                                kind: ResolveDecisionKind::CacheHit,
-                            };
-                            return self.finish(started_at, decision, response_bytes).await;
-                        }
-                        Err(_) => {
-                            self.metrics.increment(ResolverMetric::CacheMiss);
-                            cache_store_allowed = true;
-                        }
-                    }
-                }
-                CacheLookup::Miss => {
-                    self.metrics.increment(ResolverMetric::CacheMiss);
-                }
-                CacheLookup::Expired => {
-                    self.metrics.increment(ResolverMetric::CacheExpired);
-                    self.metrics.increment(ResolverMetric::CacheMiss);
-                }
-                CacheLookup::Bypass(_) => {
-                    self.metrics.increment(ResolverMetric::CacheBypass);
-                    self.metrics.increment(ResolverMetric::CacheMiss);
-                }
-                CacheLookup::Unavailable => {
-                    self.metrics.increment(ResolverMetric::CacheUnavailable);
-                    self.metrics.increment(ResolverMetric::CacheMiss);
-                }
-            }
-            Some(cache_key)
-        } else {
-            self.metrics.increment(ResolverMetric::CacheBypass);
-            self.metrics.increment(ResolverMetric::CacheMiss);
-            None
-        };
 
-        if let Some(cache_key) = cache_key {
-            if cache_store_allowed {
-                match self.miss_coalescer.begin(cache_key.clone()) {
-                    SingleFlightTicket::Leader { key, flight } => {
-                        let guard = SingleFlightLeader::new(
-                            Arc::clone(&self.miss_coalescer),
-                            key,
-                            Arc::clone(&flight),
-                        );
-                        let upstream_result = self
-                            .upstream
-                            .resolve(UpstreamRequest {
-                                query: decoded.clone(),
-                            })
-                            .await;
-                        let outcome = self
-                            .finish_upstream_result(
-                                started_at,
-                                &request,
-                                &decoded,
-                                question,
-                                Some(cache_key),
-                                true,
-                                upstream_result.clone(),
-                            )
-                            .await;
-                        guard.complete(upstream_result);
-                        outcome
-                    }
-                    SingleFlightTicket::Follower { flight } => {
-                        self.metrics.increment(ResolverMetric::CacheCoalescedMiss);
-                        let upstream_result = flight.wait().await;
-                        if let CacheLookup::Hit(cached) = self
-                            .cache
-                            .lookup(&CacheLookupRequest {
-                                key: cache_key.clone(),
-                                received_at: request.received_at.0,
-                            })
-                            .await
-                        {
-                            if cached.expires_at <= request.received_at.0 {
-                                self.metrics.increment(ResolverMetric::CacheExpired);
-                            }
-                            if let Ok(response_bytes) = self.protocol.serialize_cached_response(
-                                &decoded,
-                                &cached,
-                                request.received_at.0,
-                            ) {
-                                self.metrics.increment(ResolverMetric::CacheHit);
-                                if response_is_truncated(&response_bytes) {
-                                    self.metrics
-                                        .increment(ResolverMetric::CacheResponseTruncated);
-                                }
-                                let decision = ResolveDecision {
-                                    client_ip: request.client_ip,
-                                    question: Some(question),
-                                    kind: ResolveDecisionKind::CacheHit,
-                                };
-                                return self.finish(started_at, decision, response_bytes).await;
-                            }
-                        }
-                        self.finish_upstream_result(
-                            started_at,
-                            &request,
-                            &decoded,
-                            question,
-                            Some(cache_key),
-                            false,
-                            upstream_result,
-                        )
-                        .await
-                    }
-                }
-            } else {
-                let upstream_result = self
-                    .upstream
-                    .resolve(UpstreamRequest {
-                        query: decoded.clone(),
-                    })
+        let cache_probe = self.probe_cache(&request, &decoded).await;
+        if let Some(response_bytes) = cache_probe.hit {
+            let decision = ResolveDecision {
+                client_ip: request.client_ip,
+                question: Some(question),
+                kind: ResolveDecisionKind::CacheHit,
+            };
+            return self.finish(started_at, decision, response_bytes).await;
+        }
+
+        if let (Some(cache_key), true) = (cache_probe.key.clone(), cache_probe.store_allowed) {
+            return self
+                .resolve_coalesced_miss(started_at, &request, &decoded, question, cache_key)
+                .await;
+        }
+
+        self.resolve_upstream_and_finish(
+            started_at,
+            &request,
+            &decoded,
+            question,
+            cache_probe.key,
+            false,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn resolve_coalesced_miss(
+        &self,
+        started_at: SystemTime,
+        request: &ResolveRequest,
+        decoded: &DecodedQuery,
+        question: QuestionKey,
+        cache_key: CacheKey,
+    ) -> ResolveOutcome {
+        match self.miss_coalescer.begin(cache_key.clone()) {
+            SingleFlightTicket::Leader { key, flight } => {
+                let guard = SingleFlightLeader::new(Arc::clone(&self.miss_coalescer), key, flight);
+                let upstream_result = self.resolve_upstream(decoded).await;
+                let outcome = self
+                    .finish_upstream_result(
+                        started_at,
+                        request,
+                        decoded,
+                        question,
+                        Some(cache_key),
+                        true,
+                        upstream_result.clone(),
+                    )
                     .await;
+                guard.complete(upstream_result);
+                outcome
+            }
+            SingleFlightTicket::Follower { flight } => {
+                self.metrics.increment(ResolverMetric::CacheCoalescedMiss);
+                let upstream_result = flight.wait().await;
+                if let Some(response_bytes) = self
+                    .cache_hit_after_coalesced_miss(request, decoded, &cache_key)
+                    .await
+                {
+                    let decision = ResolveDecision {
+                        client_ip: request.client_ip,
+                        question: Some(question),
+                        kind: ResolveDecisionKind::CacheHit,
+                    };
+                    return self.finish(started_at, decision, response_bytes).await;
+                }
                 self.finish_upstream_result(
                     started_at,
-                    &request,
-                    &decoded,
+                    request,
+                    decoded,
                     question,
                     Some(cache_key),
                     false,
@@ -717,24 +645,136 @@ impl ResolveQuery {
                 )
                 .await
             }
-        } else {
-            let upstream_result = self
-                .upstream
-                .resolve(UpstreamRequest {
-                    query: decoded.clone(),
-                })
-                .await;
-            self.finish_upstream_result(
-                started_at,
-                &request,
-                &decoded,
-                question,
-                None,
-                false,
-                upstream_result,
-            )
-            .await
         }
+    }
+
+    async fn resolve_upstream_and_finish(
+        &self,
+        started_at: SystemTime,
+        request: &ResolveRequest,
+        decoded: &DecodedQuery,
+        question: QuestionKey,
+        cache_key: Option<CacheKey>,
+        cache_store_allowed: bool,
+    ) -> ResolveOutcome {
+        let upstream_result = self.resolve_upstream(decoded).await;
+        self.finish_upstream_result(
+            started_at,
+            request,
+            decoded,
+            question,
+            cache_key,
+            cache_store_allowed,
+            upstream_result,
+        )
+        .await
+    }
+
+    async fn resolve_upstream(
+        &self,
+        decoded: &DecodedQuery,
+    ) -> Result<UpstreamResponse, UpstreamError> {
+        self.upstream
+            .resolve(UpstreamRequest {
+                query: decoded.clone(),
+            })
+            .await
+    }
+
+    async fn probe_cache(&self, request: &ResolveRequest, decoded: &DecodedQuery) -> CacheProbe {
+        if !cache_supported(decoded) {
+            self.metrics.increment(ResolverMetric::CacheBypass);
+            self.metrics.increment(ResolverMetric::CacheMiss);
+            return CacheProbe {
+                key: None,
+                hit: None,
+                store_allowed: false,
+            };
+        }
+
+        let key = CacheKey::from_query(
+            decoded,
+            None,
+            self.protocol.configured_max_udp_payload_size(),
+        );
+        let lookup = self
+            .cache
+            .lookup(&CacheLookupRequest {
+                key: key.clone(),
+                received_at: request.received_at.0,
+            })
+            .await;
+        let mut probe = CacheProbe {
+            key: Some(key),
+            hit: None,
+            store_allowed: matches!(lookup, CacheLookup::Miss | CacheLookup::Expired),
+        };
+
+        match lookup {
+            CacheLookup::Hit(cached) => match self.serialize_cache_hit(decoded, &cached, request) {
+                Ok(response_bytes) => probe.hit = Some(response_bytes),
+                Err(_) => {
+                    self.metrics.increment(ResolverMetric::CacheMiss);
+                    probe.store_allowed = true;
+                }
+            },
+            CacheLookup::Miss => {
+                self.metrics.increment(ResolverMetric::CacheMiss);
+            }
+            CacheLookup::Expired => {
+                self.metrics.increment(ResolverMetric::CacheExpired);
+                self.metrics.increment(ResolverMetric::CacheMiss);
+            }
+            CacheLookup::Bypass(_) => {
+                self.metrics.increment(ResolverMetric::CacheBypass);
+                self.metrics.increment(ResolverMetric::CacheMiss);
+            }
+            CacheLookup::Unavailable => {
+                self.metrics.increment(ResolverMetric::CacheUnavailable);
+                self.metrics.increment(ResolverMetric::CacheMiss);
+            }
+        }
+
+        probe
+    }
+
+    async fn cache_hit_after_coalesced_miss(
+        &self,
+        request: &ResolveRequest,
+        decoded: &DecodedQuery,
+        cache_key: &CacheKey,
+    ) -> Option<Vec<u8>> {
+        let lookup = self
+            .cache
+            .lookup(&CacheLookupRequest {
+                key: cache_key.clone(),
+                received_at: request.received_at.0,
+            })
+            .await;
+        let CacheLookup::Hit(cached) = lookup else {
+            return None;
+        };
+        self.serialize_cache_hit(decoded, &cached, request).ok()
+    }
+
+    fn serialize_cache_hit(
+        &self,
+        decoded: &DecodedQuery,
+        cached: &CachedResponse,
+        request: &ResolveRequest,
+    ) -> crate::protocol::Result<Vec<u8>> {
+        if cached.expires_at <= request.received_at.0 {
+            self.metrics.increment(ResolverMetric::CacheExpired);
+        }
+        let response_bytes =
+            self.protocol
+                .serialize_cached_response(decoded, cached, request.received_at.0)?;
+        self.metrics.increment(ResolverMetric::CacheHit);
+        if response_is_truncated(&response_bytes) {
+            self.metrics
+                .increment(ResolverMetric::CacheResponseTruncated);
+        }
+        Ok(response_bytes)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -748,57 +788,71 @@ impl ResolveQuery {
         cache_store_allowed: bool,
         upstream_result: Result<UpstreamResponse, UpstreamError>,
     ) -> ResolveOutcome {
-        match upstream_result {
-            Ok(response) => {
-                self.metrics.increment(ResolverMetric::UpstreamSuccess);
-                let decision = ResolveDecision {
-                    client_ip: request.client_ip,
-                    question: Some(question),
-                    kind: ResolveDecisionKind::Allowed,
-                };
-                let mut response_bytes = response.bytes;
-                if self
-                    .protocol
-                    .rewrite_response_id(&mut response_bytes, decoded.message.header.id)
-                    .is_err()
-                {
-                    self.metrics.increment(ResolverMetric::UpstreamFailure);
-                    let decision = ResolveDecision {
-                        client_ip: request.client_ip,
-                        question: Some(decoded.question.clone()),
-                        kind: ResolveDecisionKind::UpstreamFailure,
-                    };
-                    let response_bytes = self.responses.servfail(Some(decoded));
-                    return self.finish(started_at, decision, response_bytes).await;
-                }
-                if let (true, Some(cache_key)) = (cache_store_allowed, cache_key) {
-                    if let Some(store) = self.cache_store_for_response(
-                        cache_key,
-                        response_bytes.clone(),
-                        decoded,
-                        request.received_at.0,
-                    ) {
-                        if store.negative_cache.is_some() {
-                            self.metrics.increment(ResolverMetric::CacheNegativeStore);
-                        }
-                        self.metrics.increment(ResolverMetric::CacheStore);
-                        self.cache.store(store).await;
-                    } else {
-                        self.metrics.increment(ResolverMetric::CacheStoreSkipped);
-                    }
-                }
-                self.finish(started_at, decision, response_bytes).await
+        let Ok(response) = upstream_result else {
+            return self
+                .finish_upstream_failure(started_at, request, decoded, question)
+                .await;
+        };
+
+        self.metrics.increment(ResolverMetric::UpstreamSuccess);
+        let mut response_bytes = response.bytes;
+        if self
+            .protocol
+            .rewrite_response_id(&mut response_bytes, decoded.message.header.id)
+            .is_err()
+        {
+            return self
+                .finish_upstream_failure(started_at, request, decoded, decoded.question.clone())
+                .await;
+        }
+
+        if let (true, Some(cache_key)) = (cache_store_allowed, cache_key) {
+            self.store_cache_response(cache_key, response_bytes.clone(), decoded, request)
+                .await;
+        }
+
+        let decision = ResolveDecision {
+            client_ip: request.client_ip,
+            question: Some(question),
+            kind: ResolveDecisionKind::Allowed,
+        };
+        self.finish(started_at, decision, response_bytes).await
+    }
+
+    async fn finish_upstream_failure(
+        &self,
+        started_at: SystemTime,
+        request: &ResolveRequest,
+        decoded: &DecodedQuery,
+        question: QuestionKey,
+    ) -> ResolveOutcome {
+        self.metrics.increment(ResolverMetric::UpstreamFailure);
+        let decision = ResolveDecision {
+            client_ip: request.client_ip,
+            question: Some(question),
+            kind: ResolveDecisionKind::UpstreamFailure,
+        };
+        let response_bytes = self.responses.servfail(Some(decoded));
+        self.finish(started_at, decision, response_bytes).await
+    }
+
+    async fn store_cache_response(
+        &self,
+        cache_key: CacheKey,
+        response_bytes: Vec<u8>,
+        decoded: &DecodedQuery,
+        request: &ResolveRequest,
+    ) {
+        if let Some(store) =
+            self.cache_store_for_response(cache_key, response_bytes, decoded, request.received_at.0)
+        {
+            if store.negative_cache.is_some() {
+                self.metrics.increment(ResolverMetric::CacheNegativeStore);
             }
-            Err(_) => {
-                self.metrics.increment(ResolverMetric::UpstreamFailure);
-                let decision = ResolveDecision {
-                    client_ip: request.client_ip,
-                    question: Some(question),
-                    kind: ResolveDecisionKind::UpstreamFailure,
-                };
-                let response_bytes = self.responses.servfail(Some(decoded));
-                self.finish(started_at, decision, response_bytes).await
-            }
+            self.metrics.increment(ResolverMetric::CacheStore);
+            self.cache.store(store).await;
+        } else {
+            self.metrics.increment(ResolverMetric::CacheStoreSkipped);
         }
     }
 
