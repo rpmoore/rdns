@@ -189,10 +189,10 @@ Apply latency requirements in every phase, not only after Phase 4.
     - Implements: [Resolver Tests](plan/02-resolver-cache.md#tests), [Milestone 5 Exit Criteria](plan/08-implementation-roadmap.md#milestone-5-configurable-resolution-strategy-and-recursive-resolver).
     - Keep existing forwarding integration tests passing through the new backend port and add fake root/TLD/authoritative recursive tests for success, negative answers, referral loops, CNAME loops, DNAME deferral, lame delegations, glue rejection, truncated authoritative answers/referrals, DNSSEC flag handling, cache namespace isolation, and timeout/deadline handling.
 
-## Phase 6: Local Policy Blocking
+## Phase 6: Local Policy And Local DNS Entries
 
 43. Add domain normalization and selector models.
-    - Implements: [Domain Normalization](plan/03-policy-blocking.md#domain-normalization), [Domain normalization concern](plan/09-reviewer-concerns.md#concern-response-matrix), [Milestone 6](plan/08-implementation-roadmap.md#milestone-6-local-policy-blocking).
+    - Implements: [Domain Normalization](plan/03-policy-blocking.md#domain-normalization), [Domain normalization concern](plan/09-reviewer-concerns.md#concern-response-matrix), [Milestone 6](plan/08-implementation-roadmap.md#milestone-6-local-policy-and-local-dns-entries).
     - Canonicalize lowercase ASCII/Punycode names without trailing dots and model exact versus subtree selectors explicitly.
 
 44. Add client identity and selector models.
@@ -208,16 +208,16 @@ Apply latency requirements in every phase, not only after Phase 4.
     - Support `Refused`, `NxDomain`, `NoData`, and optional `Sinkhole` modes with blocked-response TTL, cacheability settings, and family-specific sinkhole validation.
 
 47. Integrate policy into `ResolveQuery`.
-    - Implements: [Resolver Flow](plan/02-resolver-cache.md#flow), [Core Runtime Flow](plan/00-overview.md#core-runtime-flow), [Policy Precedence](plan/03-policy-blocking.md#precedence).
-    - Short-circuit blocked requests before cache/upstream and log the DNS response mode separately from the policy reason.
+    - Implements: [Resolver Flow](plan/02-resolver-cache.md#flow), [Local DNS Entries](plan/02-resolver-cache.md#local-dns-entries), [Core Runtime Flow](plan/00-overview.md#core-runtime-flow), [Policy Precedence](plan/03-policy-blocking.md#precedence).
+    - Short-circuit blocked requests before local entries, cache, or upstream; answer matching exact local DNS entries from structured `A`/`AAAA` data before cache/backend; log the DNS response mode separately from the policy reason.
 
 48. Add response-aware malicious-domain checks.
     - Implements: [Response-Aware Policy](plan/03-policy-blocking.md#response-aware-policy), [Malicious CNAME concern](plan/09-reviewer-concerns.md#second-review-additions).
     - Inspect CNAME targets and answer owner names in upstream responses before returning and caching; block matches and avoid storing them as allowed cache entries.
 
 49. Add policy tests.
-    - Implements: [Policy Tests](plan/03-policy-blocking.md#tests), [Milestone 6 Exit Criteria](plan/08-implementation-roadmap.md#milestone-6-local-policy-blocking).
-    - Cover normalization, exact/subtree matching, suffix edge cases, client selectors, local-rule precedence, reason codes, block response selection, and CNAME-based malicious blocking.
+    - Implements: [Policy Tests](plan/03-policy-blocking.md#tests), [Milestone 6 Exit Criteria](plan/08-implementation-roadmap.md#milestone-6-local-policy-and-local-dns-entries).
+    - Cover normalization, exact/subtree matching, suffix edge cases, client selectors, local-rule precedence, local DNS entry precedence and validation, `.local` warning metadata, generated `NODATA`, reason codes, block response selection, and CNAME-based malicious blocking.
 
 ## Phase 7: SQLite Persistence And Runtime Config
 
@@ -227,19 +227,19 @@ Apply latency requirements in every phase, not only after Phase 4.
 
 51. Add migrations for durable tables and indices.
     - Implements: [Storage Choice](plan/05-persistence-config.md#storage-choice), [Proposed Tables](plan/05-persistence-config.md#proposed-tables), [Retention](plan/05-persistence-config.md#retention).
-    - Create settings, upstreams, rules, blocklist, active generation, and query-event tables with the suggested indices.
+    - Create settings, upstreams, rules, local DNS entries, blocklist, active generation, and query-event tables with the suggested indices.
 
 52. Implement settings, upstream, rule, and query-event repositories.
     - Implements: [Repository Ports](plan/05-persistence-config.md#repository-ports), [Configuration Reload](plan/05-persistence-config.md#configuration-reload).
-    - Shape repository methods around use cases such as loading resolver settings, replacing upstreams, loading policy snapshots, appending query events, and querying observed-source/suspicious lookup read models.
+    - Shape repository methods around use cases such as loading resolver settings, replacing upstreams, loading policy and local DNS entry snapshots, appending query events, and querying observed-source/suspicious lookup read models.
 
 53. Add immutable runtime snapshots and atomic reload.
     - Implements: [Configuration Reload](plan/05-persistence-config.md#configuration-reload), [Runtime config concern](plan/09-reviewer-concerns.md#concern-response-matrix).
-    - Publish `Arc<RuntimeConfig>` and `Arc<PolicySnapshot>` only after validation and committed database transactions.
+    - Publish `Arc<RuntimeConfig>`, `Arc<PolicySnapshot>`, and local DNS entry snapshot state only after validation and committed database transactions.
 
 54. Enforce configuration validation before persistence and publication.
     - Implements: [Configuration Reload](plan/05-persistence-config.md#configuration-reload), [API Validation](plan/06-admin-api-ui.md#api-scope), [Admin/config invariant concern](plan/09-reviewer-concerns.md#second-review-additions).
-    - Validate upstream availability, bind-address conflicts, bounded timeouts and TTLs, sinkhole completeness, retention settings, and blocklist URL safety.
+    - Validate upstream availability, bind-address conflicts, bounded timeouts and TTLs, sinkhole completeness, local DNS entry names/address families/warnings, retention settings, and blocklist URL safety.
 
 55. Add startup migration and degraded-startup behavior.
     - Implements: [Startup And Migration Failure](plan/05-persistence-config.md#startup-and-migration-failure), [Health Checks](plan/07-operations-testing.md#health-checks).
@@ -317,91 +317,99 @@ Apply latency requirements in every phase, not only after Phase 4.
     - Implements: [API Scope](plan/06-admin-api-ui.md#api-scope), [Local Client/Domain Rules](plan/03-policy-blocking.md#local-clientdomain-rules).
     - Support create, update, delete, enable, and disable flows for IP/CIDR and exact/subtree deny rules with typed validation errors.
 
-73. Implement blocklist source and refresh endpoints.
+73. Implement local DNS entry endpoints.
+    - Implements: [API Scope](plan/06-admin-api-ui.md#api-scope), [Local DNS UI](plan/06-admin-api-ui.md#ui-screens), [Local DNS Entries](plan/03-policy-blocking.md#local-dns-entries).
+    - Support create, update, delete, enable, and disable flows for exact `A`/`AAAA` local DNS entries with TTL validation, `.local` warning metadata, public-address acknowledgement, cache invalidation, and typed validation errors.
+
+74. Implement blocklist source and refresh endpoints.
     - Implements: [API Scope](plan/06-admin-api-ui.md#api-scope), [Blocklist Scheduling](plan/04-blocklist-ingestion.md#scheduling), [Manual refresh roadmap task](plan/08-implementation-roadmap.md#milestone-8-external-blocklist-ingestion).
     - Manage sources, validate URLs with fetcher safety rules, trigger refresh asynchronously, and return update status.
 
-74. Implement status, query-event, and metrics endpoints.
+75. Implement status, query-event, and metrics endpoints.
     - Implements: [API Scope](plan/06-admin-api-ui.md#api-scope), [Metrics](plan/07-operations-testing.md#metrics), [Health Checks](plan/07-operations-testing.md#health-checks).
     - Expose resolver health, listener state, upstream health, cache summary, blocklist freshness, query history, suspicious-event filters, observed-source detail, dropped/sampled indicators, and metrics summary.
 
-75. Add audit-friendly admin change logging.
+76. Add audit-friendly admin change logging.
     - Implements: [Authentication And Safety](plan/06-admin-api-ui.md#authentication-and-safety), [Logging](plan/07-operations-testing.md#logging), [Metrics](plan/07-operations-testing.md#metrics).
     - Record admin mutation type, actor, target, timestamp, validation outcome, and reload result.
 
-76. Add API security and validation tests.
+77. Add API security and validation tests.
     - Implements: [Admin API Tests](plan/06-admin-api-ui.md#tests), [Milestone 9 Exit Criteria](plan/08-implementation-roadmap.md#milestone-9-admin-api).
-    - Cover first-run setup, unauthenticated mutation/query-history rejection, CSRF, session expiry, invariant validation, settings reload, source-detail authorization, suspicious lookup filters, export audit logging, and refresh endpoint behavior.
+    - Cover first-run setup, unauthenticated mutation/query-history rejection, CSRF, session expiry, invariant validation, local DNS entry validation/reload/cache invalidation, settings reload, source-detail authorization, suspicious lookup filters, export audit logging, and refresh endpoint behavior.
 
 ## Phase 10: Admin UI
 
-77. Add static UI shell served by the admin server.
+78. Add static UI shell served by the admin server.
     - Implements: [Delivery Implementation](plan/06-admin-api-ui.md#delivery-implementation), [Milestone 10](plan/08-implementation-roadmap.md#milestone-10-admin-ui).
     - Build a small static HTML/CSS/JavaScript UI first, avoiding a large frontend toolchain until the API and domain behavior are stable.
 
-78. Build the status screen.
+79. Build the status screen.
     - Implements: [UI Screens](plan/06-admin-api-ui.md#ui-screens), [Health Checks](plan/07-operations-testing.md#health-checks), [Metrics](plan/07-operations-testing.md#metrics).
     - Show resolver health, listening addresses, upstream health, cache hit rate, blocklist freshness, recent query decisions, query-event pipeline health, and suspicious observed-source count.
 
-79. Build upstream management.
+80. Build upstream management.
     - Implements: [UI Screens](plan/06-admin-api-ui.md#ui-screens), [Forwarding Resolution](plan/02-resolver-cache.md#forwarding-resolution).
     - Add, edit, enable, disable, reorder, validate, and test upstream resolvers.
 
-80. Build rules management.
+81. Build rules management.
     - Implements: [UI Screens](plan/06-admin-api-ui.md#ui-screens), [Client Identity](plan/03-policy-blocking.md#client-identity), [Local Client/Domain Rules](plan/03-policy-blocking.md#local-clientdomain-rules).
     - Manage exact IP/CIDR and exact/subtree deny rules, show match examples, and make IP-based identity limitations visible.
 
-81. Build blocklist management.
+82. Build local DNS entry management.
+    - Implements: [UI Screens](plan/06-admin-api-ui.md#ui-screens), [Local DNS Entries](plan/03-policy-blocking.md#local-dns-entries).
+    - Manage exact `A`/`AAAA` local DNS entries, show `.local` and public-address warnings, show generated `NODATA` behavior, and make clear that deny/blocklist policy still runs first.
+
+83. Build blocklist management.
     - Implements: [UI Screens](plan/06-admin-api-ui.md#ui-screens), [Guardrails](plan/04-blocklist-ingestion.md#guardrails), [Atomic Activation](plan/04-blocklist-ingestion.md#atomic-activation).
     - Add, edit, enable, disable, refresh sources, and show last status, active generation timestamp, domain count, guardrail failures, and previous-good state.
 
-82. Build query history.
+84. Build query history.
     - Implements: [UI Screens](plan/06-admin-api-ui.md#ui-screens), [Query Event Backpressure](plan/05-persistence-config.md#query-event-backpressure), [Logging](plan/07-operations-testing.md#logging).
     - Filter recent events by observed source, domain, terminal outcome, DNS response code, policy decision, cache status, suspicious reason, qtype, and time; show reason codes and sampling/drop indicators.
 
-83. Build suspicious lookup review and source detail.
+85. Build suspicious lookup review and source detail.
     - Implements: [UI Screens](plan/06-admin-api-ui.md#ui-screens), [Suspicious Lookup Classification](plan/02-resolver-cache.md#suspicious-lookup-classification), [Security Considerations](plan/07-operations-testing.md#security-considerations).
     - Group suspicious events by observed source, show classifier reason/severity/window/version, link to source timelines, show blocked/allowed breakdowns, and make observed-source identity limitations visible.
 
-84. Build settings management.
+86. Build settings management.
     - Implements: [UI Screens](plan/06-admin-api-ui.md#ui-screens), [Configuration Reload](plan/05-persistence-config.md#configuration-reload), [Block Response Mode](plan/03-policy-blocking.md#block-response-mode).
     - Manage DNS/admin listen addresses, cache TTL and size, block response mode, sinkhole settings, and query-log retention; show settings as active only after API confirmation.
 
-85. Add UI smoke and validation tests.
+87. Add UI smoke and validation tests.
     - Implements: [Admin API/UI Tests](plan/06-admin-api-ui.md#tests), [Milestone 10 Exit Criteria](plan/08-implementation-roadmap.md#milestone-10-admin-ui).
-    - Smoke-test primary screens, query review filters, suspicious source detail, core forms, validation errors, unauthenticated redirects, and API-confirmed active-state updates.
+    - Smoke-test primary screens, query review filters, suspicious source detail, local DNS entry forms/warnings, core forms, validation errors, unauthenticated redirects, and API-confirmed active-state updates.
 
 ## Phase 11: TCP Listener And Operational Hardening
 
-86. Add DNS TCP listener delivery adapter.
+88. Add DNS TCP listener delivery adapter.
     - Implements: [TCP Framing](plan/01-dns-protocol.md#tcp-framing), [Milestone 11](plan/08-implementation-roadmap.md#milestone-11-tcp-and-operational-hardening).
     - Enforce length-prefix framing, maximum message size, read/write timeouts, idle close, and configured connection limits.
 
-87. Share resolver flow between UDP and TCP listeners.
+89. Share resolver flow between UDP and TCP listeners.
     - Implements: [TCP Framing](plan/01-dns-protocol.md#tcp-framing), [Application Service](plan/02-resolver-cache.md#application-service), [Architectural Direction](plan/00-overview.md#architectural-direction).
     - Keep framing and transport concerns in delivery adapters while both transports call the same `ResolveQuery` service.
 
-88. Add structured logging and metrics coverage.
+90. Add structured logging and metrics coverage.
     - Implements: [Logging](plan/07-operations-testing.md#logging), [Metrics](plan/07-operations-testing.md#metrics), [Observability concern](plan/09-reviewer-concerns.md#concern-response-matrix).
     - Distinguish cache latency, upstream latency, policy blocks, parse errors, DB failures, ingestion failures, admin mutations, and dropped query logs.
 
-89. Add health-check completeness.
+91. Add health-check completeness.
     - Implements: [Health Checks](plan/07-operations-testing.md#health-checks), [Admin Status UI](plan/06-admin-api-ui.md#ui-screens).
     - Report DNS listener state, admin listener state, upstream health, SQLite reachability, policy snapshot load status, and blocklist freshness.
 
-90. Add fuzzing targets.
+92. Add fuzzing targets.
     - Implements: [Fuzzing](plan/01-dns-protocol.md#tests), [Fuzz And Robustness](plan/07-operations-testing.md#test-strategy), [Milestone 11 Exit Criteria](plan/08-implementation-roadmap.md#milestone-11-tcp-and-operational-hardening).
     - Fuzz DNS parser and blocklist parser with the invariant that arbitrary input returns a parsed result or structured error, never a panic.
 
-91. Add stress and race tests.
+93. Add stress and race tests.
     - Implements: [Fuzz And Robustness](plan/07-operations-testing.md#test-strategy), [Concurrency](plan/02-resolver-cache.md#cache-design), [Configuration Reload](plan/05-persistence-config.md#configuration-reload).
     - Stress concurrent DNS queries, cache single-flight behavior, snapshot swaps, slow event writing, blocklist activation, and config reload while queries are in flight.
 
-92. Add deployment and privilege documentation.
+94. Add deployment and privilege documentation.
     - Implements: [Deployment Notes](plan/07-operations-testing.md#deployment-notes), [Port 53 concern](plan/09-reviewer-concerns.md#second-review-additions), [Milestone 11 Tasks](plan/08-implementation-roadmap.md#milestone-11-tcp-and-operational-hardening).
     - Document high-port development defaults, port-53 options such as systemd socket activation or `CAP_NET_BIND_SERVICE`, and why the whole process should not run as root just to bind DNS.
 
-93. Review defaults and final local-network safety posture.
+95. Review defaults and final local-network safety posture.
     - Implements: [Security Considerations](plan/07-operations-testing.md#security-considerations), [Authentication And Safety](plan/06-admin-api-ui.md#authentication-and-safety), [Milestone Acceptance Checks](plan/07-operations-testing.md#milestone-acceptance-checks).
     - Verify safe admin bind defaults, no unauthenticated mutation endpoints, bounded packet/source/cache/log/blocklist behavior, explicit degraded modes, and clear documentation for operational tradeoffs.
 

@@ -2,7 +2,7 @@
 
 ## Responsibility
 
-The resolver domain coordinates lookup behavior. It receives a parsed query and client context, applies policy, checks cache, resolves allowed misses through a configured resolution backend, stores cacheable responses, and returns DNS response bytes.
+The resolver domain coordinates lookup behavior. It receives a parsed query and client context, applies policy, answers exact local DNS entries, checks cache, resolves allowed misses through a configured resolution backend, stores cacheable responses, and returns DNS response bytes.
 
 It should not parse blocklist files, render UI, perform direct database queries, or own low-level socket code.
 
@@ -20,6 +20,7 @@ Injected ports:
 
 - `ProtocolCodec`
 - `PolicyEvaluator`
+- `LocalDnsEntries`
 - `DnsCache`
 - `ResolutionBackend`
 - `ResponseFactory`
@@ -39,13 +40,33 @@ Output:
 3. Convert the question to a normalized `QuestionKey`.
 4. Evaluate policy for the client and domain.
 5. Return the configured blocked response if policy denies the lookup.
-6. Check cache for an allowed query.
-7. On hit, rewrite the transaction ID and return cached bytes.
-8. On miss, call the configured `ResolutionBackend`.
-9. The backend either forwards to configured upstream recursive resolvers or performs local iterative recursion.
-10. Validate that the backend response matches the request question and ID.
-11. Cache cacheable responses with an expiry based on DNS TTLs and local caps.
-12. Emit metrics and a structured query event through a non-blocking sink.
+6. Check exact local DNS entries for the allowed query.
+7. If a local entry matches, build a generated local response and skip cache and backend resolution.
+8. Check cache for an allowed query with no local entry.
+9. On hit, rewrite the transaction ID and return cached bytes.
+10. On miss, call the configured `ResolutionBackend`.
+11. The backend either forwards to configured upstream recursive resolvers or performs local iterative recursion.
+12. Validate that the backend response matches the request question and ID.
+13. Cache cacheable responses with an expiry based on DNS TTLs and local caps.
+14. Emit metrics and a structured query event through a non-blocking sink.
+
+## Local DNS Entries
+
+Local DNS entries let an administrator define exact host answers for LAN names, such as `dev1.local`.
+
+Initial behavior:
+
+- Support exact-name `IN A` and `IN AAAA` answers only.
+- Reuse the policy domain's canonical domain normalization rules.
+- Generate responses from structured entry data, not from cached upstream packets or sinkhole policy.
+- Run deny rules and known-malicious blocklists before local entry lookup, so local entries do not act as a hidden allowlist.
+- Skip upstream/backend resolution when an enabled local entry matches.
+- Return `NODATA` for a known local name only when the query type is `A` or `AAAA` and that specific family is not configured for the matched entry.
+- Defer PTR/reverse DNS, wildcard names, subtree zones, CNAME, TXT, MX, SRV, and local authoritative-zone behavior until explicitly designed.
+
+Local-entry snapshots must be immutable and generation-tracked. The DNS hot path should read only an in-memory snapshot, never SQLite directly. Updating, disabling, or deleting a local entry must flush affected cache keys or advance an answer-affecting cache namespace so stale upstream answers cannot mask current local administrator intent.
+
+Query events for generated local answers should record a local-entry outcome with entry id, snapshot generation, matched normalized name, returned address family, and TTL.
 
 ## Query Event Pipeline
 
@@ -80,6 +101,7 @@ Do not overload one field with resolver outcome, DNS response code, policy decis
 
 - `BackendMetadata` for resolution mode, generation, upstream or authority metadata, and backend result.
 - `PolicyMetadata` for explicit deny rules and response mode.
+- `LocalAnswerMetadata` for local DNS entry id, generation, address family, and TTL.
 - `BlocklistMetadata` for known-bad source and generation attribution.
 - `ResponseInspectionMetadata` for CNAME chains and answer owner names.
 - `ClassifierFindings` for suspicious lookup reasons.
@@ -135,6 +157,8 @@ Cache key:
 - Effective client UDP response size when cached serialization can differ by request size.
 
 The cache namespace must change, or the affected caches must be flushed, when resolution mode, upstream set, root hints, DNSSEC validation mode, or other answer-affecting backend settings change. Forward-mode response templates, recursive final response templates, and recursion-internal caches must not be reused across incompatible backend generations.
+
+Local DNS entry changes are answer-affecting for matching names. They must either advance the relevant cache namespace or explicitly flush affected exact-question cache entries before the new local-entry snapshot becomes active.
 
 Cache value:
 

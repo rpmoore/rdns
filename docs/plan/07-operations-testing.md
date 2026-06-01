@@ -52,6 +52,7 @@ Track:
 - Active policy generation.
 - DNS parse errors by type.
 - Active rule count.
+- Active local DNS entry count.
 - Active blocklist domain count.
 - Admin mutations by action type.
 - Query log sampling/drop counts if sampling is enabled.
@@ -96,6 +97,8 @@ Admin status should distinguish:
 - Treat query logs as sensitive data.
 - Do not expose query-event history, source detail, suspicious lookup findings, or exports without authenticated admin access.
 - Make observed-source identity limitations visible in query-review views.
+- Warn administrators that `.local` entries may conflict with mDNS and may not be queried through this resolver by all clients.
+- Require explicit acknowledgement before local DNS entries point at public/routable addresses.
 
 ## Test Strategy
 
@@ -107,6 +110,7 @@ Unit tests:
 - Cache TTL and expiry.
 - Blocklist parsers.
 - Config validation.
+- Local DNS entry validation, exact matching, generated `NODATA`, and policy precedence.
 
 Integration tests:
 
@@ -135,6 +139,7 @@ End-to-end tests:
 - Send DNS queries using raw UDP test client.
 - Verify cache hit after first upstream response.
 - Verify local rule blocking.
+- Verify local DNS entry answers for allowed `A`/`AAAA` queries and no backend request is made.
 - Verify external blocklist blocking after refresh.
 - Verify admin API changes upstream configuration.
 - Verify authenticated query review can find suspicious lookups and source history without exposing data unauthenticated.
@@ -162,6 +167,7 @@ Add explicit traits so failure and timing behavior can be tested deterministical
 - `RecursionCache`
 - `SettingsRepository`
 - `RuleRepository`
+- `LocalDnsEntryRepository`
 - `BlocklistRepository`
 - `QueryEventSink`
 - `QueryEventStore`

@@ -66,6 +66,36 @@ Resolution-mode settings should include:
 - `created_at`
 - `updated_at`
 
+`local_dns_entries`
+
+- `id`
+- `domain`
+- `enabled`
+- `ttl_seconds`
+- `description`
+- `target_acknowledgements_json`
+- `created_at`
+- `updated_at`
+- Constraints:
+  - `PRIMARY KEY (id)`
+  - `domain NOT NULL`, stored as canonical lowercase ASCII/Punycode without trailing dot
+  - `enabled NOT NULL`
+  - Unique index on `lower(domain)` for exact-name v1 behavior, so SQLite cannot persist case variants such as `Dev1.Local` and `dev1.local` as separate entries
+
+`local_dns_entry_addresses`
+
+- `entry_id`
+- `address_family`
+- `address`
+- `created_at`
+- Constraints:
+  - `entry_id NOT NULL`
+  - `address_family NOT NULL`
+  - `address NOT NULL`
+  - `FOREIGN KEY (entry_id) REFERENCES local_dns_entries(id) ON DELETE CASCADE`
+  - `UNIQUE (entry_id, address_family, address)`
+  - SQLite connections must enable `PRAGMA foreign_keys = ON` so cascade deletes are enforced.
+
 `blocklist_sources`
 
 - `id`
@@ -140,6 +170,8 @@ Suggested indices:
 
 - `client_domain_rules(enabled, client_selector_type, client_selector_value)`
 - `client_domain_rules(enabled, domain_selector_type, domain_selector_value)`
+- Unique exact-name index on `lower(local_dns_entries.domain)`, plus lookup support for enabled entries by canonical domain.
+- `local_dns_entry_addresses(entry_id, address_family)`
 - `blocklist_domains(domain)`
 - `active_blocklist_generations(source_id)`
 - `query_events(timestamp)`
@@ -156,6 +188,7 @@ If classifier findings are stored separately later, add indices for suspicious f
 - `SettingsRepository`
 - `UpstreamRepository`
 - `RuleRepository`
+- `LocalDnsEntryRepository`
 - `BlocklistRepository`
 - `QueryEventRepository`
 
@@ -167,6 +200,8 @@ Examples:
 - `replace_upstreams(upstreams)`
 - `replace_resolution_mode(settings)`
 - `load_root_hints()`
+- `load_local_dns_entries()`
+- `replace_local_dns_entries(entries)`
 - `publish_backend_snapshot(snapshot)`
 - `load_policy_snapshot()`
 - `activate_blocklist_generation(source_id, generation_id)`
@@ -190,6 +225,7 @@ Implementation shape:
 - Use `Arc<RuntimeConfig>` for resolver settings.
 - Use an atomic `Arc<BackendSnapshot>` or equivalent handle for resolution backend, backend health state, and cache namespace.
 - Use `Arc<PolicySnapshot>` for local rules and active blocklist domains.
+- Use an immutable local DNS entry snapshot, or include local entries in the policy snapshot, so exact local answers are generation-tracked and hot-path lookups never read the database.
 - Publish new snapshots only after database transactions commit.
 - Include a generation/version number in snapshots for logs and debugging.
 - Avoid direct database reads on the DNS hot path.
@@ -206,6 +242,10 @@ Configuration validation must enforce invariants before a snapshot can be publis
 - Upstream timeout, per-query deadline, cache size, TTL caps, and retention settings must be within bounded ranges.
 - Sinkhole addresses must be configured before `Sinkhole` block mode can be enabled.
 - IPv4 and IPv6 settings should be validated separately so an IPv4-only sinkhole is not used for AAAA responses.
+- Local DNS entries must use valid normalized exact domain names, bounded TTLs, and address-family-correct IP values.
+- Local DNS entries under `.local` are allowed only with warning metadata surfaced to the administrator because of mDNS conflicts.
+- Local DNS entries that target public/routable addresses require explicit acknowledgement; private/LAN targets are the safe default.
+- Local DNS entry changes must advance an answer-affecting generation or flush affected exact-question cache entries before the new snapshot becomes active.
 - Blocklist source URLs must pass fetcher safety validation before being saved as enabled.
 
 ## Blocklist Update Transactions
@@ -259,6 +299,8 @@ Options:
 - `rusqlite` isolated behind `spawn_blocking` or a dedicated database task.
 
 Do not perform blocking SQLite work on Tokio async worker threads. Repository traits should hide this choice from application services.
+
+SQLite foreign-key enforcement must be enabled for every database connection, for example with `PRAGMA foreign_keys = ON` or the equivalent pool/ORM setting. The `local_dns_entry_addresses.entry_id` cascade and duplicate-address constraints rely on that enforcement to avoid orphaned rows after entry deletion.
 
 ## Startup And Migration Failure
 
