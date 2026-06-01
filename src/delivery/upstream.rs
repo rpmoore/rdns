@@ -471,49 +471,11 @@ fn validate_response_question_prefix(
     request: &UpstreamRequest,
     response_bytes: &[u8],
 ) -> Result<(), UpstreamError> {
-    question_end_offset(response_bytes)?;
     let question = first_question(response_bytes).map_err(|_| UpstreamError::MalformedResponse)?;
     if question != request.query.message.questions[0] {
         return Err(UpstreamError::QuestionMismatch);
     }
     Ok(())
-}
-
-fn question_end_offset(response_bytes: &[u8]) -> Result<usize, UpstreamError> {
-    let mut offset = 12;
-    loop {
-        let label_len = *response_bytes
-            .get(offset)
-            .ok_or(UpstreamError::MalformedResponse)?;
-        if label_len & 0xc0 == 0xc0 {
-            response_bytes
-                .get(offset + 1)
-                .ok_or(UpstreamError::MalformedResponse)?;
-            offset += 2;
-            break;
-        }
-        if label_len & 0xc0 != 0 {
-            return Err(UpstreamError::MalformedResponse);
-        }
-        offset += 1;
-        if label_len == 0 {
-            break;
-        }
-        let end = offset
-            .checked_add(label_len as usize)
-            .ok_or(UpstreamError::MalformedResponse)?;
-        response_bytes
-            .get(offset..end)
-            .ok_or(UpstreamError::MalformedResponse)?;
-        offset = end;
-    }
-    let end = offset
-        .checked_add(4)
-        .ok_or(UpstreamError::MalformedResponse)?;
-    response_bytes
-        .get(offset..end)
-        .ok_or(UpstreamError::MalformedResponse)?;
-    Ok(end)
 }
 
 impl UpstreamResolver for UdpUpstreamResolver {
