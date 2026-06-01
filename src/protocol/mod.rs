@@ -14,8 +14,11 @@
 
 use std::collections::HashSet;
 use std::net::{Ipv4Addr, Ipv6Addr};
+use std::ops::Range;
 use std::str;
 use std::time::Duration;
+
+use bytes::Bytes;
 
 const DNS_HEADER_LEN: usize = 12;
 pub const DNS_DEFAULT_UDP_PAYLOAD_SIZE: usize = 512;
@@ -108,7 +111,7 @@ pub enum TcpFrameDecodeStatus {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Message {
     pub header: Header,
-    pub original_bytes: Vec<u8>,
+    pub original_bytes: Bytes,
     pub questions: Vec<Question>,
     pub answers: Vec<Record>,
     pub authorities: Vec<Record>,
@@ -280,6 +283,16 @@ pub struct Record {
 
 impl Message {
     pub fn parse(dns_message: &[u8]) -> Result<Self> {
+        let parts = Self::parse_parts(dns_message)?;
+        Ok(Self::from_parts(Bytes::copy_from_slice(dns_message), parts))
+    }
+
+    pub fn parse_owned(dns_message: Vec<u8>) -> Result<Self> {
+        let parts = Self::parse_parts(&dns_message)?;
+        Ok(Self::from_parts(Bytes::from(dns_message), parts))
+    }
+
+    fn parse_parts(dns_message: &[u8]) -> Result<MessageParts> {
         let header = parse_header(dns_message)?;
         let mut offset = DNS_HEADER_LEN;
         let mut context = ParseContext::default();
@@ -290,9 +303,8 @@ impl Message {
         let additionals = parse_records(dns_message, &mut offset, header.ar_count, &mut context)?;
         let edns = extract_edns_info(&additionals)?;
 
-        Ok(Self {
+        Ok(MessageParts {
             header,
-            original_bytes: dns_message.to_vec(),
             questions,
             answers,
             authorities,
@@ -301,12 +313,34 @@ impl Message {
         })
     }
 
+    fn from_parts(original_bytes: Bytes, parts: MessageParts) -> Self {
+        Self {
+            header: parts.header,
+            original_bytes,
+            questions: parts.questions,
+            answers: parts.answers,
+            authorities: parts.authorities,
+            additionals: parts.additionals,
+            edns: parts.edns,
+        }
+    }
+
     pub fn parse_standard_query(
         dns_message: &[u8],
     ) -> std::result::Result<Self, QueryValidationError> {
         let header = parse_header(dns_message)?;
         validate_standard_query_header(&header)?;
         let message = Self::parse(dns_message)?;
+        validate_standard_query_body(&message)?;
+        Ok(message)
+    }
+
+    pub fn parse_standard_query_owned(
+        dns_message: Vec<u8>,
+    ) -> std::result::Result<Self, QueryValidationError> {
+        let header = parse_header(&dns_message)?;
+        validate_standard_query_header(&header)?;
+        let message = Self::parse_owned(dns_message)?;
         validate_standard_query_body(&message)?;
         Ok(message)
     }
@@ -330,6 +364,15 @@ impl Message {
     pub fn response_exceeds_udp_payload(&self, response_len: usize, configured_max: usize) -> bool {
         response_len > self.effective_udp_payload_size(configured_max)
     }
+}
+
+struct MessageParts {
+    header: Header,
+    questions: Vec<Question>,
+    answers: Vec<Record>,
+    authorities: Vec<Record>,
+    additionals: Vec<Record>,
+    edns: Option<EdnsInfo>,
 }
 
 pub fn build_formerr_response(request_id: u16) -> Vec<u8> {
@@ -443,7 +486,17 @@ pub fn cap_response_ttls(response_bytes: &mut [u8], max_ttl: Duration) -> Result
     Ok(())
 }
 
-pub fn question_wire(dns_message: &[u8]) -> Result<Vec<u8>> {
+pub fn question_wire(dns_message: &[u8]) -> Result<Bytes> {
+    let range = question_wire_range(dns_message)?;
+    Ok(Bytes::copy_from_slice(&dns_message[range]))
+}
+
+pub fn message_question_wire(message: &Message) -> Result<Bytes> {
+    let range = question_wire_range(&message.original_bytes)?;
+    Ok(message.original_bytes.slice(range))
+}
+
+fn question_wire_range(dns_message: &[u8]) -> Result<Range<usize>> {
     let header = parse_header(dns_message)?;
     if header.qd_count != 1 {
         return Err(DnsParseError::InvalidQuestionCount);
@@ -451,7 +504,17 @@ pub fn question_wire(dns_message: &[u8]) -> Result<Vec<u8>> {
     let mut offset = DNS_HEADER_LEN;
     let start = offset;
     skip_questions(dns_message, &mut offset, 1)?;
-    Ok(dns_message[start..offset].to_vec())
+    Ok(start..offset)
+}
+
+pub fn first_question(dns_message: &[u8]) -> Result<Question> {
+    let header = parse_header(dns_message)?;
+    if header.qd_count != 1 {
+        return Err(DnsParseError::InvalidQuestionCount);
+    }
+    let mut offset = DNS_HEADER_LEN;
+    let mut context = ParseContext::default();
+    parse_question(dns_message, &mut offset, &mut context)
 }
 
 pub fn encode_tcp_frame(message: &[u8], max_size: usize) -> Result<Vec<u8>> {
@@ -1485,6 +1548,58 @@ mod tests {
         assert_eq!(parsed.questions.len(), 1);
         assert_eq!(parsed.questions[0].qname, "example.com");
         assert!(parsed.header.rd());
+    }
+
+    #[test]
+    fn parse_standard_query_owned_reuses_input_buffer() {
+        let mut message = Vec::new();
+        push_header(&mut message, 1, 0, 0, 0);
+        push_question(&mut message, "example.com", 1, 1);
+        let original_ptr = message.as_ptr();
+
+        let parsed = Message::parse_standard_query_owned(message).unwrap();
+
+        assert_eq!(parsed.original_bytes.as_ptr(), original_ptr);
+        assert_eq!(parsed.questions.len(), 1);
+        assert_eq!(parsed.questions[0].qname, "example.com");
+    }
+
+    #[test]
+    fn parse_standard_query_owned_matches_borrowed_errors() {
+        let mut response_packet = Vec::new();
+        push_header_with_flags(&mut response_packet, 0x8100, 1, 0, 0, 0);
+        push_question(&mut response_packet, "example.com", 1, 1);
+
+        let mut unsupported_opcode = Vec::new();
+        push_header_with_flags(&mut unsupported_opcode, 0x0900, 1, 0, 0, 0);
+        push_question(&mut unsupported_opcode, "example.com", 1, 1);
+
+        let mut unexpected_answer = Vec::new();
+        push_header(&mut unexpected_answer, 1, 1, 0, 0);
+        push_question(&mut unexpected_answer, "example.com", 1, 1);
+
+        let mut malformed_edns = Vec::new();
+        push_header(&mut malformed_edns, 1, 0, 0, 1);
+        push_question(&mut malformed_edns, "example.com", 1, 1);
+        push_opt_record(&mut malformed_edns, 1232, false, &[0, 15, 0, 4, 1, 2]);
+
+        let mut multiple_questions = Vec::new();
+        push_header(&mut multiple_questions, 2, 0, 0, 0);
+        push_question(&mut multiple_questions, "example.com", 1, 1);
+        push_question(&mut multiple_questions, "example.net", 1, 1);
+
+        for message in [
+            response_packet,
+            unsupported_opcode,
+            unexpected_answer,
+            malformed_edns,
+            multiple_questions,
+        ] {
+            assert_eq!(
+                Message::parse_standard_query_owned(message.clone()),
+                Message::parse_standard_query(&message)
+            );
+        }
     }
 
     #[test]

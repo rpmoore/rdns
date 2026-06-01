@@ -25,7 +25,7 @@ use tokio::net::UdpSocket;
 use tokio::time::{self, Instant};
 
 use crate::config::{RuntimeConfig, UpstreamConfig, UpstreamProtocol};
-use crate::protocol::{encode_tcp_frame, rewrite_response_id, Message};
+use crate::protocol::{encode_tcp_frame, first_question, rewrite_response_id, Message};
 use crate::resolver::{UpstreamError, UpstreamRequest, UpstreamResolver, UpstreamResponse};
 
 const DEGRADED_FAILURE_THRESHOLD: u32 = 2;
@@ -207,26 +207,32 @@ impl UdpUpstreamResolver {
         &self,
         request: UpstreamRequest,
     ) -> Result<UpstreamResponse, UpstreamError> {
-        self.resolve_attempt(&self.upstreams[0], request, self.upstreams[0].timeout)
-            .await
+        let mut upstream_query = request.query.message.original_bytes.to_vec();
+        self.resolve_attempt(
+            &self.upstreams[0],
+            &request,
+            &mut upstream_query,
+            self.upstreams[0].timeout,
+        )
+        .await
     }
 
     async fn resolve_attempt(
         &self,
         upstream: &UpstreamConfig,
-        request: UpstreamRequest,
+        request: &UpstreamRequest,
+        upstream_query: &mut [u8],
         attempt_timeout: Duration,
     ) -> Result<UpstreamResponse, UpstreamError> {
         let attempt_deadline = Instant::now() + attempt_timeout;
         let upstream_id = self.id_generator.next_id();
         let client_id = request.query.message.header.id;
-        let mut upstream_query = request.query.message.original_bytes.clone();
-        rewrite_response_id(&mut upstream_query, upstream_id)
+        rewrite_response_id(upstream_query, upstream_id)
             .map_err(|_| UpstreamError::MalformedResponse)?;
 
         let socket = bind_ephemeral_for(upstream.endpoint).await?;
         socket
-            .send_to(&upstream_query, upstream.endpoint)
+            .send_to(upstream_query, upstream.endpoint)
             .await
             .map_err(transport_error)?;
 
@@ -241,23 +247,23 @@ impl UdpUpstreamResolver {
         response_bytes.truncate(response_len);
 
         validate_upstream_response_source(source, upstream.endpoint)?;
-        if truncated_response_matches_request(&request, &response_bytes, upstream_id)? {
+        if truncated_response_matches_request(request, &response_bytes, upstream_id)? {
             return resolve_tcp_fallback(
                 upstream,
-                &request,
-                &upstream_query,
+                request,
+                upstream_query,
                 upstream_id,
                 client_id,
                 attempt_deadline,
             )
             .await;
         }
-        let response = validate_upstream_response(&request, &response_bytes, upstream_id)?;
+        let response = validate_upstream_response(request, &response_bytes, upstream_id)?;
         if response.header.tc() {
             return resolve_tcp_fallback(
                 upstream,
-                &request,
-                &upstream_query,
+                request,
+                upstream_query,
                 upstream_id,
                 client_id,
                 attempt_deadline,
@@ -279,6 +285,7 @@ impl UdpUpstreamResolver {
     ) -> Result<UpstreamResponse, UpstreamError> {
         let deadline = Instant::now() + self.per_query_deadline;
         let mut last_error = None;
+        let mut upstream_query = request.query.message.original_bytes.to_vec();
 
         for index in self.attempt_order(Instant::now()) {
             let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
@@ -291,7 +298,7 @@ impl UdpUpstreamResolver {
             let upstream = &self.upstreams[index];
             let attempt_timeout = remaining.min(upstream.timeout);
             let result = self
-                .resolve_attempt(upstream, request.clone(), attempt_timeout)
+                .resolve_attempt(upstream, &request, &mut upstream_query, attempt_timeout)
                 .await;
             match result {
                 Ok(response) => {
@@ -464,12 +471,9 @@ fn validate_response_question_prefix(
     request: &UpstreamRequest,
     response_bytes: &[u8],
 ) -> Result<(), UpstreamError> {
-    let question_end = question_end_offset(response_bytes)?;
-    let mut question_only = response_bytes[..question_end].to_vec();
-    question_only[6..12].fill(0);
-    let response = Message::parse(&question_only).map_err(|_| UpstreamError::MalformedResponse)?;
-    if response.questions.len() != 1 || response.questions[0] != request.query.message.questions[0]
-    {
+    question_end_offset(response_bytes)?;
+    let question = first_question(response_bytes).map_err(|_| UpstreamError::MalformedResponse)?;
+    if question != request.query.message.questions[0] {
         return Err(UpstreamError::QuestionMismatch);
     }
     Ok(())
@@ -582,6 +586,8 @@ mod tests {
     use crate::config::UpstreamConfig;
     use crate::resolver::DecodedQuery;
 
+    static PORT_PAIR_BIND: Mutex<()> = Mutex::new(());
+
     struct FixedTransactionId(u16);
 
     impl TransactionIdGenerator for FixedTransactionId {
@@ -680,6 +686,25 @@ mod tests {
         let mut query = vec![0u8; query_len];
         stream.read_exact(&mut query).await.unwrap();
         query
+    }
+
+    fn bind_udp_tcp_pair() -> (UdpSocket, TcpListener, SocketAddr) {
+        let _guard = PORT_PAIR_BIND.lock().unwrap();
+        for _ in 0..100 {
+            let udp_socket = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+            let addr = udp_socket.local_addr().unwrap();
+            let Ok(tcp_listener) = std::net::TcpListener::bind(addr) else {
+                continue;
+            };
+            udp_socket.set_nonblocking(true).unwrap();
+            tcp_listener.set_nonblocking(true).unwrap();
+            return (
+                UdpSocket::from_std(udp_socket).unwrap(),
+                TcpListener::from_std(tcp_listener).unwrap(),
+                addr,
+            );
+        }
+        panic!("failed to bind paired UDP/TCP test sockets");
     }
 
     #[test]
@@ -898,9 +923,7 @@ mod tests {
 
     #[tokio::test]
     async fn udp_upstream_falls_back_to_tcp_on_truncated_response() {
-        let tcp_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let upstream_addr = tcp_listener.local_addr().unwrap();
-        let udp_socket = UdpSocket::bind(upstream_addr).await.unwrap();
+        let (udp_socket, tcp_listener, upstream_addr) = bind_udp_tcp_pair();
         let seen_tcp_query = Arc::new(Mutex::new(Vec::new()));
 
         let udp_task = tokio::spawn(async move {
@@ -944,9 +967,7 @@ mod tests {
 
     #[tokio::test]
     async fn udp_upstream_falls_back_to_tcp_when_truncated_udp_parse_fails() {
-        let tcp_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let upstream_addr = tcp_listener.local_addr().unwrap();
-        let udp_socket = UdpSocket::bind(upstream_addr).await.unwrap();
+        let (udp_socket, tcp_listener, upstream_addr) = bind_udp_tcp_pair();
 
         let udp_task = tokio::spawn(async move {
             let mut request = [0u8; 512];
@@ -984,9 +1005,7 @@ mod tests {
 
     #[tokio::test]
     async fn tcp_fallback_rejects_response_id_mismatch() {
-        let tcp_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let upstream_addr = tcp_listener.local_addr().unwrap();
-        let udp_socket = UdpSocket::bind(upstream_addr).await.unwrap();
+        let (udp_socket, tcp_listener, upstream_addr) = bind_udp_tcp_pair();
 
         let udp_task = tokio::spawn(async move {
             let mut request = [0u8; 512];
@@ -1019,9 +1038,7 @@ mod tests {
 
     #[tokio::test]
     async fn tcp_fallback_timeout_returns_timeout() {
-        let tcp_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let upstream_addr = tcp_listener.local_addr().unwrap();
-        let udp_socket = UdpSocket::bind(upstream_addr).await.unwrap();
+        let (udp_socket, tcp_listener, upstream_addr) = bind_udp_tcp_pair();
 
         let udp_task = tokio::spawn(async move {
             let mut request = [0u8; 512];
@@ -1121,6 +1138,78 @@ mod tests {
         assert!(!health[0].degraded);
         assert_eq!(health[1].name, "secondary");
         assert_eq!(health[1].consecutive_failures, 0);
+    }
+
+    #[tokio::test]
+    async fn udp_upstream_reuses_query_buffer_for_failover_tcp_fallback() {
+        let first_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let first_addr = first_socket.local_addr().unwrap();
+        let (second_socket, tcp_listener, second_addr) = bind_udp_tcp_pair();
+
+        let second_udp_query = Arc::new(Mutex::new(Vec::new()));
+        let second_tcp_query = Arc::new(Mutex::new(Vec::new()));
+
+        let first_task = tokio::spawn(async move {
+            let mut request = [0u8; 512];
+            let (_, source) = first_socket.recv_from(&mut request).await.unwrap();
+            first_socket
+                .send_to(&a_response(0x9999, "example.com"), source)
+                .await
+                .unwrap();
+        });
+
+        let second_udp_query_task = second_udp_query.clone();
+        let second_udp_task = tokio::spawn(async move {
+            let mut request = [0u8; 512];
+            let (request_len, source) = second_socket.recv_from(&mut request).await.unwrap();
+            second_udp_query_task
+                .lock()
+                .unwrap()
+                .extend_from_slice(&request[..request_len]);
+            second_socket
+                .send_to(&truncated_response(0x2222, "example.com"), source)
+                .await
+                .unwrap();
+        });
+
+        let second_tcp_query_task = second_tcp_query.clone();
+        let second_tcp_task = tokio::spawn(async move {
+            let (mut stream, _) = tcp_listener.accept().await.unwrap();
+            let query = read_tcp_query(&mut stream).await;
+            second_tcp_query_task
+                .lock()
+                .unwrap()
+                .extend_from_slice(&query);
+            let response = encode_tcp_frame(&a_response(0x2222, "example.com"), 512).unwrap();
+            stream.write_all(&response).await.unwrap();
+        });
+
+        let resolver = UdpUpstreamResolver::with_upstreams_and_id_generator(
+            vec![
+                upstream_config_with("primary", first_addr, 10, Duration::from_secs(1)),
+                upstream_config_with("secondary", second_addr, 20, Duration::from_secs(1)),
+            ],
+            Duration::from_secs(2),
+            Arc::new(SequenceTransactionIds::new([0x1111, 0x2222])),
+        )
+        .unwrap();
+
+        let original_query = a_query(0x1234, "example.com");
+        let response = resolver
+            .resolve(upstream_request(0x1234, "example.com"))
+            .await
+            .unwrap();
+
+        first_task.await.unwrap();
+        second_udp_task.await.unwrap();
+        second_tcp_task.await.unwrap();
+        let second_udp_query = second_udp_query.lock().unwrap();
+        let second_tcp_query = second_tcp_query.lock().unwrap();
+        assert_eq!(&second_udp_query[0..2], &[0x22, 0x22]);
+        assert_eq!(&second_tcp_query[0..2], &[0x22, 0x22]);
+        assert_eq!(&second_udp_query[2..], &original_query[2..]);
+        assert_eq!(&second_tcp_query[2..], &original_query[2..]);
+        assert_eq!(&response.bytes[0..2], &[0x12, 0x34]);
     }
 
     #[tokio::test]

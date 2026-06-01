@@ -503,6 +503,7 @@ dependencies = [
 name = "rdns"
 version = "0.1.0"
 dependencies = [
+ "bytes",
  "opentelemetry",
  "opentelemetry-otlp",
  "opentelemetry_sdk",

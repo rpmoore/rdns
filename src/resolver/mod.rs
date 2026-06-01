@@ -19,11 +19,12 @@ use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime};
 
+use bytes::Bytes;
 use tokio::sync::{mpsc, Notify};
 
 use crate::protocol::{
     age_response_ttls, build_formerr_response, build_refused_response, build_servfail_response,
-    cap_response_ttls, question_wire, rewrite_response_id, rewrite_response_request_fields,
+    cap_response_ttls, message_question_wire, rewrite_response_id, rewrite_response_request_fields,
     Message, QueryValidationError, RecordData, ResponseCode,
 };
 
@@ -134,7 +135,7 @@ impl CacheKey {
     ) -> Self {
         Self::new(
             query.question.clone(),
-            query.question_wire.clone(),
+            query.question_wire.to_vec(),
             query.features.clone(),
             upstream_policy_variant,
             query
@@ -154,14 +155,14 @@ pub struct CacheLookupRequest {
 pub struct DecodedQuery {
     pub message: Message,
     pub question: QuestionKey,
-    pub question_wire: Vec<u8>,
+    pub question_wire: Bytes,
     pub features: QueryFeatures,
 }
 
 impl DecodedQuery {
     pub fn new(message: Message) -> Option<Self> {
         let question = QuestionKey::from_message(&message)?;
-        let question_wire = question_wire(&message.original_bytes).ok()?;
+        let question_wire = message_question_wire(&message).ok()?;
         let features = QueryFeatures::from_message(&message);
         Some(Self {
             message,
@@ -536,12 +537,13 @@ impl ResolveQuery {
         }
     }
 
-    pub async fn resolve(&self, request: ResolveRequest) -> ResolveOutcome {
+    pub async fn resolve(&self, mut request: ResolveRequest) -> ResolveOutcome {
         self.metrics.increment(ResolverMetric::QueryReceived);
         let started_at = self.clock.now();
         let request_id = request_id_from_wire(&request.bytes);
+        let request_bytes = std::mem::take(&mut request.bytes);
 
-        let decoded = match self.protocol.decode_query(&request.bytes) {
+        let decoded = match self.protocol.decode_query_owned(request_bytes) {
             Ok(decoded) => decoded,
             Err(error) => {
                 self.metrics.increment(ResolverMetric::ProtocolError);
@@ -557,14 +559,13 @@ impl ResolveQuery {
 
         self.metrics.increment(ResolverMetric::QueryAllowed);
         let question = decoded.question.clone();
-        let cache_lookup_allowed = cache_supported(&decoded);
-        let cache_key = CacheKey::from_query(
-            &decoded,
-            None,
-            self.protocol.configured_max_udp_payload_size(),
-        );
-        let mut cache_store_allowed = cache_lookup_allowed;
-        if cache_lookup_allowed {
+        let mut cache_store_allowed = false;
+        let cache_key = if cache_supported(&decoded) {
+            let cache_key = CacheKey::from_query(
+                &decoded,
+                None,
+                self.protocol.configured_max_udp_payload_size(),
+            );
             let lookup = self
                 .cache
                 .lookup(&CacheLookupRequest {
@@ -618,81 +619,102 @@ impl ResolveQuery {
                     self.metrics.increment(ResolverMetric::CacheMiss);
                 }
             }
+            Some(cache_key)
         } else {
             self.metrics.increment(ResolverMetric::CacheBypass);
             self.metrics.increment(ResolverMetric::CacheMiss);
-        }
+            None
+        };
 
-        if cache_store_allowed {
-            match self.miss_coalescer.begin(cache_key.clone()) {
-                SingleFlightTicket::Leader { key, flight } => {
-                    let guard = SingleFlightLeader::new(
-                        Arc::clone(&self.miss_coalescer),
-                        key,
-                        Arc::clone(&flight),
-                    );
-                    let upstream_result = self
-                        .upstream
-                        .resolve(UpstreamRequest {
-                            query: decoded.clone(),
-                        })
-                        .await;
-                    let outcome = self
-                        .finish_upstream_result(
+        if let Some(cache_key) = cache_key {
+            if cache_store_allowed {
+                match self.miss_coalescer.begin(cache_key.clone()) {
+                    SingleFlightTicket::Leader { key, flight } => {
+                        let guard = SingleFlightLeader::new(
+                            Arc::clone(&self.miss_coalescer),
+                            key,
+                            Arc::clone(&flight),
+                        );
+                        let upstream_result = self
+                            .upstream
+                            .resolve(UpstreamRequest {
+                                query: decoded.clone(),
+                            })
+                            .await;
+                        let outcome = self
+                            .finish_upstream_result(
+                                started_at,
+                                &request,
+                                &decoded,
+                                question,
+                                Some(cache_key),
+                                true,
+                                upstream_result.clone(),
+                            )
+                            .await;
+                        guard.complete(upstream_result);
+                        outcome
+                    }
+                    SingleFlightTicket::Follower { flight } => {
+                        self.metrics.increment(ResolverMetric::CacheCoalescedMiss);
+                        let upstream_result = flight.wait().await;
+                        if let CacheLookup::Hit(cached) = self
+                            .cache
+                            .lookup(&CacheLookupRequest {
+                                key: cache_key.clone(),
+                                received_at: request.received_at.0,
+                            })
+                            .await
+                        {
+                            if cached.expires_at <= request.received_at.0 {
+                                self.metrics.increment(ResolverMetric::CacheExpired);
+                            }
+                            if let Ok(response_bytes) = self.protocol.serialize_cached_response(
+                                &decoded,
+                                &cached,
+                                request.received_at.0,
+                            ) {
+                                if response_is_truncated(&response_bytes) {
+                                    self.metrics
+                                        .increment(ResolverMetric::CacheResponseTruncated);
+                                }
+                                let decision = ResolveDecision {
+                                    client_ip: request.client_ip,
+                                    question: Some(question),
+                                    kind: ResolveDecisionKind::CacheHit,
+                                };
+                                return self.finish(started_at, decision, response_bytes).await;
+                            }
+                        }
+                        self.finish_upstream_result(
                             started_at,
                             &request,
                             &decoded,
                             question,
-                            cache_key,
-                            true,
-                            upstream_result.clone(),
+                            Some(cache_key),
+                            false,
+                            upstream_result,
                         )
-                        .await;
-                    guard.complete(upstream_result);
-                    outcome
-                }
-                SingleFlightTicket::Follower { flight } => {
-                    self.metrics.increment(ResolverMetric::CacheCoalescedMiss);
-                    let upstream_result = flight.wait().await;
-                    if let CacheLookup::Hit(cached) = self
-                        .cache
-                        .lookup(&CacheLookupRequest {
-                            key: cache_key.clone(),
-                            received_at: request.received_at.0,
-                        })
                         .await
-                    {
-                        if cached.expires_at <= request.received_at.0 {
-                            self.metrics.increment(ResolverMetric::CacheExpired);
-                        }
-                        if let Ok(response_bytes) = self.protocol.serialize_cached_response(
-                            &decoded,
-                            &cached,
-                            request.received_at.0,
-                        ) {
-                            if response_is_truncated(&response_bytes) {
-                                self.metrics
-                                    .increment(ResolverMetric::CacheResponseTruncated);
-                            }
-                            let decision = ResolveDecision {
-                                client_ip: request.client_ip,
-                                question: Some(question),
-                                kind: ResolveDecisionKind::CacheHit,
-                            };
-                            return self.finish(started_at, decision, response_bytes).await;
-                        }
                     }
-                    self.finish_upstream_result(
-                        started_at,
-                        &request,
-                        &decoded,
-                        question,
-                        cache_key,
-                        false,
-                        upstream_result,
-                    )
-                    .await
                 }
+            } else {
+                let upstream_result = self
+                    .upstream
+                    .resolve(UpstreamRequest {
+                        query: decoded.clone(),
+                    })
+                    .await;
+                self.finish_upstream_result(
+                    started_at,
+                    &request,
+                    &decoded,
+                    question,
+                    Some(cache_key),
+                    false,
+                    upstream_result,
+                )
+                .await
             }
         } else {
             let upstream_result = self
@@ -706,7 +728,7 @@ impl ResolveQuery {
                 &request,
                 &decoded,
                 question,
-                cache_key,
+                None,
                 false,
                 upstream_result,
             )
@@ -721,7 +743,7 @@ impl ResolveQuery {
         request: &ResolveRequest,
         decoded: &DecodedQuery,
         question: QuestionKey,
-        cache_key: CacheKey,
+        cache_key: Option<CacheKey>,
         cache_store_allowed: bool,
         upstream_result: Result<UpstreamResponse, UpstreamError>,
     ) -> ResolveOutcome {
@@ -748,7 +770,7 @@ impl ResolveQuery {
                     let response_bytes = self.responses.servfail(Some(decoded));
                     return self.finish(started_at, decision, response_bytes).await;
                 }
-                if cache_store_allowed {
+                if let (true, Some(cache_key)) = (cache_store_allowed, cache_key) {
                     if let Some(store) = self.cache_store_for_response(
                         cache_key,
                         response_bytes.clone(),
@@ -982,6 +1004,11 @@ impl ProtocolCodec for StandardProtocolCodec {
         DecodedQuery::new(message).ok_or(QueryValidationError::InvalidQuestionCount { count: 0 })
     }
 
+    fn decode_query_owned(&self, bytes: Vec<u8>) -> Result<DecodedQuery, QueryValidationError> {
+        let message = Message::parse_standard_query_owned(bytes)?;
+        DecodedQuery::new(message).ok_or(QueryValidationError::InvalidQuestionCount { count: 0 })
+    }
+
     fn configured_max_udp_payload_size(&self) -> usize {
         self.configured_max_udp_payload_size
     }
@@ -1056,6 +1083,10 @@ fn build_header_only_protocol_error(request_id: u16, rcode: ResponseCode) -> Vec
 
 pub trait ProtocolCodec: Send + Sync {
     fn decode_query(&self, bytes: &[u8]) -> Result<DecodedQuery, QueryValidationError>;
+
+    fn decode_query_owned(&self, bytes: Vec<u8>) -> Result<DecodedQuery, QueryValidationError> {
+        self.decode_query(&bytes)
+    }
 
     fn configured_max_udp_payload_size(&self) -> usize;
 
@@ -1343,7 +1374,7 @@ mod tests {
     use super::*;
     use std::sync::Mutex;
 
-    use crate::protocol::{build_a_block_response, Header, Question, Record};
+    use crate::protocol::{build_a_block_response, question_wire, Header, Question, Record};
 
     fn a_query(id: u16, name: &str) -> Vec<u8> {
         let mut bytes = Vec::new();
@@ -1535,6 +1566,60 @@ mod tests {
         }
     }
 
+    #[derive(Default)]
+    struct OwnedOnlyProtocolCodec {
+        borrowed_calls: Mutex<usize>,
+        owned_calls: Mutex<usize>,
+        expected_owned_ptr: Mutex<Option<usize>>,
+        received_owned_ptr: Mutex<Option<usize>>,
+    }
+
+    impl OwnedOnlyProtocolCodec {
+        fn expect_owned_ptr(expected_owned_ptr: *const u8) -> Self {
+            Self {
+                expected_owned_ptr: Mutex::new(Some(expected_owned_ptr as usize)),
+                ..Self::default()
+            }
+        }
+    }
+
+    impl ProtocolCodec for OwnedOnlyProtocolCodec {
+        fn decode_query(&self, _bytes: &[u8]) -> Result<DecodedQuery, QueryValidationError> {
+            *self.borrowed_calls.lock().unwrap() += 1;
+            panic!("resolve should decode owned request bytes");
+        }
+
+        fn decode_query_owned(&self, bytes: Vec<u8>) -> Result<DecodedQuery, QueryValidationError> {
+            *self.owned_calls.lock().unwrap() += 1;
+            *self.received_owned_ptr.lock().unwrap() = Some(bytes.as_ptr() as usize);
+            if let Some(expected) = *self.expected_owned_ptr.lock().unwrap() {
+                assert_eq!(bytes.as_ptr() as usize, expected);
+            }
+            StandardProtocolCodec::new(1232).decode_query_owned(bytes)
+        }
+
+        fn configured_max_udp_payload_size(&self) -> usize {
+            1232
+        }
+
+        fn rewrite_response_id(
+            &self,
+            response_bytes: &mut [u8],
+            request_id: u16,
+        ) -> crate::protocol::Result<()> {
+            rewrite_response_id(response_bytes, request_id)
+        }
+
+        fn serialize_cached_response(
+            &self,
+            query: &DecodedQuery,
+            cached: &CachedResponse,
+            now: SystemTime,
+        ) -> crate::protocol::Result<Vec<u8>> {
+            StandardProtocolCodec::new(1232).serialize_cached_response(query, cached, now)
+        }
+    }
+
     struct StaticUpstream {
         response: Result<UpstreamResponse, UpstreamError>,
         requests: Mutex<Vec<UpstreamRequest>>,
@@ -1670,6 +1755,68 @@ mod tests {
         build_a_block_response(&query, "192.0.2.10".parse().unwrap(), ttl)
     }
 
+    #[tokio::test]
+    async fn resolve_decodes_owned_request_bytes() {
+        let request_bytes = a_query(0x1234, "example.com");
+        let request_ptr = request_bytes.as_ptr();
+        let codec = Arc::new(OwnedOnlyProtocolCodec::expect_owned_ptr(request_ptr));
+        let upstream = Arc::new(StaticUpstream::new(Ok(UpstreamResponse {
+            bytes: a_response_with_answer(0x1234, "example.com", 60),
+            received_at: SystemTime::UNIX_EPOCH,
+        })));
+        let events = Arc::new(RecordingEvents::default());
+        let metrics = Arc::new(RecordingMetrics::default());
+        let service = ResolveQuery::new(
+            codec.clone(),
+            upstream,
+            Arc::new(BasicResponseFactory),
+            Arc::new(FixedClock(SystemTime::UNIX_EPOCH)),
+            events,
+            metrics,
+        );
+
+        let outcome = service
+            .resolve(ResolveRequest::new(
+                "192.0.2.10".parse().unwrap(),
+                SystemTime::UNIX_EPOCH,
+                request_bytes,
+            ))
+            .await;
+
+        assert_eq!(outcome.decision.kind, ResolveDecisionKind::Allowed);
+        assert_eq!(*codec.owned_calls.lock().unwrap(), 1);
+        assert_eq!(*codec.borrowed_calls.lock().unwrap(), 0);
+        assert_eq!(
+            *codec.received_owned_ptr.lock().unwrap(),
+            Some(request_ptr as usize)
+        );
+    }
+
+    #[test]
+    fn decoded_query_question_wire_slices_original_message_bytes() {
+        let query_bytes = a_query(0x1234, "Example.COM");
+        let message = Message::parse_standard_query_owned(query_bytes.clone()).unwrap();
+        let decoded = DecodedQuery::new(message).unwrap();
+
+        assert_eq!(decoded.question_wire.as_ref(), &query_bytes[12..]);
+        assert_eq!(
+            decoded.question_wire.as_ptr(),
+            decoded.message.original_bytes.as_ptr().wrapping_add(12)
+        );
+    }
+
+    #[test]
+    fn standard_protocol_codec_owned_decode_reuses_input_buffer() {
+        let query_bytes = a_query(0x1234, "example.com");
+        let original_ptr = query_bytes.as_ptr();
+
+        let decoded = StandardProtocolCodec::new(1232)
+            .decode_query_owned(query_bytes)
+            .unwrap();
+
+        assert_eq!(decoded.message.original_bytes.as_ptr(), original_ptr);
+    }
+
     fn multi_question_a_response_with_answer(id: u16, name: &str, ttl: u32) -> Vec<u8> {
         let query = a_query(id, name);
         let mut response = a_response_with_answer(id, name, ttl);
@@ -1739,7 +1886,9 @@ mod tests {
         let entry = CacheStore {
             key: CacheKey::new(
                 question,
-                question_wire(&aaaa_query(0x1000, "example.com")).unwrap(),
+                question_wire(&aaaa_query(0x1000, "example.com"))
+                    .unwrap()
+                    .to_vec(),
                 QueryFeatures {
                     recursion_desired: true,
                     dnssec_ok: false,
@@ -1772,7 +1921,7 @@ mod tests {
     fn cache_key(name: &str) -> CacheKey {
         CacheKey::new(
             QuestionKey::new(name, 1, 1),
-            question_wire(&a_query(0x1000, name)).unwrap(),
+            question_wire(&a_query(0x1000, name)).unwrap().to_vec(),
             QueryFeatures {
                 recursion_desired: true,
                 dnssec_ok: false,
@@ -1809,7 +1958,7 @@ mod tests {
                 ns_count: authorities.len() as u16,
                 ar_count: 0,
             },
-            original_bytes: Vec::new(),
+            original_bytes: Vec::new().into(),
             questions: vec![Question {
                 qname: "example.com".to_string(),
                 qtype: 1,
