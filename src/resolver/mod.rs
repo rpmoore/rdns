@@ -674,6 +674,7 @@ impl ResolveQuery {
                                 &cached,
                                 request.received_at.0,
                             ) {
+                                self.metrics.increment(ResolverMetric::CacheHit);
                                 if response_is_truncated(&response_bytes) {
                                     self.metrics
                                         .increment(ResolverMetric::CacheResponseTruncated);
@@ -2830,7 +2831,7 @@ mod tests {
         assert_eq!(first.decision.kind, ResolveDecisionKind::Allowed);
         assert_eq!(second.decision.kind, ResolveDecisionKind::CacheHit);
         assert_eq!(metrics.count(ResolverMetric::CacheCoalescedMiss), 1);
-        assert_eq!(metrics.count(ResolverMetric::CacheHit), 0);
+        assert_eq!(metrics.count(ResolverMetric::CacheHit), 1);
         assert_eq!(metrics.count(ResolverMetric::CacheMiss), 2);
     }
 
