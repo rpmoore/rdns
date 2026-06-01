@@ -566,7 +566,7 @@ impl ResolveQuery {
         self.metrics.increment(ResolverMetric::QueryAllowed);
         let question = decoded.question.clone();
 
-        let cache_probe = self.probe_cache(&request, &decoded).await;
+        let mut cache_probe = self.probe_cache(&request, &decoded).await;
         if let Some(response_bytes) = cache_probe.hit {
             let decision = ResolveDecision {
                 client_ip: request.client_ip,
@@ -576,7 +576,7 @@ impl ResolveQuery {
             return self.finish(started_at, decision, response_bytes).await;
         }
 
-        if let (Some(cache_key), true) = (cache_probe.key.clone(), cache_probe.store_allowed) {
+        if let (Some(cache_key), true) = (cache_probe.key.take(), cache_probe.store_allowed) {
             return self
                 .resolve_coalesced_miss(started_at, &request, &decoded, question, cache_key)
                 .await;

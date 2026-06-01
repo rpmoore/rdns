@@ -258,13 +258,13 @@ impl UdpUpstreamResolver {
         validate_upstream_response_source(source, upstream.endpoint)?;
         if truncated_response_matches_request(request, &response_bytes, attempt.upstream_id)? {
             return self
-                .resolve_tcp_fallback(upstream, request, upstream_query, attempt)
+                .resolve_tcp_fallback_attempt(upstream, request, upstream_query, attempt)
                 .await;
         }
         let response = validate_upstream_response(request, &response_bytes, attempt.upstream_id)?;
         if response.header.tc() {
             return self
-                .resolve_tcp_fallback(upstream, request, upstream_query, attempt)
+                .resolve_tcp_fallback_attempt(upstream, request, upstream_query, attempt)
                 .await;
         }
         rewrite_response_id(&mut response_bytes, attempt.client_id)
@@ -312,14 +312,14 @@ impl UdpUpstreamResolver {
         Err(last_error.unwrap_or(UpstreamError::Timeout))
     }
 
-    async fn resolve_tcp_fallback(
+    async fn resolve_tcp_fallback_attempt(
         &self,
         upstream: &UpstreamConfig,
         request: &UpstreamRequest,
         upstream_query: &[u8],
         attempt: UpstreamAttempt,
     ) -> Result<UpstreamResponse, UpstreamError> {
-        self::resolve_tcp_fallback(
+        resolve_tcp_fallback(
             upstream,
             request,
             upstream_query,
