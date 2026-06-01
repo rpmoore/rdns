@@ -27,7 +27,7 @@ use rdns::resolver::{
     InMemoryDnsCache, MetricsSink, QueryEventSink, ResolveDecision, ResolveQuery, ResolverMetric,
     StandardProtocolCodec,
 };
-use tokio::task::JoinSet;
+use tokio::task::{JoinError, JoinSet};
 
 const DEFAULT_CACHE_ENTRIES: usize = 10_000;
 const QUERY_EVENT_QUEUE_CAPACITY: usize = 1024;
@@ -97,9 +97,10 @@ async fn main() -> io::Result<()> {
         }
         result = server_tasks.join_next() => {
             match result {
-                Some(Ok(Ok(()))) => println!("DNS listener stopped"),
-                Some(Ok(Err(error))) => return Err(error),
-                Some(Err(error)) => return Err(io::Error::other(format!("DNS listener task failed: {error}"))),
+                Some(result) => {
+                    listener_task_result_to_io(result)?;
+                    println!("DNS listener stopped");
+                }
                 None => return Ok(()),
             }
         }
@@ -110,15 +111,7 @@ async fn main() -> io::Result<()> {
     }
 
     while let Some(result) = server_tasks.join_next().await {
-        match result {
-            Ok(Ok(())) => {}
-            Ok(Err(error)) => return Err(error),
-            Err(error) => {
-                return Err(io::Error::other(format!(
-                    "DNS listener task failed: {error}"
-                )));
-            }
-        }
+        listener_task_result_to_io(result)?;
     }
 
     event_drain.abort();
@@ -133,6 +126,10 @@ async fn main() -> io::Result<()> {
     }
 
     Ok(())
+}
+
+fn listener_task_result_to_io(result: Result<io::Result<()>, JoinError>) -> io::Result<()> {
+    result.map_err(|error| io::Error::other(format!("DNS listener task failed: {error}")))?
 }
 
 struct SystemClock;

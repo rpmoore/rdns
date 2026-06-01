@@ -124,9 +124,7 @@ impl UdpDnsServer {
                 tokio::select! {
                     _ = &mut shutdown => break,
                     result = self.receive_permitted_datagram(semaphore.clone()) => {
-                        if let Some(datagram) = result? {
-                            self.spawn_datagram_task(datagram, &mut tasks);
-                        } else {
+                        if !self.spawn_received_datagram(result?, &mut tasks) {
                             break;
                         }
                     }
@@ -135,9 +133,7 @@ impl UdpDnsServer {
                 tokio::select! {
                     _ = &mut shutdown => break,
                     result = self.receive_permitted_datagram(semaphore.clone()) => {
-                        if let Some(datagram) = result? {
-                            self.spawn_datagram_task(datagram, &mut tasks);
-                        } else {
+                        if !self.spawn_received_datagram(result?, &mut tasks) {
                             break;
                         }
                     }
@@ -154,6 +150,18 @@ impl UdpDnsServer {
             task_result_to_io(result)??;
         }
         Ok(())
+    }
+
+    fn spawn_received_datagram(
+        &self,
+        datagram: Option<ReceivedDatagram>,
+        tasks: &mut JoinSet<io::Result<()>>,
+    ) -> bool {
+        let Some(datagram) = datagram else {
+            return false;
+        };
+        self.spawn_datagram_task(datagram, tasks);
+        true
     }
 
     async fn receive_permitted_datagram(
