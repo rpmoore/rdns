@@ -606,10 +606,8 @@ impl ResolveQuery {
             SingleFlightTicket::Leader { key, flight } => {
                 let guard = SingleFlightLeader::new(Arc::clone(&self.miss_coalescer), key, flight);
                 let upstream_result = self.resolve_upstream(decoded).await;
-                guard.complete(upstream_result.clone());
-                let outcome = self
-                    .finish_upstream_result(
-                        started_at,
+                let (decision, response_bytes) = self
+                    .prepare_upstream_result(
                         request,
                         decoded,
                         question,
@@ -618,7 +616,8 @@ impl ResolveQuery {
                         upstream_result.clone(),
                     )
                     .await;
-                outcome
+                guard.complete(upstream_result);
+                self.finish(started_at, decision, response_bytes).await
             }
             SingleFlightTicket::Follower { flight } => {
                 self.metrics.increment(ResolverMetric::CacheCoalescedMiss);
@@ -788,10 +787,30 @@ impl ResolveQuery {
         cache_store_allowed: bool,
         upstream_result: Result<UpstreamResponse, UpstreamError>,
     ) -> ResolveOutcome {
+        let (decision, response_bytes) = self
+            .prepare_upstream_result(
+                request,
+                decoded,
+                question,
+                cache_key,
+                cache_store_allowed,
+                upstream_result,
+            )
+            .await;
+        self.finish(started_at, decision, response_bytes).await
+    }
+
+    async fn prepare_upstream_result(
+        &self,
+        request: &ResolveRequest,
+        decoded: &DecodedQuery,
+        question: QuestionKey,
+        cache_key: Option<CacheKey>,
+        cache_store_allowed: bool,
+        upstream_result: Result<UpstreamResponse, UpstreamError>,
+    ) -> (ResolveDecision, Vec<u8>) {
         let Ok(response) = upstream_result else {
-            return self
-                .finish_upstream_failure(started_at, request, decoded, question)
-                .await;
+            return self.upstream_failure_response(request, decoded, question);
         };
 
         self.metrics.increment(ResolverMetric::UpstreamSuccess);
@@ -801,9 +820,7 @@ impl ResolveQuery {
             .rewrite_response_id(&mut response_bytes, decoded.message.header.id)
             .is_err()
         {
-            return self
-                .finish_upstream_failure(started_at, request, decoded, decoded.question.clone())
-                .await;
+            return self.upstream_failure_response(request, decoded, decoded.question.clone());
         }
 
         if let (true, Some(cache_key)) = (cache_store_allowed, cache_key) {
@@ -816,16 +833,15 @@ impl ResolveQuery {
             question: Some(question),
             kind: ResolveDecisionKind::Allowed,
         };
-        self.finish(started_at, decision, response_bytes).await
+        (decision, response_bytes)
     }
 
-    async fn finish_upstream_failure(
+    fn upstream_failure_response(
         &self,
-        started_at: SystemTime,
         request: &ResolveRequest,
         decoded: &DecodedQuery,
         question: QuestionKey,
-    ) -> ResolveOutcome {
+    ) -> (ResolveDecision, Vec<u8>) {
         self.metrics.increment(ResolverMetric::UpstreamFailure);
         let decision = ResolveDecision {
             client_ip: request.client_ip,
@@ -833,7 +849,7 @@ impl ResolveQuery {
             kind: ResolveDecisionKind::UpstreamFailure,
         };
         let response_bytes = self.responses.servfail(Some(decoded));
-        self.finish(started_at, decision, response_bytes).await
+        (decision, response_bytes)
     }
 
     async fn store_cache_response(
