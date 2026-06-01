@@ -319,7 +319,7 @@ impl UdpUpstreamResolver {
         upstream_query: &[u8],
         attempt: UpstreamAttempt,
     ) -> Result<UpstreamResponse, UpstreamError> {
-        resolve_tcp_fallback(
+        self::resolve_tcp_fallback(
             upstream,
             request,
             upstream_query,

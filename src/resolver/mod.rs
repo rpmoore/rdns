@@ -606,6 +606,7 @@ impl ResolveQuery {
             SingleFlightTicket::Leader { key, flight } => {
                 let guard = SingleFlightLeader::new(Arc::clone(&self.miss_coalescer), key, flight);
                 let upstream_result = self.resolve_upstream(decoded).await;
+                guard.complete(upstream_result.clone());
                 let outcome = self
                     .finish_upstream_result(
                         started_at,
@@ -617,7 +618,6 @@ impl ResolveQuery {
                         upstream_result.clone(),
                     )
                     .await;
-                guard.complete(upstream_result);
                 outcome
             }
             SingleFlightTicket::Follower { flight } => {
