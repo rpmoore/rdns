@@ -590,6 +590,7 @@ struct CacheProbe {
     key: Option<CacheKey>,
     hit: Option<Vec<u8>>,
     store_allowed: bool,
+    event_cache_result: Option<QueryEventCacheResult>,
 }
 
 pub struct ResolveQuery {
@@ -667,7 +668,9 @@ impl ResolveQuery {
                     kind: ResolveDecisionKind::ProtocolError(error.response_code()),
                 };
                 let response_bytes = self.responses.protocol_error(request_id, &error);
-                return self.finish(started_at, decision, response_bytes).await;
+                return self
+                    .finish(started_at, decision, response_bytes, None)
+                    .await;
             }
         };
 
@@ -681,12 +684,26 @@ impl ResolveQuery {
                 question: Some(question),
                 kind: ResolveDecisionKind::CacheHit,
             };
-            return self.finish(started_at, decision, response_bytes).await;
+            return self
+                .finish(
+                    started_at,
+                    decision,
+                    response_bytes,
+                    cache_probe.event_cache_result,
+                )
+                .await;
         }
 
         if let (Some(cache_key), true) = (cache_probe.key.take(), cache_probe.store_allowed) {
             return self
-                .resolve_coalesced_miss(started_at, &request, &decoded, question, cache_key)
+                .resolve_coalesced_miss(
+                    started_at,
+                    &request,
+                    &decoded,
+                    question,
+                    cache_key,
+                    cache_probe.event_cache_result,
+                )
                 .await;
         }
 
@@ -697,6 +714,7 @@ impl ResolveQuery {
             question,
             cache_probe.key,
             false,
+            cache_probe.event_cache_result,
         )
         .await
     }
@@ -709,6 +727,7 @@ impl ResolveQuery {
         decoded: &DecodedQuery,
         question: QuestionKey,
         cache_key: CacheKey,
+        event_cache_result: Option<QueryEventCacheResult>,
     ) -> ResolveOutcome {
         match self.miss_coalescer.begin(cache_key.clone()) {
             SingleFlightTicket::Leader { key, flight } => {
@@ -725,7 +744,8 @@ impl ResolveQuery {
                     )
                     .await;
                 guard.complete(upstream_result);
-                self.finish(started_at, decision, response_bytes).await
+                self.finish(started_at, decision, response_bytes, event_cache_result)
+                    .await
             }
             SingleFlightTicket::Follower { flight } => {
                 self.metrics.increment(ResolverMetric::CacheCoalescedMiss);
@@ -739,7 +759,14 @@ impl ResolveQuery {
                         question: Some(question),
                         kind: ResolveDecisionKind::CacheHit,
                     };
-                    return self.finish(started_at, decision, response_bytes).await;
+                    return self
+                        .finish(
+                            started_at,
+                            decision,
+                            response_bytes,
+                            Some(QueryEventCacheResult::Hit),
+                        )
+                        .await;
                 }
                 self.finish_upstream_result(
                     started_at,
@@ -748,6 +775,7 @@ impl ResolveQuery {
                     question,
                     Some(cache_key),
                     false,
+                    event_cache_result,
                     upstream_result,
                 )
                 .await
@@ -763,6 +791,7 @@ impl ResolveQuery {
         question: QuestionKey,
         cache_key: Option<CacheKey>,
         cache_store_allowed: bool,
+        event_cache_result: Option<QueryEventCacheResult>,
     ) -> ResolveOutcome {
         let upstream_result = self.resolve_upstream(decoded).await;
         self.finish_upstream_result(
@@ -772,6 +801,7 @@ impl ResolveQuery {
             question,
             cache_key,
             cache_store_allowed,
+            event_cache_result,
             upstream_result,
         )
         .await
@@ -796,6 +826,7 @@ impl ResolveQuery {
                 key: None,
                 hit: None,
                 store_allowed: false,
+                event_cache_result: Some(QueryEventCacheResult::Bypass),
             };
         }
 
@@ -815,30 +846,39 @@ impl ResolveQuery {
             key: Some(key),
             hit: None,
             store_allowed: matches!(lookup, CacheLookup::Miss | CacheLookup::Expired),
+            event_cache_result: Some(QueryEventCacheResult::Miss),
         };
 
         match lookup {
             CacheLookup::Hit(cached) => match self.serialize_cache_hit(decoded, &cached, request) {
-                Ok(response_bytes) => probe.hit = Some(response_bytes),
+                Ok(response_bytes) => {
+                    probe.event_cache_result = Some(QueryEventCacheResult::Hit);
+                    probe.hit = Some(response_bytes);
+                }
                 Err(_) => {
                     self.metrics.increment(ResolverMetric::CacheMiss);
                     probe.store_allowed = true;
+                    probe.event_cache_result = Some(QueryEventCacheResult::Miss);
                 }
             },
             CacheLookup::Miss => {
                 self.metrics.increment(ResolverMetric::CacheMiss);
+                probe.event_cache_result = Some(QueryEventCacheResult::Miss);
             }
             CacheLookup::Expired => {
                 self.metrics.increment(ResolverMetric::CacheExpired);
                 self.metrics.increment(ResolverMetric::CacheMiss);
+                probe.event_cache_result = Some(QueryEventCacheResult::Expired);
             }
             CacheLookup::Bypass(_) => {
                 self.metrics.increment(ResolverMetric::CacheBypass);
                 self.metrics.increment(ResolverMetric::CacheMiss);
+                probe.event_cache_result = Some(QueryEventCacheResult::Bypass);
             }
             CacheLookup::Unavailable => {
                 self.metrics.increment(ResolverMetric::CacheUnavailable);
                 self.metrics.increment(ResolverMetric::CacheMiss);
+                probe.event_cache_result = Some(QueryEventCacheResult::Unavailable);
             }
         }
 
@@ -893,6 +933,7 @@ impl ResolveQuery {
         question: QuestionKey,
         cache_key: Option<CacheKey>,
         cache_store_allowed: bool,
+        event_cache_result: Option<QueryEventCacheResult>,
         upstream_result: Result<UpstreamResponse, UpstreamError>,
     ) -> ResolveOutcome {
         let (decision, response_bytes) = self
@@ -905,7 +946,8 @@ impl ResolveQuery {
                 upstream_result,
             )
             .await;
-        self.finish(started_at, decision, response_bytes).await
+        self.finish(started_at, decision, response_bytes, event_cache_result)
+            .await
     }
 
     async fn prepare_upstream_result(
@@ -1016,6 +1058,7 @@ impl ResolveQuery {
         started_at: SystemTime,
         decision: ResolveDecision,
         response_bytes: Vec<u8>,
+        cache_result: Option<QueryEventCacheResult>,
     ) -> ResolveOutcome {
         let finished_at = self.clock.now();
         let latency = finished_at.duration_since(started_at).ok();
@@ -1024,7 +1067,7 @@ impl ResolveQuery {
             finished_at,
             &decision,
             response_code_from_wire(&response_bytes),
-            cache_result_from_decision(&decision.kind),
+            cache_result,
             latency,
         );
         self.record_query_event(event);
@@ -1177,13 +1220,6 @@ fn response_code_from_wire(bytes: &[u8]) -> Option<ResponseCode> {
         3 => Some(ResponseCode::NxDomain),
         4 => Some(ResponseCode::NotImp),
         5 => Some(ResponseCode::Refused),
-        _ => None,
-    }
-}
-
-fn cache_result_from_decision(kind: &ResolveDecisionKind) -> Option<QueryEventCacheResult> {
-    match kind {
-        ResolveDecisionKind::CacheHit => Some(QueryEventCacheResult::Hit),
         _ => None,
     }
 }
@@ -2837,7 +2873,22 @@ mod tests {
         assert_eq!(outcome.decision.question.unwrap().qname, "example.com");
         assert_eq!(outcome.decision.kind, ResolveDecisionKind::Allowed);
         assert_eq!(upstream.requests.lock().unwrap().len(), 1);
-        assert_eq!(events.events.lock().unwrap().len(), 1);
+        {
+            let recorded_events = events.events.lock().unwrap();
+            assert_eq!(recorded_events.len(), 1);
+            assert_eq!(
+                recorded_events[0].terminal_outcome,
+                QueryEventOutcome::AllowedFromBackend
+            );
+            assert_eq!(
+                recorded_events[0].response_code,
+                Some(ResponseCode::NoError)
+            );
+            assert_eq!(
+                recorded_events[0].cache_result,
+                Some(QueryEventCacheResult::Miss)
+            );
+        }
         assert!(metrics
             .increments
             .lock()
@@ -2863,8 +2914,13 @@ mod tests {
         let upstream = Arc::new(StaticUpstream::new(Err(UpstreamError::Timeout)));
         let events = Arc::new(RecordingEvents::default());
         let metrics = Arc::new(RecordingMetrics::default());
-        let service =
-            resolve_service_with_cache(upstream.clone(), cache, events, metrics.clone(), 1232);
+        let service = resolve_service_with_cache(
+            upstream.clone(),
+            cache,
+            events.clone(),
+            metrics.clone(),
+            1232,
+        );
 
         let outcome = service
             .resolve(ResolveRequest::new(
@@ -2877,6 +2933,22 @@ mod tests {
         assert_eq!(&outcome.response_bytes[0..2], &[0x22, 0x22]);
         assert_eq!(outcome.decision.kind, ResolveDecisionKind::CacheHit);
         assert!(upstream.requests.lock().unwrap().is_empty());
+        {
+            let recorded_events = events.events.lock().unwrap();
+            assert_eq!(recorded_events.len(), 1);
+            assert_eq!(
+                recorded_events[0].terminal_outcome,
+                QueryEventOutcome::AllowedFromCache
+            );
+            assert_eq!(
+                recorded_events[0].response_code,
+                Some(ResponseCode::NoError)
+            );
+            assert_eq!(
+                recorded_events[0].cache_result,
+                Some(QueryEventCacheResult::Hit)
+            );
+        }
         assert_eq!(metrics.count(ResolverMetric::CacheHit), 1);
         assert_eq!(metrics.count(ResolverMetric::CacheMiss), 0);
     }
@@ -3365,7 +3437,19 @@ mod tests {
             ResolveDecisionKind::ProtocolError(ResponseCode::FormErr)
         );
         assert!(upstream.requests.lock().unwrap().is_empty());
-        assert_eq!(events.events.lock().unwrap().len(), 1);
+        {
+            let recorded_events = events.events.lock().unwrap();
+            assert_eq!(recorded_events.len(), 1);
+            assert_eq!(
+                recorded_events[0].terminal_outcome,
+                QueryEventOutcome::ProtocolError(ResponseCode::FormErr)
+            );
+            assert_eq!(
+                recorded_events[0].response_code,
+                Some(ResponseCode::FormErr)
+            );
+            assert_eq!(recorded_events[0].cache_result, None);
+        }
         assert!(metrics
             .increments
             .lock()
@@ -3378,7 +3462,7 @@ mod tests {
         let upstream = Arc::new(StaticUpstream::new(Err(UpstreamError::Timeout)));
         let events = Arc::new(RecordingEvents::default());
         let metrics = Arc::new(RecordingMetrics::default());
-        let service = resolve_service(upstream, events, metrics.clone());
+        let service = resolve_service(upstream, events.clone(), metrics.clone());
 
         let outcome = service
             .resolve(ResolveRequest::new(
@@ -3393,6 +3477,22 @@ mod tests {
             ResponseCode::ServFail as u8
         );
         assert_eq!(outcome.decision.kind, ResolveDecisionKind::UpstreamFailure);
+        {
+            let recorded_events = events.events.lock().unwrap();
+            assert_eq!(recorded_events.len(), 1);
+            assert_eq!(
+                recorded_events[0].terminal_outcome,
+                QueryEventOutcome::BackendFailure
+            );
+            assert_eq!(
+                recorded_events[0].response_code,
+                Some(ResponseCode::ServFail)
+            );
+            assert_eq!(
+                recorded_events[0].cache_result,
+                Some(QueryEventCacheResult::Miss)
+            );
+        }
         assert!(metrics
             .increments
             .lock()
