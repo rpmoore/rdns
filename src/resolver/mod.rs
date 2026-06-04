@@ -64,12 +64,12 @@ impl ObservedSourceEndpoint {
         }
     }
 
-    pub fn udp(source: SocketAddr, listener: SocketAddr) -> Self {
+    pub fn udp(source: SocketAddr, listener: Option<SocketAddr>) -> Self {
         Self {
             ip: source.ip(),
             port: Some(source.port()),
             transport: Some(QueryTransport::Udp),
-            listener: Some(listener),
+            listener,
         }
     }
 }
@@ -520,10 +520,7 @@ impl QueryEventV1 {
             sequence,
             timestamp,
             ObservedSourceEndpoint::ip(decision.client_ip),
-            decision
-                .question
-                .as_ref()
-                .map(|question| question.qname.clone()),
+            None,
             decision,
             response_code,
             cache_result,
@@ -1586,6 +1583,7 @@ impl InMemoryQueryEventStore {
         }
     }
 
+    /// Returns retained query events in chronological order, oldest first.
     pub fn recent_events(&self) -> Vec<QueryEventV1> {
         self.state
             .lock()
@@ -3192,7 +3190,7 @@ mod tests {
             event.observed_source,
             ObservedSourceEndpoint::ip(decision.client_ip)
         );
-        assert_eq!(event.original_question_name.as_deref(), Some("example.com"));
+        assert_eq!(event.original_question_name, None);
         assert_eq!(event.normalized_question, decision.question);
         assert_eq!(event.qtype, Some(1));
         assert_eq!(event.qclass, Some(1));

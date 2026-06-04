@@ -54,8 +54,8 @@ async fn main() -> io::Result<()> {
         let query_event_store = Arc::clone(&query_event_store);
         tokio::spawn(async move {
             while let Some(event) = event_rx.recv().await {
-                query_event_store.record(event.clone());
-                let _ = stdout_events.record(event);
+                stdout_events.record_ref(&event);
+                query_event_store.record(event);
             }
         })
     };
@@ -154,9 +154,15 @@ impl Clock for SystemClock {
 
 struct StdoutEvents;
 
+impl StdoutEvents {
+    fn record_ref(&self, event: &QueryEventV1) {
+        println!("{event:?}");
+    }
+}
+
 impl QueryEventSink for StdoutEvents {
     fn record(&self, event: QueryEventV1) -> QueryEventRecordResult {
-        println!("{event:?}");
+        self.record_ref(&event);
         QueryEventRecordResult::Accepted
     }
 }

@@ -59,6 +59,7 @@ async fn bind_listener_socket(address: SocketAddr) -> io::Result<UdpSocket> {
 pub struct UdpDnsServer {
     socket: Arc<UdpSocket>,
     resolver: Arc<ResolveQuery>,
+    listener: Option<SocketAddr>,
     max_request_size: usize,
     max_in_flight_requests: usize,
 }
@@ -79,9 +80,11 @@ impl UdpDnsServer {
         max_request_size: usize,
         max_in_flight_requests: usize,
     ) -> Self {
+        let listener = socket.local_addr().ok();
         Self {
             socket: Arc::new(socket),
             resolver,
+            listener,
             max_request_size,
             max_in_flight_requests,
         }
@@ -185,7 +188,8 @@ impl UdpDnsServer {
     fn spawn_datagram_task(&self, datagram: ReceivedDatagram, tasks: &mut JoinSet<io::Result<()>>) {
         let socket = Arc::clone(&self.socket);
         let resolver = Arc::clone(&self.resolver);
-        tasks.spawn(async move { handle_datagram(socket, resolver, datagram).await });
+        let listener = self.listener;
+        tasks.spawn(async move { handle_datagram(socket, resolver, listener, datagram).await });
     }
 }
 
@@ -198,10 +202,10 @@ struct ReceivedDatagram {
 async fn handle_datagram(
     socket: Arc<UdpSocket>,
     resolver: Arc<ResolveQuery>,
+    listener: Option<SocketAddr>,
     datagram: ReceivedDatagram,
 ) -> io::Result<()> {
     let _permit = datagram.permit;
-    let listener = socket.local_addr()?;
     let outcome = resolver
         .resolve(ResolveRequest::new_with_observed_source(
             ObservedSourceEndpoint::udp(datagram.source, listener),
