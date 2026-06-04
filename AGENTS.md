@@ -42,6 +42,7 @@ Guidance for Codex and other coding agents working in this repository.
 - Keep edits scoped to the requested behavior.
 - When adding behavior, add or update tests that would fail without the change.
 - When fixing a bug, include a regression test whenever practical.
+- Before committing substantive code or documentation changes, spawn a new adversarial sub-agent to review the intended diff for bugs, regressions, missed requirements, and unclear instructions. Address actionable feedback before committing, or document why feedback is not being acted on. If feedback fixes materially change the diff, run one follow-up adversarial review on the updated diff before committing.
 - When working on a step in `docs/steps.md` that links to a GitHub issue, update that issue's status as work progresses. Leave a concise progress comment when starting or materially changing scope, and close the issue only after the step's acceptance criteria and verification are complete.
 - After changes, summarize what changed and which verification commands were run.
 
@@ -50,7 +51,7 @@ Guidance for Codex and other coding agents working in this repository.
 Do not use this root `AGENTS.md` to store a full summary of the current codebase. Instead, future agents should summarize code close to the directory being described.
 
 - Before searching through a directory for context, inspect that directory's local `AGENTS.md` if one exists. Use it to understand the directory's responsibilities, boundaries, and testing expectations before reading or searching broader code.
-- When adding or substantially changing a directory under `src`, add or update a directory-local `AGENTS.md` in that directory when extra context would help future work.
+- Do not update a directory-local `AGENTS.md` after every change. Add or update one only when a change makes the existing summary stale or when new context would materially help future agents understand that directory.
 - Each directory-local summary must describe what that directory contains at a high level.
 - Keep each directory summary under 200 lines.
 - Summaries should explain responsibilities, important module boundaries, and testing expectations.

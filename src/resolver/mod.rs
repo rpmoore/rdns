@@ -14,9 +14,12 @@
 
 use std::collections::{HashMap, VecDeque};
 use std::future::Future;
-use std::net::IpAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::pin::Pin;
-use std::sync::{Arc, Mutex};
+use std::sync::{
+    atomic::{AtomicU64, Ordering},
+    Arc, Mutex,
+};
 use std::time::{Duration, SystemTime};
 
 use bytes::Bytes;
@@ -38,9 +41,54 @@ pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ReceivedAt(pub SystemTime);
 
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct ObservedSourceEndpoint {
+    pub ip: IpAddr,
+    pub port: Option<u16>,
+    pub transport: Option<QueryTransport>,
+    pub listener: Option<SocketAddr>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum QueryTransport {
+    Udp,
+}
+
+impl ObservedSourceEndpoint {
+    pub fn ip(ip: IpAddr) -> Self {
+        Self {
+            ip,
+            port: None,
+            transport: None,
+            listener: None,
+        }
+    }
+
+    pub fn udp(source: SocketAddr, listener: Option<SocketAddr>) -> Self {
+        Self {
+            ip: source.ip(),
+            port: Some(source.port()),
+            transport: Some(QueryTransport::Udp),
+            listener,
+        }
+    }
+}
+
+impl From<SocketAddr> for ObservedSourceEndpoint {
+    fn from(endpoint: SocketAddr) -> Self {
+        Self {
+            ip: endpoint.ip(),
+            port: Some(endpoint.port()),
+            transport: None,
+            listener: None,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ResolveRequest {
     pub client_ip: IpAddr,
+    pub observed_source: ObservedSourceEndpoint,
     pub received_at: ReceivedAt,
     pub bytes: Vec<u8>,
 }
@@ -49,6 +97,21 @@ impl ResolveRequest {
     pub fn new(client_ip: IpAddr, received_at: SystemTime, bytes: Vec<u8>) -> Self {
         Self {
             client_ip,
+            observed_source: ObservedSourceEndpoint::ip(client_ip),
+            received_at: ReceivedAt(received_at),
+            bytes,
+        }
+    }
+
+    pub fn new_with_observed_source(
+        observed_source: impl Into<ObservedSourceEndpoint>,
+        received_at: SystemTime,
+        bytes: Vec<u8>,
+    ) -> Self {
+        let observed_source = observed_source.into();
+        Self {
+            client_ip: observed_source.ip,
+            observed_source,
             received_at: ReceivedAt(received_at),
             bytes,
         }
@@ -430,13 +493,16 @@ pub struct QueryEventV1 {
     pub schema_version: u8,
     pub sequence: u64,
     pub timestamp: SystemTime,
-    pub observed_source_ip: IpAddr,
-    pub original_question: Option<QuestionKey>,
+    pub observed_source: ObservedSourceEndpoint,
+    pub original_question_name: Option<String>,
     pub normalized_question: Option<QuestionKey>,
-    pub terminal_outcome: ResolveDecisionKind,
-    pub response_code: Option<ResponseCode>,
+    pub qtype: Option<u16>,
+    pub qclass: Option<u16>,
+    pub terminal_outcome: QueryEventOutcome,
+    pub response_code: Option<u16>,
     pub cache_result: Option<QueryEventCacheResult>,
     pub latency: Option<Duration>,
+    pub advisory_findings: Vec<QueryEventClassifierFinding>,
 }
 
 impl QueryEventV1 {
@@ -446,21 +512,70 @@ impl QueryEventV1 {
         sequence: u64,
         timestamp: SystemTime,
         decision: &ResolveDecision,
-        response_code: Option<ResponseCode>,
+        response_code: Option<u16>,
         cache_result: Option<QueryEventCacheResult>,
         latency: Option<Duration>,
     ) -> Self {
+        Self::from_decision_context(
+            sequence,
+            timestamp,
+            ObservedSourceEndpoint::ip(decision.client_ip),
+            None,
+            decision,
+            response_code,
+            cache_result,
+            latency,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn from_decision_context(
+        sequence: u64,
+        timestamp: SystemTime,
+        observed_source: ObservedSourceEndpoint,
+        original_question_name: Option<String>,
+        decision: &ResolveDecision,
+        response_code: Option<u16>,
+        cache_result: Option<QueryEventCacheResult>,
+        latency: Option<Duration>,
+    ) -> Self {
+        let normalized_question = decision.question.clone();
         Self {
             schema_version: Self::SCHEMA_VERSION,
             sequence,
             timestamp,
-            observed_source_ip: decision.client_ip,
-            original_question: decision.question.clone(),
-            normalized_question: decision.question.clone(),
-            terminal_outcome: decision.kind.clone(),
+            observed_source,
+            original_question_name,
+            qtype: normalized_question.as_ref().map(|question| question.qtype),
+            qclass: normalized_question.as_ref().map(|question| question.qclass),
+            normalized_question,
+            terminal_outcome: QueryEventOutcome::from_decision_kind(&decision.kind),
             response_code,
             cache_result,
             latency,
+            advisory_findings: Vec::new(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum QueryEventOutcome {
+    AllowedFromBackend,
+    AllowedFromCache,
+    Blocked(BlockReason),
+    ProtocolError(ResponseCode),
+    BackendFailure,
+}
+
+impl QueryEventOutcome {
+    fn from_decision_kind(kind: &ResolveDecisionKind) -> Self {
+        match kind {
+            ResolveDecisionKind::Allowed => Self::AllowedFromBackend,
+            ResolveDecisionKind::Blocked(reason) => Self::Blocked(reason.clone()),
+            ResolveDecisionKind::CacheHit => Self::AllowedFromCache,
+            ResolveDecisionKind::CacheMiss => Self::AllowedFromBackend,
+            ResolveDecisionKind::ProtocolError(code) => Self::ProtocolError(*code),
+            ResolveDecisionKind::UpstreamFailure => Self::BackendFailure,
         }
     }
 }
@@ -475,6 +590,57 @@ pub enum QueryEventCacheResult {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct QueryEventClassifierFinding {
+    pub classifier_version: String,
+    pub config_generation: u64,
+    pub reason: QueryEventClassifierReason,
+    pub severity: QueryEventClassifierSeverity,
+    pub score: u8,
+    pub evaluated_window: QueryEventClassifierWindow,
+    pub details: Vec<QueryEventClassifierDetail>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum QueryEventClassifierReason {
+    NxdomainBurst,
+    ServfailBurst,
+    HighEntropyName,
+    RepeatedTxtLookup,
+    RareDomain,
+    NewDomain,
+    SuspiciousSelector,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum QueryEventClassifierSeverity {
+    Low,
+    Medium,
+    High,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct QueryEventClassifierWindow {
+    pub started_at: SystemTime,
+    pub ended_at: SystemTime,
+    pub retained_event_count: usize,
+    pub incomplete_reason: Option<QueryEventClassifierWindowIncompleteReason>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum QueryEventClassifierWindowIncompleteReason {
+    ColdStart,
+    RetentionEviction,
+    SampledEvents,
+    DroppedEvents,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct QueryEventClassifierDetail {
+    pub key: String,
+    pub value: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ResolveOutcome {
     pub response_bytes: Vec<u8>,
     pub decision: ResolveDecision,
@@ -484,6 +650,7 @@ struct CacheProbe {
     key: Option<CacheKey>,
     hit: Option<Vec<u8>>,
     store_allowed: bool,
+    event_cache_result: Option<QueryEventCacheResult>,
 }
 
 pub struct ResolveQuery {
@@ -495,6 +662,7 @@ pub struct ResolveQuery {
     responses: Arc<dyn ResponseFactory>,
     clock: Arc<dyn Clock>,
     events: Arc<dyn QueryEventSink>,
+    event_sequence: AtomicU64,
     metrics: Arc<dyn MetricsSink>,
 }
 
@@ -539,6 +707,7 @@ impl ResolveQuery {
             responses,
             clock,
             events,
+            event_sequence: AtomicU64::new(0),
             metrics,
         }
     }
@@ -559,7 +728,9 @@ impl ResolveQuery {
                     kind: ResolveDecisionKind::ProtocolError(error.response_code()),
                 };
                 let response_bytes = self.responses.protocol_error(request_id, &error);
-                return self.finish(started_at, decision, response_bytes).await;
+                return self
+                    .finish(started_at, &request, None, decision, response_bytes, None)
+                    .await;
             }
         };
 
@@ -573,12 +744,28 @@ impl ResolveQuery {
                 question: Some(question),
                 kind: ResolveDecisionKind::CacheHit,
             };
-            return self.finish(started_at, decision, response_bytes).await;
+            return self
+                .finish(
+                    started_at,
+                    &request,
+                    decoded_original_question_name(&decoded),
+                    decision,
+                    response_bytes,
+                    cache_probe.event_cache_result,
+                )
+                .await;
         }
 
         if let (Some(cache_key), true) = (cache_probe.key.take(), cache_probe.store_allowed) {
             return self
-                .resolve_coalesced_miss(started_at, &request, &decoded, question, cache_key)
+                .resolve_coalesced_miss(
+                    started_at,
+                    &request,
+                    &decoded,
+                    question,
+                    cache_key,
+                    cache_probe.event_cache_result,
+                )
                 .await;
         }
 
@@ -589,6 +776,7 @@ impl ResolveQuery {
             question,
             cache_probe.key,
             false,
+            cache_probe.event_cache_result,
         )
         .await
     }
@@ -601,6 +789,7 @@ impl ResolveQuery {
         decoded: &DecodedQuery,
         question: QuestionKey,
         cache_key: CacheKey,
+        event_cache_result: Option<QueryEventCacheResult>,
     ) -> ResolveOutcome {
         match self.miss_coalescer.begin(cache_key.clone()) {
             SingleFlightTicket::Leader { key, flight } => {
@@ -617,7 +806,15 @@ impl ResolveQuery {
                     )
                     .await;
                 guard.complete(upstream_result);
-                self.finish(started_at, decision, response_bytes).await
+                self.finish(
+                    started_at,
+                    request,
+                    decoded_original_question_name(decoded),
+                    decision,
+                    response_bytes,
+                    event_cache_result,
+                )
+                .await
             }
             SingleFlightTicket::Follower { flight } => {
                 self.metrics.increment(ResolverMetric::CacheCoalescedMiss);
@@ -631,7 +828,16 @@ impl ResolveQuery {
                         question: Some(question),
                         kind: ResolveDecisionKind::CacheHit,
                     };
-                    return self.finish(started_at, decision, response_bytes).await;
+                    return self
+                        .finish(
+                            started_at,
+                            request,
+                            decoded_original_question_name(decoded),
+                            decision,
+                            response_bytes,
+                            Some(QueryEventCacheResult::Hit),
+                        )
+                        .await;
                 }
                 self.finish_upstream_result(
                     started_at,
@@ -640,6 +846,7 @@ impl ResolveQuery {
                     question,
                     Some(cache_key),
                     false,
+                    event_cache_result,
                     upstream_result,
                 )
                 .await
@@ -647,6 +854,7 @@ impl ResolveQuery {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn resolve_upstream_and_finish(
         &self,
         started_at: SystemTime,
@@ -655,6 +863,7 @@ impl ResolveQuery {
         question: QuestionKey,
         cache_key: Option<CacheKey>,
         cache_store_allowed: bool,
+        event_cache_result: Option<QueryEventCacheResult>,
     ) -> ResolveOutcome {
         let upstream_result = self.resolve_upstream(decoded).await;
         self.finish_upstream_result(
@@ -664,6 +873,7 @@ impl ResolveQuery {
             question,
             cache_key,
             cache_store_allowed,
+            event_cache_result,
             upstream_result,
         )
         .await
@@ -688,6 +898,7 @@ impl ResolveQuery {
                 key: None,
                 hit: None,
                 store_allowed: false,
+                event_cache_result: Some(QueryEventCacheResult::Bypass),
             };
         }
 
@@ -707,30 +918,39 @@ impl ResolveQuery {
             key: Some(key),
             hit: None,
             store_allowed: matches!(lookup, CacheLookup::Miss | CacheLookup::Expired),
+            event_cache_result: Some(QueryEventCacheResult::Miss),
         };
 
         match lookup {
             CacheLookup::Hit(cached) => match self.serialize_cache_hit(decoded, &cached, request) {
-                Ok(response_bytes) => probe.hit = Some(response_bytes),
+                Ok(response_bytes) => {
+                    probe.event_cache_result = Some(QueryEventCacheResult::Hit);
+                    probe.hit = Some(response_bytes);
+                }
                 Err(_) => {
                     self.metrics.increment(ResolverMetric::CacheMiss);
                     probe.store_allowed = true;
+                    probe.event_cache_result = Some(QueryEventCacheResult::Miss);
                 }
             },
             CacheLookup::Miss => {
                 self.metrics.increment(ResolverMetric::CacheMiss);
+                probe.event_cache_result = Some(QueryEventCacheResult::Miss);
             }
             CacheLookup::Expired => {
                 self.metrics.increment(ResolverMetric::CacheExpired);
                 self.metrics.increment(ResolverMetric::CacheMiss);
+                probe.event_cache_result = Some(QueryEventCacheResult::Expired);
             }
             CacheLookup::Bypass(_) => {
                 self.metrics.increment(ResolverMetric::CacheBypass);
                 self.metrics.increment(ResolverMetric::CacheMiss);
+                probe.event_cache_result = Some(QueryEventCacheResult::Bypass);
             }
             CacheLookup::Unavailable => {
                 self.metrics.increment(ResolverMetric::CacheUnavailable);
                 self.metrics.increment(ResolverMetric::CacheMiss);
+                probe.event_cache_result = Some(QueryEventCacheResult::Unavailable);
             }
         }
 
@@ -785,6 +1005,7 @@ impl ResolveQuery {
         question: QuestionKey,
         cache_key: Option<CacheKey>,
         cache_store_allowed: bool,
+        event_cache_result: Option<QueryEventCacheResult>,
         upstream_result: Result<UpstreamResponse, UpstreamError>,
     ) -> ResolveOutcome {
         let (decision, response_bytes) = self
@@ -797,7 +1018,15 @@ impl ResolveQuery {
                 upstream_result,
             )
             .await;
-        self.finish(started_at, decision, response_bytes).await
+        self.finish(
+            started_at,
+            request,
+            decoded_original_question_name(decoded),
+            decision,
+            response_bytes,
+            event_cache_result,
+        )
+        .await
     }
 
     async fn prepare_upstream_result(
@@ -906,11 +1135,26 @@ impl ResolveQuery {
     async fn finish(
         &self,
         started_at: SystemTime,
+        request: &ResolveRequest,
+        original_question_name: Option<String>,
         decision: ResolveDecision,
         response_bytes: Vec<u8>,
+        cache_result: Option<QueryEventCacheResult>,
     ) -> ResolveOutcome {
-        self.events.record(decision.clone()).await;
-        if let Ok(duration) = self.clock.now().duration_since(started_at) {
+        let finished_at = self.clock.now();
+        let latency = finished_at.duration_since(started_at).ok();
+        let event = QueryEventV1::from_decision_context(
+            self.event_sequence.fetch_add(1, Ordering::Relaxed),
+            finished_at,
+            request.observed_source.clone(),
+            original_question_name,
+            &decision,
+            response_code_from_wire(&response_bytes),
+            cache_result,
+            latency,
+        );
+        self.record_query_event(event);
+        if let Some(duration) = latency {
             self.metrics
                 .observe_duration(ResolverMetric::QueryDuration, duration);
         }
@@ -918,6 +1162,17 @@ impl ResolveQuery {
             response_bytes,
             decision,
         }
+    }
+
+    fn record_query_event(&self, event: QueryEventV1) {
+        let metric = match self.events.record(event) {
+            QueryEventRecordResult::Accepted => ResolverMetric::QueryEventAccepted,
+            QueryEventRecordResult::Disabled => ResolverMetric::QueryEventDisabled,
+            QueryEventRecordResult::DroppedNewest => ResolverMetric::QueryEventDroppedNewest,
+            QueryEventRecordResult::DroppedOldest => ResolverMetric::QueryEventDroppedOldest,
+            QueryEventRecordResult::Sampled => ResolverMetric::QueryEventSampled,
+        };
+        self.metrics.increment(metric);
     }
 }
 
@@ -1038,6 +1293,166 @@ fn response_is_truncated(bytes: &[u8]) -> bool {
         .get(2)
         .map(|flags| (flags & 0x02) != 0)
         .unwrap_or(false)
+}
+
+fn response_code_from_wire(bytes: &[u8]) -> Option<u16> {
+    let base = bytes.get(3).map(|flags| u16::from(flags & 0x0f))?;
+    let extended = opt_extended_rcode_from_wire(bytes).unwrap_or(0);
+    Some((u16::from(extended) << 4) | base)
+}
+
+fn opt_extended_rcode_from_wire(bytes: &[u8]) -> Option<u8> {
+    let qd_count = read_dns_u16(bytes, 4).unwrap_or(0);
+    let an_count = read_dns_u16(bytes, 6).unwrap_or(0);
+    let ns_count = read_dns_u16(bytes, 8).unwrap_or(0);
+    let ar_count = read_dns_u16(bytes, 10).unwrap_or(0);
+    if ar_count == 0 {
+        return Some(0);
+    }
+
+    let mut offset = 12usize;
+    skip_dns_questions(bytes, &mut offset, qd_count)?;
+    skip_dns_records(bytes, &mut offset, an_count)?;
+    skip_dns_records(bytes, &mut offset, ns_count)?;
+    let mut extended_rcode = None;
+    for _ in 0..ar_count {
+        let has_root_owner = matches!(bytes.get(offset), Some(0));
+        skip_dns_name(bytes, &mut offset)?;
+        let record_start = offset;
+        let rtype = read_dns_u16(bytes, offset)?;
+        let ttl = read_dns_u32(bytes, offset.checked_add(4)?)?;
+        let rdlength = read_dns_u16(bytes, offset.checked_add(8)?)? as usize;
+        let rdata_start = offset.checked_add(10)?;
+        let rdata_end = rdata_start.checked_add(rdlength)?;
+        bytes.get(record_start..rdata_end)?;
+        if has_root_owner && rtype == 41 {
+            extended_rcode = Some(((ttl >> 24) & 0xff) as u8);
+        }
+        offset = rdata_end;
+    }
+    Some(extended_rcode.unwrap_or(0))
+}
+
+fn skip_dns_questions(bytes: &[u8], offset: &mut usize, count: u16) -> Option<()> {
+    for _ in 0..count {
+        skip_dns_name(bytes, offset)?;
+        let question_end = offset.checked_add(4)?;
+        bytes.get(*offset..question_end)?;
+        *offset = question_end;
+    }
+    Some(())
+}
+
+fn skip_dns_records(bytes: &[u8], offset: &mut usize, count: u16) -> Option<()> {
+    for _ in 0..count {
+        skip_dns_name(bytes, offset)?;
+        let record_start = *offset;
+        let rdlength = read_dns_u16(bytes, record_start.checked_add(8)?)? as usize;
+        let rdata_start = record_start.checked_add(10)?;
+        let record_end = rdata_start.checked_add(rdlength)?;
+        bytes.get(record_start..record_end)?;
+        *offset = record_end;
+    }
+    Some(())
+}
+
+fn skip_dns_name(bytes: &[u8], offset: &mut usize) -> Option<()> {
+    loop {
+        let length = *bytes.get(*offset)?;
+        match length & 0b1100_0000 {
+            0b0000_0000 => {
+                *offset = offset.checked_add(1)?;
+                if length == 0 {
+                    return Some(());
+                }
+                if length > 63 {
+                    return None;
+                }
+                let label_end = offset.checked_add(length as usize)?;
+                bytes.get(*offset..label_end)?;
+                *offset = label_end;
+            }
+            0b1100_0000 => {
+                let pointer_start = *offset;
+                let pointer_end = offset.checked_add(2)?;
+                bytes.get(*offset..pointer_end)?;
+                let pointer = (((u16::from(length) & 0x3f) << 8)
+                    | u16::from(*bytes.get(pointer_start.checked_add(1)?)?))
+                    as usize;
+                if !dns_name_pointer_target_is_valid(bytes, pointer, pointer_start) {
+                    return None;
+                }
+                *offset = pointer_end;
+                return Some(());
+            }
+            _ => return None,
+        }
+    }
+}
+
+fn dns_name_pointer_target_is_valid(bytes: &[u8], mut offset: usize, limit: usize) -> bool {
+    if offset < 12 || offset >= limit {
+        return false;
+    }
+
+    for _ in 0..128 {
+        let Some(length) = bytes.get(offset).copied() else {
+            return false;
+        };
+        match length & 0b1100_0000 {
+            0b0000_0000 => {
+                offset = match offset.checked_add(1) {
+                    Some(offset) => offset,
+                    None => return false,
+                };
+                if length == 0 {
+                    return true;
+                }
+                if length > 63 {
+                    return false;
+                }
+                let label_end = match offset.checked_add(length as usize) {
+                    Some(label_end) => label_end,
+                    None => return false,
+                };
+                if label_end > limit || bytes.get(offset..label_end).is_none() {
+                    return false;
+                }
+                offset = label_end;
+            }
+            0b1100_0000 => {
+                let Some(next) = bytes.get(offset.saturating_add(1)).copied() else {
+                    return false;
+                };
+                let pointer = (((u16::from(length) & 0x3f) << 8) | u16::from(next)) as usize;
+                if pointer < 12 || pointer >= offset || pointer >= limit {
+                    return false;
+                }
+                offset = pointer;
+            }
+            _ => return false,
+        }
+    }
+
+    false
+}
+
+fn read_dns_u16(bytes: &[u8], offset: usize) -> Option<u16> {
+    let value = bytes.get(offset..offset.checked_add(2)?)?;
+    Some(u16::from_be_bytes([value[0], value[1]]))
+}
+
+fn read_dns_u32(bytes: &[u8], offset: usize) -> Option<u32> {
+    let value = bytes.get(offset..offset.checked_add(4)?)?;
+    Some(u32::from_be_bytes([value[0], value[1], value[2], value[3]]))
+}
+
+fn decoded_original_question_name(decoded: &DecodedQuery) -> Option<String> {
+    decoded
+        .message
+        .questions
+        .first()
+        .map(|question| question.qname.clone())
 }
 
 fn cache_supported(query: &DecodedQuery) -> bool {
@@ -1198,21 +1613,354 @@ impl DnsCache for NoopDnsCache {
 }
 
 pub struct ChannelQueryEventSink {
-    sender: mpsc::Sender<ResolveDecision>,
+    sender: mpsc::Sender<QueryEventV1>,
 }
 
 impl ChannelQueryEventSink {
-    pub fn new(sender: mpsc::Sender<ResolveDecision>) -> Self {
+    pub fn new(sender: mpsc::Sender<QueryEventV1>) -> Self {
         Self { sender }
     }
 }
 
 impl QueryEventSink for ChannelQueryEventSink {
-    fn record<'a>(&'a self, decision: ResolveDecision) -> BoxFuture<'a, ()> {
-        Box::pin(async move {
-            let _ = self.sender.try_send(decision);
-        })
+    fn record(&self, event: QueryEventV1) -> QueryEventRecordResult {
+        match self.sender.try_send(event) {
+            Ok(()) => QueryEventRecordResult::Accepted,
+            Err(mpsc::error::TrySendError::Full(_)) => QueryEventRecordResult::DroppedNewest,
+            Err(mpsc::error::TrySendError::Closed(_)) => QueryEventRecordResult::Disabled,
+        }
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InMemoryQueryEventStoreConfig {
+    pub max_retained_events: usize,
+    pub max_indexed_sources: usize,
+    pub max_indexed_domains: usize,
+    pub retention: Option<Duration>,
+}
+
+impl Default for InMemoryQueryEventStoreConfig {
+    fn default() -> Self {
+        Self {
+            max_retained_events: 10_000,
+            max_indexed_sources: 1_024,
+            max_indexed_domains: 10_000,
+            retention: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct QueryEventStoreSummary {
+    pub retained_event_count: usize,
+    pub indexed_source_count: usize,
+    pub indexed_domain_count: usize,
+    pub evicted_event_count: u64,
+    pub unindexed_source_event_count: u64,
+    pub unindexed_domain_event_count: u64,
+    pub dropped_newest_event_count: u64,
+    pub dropped_oldest_event_count: u64,
+    pub sampled_event_count: u64,
+}
+
+pub struct InMemoryQueryEventStore {
+    config: InMemoryQueryEventStoreConfig,
+    state: Mutex<InMemoryQueryEventStoreState>,
+}
+
+#[derive(Default)]
+struct InMemoryQueryEventStoreState {
+    events: VecDeque<StoredQueryEvent>,
+    indexed_sources: HashMap<ObservedSourceEndpoint, usize>,
+    indexed_domains: HashMap<String, usize>,
+    evicted_event_count: u64,
+    unindexed_source_event_count: u64,
+    unindexed_domain_event_count: u64,
+    dropped_newest_event_count: u64,
+    dropped_oldest_event_count: u64,
+    sampled_event_count: u64,
+}
+
+struct StoredQueryEvent {
+    event: QueryEventV1,
+    indexed_source: bool,
+    indexed_domain: bool,
+}
+
+impl InMemoryQueryEventStore {
+    pub fn new(config: InMemoryQueryEventStoreConfig) -> Self {
+        Self {
+            config,
+            state: Mutex::new(InMemoryQueryEventStoreState::default()),
+        }
+    }
+
+    pub fn record(&self, event: QueryEventV1) {
+        let mut state = self.state.lock().unwrap();
+        state.record(event, &self.config);
+    }
+
+    pub fn record_outcome(&self, result: QueryEventRecordResult) {
+        let mut state = self.state.lock().unwrap();
+        match result {
+            QueryEventRecordResult::Accepted | QueryEventRecordResult::Disabled => {}
+            QueryEventRecordResult::DroppedNewest => {
+                state.dropped_newest_event_count =
+                    state.dropped_newest_event_count.saturating_add(1);
+            }
+            QueryEventRecordResult::DroppedOldest => {
+                state.dropped_oldest_event_count =
+                    state.dropped_oldest_event_count.saturating_add(1);
+            }
+            QueryEventRecordResult::Sampled => {
+                state.sampled_event_count = state.sampled_event_count.saturating_add(1);
+            }
+        }
+    }
+
+    /// Returns retained query events in chronological order, oldest first.
+    pub fn recent_events(&self) -> Vec<QueryEventV1> {
+        self.state
+            .lock()
+            .unwrap()
+            .events
+            .iter()
+            .map(|entry| entry.event.clone())
+            .collect()
+    }
+
+    pub fn summary(&self) -> QueryEventStoreSummary {
+        let state = self.state.lock().unwrap();
+        QueryEventStoreSummary {
+            retained_event_count: state.events.len(),
+            indexed_source_count: state.indexed_sources.len(),
+            indexed_domain_count: state.indexed_domains.len(),
+            evicted_event_count: state.evicted_event_count,
+            unindexed_source_event_count: state.unindexed_source_event_count,
+            unindexed_domain_event_count: state.unindexed_domain_event_count,
+            dropped_newest_event_count: state.dropped_newest_event_count,
+            dropped_oldest_event_count: state.dropped_oldest_event_count,
+            sampled_event_count: state.sampled_event_count,
+        }
+    }
+}
+
+impl InMemoryQueryEventStoreState {
+    fn record(&mut self, event: QueryEventV1, config: &InMemoryQueryEventStoreConfig) {
+        let key = event_order_key(&event);
+        let appends_to_tail = self
+            .events
+            .back()
+            .map(|existing| event_order_key(&existing.event) <= key)
+            .unwrap_or(true);
+
+        if appends_to_tail {
+            self.evict_expired_before(event.timestamp, config.retention);
+            if config.max_retained_events == 0 {
+                self.evicted_event_count = self.evicted_event_count.saturating_add(1);
+                return;
+            }
+            while self.events.len() >= config.max_retained_events {
+                self.evict_front();
+            }
+            let (indexed_source, indexed_domain) = self.record_index_membership(&event, config);
+            self.events.push_back(StoredQueryEvent {
+                event,
+                indexed_source,
+                indexed_domain,
+            });
+            return;
+        }
+
+        self.insert_ordered(event);
+        self.evict_expired(config.retention);
+        self.evict_to_bound(config.max_retained_events);
+        self.rebuild_indexes(config);
+    }
+
+    fn record_index_membership(
+        &mut self,
+        event: &QueryEventV1,
+        config: &InMemoryQueryEventStoreConfig,
+    ) -> (bool, bool) {
+        let indexed_source = if let Some(count) =
+            self.indexed_sources.get_mut(&event.observed_source)
+        {
+            *count = count.saturating_add(1);
+            true
+        } else if self.indexed_sources.len() < config.max_indexed_sources {
+            self.indexed_sources
+                .insert(event.observed_source.clone(), 1);
+            true
+        } else {
+            self.unindexed_source_event_count = self.unindexed_source_event_count.saturating_add(1);
+            false
+        };
+
+        let indexed_domain = self.record_domain_index_membership(event, config);
+        (indexed_source, indexed_domain)
+    }
+
+    fn record_domain_index_membership(
+        &mut self,
+        event: &QueryEventV1,
+        config: &InMemoryQueryEventStoreConfig,
+    ) -> bool {
+        let Some(domain) = event
+            .normalized_question
+            .as_ref()
+            .map(|question| &question.qname)
+        else {
+            return false;
+        };
+        if let Some(count) = self.indexed_domains.get_mut(domain) {
+            *count = count.saturating_add(1);
+            true
+        } else if self.indexed_domains.len() < config.max_indexed_domains {
+            self.indexed_domains.insert(domain.clone(), 1);
+            true
+        } else {
+            self.unindexed_domain_event_count = self.unindexed_domain_event_count.saturating_add(1);
+            false
+        }
+    }
+
+    fn insert_ordered(&mut self, event: QueryEventV1) {
+        let key = event_order_key(&event);
+        let position = self
+            .events
+            .iter()
+            .position(|existing| event_order_key(&existing.event) > key);
+        let entry = StoredQueryEvent {
+            event,
+            indexed_source: false,
+            indexed_domain: false,
+        };
+        match position {
+            Some(position) => self.events.insert(position, entry),
+            None => self.events.push_back(entry),
+        }
+    }
+
+    fn evict_expired(&mut self, retention: Option<Duration>) {
+        let Some(retention) = retention else {
+            return;
+        };
+        let Some(newest_timestamp) = self.events.back().map(|entry| entry.event.timestamp) else {
+            return;
+        };
+        self.evict_expired_before(newest_timestamp, Some(retention));
+    }
+
+    fn evict_expired_before(&mut self, newest_timestamp: SystemTime, retention: Option<Duration>) {
+        let Some(retention) = retention else {
+            return;
+        };
+        while self
+            .events
+            .front()
+            .and_then(|entry| entry.event.timestamp.checked_add(retention))
+            .map(|expires_at| expires_at <= newest_timestamp)
+            .unwrap_or(false)
+        {
+            self.evict_front();
+        }
+    }
+
+    fn evict_to_bound(&mut self, max_retained_events: usize) {
+        while self.events.len() > max_retained_events {
+            self.evict_front();
+        }
+    }
+
+    fn evict_front(&mut self) {
+        let Some(entry) = self.events.pop_front() else {
+            return;
+        };
+        self.remove_index_membership(&entry);
+        self.evicted_event_count = self.evicted_event_count.saturating_add(1);
+    }
+
+    fn remove_index_membership(&mut self, entry: &StoredQueryEvent) {
+        let event = &entry.event;
+        if entry.indexed_source {
+            if let Some(count) = self.indexed_sources.get_mut(&event.observed_source) {
+                *count = count.saturating_sub(1);
+                if *count == 0 {
+                    self.indexed_sources.remove(&event.observed_source);
+                }
+            }
+        } else {
+            self.unindexed_source_event_count = self.unindexed_source_event_count.saturating_sub(1);
+        }
+
+        let Some(domain) = event
+            .normalized_question
+            .as_ref()
+            .map(|question| &question.qname)
+        else {
+            return;
+        };
+        if entry.indexed_domain {
+            if let Some(count) = self.indexed_domains.get_mut(domain) {
+                *count = count.saturating_sub(1);
+                if *count == 0 {
+                    self.indexed_domains.remove(domain);
+                }
+            }
+        } else {
+            self.unindexed_domain_event_count = self.unindexed_domain_event_count.saturating_sub(1);
+        }
+    }
+
+    fn rebuild_indexes(&mut self, config: &InMemoryQueryEventStoreConfig) {
+        self.indexed_sources.clear();
+        self.indexed_domains.clear();
+        self.unindexed_source_event_count = 0;
+        self.unindexed_domain_event_count = 0;
+
+        for entry in &mut self.events {
+            entry.indexed_source =
+                if let Some(count) = self.indexed_sources.get_mut(&entry.event.observed_source) {
+                    *count = count.saturating_add(1);
+                    true
+                } else if self.indexed_sources.len() < config.max_indexed_sources {
+                    self.indexed_sources
+                        .insert(entry.event.observed_source.clone(), 1);
+                    true
+                } else {
+                    self.unindexed_source_event_count =
+                        self.unindexed_source_event_count.saturating_add(1);
+                    false
+                };
+
+            entry.indexed_domain = if let Some(domain) = entry
+                .event
+                .normalized_question
+                .as_ref()
+                .map(|question| &question.qname)
+            {
+                if let Some(count) = self.indexed_domains.get_mut(domain) {
+                    *count = count.saturating_add(1);
+                    true
+                } else if self.indexed_domains.len() < config.max_indexed_domains {
+                    self.indexed_domains.insert(domain.clone(), 1);
+                    true
+                } else {
+                    self.unindexed_domain_event_count =
+                        self.unindexed_domain_event_count.saturating_add(1);
+                    false
+                }
+            } else {
+                false
+            };
+        }
+    }
+}
+
+fn event_order_key(event: &QueryEventV1) -> (SystemTime, u64) {
+    (event.timestamp, event.sequence)
 }
 
 pub struct InMemoryDnsCache {
@@ -1410,7 +2158,16 @@ pub trait Clock: Send + Sync {
 }
 
 pub trait QueryEventSink: Send + Sync {
-    fn record<'a>(&'a self, decision: ResolveDecision) -> BoxFuture<'a, ()>;
+    fn record(&self, event: QueryEventV1) -> QueryEventRecordResult;
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum QueryEventRecordResult {
+    Accepted,
+    Disabled,
+    DroppedNewest,
+    DroppedOldest,
+    Sampled,
 }
 
 pub trait MetricsSink: Send + Sync {
@@ -1434,6 +2191,11 @@ pub enum ResolverMetric {
     CacheNegativeStore,
     CacheResponseTruncated,
     CacheCoalescedMiss,
+    QueryEventAccepted,
+    QueryEventDisabled,
+    QueryEventDroppedNewest,
+    QueryEventDroppedOldest,
+    QueryEventSampled,
     UpstreamSuccess,
     UpstreamFailure,
     QueryDuration,
@@ -1562,23 +2324,39 @@ mod tests {
 
     #[derive(Default)]
     struct RecordingEvents {
-        decisions: Mutex<Vec<ResolveDecision>>,
+        events: Mutex<Vec<QueryEventV1>>,
     }
 
     impl QueryEventSink for RecordingEvents {
-        fn record<'a>(&'a self, decision: ResolveDecision) -> BoxFuture<'a, ()> {
-            Box::pin(async move {
-                self.decisions.lock().unwrap().push(decision);
-            })
+        fn record(&self, event: QueryEventV1) -> QueryEventRecordResult {
+            self.events.lock().unwrap().push(event);
+            QueryEventRecordResult::Accepted
         }
     }
 
-    fn decision_for(name: &str) -> ResolveDecision {
-        ResolveDecision {
+    fn event_for(name: &str) -> QueryEventV1 {
+        let decision = ResolveDecision {
             client_ip: "127.0.0.1".parse().unwrap(),
             question: Some(QuestionKey::new(name, 1, 1)),
             kind: ResolveDecisionKind::Allowed,
-        }
+        };
+        QueryEventV1::from_decision(0, SystemTime::UNIX_EPOCH, &decision, None, None, None)
+    }
+
+    fn event_with(sequence: u64, seconds: u64, source_ip: &str, name: &str) -> QueryEventV1 {
+        let decision = ResolveDecision {
+            client_ip: source_ip.parse().unwrap(),
+            question: Some(QuestionKey::new(name, 1, 1)),
+            kind: ResolveDecisionKind::Allowed,
+        };
+        QueryEventV1::from_decision(
+            sequence,
+            SystemTime::UNIX_EPOCH + Duration::from_secs(seconds),
+            &decision,
+            Some(ResponseCode::NoError as u16),
+            Some(QueryEventCacheResult::Miss),
+            Some(Duration::from_millis(1)),
+        )
     }
 
     #[tokio::test]
@@ -1586,28 +2364,206 @@ mod tests {
         let (tx, mut rx) = mpsc::channel(1);
         let sink = ChannelQueryEventSink::new(tx);
 
-        sink.record(decision_for("accepted.example")).await;
+        let result = sink.record(event_for("accepted.example"));
 
+        assert_eq!(result, QueryEventRecordResult::Accepted);
         let received = rx.recv().await.unwrap();
-        assert_eq!(received.question.unwrap().qname, "accepted.example");
+        assert_eq!(
+            received.normalized_question.unwrap().qname,
+            "accepted.example"
+        );
     }
 
     #[tokio::test]
     async fn channel_query_event_sink_drops_promptly_when_full() {
         let (tx, mut rx) = mpsc::channel(1);
-        tx.try_send(decision_for("existing.example")).unwrap();
+        tx.try_send(event_for("existing.example")).unwrap();
         let sink = ChannelQueryEventSink::new(tx);
 
-        tokio::time::timeout(
-            Duration::from_millis(10),
-            sink.record(decision_for("dropped.example")),
-        )
-        .await
-        .unwrap();
+        let result = sink.record(event_for("dropped.example"));
 
+        assert_eq!(result, QueryEventRecordResult::DroppedNewest);
         let received = rx.recv().await.unwrap();
-        assert_eq!(received.question.unwrap().qname, "existing.example");
+        assert_eq!(
+            received.normalized_question.unwrap().qname,
+            "existing.example"
+        );
         assert!(rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn channel_query_event_sink_reports_disabled_when_closed() {
+        let (tx, rx) = mpsc::channel(1);
+        drop(rx);
+        let sink = ChannelQueryEventSink::new(tx);
+
+        let result = sink.record(event_for("disabled.example"));
+
+        assert_eq!(result, QueryEventRecordResult::Disabled);
+    }
+
+    #[test]
+    fn in_memory_query_event_store_orders_and_bounds_recent_events() {
+        let store = InMemoryQueryEventStore::new(InMemoryQueryEventStoreConfig {
+            max_retained_events: 2,
+            ..InMemoryQueryEventStoreConfig::default()
+        });
+
+        store.record(event_with(2, 2, "192.0.2.2", "second.example"));
+        store.record(event_with(1, 1, "192.0.2.1", "first.example"));
+        store.record(event_with(3, 3, "192.0.2.3", "third.example"));
+
+        let events = store.recent_events();
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0].sequence, 2);
+        assert_eq!(events[1].sequence, 3);
+        assert_eq!(store.summary().evicted_event_count, 1);
+    }
+
+    #[test]
+    fn in_memory_query_event_store_applies_retention_duration() {
+        let store = InMemoryQueryEventStore::new(InMemoryQueryEventStoreConfig {
+            max_retained_events: 16,
+            retention: Some(Duration::from_secs(10)),
+            ..InMemoryQueryEventStoreConfig::default()
+        });
+
+        store.record(event_with(1, 0, "192.0.2.1", "old.example"));
+        store.record(event_with(2, 5, "192.0.2.1", "kept.example"));
+        store.record(event_with(3, 11, "192.0.2.1", "new.example"));
+
+        let events = store.recent_events();
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0].sequence, 2);
+        assert_eq!(events[1].sequence, 3);
+        assert_eq!(store.summary().evicted_event_count, 1);
+    }
+
+    #[test]
+    fn in_memory_query_event_store_caps_source_and_domain_indexes() {
+        let store = InMemoryQueryEventStore::new(InMemoryQueryEventStoreConfig {
+            max_retained_events: 16,
+            max_indexed_sources: 1,
+            max_indexed_domains: 1,
+            ..InMemoryQueryEventStoreConfig::default()
+        });
+
+        store.record(event_with(1, 1, "192.0.2.1", "first.example"));
+        store.record(event_with(2, 2, "192.0.2.2", "second.example"));
+
+        let summary = store.summary();
+        assert_eq!(summary.retained_event_count, 2);
+        assert_eq!(summary.indexed_source_count, 1);
+        assert_eq!(summary.indexed_domain_count, 1);
+        assert_eq!(summary.unindexed_source_event_count, 1);
+        assert_eq!(summary.unindexed_domain_event_count, 1);
+    }
+
+    #[test]
+    fn in_memory_query_event_store_releases_index_slots_after_eviction() {
+        let store = InMemoryQueryEventStore::new(InMemoryQueryEventStoreConfig {
+            max_retained_events: 1,
+            max_indexed_sources: 1,
+            max_indexed_domains: 1,
+            ..InMemoryQueryEventStoreConfig::default()
+        });
+
+        store.record(event_with(1, 1, "192.0.2.1", "first.example"));
+        store.record(event_with(2, 2, "192.0.2.2", "second.example"));
+
+        let summary = store.summary();
+        assert_eq!(summary.retained_event_count, 1);
+        assert_eq!(summary.indexed_source_count, 1);
+        assert_eq!(summary.indexed_domain_count, 1);
+        assert_eq!(summary.unindexed_source_event_count, 0);
+        assert_eq!(summary.unindexed_domain_event_count, 0);
+        assert_eq!(store.recent_events()[0].sequence, 2);
+    }
+
+    #[test]
+    fn in_memory_query_event_store_releases_unindexed_counts_after_eviction() {
+        let store = InMemoryQueryEventStore::new(InMemoryQueryEventStoreConfig {
+            max_retained_events: 1,
+            max_indexed_sources: 0,
+            max_indexed_domains: 0,
+            ..InMemoryQueryEventStoreConfig::default()
+        });
+
+        store.record(event_with(1, 1, "192.0.2.1", "first.example"));
+        store.record(event_with(2, 2, "192.0.2.2", "second.example"));
+
+        let summary = store.summary();
+        assert_eq!(summary.retained_event_count, 1);
+        assert_eq!(summary.unindexed_source_event_count, 1);
+        assert_eq!(summary.unindexed_domain_event_count, 1);
+        assert_eq!(store.recent_events()[0].sequence, 2);
+    }
+
+    #[test]
+    fn in_memory_query_event_store_evicts_unindexed_event_without_removing_later_indexed_key() {
+        let store = InMemoryQueryEventStore::new(InMemoryQueryEventStoreConfig {
+            max_retained_events: 3,
+            max_indexed_sources: 1,
+            max_indexed_domains: 1,
+            ..InMemoryQueryEventStoreConfig::default()
+        });
+
+        store.record(event_with(1, 1, "192.0.2.1", "first.example"));
+        store.record(event_with(2, 2, "192.0.2.2", "second.example"));
+        store.record(event_with(3, 3, "192.0.2.3", "third.example"));
+        store.record(event_with(4, 4, "192.0.2.2", "second.example"));
+        store.record(event_with(5, 5, "192.0.2.4", "fourth.example"));
+
+        let indexed_source = ObservedSourceEndpoint::ip("192.0.2.2".parse().unwrap());
+        let state = store.state.lock().unwrap();
+        assert_eq!(state.indexed_sources.get(&indexed_source), Some(&1));
+        assert_eq!(state.indexed_domains.get("second.example"), Some(&1));
+        assert_eq!(state.unindexed_source_event_count, 2);
+        assert_eq!(state.unindexed_domain_event_count, 2);
+    }
+
+    #[test]
+    fn query_event_context_preserves_observed_source_and_original_question() {
+        let decision = ResolveDecision {
+            client_ip: "192.0.2.10".parse().unwrap(),
+            question: Some(QuestionKey::new("example.com", 1, 1)),
+            kind: ResolveDecisionKind::Allowed,
+        };
+        let source: SocketAddr = "192.0.2.10:53000".parse().unwrap();
+
+        let event = QueryEventV1::from_decision_context(
+            1,
+            SystemTime::UNIX_EPOCH,
+            source.into(),
+            Some("Example.COM.".to_string()),
+            &decision,
+            Some(ResponseCode::NoError as u16),
+            Some(QueryEventCacheResult::Miss),
+            Some(Duration::from_millis(1)),
+        );
+
+        assert_eq!(event.observed_source.ip, decision.client_ip);
+        assert_eq!(event.observed_source.port, Some(53000));
+        assert_eq!(
+            event.original_question_name.as_deref(),
+            Some("Example.COM.")
+        );
+        assert_eq!(event.normalized_question.unwrap().qname, "example.com");
+    }
+
+    #[test]
+    fn in_memory_query_event_store_tracks_dropped_and_sampled_indicators() {
+        let store = InMemoryQueryEventStore::new(InMemoryQueryEventStoreConfig::default());
+
+        store.record_outcome(QueryEventRecordResult::DroppedNewest);
+        store.record_outcome(QueryEventRecordResult::DroppedOldest);
+        store.record_outcome(QueryEventRecordResult::Sampled);
+        store.record_outcome(QueryEventRecordResult::Accepted);
+
+        let summary = store.summary();
+        assert_eq!(summary.dropped_newest_event_count, 1);
+        assert_eq!(summary.dropped_oldest_event_count, 1);
+        assert_eq!(summary.sampled_event_count, 1);
     }
 
     #[derive(Default)]
@@ -1861,6 +2817,32 @@ mod tests {
             *codec.received_owned_ptr.lock().unwrap(),
             Some(request_ptr as usize)
         );
+    }
+
+    #[tokio::test]
+    async fn resolve_records_accepted_query_event_metric() {
+        let upstream = Arc::new(StaticUpstream::new(Ok(UpstreamResponse {
+            bytes: a_response_with_answer(0x1234, "example.com", 60),
+            received_at: SystemTime::UNIX_EPOCH,
+        })));
+        let events = Arc::new(RecordingEvents::default());
+        let metrics = Arc::new(RecordingMetrics::default());
+        let service = resolve_service(upstream, events.clone(), metrics.clone());
+
+        let _ = service
+            .resolve(ResolveRequest::new(
+                "192.0.2.10".parse().unwrap(),
+                SystemTime::UNIX_EPOCH,
+                a_query(0x1234, "example.com"),
+            ))
+            .await;
+
+        assert_eq!(events.events.lock().unwrap().len(), 1);
+        assert!(metrics
+            .increments
+            .lock()
+            .unwrap()
+            .contains(&ResolverMetric::QueryEventAccepted));
     }
 
     #[test]
@@ -2332,7 +3314,7 @@ mod tests {
             7,
             timestamp,
             &decision,
-            Some(ResponseCode::NoError),
+            Some(ResponseCode::NoError as u16),
             Some(QueryEventCacheResult::Hit),
             Some(Duration::from_millis(12)),
         );
@@ -2340,13 +3322,102 @@ mod tests {
         assert_eq!(event.schema_version, QueryEventV1::SCHEMA_VERSION);
         assert_eq!(event.sequence, 7);
         assert_eq!(event.timestamp, timestamp);
-        assert_eq!(event.observed_source_ip, decision.client_ip);
-        assert_eq!(event.original_question, decision.question);
+        assert_eq!(
+            event.observed_source,
+            ObservedSourceEndpoint::ip(decision.client_ip)
+        );
+        assert_eq!(event.original_question_name, None);
         assert_eq!(event.normalized_question, decision.question);
-        assert_eq!(event.terminal_outcome, ResolveDecisionKind::CacheHit);
-        assert_eq!(event.response_code, Some(ResponseCode::NoError));
+        assert_eq!(event.qtype, Some(1));
+        assert_eq!(event.qclass, Some(1));
+        assert_eq!(event.terminal_outcome, QueryEventOutcome::AllowedFromCache);
+        assert_eq!(event.response_code, Some(ResponseCode::NoError as u16));
         assert_eq!(event.cache_result, Some(QueryEventCacheResult::Hit));
         assert_eq!(event.latency, Some(Duration::from_millis(12)));
+        assert!(event.advisory_findings.is_empty());
+    }
+
+    #[test]
+    fn response_code_from_wire_includes_edns_extended_rcode() {
+        let mut response = a_query_with_edns_details(0x1234, "example.com", 1232, false, 1, 0, &[]);
+        response[2] = 0x81;
+        response[3] = 0x80;
+
+        assert_eq!(response_code_from_wire(&response), Some(16));
+    }
+
+    #[test]
+    fn response_code_from_wire_returns_base_rcode_when_additional_parse_fails() {
+        let mut response = a_query(0x1234, "example.com");
+        response[2] = 0x81;
+        response[3] = 0x82;
+        response[10..12].copy_from_slice(&1u16.to_be_bytes());
+
+        assert_eq!(response_code_from_wire(&response), Some(2));
+    }
+
+    #[test]
+    fn response_code_from_wire_returns_base_rcode_without_opt_additional() {
+        let mut response = a_query(0x1234, "example.com");
+        response[2] = 0x81;
+        response[3] = 0x85;
+        response[10..12].copy_from_slice(&1u16.to_be_bytes());
+        response.push(0);
+        response.extend_from_slice(&1u16.to_be_bytes());
+        response.extend_from_slice(&1u16.to_be_bytes());
+        response.extend_from_slice(&60u32.to_be_bytes());
+        response.extend_from_slice(&4u16.to_be_bytes());
+        response.extend_from_slice(&[192, 0, 2, 1]);
+
+        assert_eq!(response_code_from_wire(&response), Some(5));
+    }
+
+    #[test]
+    fn response_code_from_wire_ignores_type_41_with_non_root_owner() {
+        let mut response = a_query(0x1234, "example.com");
+        response[2] = 0x81;
+        response[3] = 0x83;
+        response[10..12].copy_from_slice(&1u16.to_be_bytes());
+        response.push(3);
+        response.extend_from_slice(b"bad");
+        response.push(0);
+        response.extend_from_slice(&41u16.to_be_bytes());
+        response.extend_from_slice(&1232u16.to_be_bytes());
+        response.push(1);
+        response.push(0);
+        response.extend_from_slice(&0u16.to_be_bytes());
+        response.extend_from_slice(&0u16.to_be_bytes());
+
+        assert_eq!(response_code_from_wire(&response), Some(3));
+    }
+
+    #[test]
+    fn response_code_from_wire_returns_base_rcode_after_malformed_pointer_before_opt() {
+        let mut response = a_query_with_edns_details(0x1234, "example.com", 1232, false, 1, 0, &[]);
+        response[2] = 0x81;
+        response[3] = 0x82;
+        response[6..8].copy_from_slice(&1u16.to_be_bytes());
+        let opt = response.split_off(response.len() - 11);
+        response.extend_from_slice(&[0xc0, 0x00]);
+        response.extend_from_slice(&1u16.to_be_bytes());
+        response.extend_from_slice(&1u16.to_be_bytes());
+        response.extend_from_slice(&60u32.to_be_bytes());
+        response.extend_from_slice(&4u16.to_be_bytes());
+        response.extend_from_slice(&[192, 0, 2, 1]);
+        response.extend_from_slice(&opt);
+
+        assert_eq!(response_code_from_wire(&response), Some(2));
+    }
+
+    #[test]
+    fn response_code_from_wire_returns_base_rcode_when_later_additional_is_malformed() {
+        let mut response = a_query_with_edns_details(0x1234, "example.com", 1232, false, 1, 0, &[]);
+        response[2] = 0x81;
+        response[3] = 0x84;
+        response[10..12].copy_from_slice(&2u16.to_be_bytes());
+        response.extend_from_slice(&[0xc0, 0x00]);
+
+        assert_eq!(response_code_from_wire(&response), Some(4));
     }
 
     #[test]
@@ -2627,7 +3698,33 @@ mod tests {
         assert_eq!(outcome.decision.question.unwrap().qname, "example.com");
         assert_eq!(outcome.decision.kind, ResolveDecisionKind::Allowed);
         assert_eq!(upstream.requests.lock().unwrap().len(), 1);
-        assert_eq!(events.decisions.lock().unwrap().len(), 1);
+        {
+            let recorded_events = events.events.lock().unwrap();
+            assert_eq!(recorded_events.len(), 1);
+            assert_eq!(
+                recorded_events[0].terminal_outcome,
+                QueryEventOutcome::AllowedFromBackend
+            );
+            assert_eq!(
+                recorded_events[0].original_question_name.as_deref(),
+                Some("Example.COM")
+            );
+            assert_eq!(
+                recorded_events[0]
+                    .normalized_question
+                    .as_ref()
+                    .map(|question| question.qname.as_str()),
+                Some("example.com")
+            );
+            assert_eq!(
+                recorded_events[0].response_code,
+                Some(ResponseCode::NoError as u16)
+            );
+            assert_eq!(
+                recorded_events[0].cache_result,
+                Some(QueryEventCacheResult::Miss)
+            );
+        }
         assert!(metrics
             .increments
             .lock()
@@ -2653,8 +3750,13 @@ mod tests {
         let upstream = Arc::new(StaticUpstream::new(Err(UpstreamError::Timeout)));
         let events = Arc::new(RecordingEvents::default());
         let metrics = Arc::new(RecordingMetrics::default());
-        let service =
-            resolve_service_with_cache(upstream.clone(), cache, events, metrics.clone(), 1232);
+        let service = resolve_service_with_cache(
+            upstream.clone(),
+            cache,
+            events.clone(),
+            metrics.clone(),
+            1232,
+        );
 
         let outcome = service
             .resolve(ResolveRequest::new(
@@ -2667,6 +3769,22 @@ mod tests {
         assert_eq!(&outcome.response_bytes[0..2], &[0x22, 0x22]);
         assert_eq!(outcome.decision.kind, ResolveDecisionKind::CacheHit);
         assert!(upstream.requests.lock().unwrap().is_empty());
+        {
+            let recorded_events = events.events.lock().unwrap();
+            assert_eq!(recorded_events.len(), 1);
+            assert_eq!(
+                recorded_events[0].terminal_outcome,
+                QueryEventOutcome::AllowedFromCache
+            );
+            assert_eq!(
+                recorded_events[0].response_code,
+                Some(ResponseCode::NoError as u16)
+            );
+            assert_eq!(
+                recorded_events[0].cache_result,
+                Some(QueryEventCacheResult::Hit)
+            );
+        }
         assert_eq!(metrics.count(ResolverMetric::CacheHit), 1);
         assert_eq!(metrics.count(ResolverMetric::CacheMiss), 0);
     }
@@ -3155,7 +4273,19 @@ mod tests {
             ResolveDecisionKind::ProtocolError(ResponseCode::FormErr)
         );
         assert!(upstream.requests.lock().unwrap().is_empty());
-        assert_eq!(events.decisions.lock().unwrap().len(), 1);
+        {
+            let recorded_events = events.events.lock().unwrap();
+            assert_eq!(recorded_events.len(), 1);
+            assert_eq!(
+                recorded_events[0].terminal_outcome,
+                QueryEventOutcome::ProtocolError(ResponseCode::FormErr)
+            );
+            assert_eq!(
+                recorded_events[0].response_code,
+                Some(ResponseCode::FormErr as u16)
+            );
+            assert_eq!(recorded_events[0].cache_result, None);
+        }
         assert!(metrics
             .increments
             .lock()
@@ -3168,7 +4298,7 @@ mod tests {
         let upstream = Arc::new(StaticUpstream::new(Err(UpstreamError::Timeout)));
         let events = Arc::new(RecordingEvents::default());
         let metrics = Arc::new(RecordingMetrics::default());
-        let service = resolve_service(upstream, events, metrics.clone());
+        let service = resolve_service(upstream, events.clone(), metrics.clone());
 
         let outcome = service
             .resolve(ResolveRequest::new(
@@ -3183,6 +4313,22 @@ mod tests {
             ResponseCode::ServFail as u8
         );
         assert_eq!(outcome.decision.kind, ResolveDecisionKind::UpstreamFailure);
+        {
+            let recorded_events = events.events.lock().unwrap();
+            assert_eq!(recorded_events.len(), 1);
+            assert_eq!(
+                recorded_events[0].terminal_outcome,
+                QueryEventOutcome::BackendFailure
+            );
+            assert_eq!(
+                recorded_events[0].response_code,
+                Some(ResponseCode::ServFail as u16)
+            );
+            assert_eq!(
+                recorded_events[0].cache_result,
+                Some(QueryEventCacheResult::Miss)
+            );
+        }
         assert!(metrics
             .increments
             .lock()

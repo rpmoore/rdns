@@ -23,13 +23,14 @@ use rdns::config::RuntimeConfig;
 use rdns::delivery::dns::UdpDnsServer;
 use rdns::delivery::upstream::UdpUpstreamResolver;
 use rdns::resolver::{
-    BasicResponseFactory, BoxFuture, CacheTtlPolicy, ChannelQueryEventSink, Clock,
-    InMemoryDnsCache, MetricsSink, QueryEventSink, ResolveDecision, ResolveQuery, ResolverMetric,
-    StandardProtocolCodec,
+    BasicResponseFactory, CacheTtlPolicy, ChannelQueryEventSink, Clock, InMemoryDnsCache,
+    InMemoryQueryEventStore, InMemoryQueryEventStoreConfig, MetricsSink, QueryEventRecordResult,
+    QueryEventSink, QueryEventV1, ResolveQuery, ResolverMetric, StandardProtocolCodec,
 };
 use tokio::task::{JoinError, JoinSet};
 
 const DEFAULT_CACHE_ENTRIES: usize = 10_000;
+const DEFAULT_QUERY_EVENT_STORE_ENTRIES: usize = 10_000;
 const QUERY_EVENT_QUEUE_CAPACITY: usize = 1024;
 
 #[tokio::main]
@@ -40,12 +41,21 @@ async fn main() -> io::Result<()> {
         .map_err(|error| io::Error::other(format!("invalid runtime config: {error:?}")))?;
 
     let stdout_events = Arc::new(StdoutEvents);
-    let (event_tx, mut event_rx) = tokio::sync::mpsc::channel(QUERY_EVENT_QUEUE_CAPACITY);
+    let query_event_store = Arc::new(InMemoryQueryEventStore::new(
+        InMemoryQueryEventStoreConfig {
+            max_retained_events: DEFAULT_QUERY_EVENT_STORE_ENTRIES,
+            ..InMemoryQueryEventStoreConfig::default()
+        },
+    ));
+    let (event_tx, mut event_rx) =
+        tokio::sync::mpsc::channel::<QueryEventV1>(QUERY_EVENT_QUEUE_CAPACITY);
     let event_drain = {
         let stdout_events = Arc::clone(&stdout_events);
+        let query_event_store = Arc::clone(&query_event_store);
         tokio::spawn(async move {
-            while let Some(decision) = event_rx.recv().await {
-                stdout_events.record(decision).await;
+            while let Some(event) = event_rx.recv().await {
+                stdout_events.record_ref(&event);
+                query_event_store.record(event);
             }
         })
     };
@@ -60,7 +70,10 @@ async fn main() -> io::Result<()> {
         ),
         Arc::new(BasicResponseFactory),
         Arc::new(SystemClock),
-        Arc::new(ChannelQueryEventSink::new(event_tx)),
+        Arc::new(StoreRecordingQueryEventSink::new(
+            ChannelQueryEventSink::new(event_tx),
+            Arc::clone(&query_event_store),
+        )),
         OpenTelemetryMetrics::new()
             .map(|metrics| Arc::new(metrics) as Arc<dyn MetricsSink>)
             .unwrap_or_else(|error| {
@@ -69,7 +82,7 @@ async fn main() -> io::Result<()> {
             }),
     ));
 
-    let servers = UdpDnsServer::bind_configured(&config, resolver).await?;
+    let servers = UdpDnsServer::bind_configured(&config, Arc::clone(&resolver)).await?;
     if servers.is_empty() {
         return Err(io::Error::other("no DNS listeners configured"));
     }
@@ -114,10 +127,9 @@ async fn main() -> io::Result<()> {
         listener_task_result_to_io(result)?;
     }
 
-    event_drain.abort();
+    drop(resolver);
     match event_drain.await {
         Ok(()) => {}
-        Err(error) if error.is_cancelled() => {}
         Err(error) => {
             return Err(io::Error::other(format!(
                 "query event drain task failed: {error}"
@@ -142,11 +154,37 @@ impl Clock for SystemClock {
 
 struct StdoutEvents;
 
+impl StdoutEvents {
+    fn record_ref(&self, event: &QueryEventV1) {
+        println!("{event:?}");
+    }
+}
+
 impl QueryEventSink for StdoutEvents {
-    fn record<'a>(&'a self, decision: ResolveDecision) -> BoxFuture<'a, ()> {
-        Box::pin(async move {
-            println!("{decision:?}");
-        })
+    fn record(&self, event: QueryEventV1) -> QueryEventRecordResult {
+        self.record_ref(&event);
+        QueryEventRecordResult::Accepted
+    }
+}
+
+struct StoreRecordingQueryEventSink {
+    inner: ChannelQueryEventSink,
+    store: Arc<InMemoryQueryEventStore>,
+}
+
+impl StoreRecordingQueryEventSink {
+    fn new(inner: ChannelQueryEventSink, store: Arc<InMemoryQueryEventStore>) -> Self {
+        Self { inner, store }
+    }
+}
+
+impl QueryEventSink for StoreRecordingQueryEventSink {
+    fn record(&self, event: QueryEventV1) -> QueryEventRecordResult {
+        let result = self.inner.record(event);
+        if !matches!(result, QueryEventRecordResult::Accepted) {
+            self.store.record_outcome(result);
+        }
+        result
     }
 }
 
@@ -173,6 +211,11 @@ struct OpenTelemetryMetrics {
     cache_negative_store_total: Counter<u64>,
     cache_response_truncated_total: Counter<u64>,
     cache_coalesced_miss_total: Counter<u64>,
+    query_event_accepted_total: Counter<u64>,
+    query_event_disabled_total: Counter<u64>,
+    query_event_dropped_newest_total: Counter<u64>,
+    query_event_dropped_oldest_total: Counter<u64>,
+    query_event_sampled_total: Counter<u64>,
     upstream_success_total: Counter<u64>,
     upstream_failure_total: Counter<u64>,
     protocol_error_total: Counter<u64>,
@@ -206,6 +249,15 @@ impl OpenTelemetryMetrics {
                 .u64_counter("cache_response_truncated_total")
                 .build(),
             cache_coalesced_miss_total: meter.u64_counter("cache_coalesced_miss_total").build(),
+            query_event_accepted_total: meter.u64_counter("query_event_accepted_total").build(),
+            query_event_disabled_total: meter.u64_counter("query_event_disabled_total").build(),
+            query_event_dropped_newest_total: meter
+                .u64_counter("query_event_dropped_newest_total")
+                .build(),
+            query_event_dropped_oldest_total: meter
+                .u64_counter("query_event_dropped_oldest_total")
+                .build(),
+            query_event_sampled_total: meter.u64_counter("query_event_sampled_total").build(),
             upstream_success_total: meter.u64_counter("upstream_success_total").build(),
             upstream_failure_total: meter.u64_counter("upstream_failure_total").build(),
             protocol_error_total: meter.u64_counter("protocol_error_total").build(),
@@ -232,6 +284,15 @@ impl MetricsSink for OpenTelemetryMetrics {
                 self.cache_response_truncated_total.add(1, &[])
             }
             ResolverMetric::CacheCoalescedMiss => self.cache_coalesced_miss_total.add(1, &[]),
+            ResolverMetric::QueryEventAccepted => self.query_event_accepted_total.add(1, &[]),
+            ResolverMetric::QueryEventDisabled => self.query_event_disabled_total.add(1, &[]),
+            ResolverMetric::QueryEventDroppedNewest => {
+                self.query_event_dropped_newest_total.add(1, &[])
+            }
+            ResolverMetric::QueryEventDroppedOldest => {
+                self.query_event_dropped_oldest_total.add(1, &[])
+            }
+            ResolverMetric::QueryEventSampled => self.query_event_sampled_total.add(1, &[]),
             ResolverMetric::UpstreamSuccess => self.upstream_success_total.add(1, &[]),
             ResolverMetric::UpstreamFailure => self.upstream_failure_total.add(1, &[]),
             ResolverMetric::ProtocolError => self.protocol_error_total.add(1, &[]),
@@ -244,5 +305,40 @@ impl MetricsSink for OpenTelemetryMetrics {
             self.query_duration_seconds
                 .record(duration.as_secs_f64(), &[]);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rdns::resolver::{QuestionKey, ResolveDecision, ResolveDecisionKind};
+
+    fn event_for(name: &str) -> QueryEventV1 {
+        let decision = ResolveDecision {
+            client_ip: "127.0.0.1".parse().unwrap(),
+            question: Some(QuestionKey::new(name, 1, 1)),
+            kind: ResolveDecisionKind::Allowed,
+        };
+        QueryEventV1::from_decision(0, SystemTime::UNIX_EPOCH, &decision, None, None, None)
+    }
+
+    #[tokio::test]
+    async fn store_recording_query_event_sink_counts_channel_drops() {
+        let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+        tx.try_send(event_for("queued.example")).unwrap();
+        let store = Arc::new(InMemoryQueryEventStore::new(
+            InMemoryQueryEventStoreConfig::default(),
+        ));
+        let sink = StoreRecordingQueryEventSink::new(ChannelQueryEventSink::new(tx), store.clone());
+
+        let result = sink.record(event_for("dropped.example"));
+
+        assert_eq!(result, QueryEventRecordResult::DroppedNewest);
+        assert_eq!(store.summary().dropped_newest_event_count, 1);
+        assert_eq!(
+            rx.recv().await.unwrap().normalized_question.unwrap().qname,
+            "queued.example"
+        );
+        assert!(rx.try_recv().is_err());
     }
 }

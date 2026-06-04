@@ -23,7 +23,7 @@ use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tokio::task::JoinSet;
 
 use crate::config::RuntimeConfig;
-use crate::resolver::{ResolveQuery, ResolveRequest};
+use crate::resolver::{ObservedSourceEndpoint, ResolveQuery, ResolveRequest};
 
 const DEFAULT_MAX_IN_FLIGHT_REQUESTS: usize = 1024;
 
@@ -59,6 +59,7 @@ async fn bind_listener_socket(address: SocketAddr) -> io::Result<UdpSocket> {
 pub struct UdpDnsServer {
     socket: Arc<UdpSocket>,
     resolver: Arc<ResolveQuery>,
+    listener: Option<SocketAddr>,
     max_request_size: usize,
     max_in_flight_requests: usize,
 }
@@ -79,9 +80,11 @@ impl UdpDnsServer {
         max_request_size: usize,
         max_in_flight_requests: usize,
     ) -> Self {
+        let listener = socket.local_addr().ok();
         Self {
             socket: Arc::new(socket),
             resolver,
+            listener,
             max_request_size,
             max_in_flight_requests,
         }
@@ -185,7 +188,8 @@ impl UdpDnsServer {
     fn spawn_datagram_task(&self, datagram: ReceivedDatagram, tasks: &mut JoinSet<io::Result<()>>) {
         let socket = Arc::clone(&self.socket);
         let resolver = Arc::clone(&self.resolver);
-        tasks.spawn(async move { handle_datagram(socket, resolver, datagram).await });
+        let listener = self.listener;
+        tasks.spawn(async move { handle_datagram(socket, resolver, listener, datagram).await });
     }
 }
 
@@ -198,12 +202,13 @@ struct ReceivedDatagram {
 async fn handle_datagram(
     socket: Arc<UdpSocket>,
     resolver: Arc<ResolveQuery>,
+    listener: Option<SocketAddr>,
     datagram: ReceivedDatagram,
 ) -> io::Result<()> {
     let _permit = datagram.permit;
     let outcome = resolver
-        .resolve(ResolveRequest::new(
-            datagram.source.ip(),
+        .resolve(ResolveRequest::new_with_observed_source(
+            ObservedSourceEndpoint::udp(datagram.source, listener),
             SystemTime::now(),
             datagram.request_bytes,
         ))
@@ -231,9 +236,9 @@ mod tests {
     use tokio::time;
 
     use crate::resolver::{
-        BasicResponseFactory, BoxFuture, Clock, MetricsSink, QueryEventSink, ResolveDecision,
-        ResolverMetric, StandardProtocolCodec, UpstreamError, UpstreamRequest, UpstreamResolver,
-        UpstreamResponse,
+        BasicResponseFactory, Clock, MetricsSink, QueryEventRecordResult, QueryEventSink,
+        QueryEventV1, QueryTransport, ResolverMetric, StandardProtocolCodec, UpstreamError,
+        UpstreamRequest, UpstreamResolver, UpstreamResponse,
     };
 
     fn a_query(id: u16, name: &str) -> Vec<u8> {
@@ -264,14 +269,13 @@ mod tests {
 
     #[derive(Default)]
     struct RecordingEvents {
-        decisions: Mutex<Vec<ResolveDecision>>,
+        events: Mutex<Vec<QueryEventV1>>,
     }
 
     impl QueryEventSink for RecordingEvents {
-        fn record<'a>(&'a self, decision: ResolveDecision) -> BoxFuture<'a, ()> {
-            Box::pin(async move {
-                self.decisions.lock().unwrap().push(decision);
-            })
+        fn record(&self, event: QueryEventV1) -> QueryEventRecordResult {
+            self.events.lock().unwrap().push(event);
+            QueryEventRecordResult::Accepted
         }
     }
 
@@ -417,9 +421,21 @@ mod tests {
             assert_eq!(upstream_requests[0].query.question.qname, "example.com");
         }
         {
-            let decisions = events.decisions.lock().unwrap();
-            assert_eq!(decisions.len(), 1);
-            assert_eq!(decisions[0].client_ip, client_addr.ip());
+            let recorded_events = events.events.lock().unwrap();
+            assert_eq!(recorded_events.len(), 1);
+            assert_eq!(recorded_events[0].observed_source.ip, client_addr.ip());
+            assert_eq!(
+                recorded_events[0].observed_source.port,
+                Some(client_addr.port())
+            );
+            assert_eq!(
+                recorded_events[0].observed_source.transport,
+                Some(QueryTransport::Udp)
+            );
+            assert_eq!(
+                recorded_events[0].observed_source.listener,
+                Some(server_addr)
+            );
         }
 
         shutdown_tx.send(()).unwrap();
