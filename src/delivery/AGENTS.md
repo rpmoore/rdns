@@ -6,7 +6,7 @@ High-level summary for `src/delivery`.
 
 This directory owns network transport for DNS traffic.
 
-- `dns.rs` handles UDP listener binding, datagram receive/send loops, request concurrency limits, shutdown, and dispatch into resolver logic.
+- `dns.rs` handles UDP listener binding, datagram receive/send loops, request concurrency limits, shutdown, and dispatch into resolver logic. It passes the full observed client socket endpoint into resolver requests so query events can retain both source IP and source port.
 - `upstream.rs` handles outbound upstream DNS transport, transaction ID generation, UDP/TCP exchange behavior, timeout handling, upstream health state, retry timing, and response/source validation.
 - `mod.rs` exposes delivery submodules.
 
@@ -19,6 +19,6 @@ This directory owns network transport for DNS traffic.
 
 ## Testing Expectations
 
-- Unit tests should cover listener lifecycle, datagram handling, concurrency limits, shutdown behavior, upstream failover/degraded state, timeout behavior, TCP framing paths, and response source validation.
+- Unit tests should cover listener lifecycle, datagram handling, observed source endpoint propagation, concurrency limits, shutdown behavior, upstream failover/degraded state, timeout behavior, TCP framing paths, and response source validation.
 - Prefer Tokio tests with local loopback sockets or fakes.
 - Avoid depending on external DNS servers or real internet access.
