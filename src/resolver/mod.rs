@@ -14,7 +14,7 @@
 
 use std::collections::{HashMap, VecDeque};
 use std::future::Future;
-use std::net::IpAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime};
@@ -430,13 +430,16 @@ pub struct QueryEventV1 {
     pub schema_version: u8,
     pub sequence: u64,
     pub timestamp: SystemTime,
-    pub observed_source_ip: IpAddr,
-    pub original_question: Option<QuestionKey>,
+    pub observed_source: ObservedSourceEndpoint,
+    pub original_question_name: Option<String>,
     pub normalized_question: Option<QuestionKey>,
-    pub terminal_outcome: ResolveDecisionKind,
+    pub qtype: Option<u16>,
+    pub qclass: Option<u16>,
+    pub terminal_outcome: QueryEventOutcome,
     pub response_code: Option<ResponseCode>,
     pub cache_result: Option<QueryEventCacheResult>,
     pub latency: Option<Duration>,
+    pub advisory_findings: Vec<QueryEventClassifierFinding>,
 }
 
 impl QueryEventV1 {
@@ -450,17 +453,66 @@ impl QueryEventV1 {
         cache_result: Option<QueryEventCacheResult>,
         latency: Option<Duration>,
     ) -> Self {
+        let normalized_question = decision.question.clone();
         Self {
             schema_version: Self::SCHEMA_VERSION,
             sequence,
             timestamp,
-            observed_source_ip: decision.client_ip,
-            original_question: decision.question.clone(),
-            normalized_question: decision.question.clone(),
-            terminal_outcome: decision.kind.clone(),
+            observed_source: ObservedSourceEndpoint::ip(decision.client_ip),
+            original_question_name: normalized_question
+                .as_ref()
+                .map(|question| question.qname.clone()),
+            qtype: normalized_question.as_ref().map(|question| question.qtype),
+            qclass: normalized_question.as_ref().map(|question| question.qclass),
+            normalized_question,
+            terminal_outcome: QueryEventOutcome::from_decision_kind(&decision.kind),
             response_code,
             cache_result,
             latency,
+            advisory_findings: Vec::new(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct ObservedSourceEndpoint {
+    pub ip: IpAddr,
+    pub port: Option<u16>,
+}
+
+impl ObservedSourceEndpoint {
+    pub fn ip(ip: IpAddr) -> Self {
+        Self { ip, port: None }
+    }
+}
+
+impl From<SocketAddr> for ObservedSourceEndpoint {
+    fn from(endpoint: SocketAddr) -> Self {
+        Self {
+            ip: endpoint.ip(),
+            port: Some(endpoint.port()),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum QueryEventOutcome {
+    AllowedFromBackend,
+    AllowedFromCache,
+    Blocked(BlockReason),
+    ProtocolError(ResponseCode),
+    BackendFailure,
+}
+
+impl QueryEventOutcome {
+    fn from_decision_kind(kind: &ResolveDecisionKind) -> Self {
+        match kind {
+            ResolveDecisionKind::Allowed => Self::AllowedFromBackend,
+            ResolveDecisionKind::Blocked(reason) => Self::Blocked(reason.clone()),
+            ResolveDecisionKind::CacheHit => Self::AllowedFromCache,
+            ResolveDecisionKind::CacheMiss => Self::AllowedFromBackend,
+            ResolveDecisionKind::ProtocolError(code) => Self::ProtocolError(*code),
+            ResolveDecisionKind::UpstreamFailure => Self::BackendFailure,
         }
     }
 }
@@ -472,6 +524,57 @@ pub enum QueryEventCacheResult {
     Expired,
     Bypass,
     Unavailable,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct QueryEventClassifierFinding {
+    pub classifier_version: String,
+    pub config_generation: u64,
+    pub reason: QueryEventClassifierReason,
+    pub severity: QueryEventClassifierSeverity,
+    pub score: u8,
+    pub evaluated_window: QueryEventClassifierWindow,
+    pub details: Vec<QueryEventClassifierDetail>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum QueryEventClassifierReason {
+    NxdomainBurst,
+    ServfailBurst,
+    HighEntropyName,
+    RepeatedTxtLookup,
+    RareDomain,
+    NewDomain,
+    SuspiciousSelector,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum QueryEventClassifierSeverity {
+    Low,
+    Medium,
+    High,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct QueryEventClassifierWindow {
+    pub started_at: SystemTime,
+    pub ended_at: SystemTime,
+    pub retained_event_count: usize,
+    pub incomplete_reason: Option<QueryEventClassifierWindowIncompleteReason>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum QueryEventClassifierWindowIncompleteReason {
+    ColdStart,
+    RetentionEviction,
+    SampledEvents,
+    DroppedEvents,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct QueryEventClassifierDetail {
+    pub key: String,
+    pub value: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2340,13 +2443,19 @@ mod tests {
         assert_eq!(event.schema_version, QueryEventV1::SCHEMA_VERSION);
         assert_eq!(event.sequence, 7);
         assert_eq!(event.timestamp, timestamp);
-        assert_eq!(event.observed_source_ip, decision.client_ip);
-        assert_eq!(event.original_question, decision.question);
+        assert_eq!(
+            event.observed_source,
+            ObservedSourceEndpoint::ip(decision.client_ip)
+        );
+        assert_eq!(event.original_question_name.as_deref(), Some("example.com"));
         assert_eq!(event.normalized_question, decision.question);
-        assert_eq!(event.terminal_outcome, ResolveDecisionKind::CacheHit);
+        assert_eq!(event.qtype, Some(1));
+        assert_eq!(event.qclass, Some(1));
+        assert_eq!(event.terminal_outcome, QueryEventOutcome::AllowedFromCache);
         assert_eq!(event.response_code, Some(ResponseCode::NoError));
         assert_eq!(event.cache_result, Some(QueryEventCacheResult::Hit));
         assert_eq!(event.latency, Some(Duration::from_millis(12)));
+        assert!(event.advisory_findings.is_empty());
     }
 
     #[test]
