@@ -41,6 +41,7 @@ Guidance for Codex and other coding agents working in this repository.
 - Keep edits scoped to the requested behavior.
 - When adding behavior, add or update tests that would fail without the change.
 - When fixing a bug, include a regression test whenever practical.
+- Before committing substantive code or documentation changes, spawn a new adversarial sub-agent to review the intended diff for bugs, regressions, missed requirements, and unclear instructions. Address actionable feedback before committing, or document why feedback is not being acted on. If feedback fixes materially change the diff, run one follow-up adversarial review on the updated diff before committing.
 - When working on a step in `docs/steps.md` that links to a GitHub issue, update that issue's status as work progresses. Leave a concise progress comment when starting or materially changing scope, and close the issue only after the step's acceptance criteria and verification are complete.
 - After changes, summarize what changed and which verification commands were run.
 
