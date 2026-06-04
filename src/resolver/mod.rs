@@ -834,6 +834,7 @@ impl ResolveQuery {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn resolve_upstream_and_finish(
         &self,
         started_at: SystemTime,
