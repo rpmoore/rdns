@@ -1012,8 +1012,9 @@ fn matching_suspicious_selector(
 ) -> Option<String> {
     for domain in suspicious_domains {
         let domain = normalize_question_name(domain);
+        let domain = domain.trim_start_matches('.');
         if qname == domain || qname.ends_with(&format!(".{domain}")) {
-            return Some(domain);
+            return Some(domain.to_string());
         }
     }
 
@@ -2549,7 +2550,6 @@ impl InMemoryQueryEventStoreState {
             .map(|entry| Arc::clone(&entry.event))
             .collect::<Vec<_>>();
         events.push(Arc::new(event.clone()));
-        events.sort_by_key(|event| event_order_key(event));
 
         let mut retention_evicted_for_event = false;
         let pre_retention_len = events.len();
@@ -3920,6 +3920,22 @@ mod tests {
         let tld_event = event_with(3, 3, "192.0.2.1", "selector.bad");
         let retained_events = vec![tld_event];
         let reasons = finding_reasons(&classifier, &retained_events[0], &retained_events);
+
+        assert!(reasons.contains(&QueryEventClassifierReason::SuspiciousSelector));
+
+        let dotted_domain_classifier =
+            InMemorySuspiciousLookupClassifier::new(InMemorySuspiciousLookupClassifierConfig {
+                high_entropy_score_threshold: 100,
+                suspicious_domains: vec![".blocked.example".to_string()],
+                ..InMemorySuspiciousLookupClassifierConfig::default()
+            });
+        let domain_event = event_with(4, 4, "192.0.2.1", "selector.blocked.example");
+        let retained_events = vec![domain_event];
+        let reasons = finding_reasons(
+            &dotted_domain_classifier,
+            &retained_events[0],
+            &retained_events,
+        );
 
         assert!(reasons.contains(&QueryEventClassifierReason::SuspiciousSelector));
     }
