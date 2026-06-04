@@ -2292,6 +2292,7 @@ impl QueryEventReadModel for InMemoryQueryEventStore {
 
     fn top_suspicious_sources(&self, limit: usize) -> Vec<QueryEventSuspiciousSourceSummary> {
         let state = self.state.lock().unwrap();
+        let window = read_model_window(&state);
         let mut summaries =
             HashMap::<ObservedSourceEndpoint, QueryEventSuspiciousSourceSummary>::new();
         for event in state
@@ -2311,7 +2312,7 @@ impl QueryEventReadModel for InMemoryQueryEventStore {
                     finding_count: 0,
                     highest_severity: None,
                     last_seen: None,
-                    window: read_model_window(&state),
+                    window: window.clone(),
                 });
             update_source_summary(summary, event);
         }
@@ -2323,6 +2324,7 @@ impl QueryEventReadModel for InMemoryQueryEventStore {
 
     fn top_suspicious_domains(&self, limit: usize) -> Vec<QueryEventSuspiciousDomainSummary> {
         let state = self.state.lock().unwrap();
+        let window = read_model_window(&state);
         let mut summaries = HashMap::<String, QueryEventSuspiciousDomainSummary>::new();
         for event in state
             .events
@@ -2347,7 +2349,7 @@ impl QueryEventReadModel for InMemoryQueryEventStore {
                     finding_count: 0,
                     highest_severity: None,
                     last_seen: None,
-                    window: read_model_window(&state),
+                    window: window.clone(),
                 }
             });
             update_domain_summary(summary, event);
@@ -2482,57 +2484,77 @@ fn compare_source_summaries(
     left: &QueryEventSuspiciousSourceSummary,
     right: &QueryEventSuspiciousSourceSummary,
 ) -> std::cmp::Ordering {
-    compare_suspicious_ranks(
+    compare_suspicious_rank_fields(
         left.suspicious_event_count,
         left.finding_count,
         left.highest_severity,
         left.last_seen,
-        &format!("{:?}", left.observed_source),
         right.suspicious_event_count,
         right.finding_count,
         right.highest_severity,
         right.last_seen,
-        &format!("{:?}", right.observed_source),
     )
+    .then_with(|| compare_observed_source_endpoints(&left.observed_source, &right.observed_source))
+}
+
+fn compare_observed_source_endpoints(
+    left: &ObservedSourceEndpoint,
+    right: &ObservedSourceEndpoint,
+) -> std::cmp::Ordering {
+    left.ip
+        .cmp(&right.ip)
+        .then_with(|| left.port.cmp(&right.port))
+        .then_with(|| compare_optional_transport(left.transport, right.transport))
+        .then_with(|| left.listener.cmp(&right.listener))
+}
+
+fn compare_optional_transport(
+    left: Option<QueryTransport>,
+    right: Option<QueryTransport>,
+) -> std::cmp::Ordering {
+    transport_rank(left).cmp(&transport_rank(right))
+}
+
+fn transport_rank(transport: Option<QueryTransport>) -> u8 {
+    match transport {
+        None => 0,
+        Some(QueryTransport::Udp) => 1,
+    }
 }
 
 fn compare_domain_summaries(
     left: &QueryEventSuspiciousDomainSummary,
     right: &QueryEventSuspiciousDomainSummary,
 ) -> std::cmp::Ordering {
-    compare_suspicious_ranks(
+    compare_suspicious_rank_fields(
         left.suspicious_event_count,
         left.finding_count,
         left.highest_severity,
         left.last_seen,
-        &left.domain,
         right.suspicious_event_count,
         right.finding_count,
         right.highest_severity,
         right.last_seen,
-        &right.domain,
     )
+    .then_with(|| left.domain.cmp(&right.domain))
 }
 
 #[allow(clippy::too_many_arguments)]
-fn compare_suspicious_ranks(
+fn compare_suspicious_rank_fields(
     left_event_count: usize,
     left_finding_count: usize,
     left_severity: Option<QueryEventClassifierSeverity>,
     left_last_seen: Option<SystemTime>,
-    left_key: &str,
     right_event_count: usize,
     right_finding_count: usize,
     right_severity: Option<QueryEventClassifierSeverity>,
     right_last_seen: Option<SystemTime>,
-    right_key: &str,
 ) -> std::cmp::Ordering {
     right_event_count
         .cmp(&left_event_count)
         .then_with(|| right_finding_count.cmp(&left_finding_count))
         .then_with(|| right_severity.cmp(&left_severity))
         .then_with(|| right_last_seen.cmp(&left_last_seen))
-        .then_with(|| left_key.cmp(right_key))
 }
 
 impl InMemoryQueryEventStoreState {
