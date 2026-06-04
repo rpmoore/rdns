@@ -1297,26 +1297,154 @@ fn response_is_truncated(bytes: &[u8]) -> bool {
 
 fn response_code_from_wire(bytes: &[u8]) -> Option<u16> {
     let base = bytes.get(3).map(|flags| u16::from(flags & 0x0f))?;
-    let additional_count = bytes
-        .get(10..12)
-        .map(|count| u16::from_be_bytes([count[0], count[1]]))
-        .unwrap_or(0);
-    if additional_count == 0 {
-        return Some(base);
-    }
-    Message::parse(bytes)
-        .ok()
-        .map(|message| full_response_code(&message))
-        .or(Some(base))
+    let extended = opt_extended_rcode_from_wire(bytes).unwrap_or(0);
+    Some((u16::from(extended) << 4) | base)
 }
 
-fn full_response_code(message: &Message) -> u16 {
-    let extended = message
-        .edns
-        .as_ref()
-        .map(|edns| u16::from(edns.extended_rcode))
-        .unwrap_or(0);
-    (extended << 4) | u16::from(message.header.r_code())
+fn opt_extended_rcode_from_wire(bytes: &[u8]) -> Option<u8> {
+    let qd_count = read_dns_u16(bytes, 4).unwrap_or(0);
+    let an_count = read_dns_u16(bytes, 6).unwrap_or(0);
+    let ns_count = read_dns_u16(bytes, 8).unwrap_or(0);
+    let ar_count = read_dns_u16(bytes, 10).unwrap_or(0);
+    if ar_count == 0 {
+        return Some(0);
+    }
+
+    let mut offset = 12usize;
+    skip_dns_questions(bytes, &mut offset, qd_count)?;
+    skip_dns_records(bytes, &mut offset, an_count)?;
+    skip_dns_records(bytes, &mut offset, ns_count)?;
+    let mut extended_rcode = None;
+    for _ in 0..ar_count {
+        let has_root_owner = matches!(bytes.get(offset), Some(0));
+        skip_dns_name(bytes, &mut offset)?;
+        let record_start = offset;
+        let rtype = read_dns_u16(bytes, offset)?;
+        let ttl = read_dns_u32(bytes, offset.checked_add(4)?)?;
+        let rdlength = read_dns_u16(bytes, offset.checked_add(8)?)? as usize;
+        let rdata_start = offset.checked_add(10)?;
+        let rdata_end = rdata_start.checked_add(rdlength)?;
+        bytes.get(record_start..rdata_end)?;
+        if has_root_owner && rtype == 41 {
+            extended_rcode = Some(((ttl >> 24) & 0xff) as u8);
+        }
+        offset = rdata_end;
+    }
+    Some(extended_rcode.unwrap_or(0))
+}
+
+fn skip_dns_questions(bytes: &[u8], offset: &mut usize, count: u16) -> Option<()> {
+    for _ in 0..count {
+        skip_dns_name(bytes, offset)?;
+        let question_end = offset.checked_add(4)?;
+        bytes.get(*offset..question_end)?;
+        *offset = question_end;
+    }
+    Some(())
+}
+
+fn skip_dns_records(bytes: &[u8], offset: &mut usize, count: u16) -> Option<()> {
+    for _ in 0..count {
+        skip_dns_name(bytes, offset)?;
+        let record_start = *offset;
+        let rdlength = read_dns_u16(bytes, record_start.checked_add(8)?)? as usize;
+        let rdata_start = record_start.checked_add(10)?;
+        let record_end = rdata_start.checked_add(rdlength)?;
+        bytes.get(record_start..record_end)?;
+        *offset = record_end;
+    }
+    Some(())
+}
+
+fn skip_dns_name(bytes: &[u8], offset: &mut usize) -> Option<()> {
+    loop {
+        let length = *bytes.get(*offset)?;
+        match length & 0b1100_0000 {
+            0b0000_0000 => {
+                *offset = offset.checked_add(1)?;
+                if length == 0 {
+                    return Some(());
+                }
+                if length > 63 {
+                    return None;
+                }
+                let label_end = offset.checked_add(length as usize)?;
+                bytes.get(*offset..label_end)?;
+                *offset = label_end;
+            }
+            0b1100_0000 => {
+                let pointer_start = *offset;
+                let pointer_end = offset.checked_add(2)?;
+                bytes.get(*offset..pointer_end)?;
+                let pointer = (((u16::from(length) & 0x3f) << 8)
+                    | u16::from(*bytes.get(pointer_start.checked_add(1)?)?))
+                    as usize;
+                if !dns_name_pointer_target_is_valid(bytes, pointer, pointer_start) {
+                    return None;
+                }
+                *offset = pointer_end;
+                return Some(());
+            }
+            _ => return None,
+        }
+    }
+}
+
+fn dns_name_pointer_target_is_valid(bytes: &[u8], mut offset: usize, limit: usize) -> bool {
+    if offset < 12 || offset >= limit {
+        return false;
+    }
+
+    for _ in 0..128 {
+        let Some(length) = bytes.get(offset).copied() else {
+            return false;
+        };
+        match length & 0b1100_0000 {
+            0b0000_0000 => {
+                offset = match offset.checked_add(1) {
+                    Some(offset) => offset,
+                    None => return false,
+                };
+                if length == 0 {
+                    return true;
+                }
+                if length > 63 {
+                    return false;
+                }
+                let label_end = match offset.checked_add(length as usize) {
+                    Some(label_end) => label_end,
+                    None => return false,
+                };
+                if label_end > limit || bytes.get(offset..label_end).is_none() {
+                    return false;
+                }
+                offset = label_end;
+            }
+            0b1100_0000 => {
+                let Some(next) = bytes.get(offset.saturating_add(1)).copied() else {
+                    return false;
+                };
+                let pointer = (((u16::from(length) & 0x3f) << 8) | u16::from(next)) as usize;
+                if pointer < 12 || pointer >= offset || pointer >= limit {
+                    return false;
+                }
+                offset = pointer;
+            }
+            _ => return false,
+        }
+    }
+
+    false
+}
+
+fn read_dns_u16(bytes: &[u8], offset: usize) -> Option<u16> {
+    let value = bytes.get(offset..offset.checked_add(2)?)?;
+    Some(u16::from_be_bytes([value[0], value[1]]))
+}
+
+fn read_dns_u32(bytes: &[u8], offset: usize) -> Option<u32> {
+    let value = bytes.get(offset..offset.checked_add(4)?)?;
+    Some(u32::from_be_bytes([value[0], value[1], value[2], value[3]]))
 }
 
 fn decoded_original_question_name(decoded: &DecodedQuery) -> Option<String> {
@@ -3226,6 +3354,70 @@ mod tests {
         response[10..12].copy_from_slice(&1u16.to_be_bytes());
 
         assert_eq!(response_code_from_wire(&response), Some(2));
+    }
+
+    #[test]
+    fn response_code_from_wire_returns_base_rcode_without_opt_additional() {
+        let mut response = a_query(0x1234, "example.com");
+        response[2] = 0x81;
+        response[3] = 0x85;
+        response[10..12].copy_from_slice(&1u16.to_be_bytes());
+        response.push(0);
+        response.extend_from_slice(&1u16.to_be_bytes());
+        response.extend_from_slice(&1u16.to_be_bytes());
+        response.extend_from_slice(&60u32.to_be_bytes());
+        response.extend_from_slice(&4u16.to_be_bytes());
+        response.extend_from_slice(&[192, 0, 2, 1]);
+
+        assert_eq!(response_code_from_wire(&response), Some(5));
+    }
+
+    #[test]
+    fn response_code_from_wire_ignores_type_41_with_non_root_owner() {
+        let mut response = a_query(0x1234, "example.com");
+        response[2] = 0x81;
+        response[3] = 0x83;
+        response[10..12].copy_from_slice(&1u16.to_be_bytes());
+        response.push(3);
+        response.extend_from_slice(b"bad");
+        response.push(0);
+        response.extend_from_slice(&41u16.to_be_bytes());
+        response.extend_from_slice(&1232u16.to_be_bytes());
+        response.push(1);
+        response.push(0);
+        response.extend_from_slice(&0u16.to_be_bytes());
+        response.extend_from_slice(&0u16.to_be_bytes());
+
+        assert_eq!(response_code_from_wire(&response), Some(3));
+    }
+
+    #[test]
+    fn response_code_from_wire_returns_base_rcode_after_malformed_pointer_before_opt() {
+        let mut response = a_query_with_edns_details(0x1234, "example.com", 1232, false, 1, 0, &[]);
+        response[2] = 0x81;
+        response[3] = 0x82;
+        response[6..8].copy_from_slice(&1u16.to_be_bytes());
+        let opt = response.split_off(response.len() - 11);
+        response.extend_from_slice(&[0xc0, 0x00]);
+        response.extend_from_slice(&1u16.to_be_bytes());
+        response.extend_from_slice(&1u16.to_be_bytes());
+        response.extend_from_slice(&60u32.to_be_bytes());
+        response.extend_from_slice(&4u16.to_be_bytes());
+        response.extend_from_slice(&[192, 0, 2, 1]);
+        response.extend_from_slice(&opt);
+
+        assert_eq!(response_code_from_wire(&response), Some(2));
+    }
+
+    #[test]
+    fn response_code_from_wire_returns_base_rcode_when_later_additional_is_malformed() {
+        let mut response = a_query_with_edns_details(0x1234, "example.com", 1232, false, 1, 0, &[]);
+        response[2] = 0x81;
+        response[3] = 0x84;
+        response[10..12].copy_from_slice(&2u16.to_be_bytes());
+        response.extend_from_slice(&[0xc0, 0x00]);
+
+        assert_eq!(response_code_from_wire(&response), Some(4));
     }
 
     #[test]
