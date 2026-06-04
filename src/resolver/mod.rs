@@ -623,7 +623,7 @@ pub struct QueryEventClassifierWindow {
     pub started_at: SystemTime,
     pub ended_at: SystemTime,
     pub retained_event_count: usize,
-    pub incomplete_reason: Option<QueryEventClassifierWindowIncompleteReason>,
+    pub incomplete_reasons: Vec<QueryEventClassifierWindowIncompleteReason>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -638,6 +638,400 @@ pub enum QueryEventClassifierWindowIncompleteReason {
 pub struct QueryEventClassifierDetail {
     pub key: String,
     pub value: String,
+}
+
+pub struct SuspiciousLookupClassifierInput<'a> {
+    pub event: &'a QueryEventV1,
+    pub retained_events: &'a [QueryEventV1],
+    pub window: QueryEventClassifierWindow,
+}
+
+pub trait SuspiciousLookupClassifier: Send + Sync {
+    fn classify(
+        &self,
+        input: SuspiciousLookupClassifierInput<'_>,
+    ) -> Vec<QueryEventClassifierFinding>;
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NoopSuspiciousLookupClassifier {
+    pub classifier_version: String,
+    pub config_generation: u64,
+}
+
+impl NoopSuspiciousLookupClassifier {
+    pub fn new(classifier_version: impl Into<String>, config_generation: u64) -> Self {
+        Self {
+            classifier_version: classifier_version.into(),
+            config_generation,
+        }
+    }
+}
+
+impl SuspiciousLookupClassifier for NoopSuspiciousLookupClassifier {
+    fn classify(
+        &self,
+        _input: SuspiciousLookupClassifierInput<'_>,
+    ) -> Vec<QueryEventClassifierFinding> {
+        Vec::new()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InMemorySuspiciousLookupClassifierConfig {
+    pub classifier_version: String,
+    pub config_generation: u64,
+    pub nxdomain_burst_threshold: usize,
+    pub servfail_burst_threshold: usize,
+    pub repeated_txt_threshold: usize,
+    pub burst_window: Duration,
+    pub repeated_txt_window: Duration,
+    pub baseline_complete_after_events: usize,
+    pub enable_domain_frequency_findings: bool,
+    pub rare_domain_threshold: usize,
+    pub high_entropy_min_label_len: usize,
+    pub high_entropy_score_threshold: u8,
+    pub suspicious_tlds: Vec<String>,
+    pub suspicious_domains: Vec<String>,
+}
+
+impl Default for InMemorySuspiciousLookupClassifierConfig {
+    fn default() -> Self {
+        Self {
+            classifier_version: "in-memory-heuristics-v1".to_string(),
+            config_generation: 0,
+            nxdomain_burst_threshold: 5,
+            servfail_burst_threshold: 5,
+            repeated_txt_threshold: 5,
+            burst_window: Duration::from_secs(60),
+            repeated_txt_window: Duration::from_secs(60),
+            baseline_complete_after_events: 100,
+            enable_domain_frequency_findings: false,
+            rare_domain_threshold: 2,
+            high_entropy_min_label_len: 12,
+            high_entropy_score_threshold: 70,
+            suspicious_tlds: Vec::new(),
+            suspicious_domains: Vec::new(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InMemorySuspiciousLookupClassifier {
+    config: InMemorySuspiciousLookupClassifierConfig,
+}
+
+impl InMemorySuspiciousLookupClassifier {
+    pub fn new(config: InMemorySuspiciousLookupClassifierConfig) -> Self {
+        Self { config }
+    }
+}
+
+impl SuspiciousLookupClassifier for InMemorySuspiciousLookupClassifier {
+    fn classify(
+        &self,
+        input: SuspiciousLookupClassifierInput<'_>,
+    ) -> Vec<QueryEventClassifierFinding> {
+        let Some(question) = input.event.normalized_question.as_ref() else {
+            return Vec::new();
+        };
+        let mut findings = Vec::new();
+        self.classify_response_bursts(&input, &mut findings);
+        self.classify_repeated_txt(&input, &mut findings);
+        self.classify_high_entropy_name(question, &input, &mut findings);
+        self.classify_domain_frequency(question, &input, &mut findings);
+        self.classify_suspicious_selectors(question, &input, &mut findings);
+        findings
+    }
+}
+
+impl InMemorySuspiciousLookupClassifier {
+    fn classify_response_bursts(
+        &self,
+        input: &SuspiciousLookupClassifierInput<'_>,
+        findings: &mut Vec<QueryEventClassifierFinding>,
+    ) {
+        if input.event.response_code == Some(ResponseCode::NxDomain as u16) {
+            let count = count_source_response_code(
+                input.retained_events,
+                &input.event.observed_source,
+                ResponseCode::NxDomain as u16,
+                input.event.timestamp,
+                self.config.burst_window,
+            );
+            if count >= self.config.nxdomain_burst_threshold {
+                findings.push(self.finding(
+                    QueryEventClassifierReason::NxdomainBurst,
+                    QueryEventClassifierSeverity::Medium,
+                    70,
+                    input,
+                    vec![
+                        detail("source_response_count", count),
+                        detail("threshold", self.config.nxdomain_burst_threshold),
+                    ],
+                ));
+            }
+        }
+
+        if input.event.response_code == Some(ResponseCode::ServFail as u16) {
+            let count = count_source_response_code(
+                input.retained_events,
+                &input.event.observed_source,
+                ResponseCode::ServFail as u16,
+                input.event.timestamp,
+                self.config.burst_window,
+            );
+            if count >= self.config.servfail_burst_threshold {
+                findings.push(self.finding(
+                    QueryEventClassifierReason::ServfailBurst,
+                    QueryEventClassifierSeverity::Medium,
+                    65,
+                    input,
+                    vec![
+                        detail("source_response_count", count),
+                        detail("threshold", self.config.servfail_burst_threshold),
+                    ],
+                ));
+            }
+        }
+    }
+
+    fn classify_repeated_txt(
+        &self,
+        input: &SuspiciousLookupClassifierInput<'_>,
+        findings: &mut Vec<QueryEventClassifierFinding>,
+    ) {
+        if input.event.qtype != Some(16) {
+            return;
+        }
+        let count = input
+            .retained_events
+            .iter()
+            .filter(|event| {
+                event_in_window(
+                    event,
+                    input.event.timestamp,
+                    self.config.repeated_txt_window,
+                )
+            })
+            .filter(|event| event.observed_source == input.event.observed_source)
+            .filter(|event| event.qtype == Some(16))
+            .count();
+        if count >= self.config.repeated_txt_threshold {
+            findings.push(self.finding(
+                QueryEventClassifierReason::RepeatedTxtLookup,
+                QueryEventClassifierSeverity::Low,
+                55,
+                input,
+                vec![
+                    detail("source_txt_count", count),
+                    detail("threshold", self.config.repeated_txt_threshold),
+                ],
+            ));
+        }
+    }
+
+    fn classify_high_entropy_name(
+        &self,
+        question: &QuestionKey,
+        input: &SuspiciousLookupClassifierInput<'_>,
+        findings: &mut Vec<QueryEventClassifierFinding>,
+    ) {
+        let Some(label) = question.qname.split('.').next() else {
+            return;
+        };
+        if label.len() < self.config.high_entropy_min_label_len {
+            return;
+        }
+        let score = entropy_score(label);
+        if score >= self.config.high_entropy_score_threshold {
+            findings.push(self.finding(
+                QueryEventClassifierReason::HighEntropyName,
+                QueryEventClassifierSeverity::Medium,
+                score,
+                input,
+                vec![
+                    detail("label", label),
+                    detail("score", score),
+                    detail("threshold", self.config.high_entropy_score_threshold),
+                ],
+            ));
+        }
+    }
+
+    fn classify_domain_frequency(
+        &self,
+        question: &QuestionKey,
+        input: &SuspiciousLookupClassifierInput<'_>,
+        findings: &mut Vec<QueryEventClassifierFinding>,
+    ) {
+        if !self.config.enable_domain_frequency_findings {
+            return;
+        }
+        let count = input
+            .retained_events
+            .iter()
+            .filter_map(|event| event.normalized_question.as_ref())
+            .filter(|retained_question| retained_question.qname == question.qname)
+            .count();
+        if count == 1 {
+            findings.push(self.finding(
+                QueryEventClassifierReason::NewDomain,
+                QueryEventClassifierSeverity::Low,
+                35,
+                input,
+                vec![detail("retained_domain_count", count)],
+            ));
+        } else if count > 1 && count <= self.config.rare_domain_threshold {
+            findings.push(self.finding(
+                QueryEventClassifierReason::RareDomain,
+                QueryEventClassifierSeverity::Low,
+                30,
+                input,
+                vec![
+                    detail("retained_domain_count", count),
+                    detail("threshold", self.config.rare_domain_threshold),
+                ],
+            ));
+        }
+    }
+
+    fn classify_suspicious_selectors(
+        &self,
+        question: &QuestionKey,
+        input: &SuspiciousLookupClassifierInput<'_>,
+        findings: &mut Vec<QueryEventClassifierFinding>,
+    ) {
+        if let Some(selector) = matching_suspicious_selector(
+            &question.qname,
+            &self.config.suspicious_tlds,
+            &self.config.suspicious_domains,
+        ) {
+            findings.push(self.finding(
+                QueryEventClassifierReason::SuspiciousSelector,
+                QueryEventClassifierSeverity::High,
+                90,
+                input,
+                vec![detail("selector", selector)],
+            ));
+        }
+    }
+
+    fn finding(
+        &self,
+        reason: QueryEventClassifierReason,
+        severity: QueryEventClassifierSeverity,
+        score: u8,
+        input: &SuspiciousLookupClassifierInput<'_>,
+        mut details: Vec<QueryEventClassifierDetail>,
+    ) -> QueryEventClassifierFinding {
+        let mut evaluated_window = input.window.clone();
+        if is_baseline_dependent_reason(&reason)
+            && evaluated_window.retained_event_count < self.config.baseline_complete_after_events
+            && !evaluated_window
+                .incomplete_reasons
+                .contains(&QueryEventClassifierWindowIncompleteReason::ColdStart)
+        {
+            evaluated_window
+                .incomplete_reasons
+                .push(QueryEventClassifierWindowIncompleteReason::ColdStart);
+        }
+        for incomplete_reason in &evaluated_window.incomplete_reasons {
+            details.push(detail(
+                "window_incomplete_reason",
+                format!("{incomplete_reason:?}"),
+            ));
+        }
+        QueryEventClassifierFinding {
+            classifier_version: self.config.classifier_version.clone(),
+            config_generation: self.config.config_generation,
+            reason,
+            severity,
+            score,
+            evaluated_window,
+            details,
+        }
+    }
+}
+
+fn is_baseline_dependent_reason(reason: &QueryEventClassifierReason) -> bool {
+    matches!(
+        reason,
+        QueryEventClassifierReason::NxdomainBurst
+            | QueryEventClassifierReason::ServfailBurst
+            | QueryEventClassifierReason::RepeatedTxtLookup
+            | QueryEventClassifierReason::RareDomain
+            | QueryEventClassifierReason::NewDomain
+    )
+}
+
+fn count_source_response_code(
+    retained_events: &[QueryEventV1],
+    source: &ObservedSourceEndpoint,
+    response_code: u16,
+    ended_at: SystemTime,
+    window: Duration,
+) -> usize {
+    retained_events
+        .iter()
+        .filter(|event| event_in_window(event, ended_at, window))
+        .filter(|event| event.observed_source == *source)
+        .filter(|event| event.response_code == Some(response_code))
+        .count()
+}
+
+fn event_in_window(event: &QueryEventV1, ended_at: SystemTime, window: Duration) -> bool {
+    event
+        .timestamp
+        .checked_add(window)
+        .map(|expires_at| expires_at >= ended_at)
+        .unwrap_or(true)
+        && event.timestamp <= ended_at
+}
+
+fn entropy_score(label: &str) -> u8 {
+    if label.is_empty() {
+        return 0;
+    }
+    let mut counts = HashMap::<char, usize>::new();
+    for ch in label.chars() {
+        *counts.entry(ch).or_insert(0) += 1;
+    }
+    let len = label.chars().count() as f64;
+    let entropy = counts.values().fold(0.0, |sum, count| {
+        let probability = *count as f64 / len;
+        sum - probability * probability.log2()
+    });
+    ((entropy / 5.0) * 100.0).round().clamp(0.0, 100.0) as u8
+}
+
+fn matching_suspicious_selector(
+    qname: &str,
+    suspicious_tlds: &[String],
+    suspicious_domains: &[String],
+) -> Option<String> {
+    for domain in suspicious_domains {
+        let domain = normalize_question_name(domain);
+        if qname == domain || qname.ends_with(&format!(".{domain}")) {
+            return Some(domain);
+        }
+    }
+
+    let tld = qname.rsplit('.').next()?;
+    for configured_tld in suspicious_tlds {
+        let configured_tld = normalize_question_name(configured_tld);
+        if tld == configured_tld.trim_start_matches('.') {
+            return Some(format!(".{tld}"));
+        }
+    }
+    None
+}
+
+fn detail(key: impl Into<String>, value: impl ToString) -> QueryEventClassifierDetail {
+    QueryEventClassifierDetail {
+        key: key.into(),
+        value: value.to_string(),
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1669,6 +2063,62 @@ pub struct InMemoryQueryEventStore {
     state: Mutex<InMemoryQueryEventStoreState>,
 }
 
+pub trait QueryEventReadModel: Send + Sync {
+    fn recent_query_events(&self, limit: usize) -> Vec<QueryEventV1>;
+
+    fn suspicious_query_events(&self, limit: usize) -> Vec<QueryEventV1>;
+
+    fn query_events_for_source(
+        &self,
+        source: &ObservedSourceEndpoint,
+        limit: usize,
+    ) -> Vec<QueryEventV1>;
+
+    fn suspicious_summary_for_source(
+        &self,
+        source: &ObservedSourceEndpoint,
+    ) -> QueryEventSuspiciousSourceSummary;
+
+    fn query_events_for_domain(&self, domain: &str, limit: usize) -> Vec<QueryEventV1>;
+
+    fn top_suspicious_sources(&self, limit: usize) -> Vec<QueryEventSuspiciousSourceSummary>;
+
+    fn top_suspicious_domains(&self, limit: usize) -> Vec<QueryEventSuspiciousDomainSummary>;
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct QueryEventSuspiciousSourceSummary {
+    pub observed_source: ObservedSourceEndpoint,
+    pub suspicious_event_count: usize,
+    pub finding_count: usize,
+    pub highest_severity: Option<QueryEventClassifierSeverity>,
+    pub last_seen: Option<SystemTime>,
+    pub window: QueryEventReadModelWindow,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct QueryEventSuspiciousDomainSummary {
+    pub domain: String,
+    pub suspicious_event_count: usize,
+    pub finding_count: usize,
+    pub highest_severity: Option<QueryEventClassifierSeverity>,
+    pub last_seen: Option<SystemTime>,
+    pub window: QueryEventReadModelWindow,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct QueryEventReadModelWindow {
+    pub retained_event_count: usize,
+    pub incomplete_reasons: Vec<QueryEventReadModelIncompleteReason>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum QueryEventReadModelIncompleteReason {
+    RetentionEviction,
+    DroppedEvents,
+    SampledEvents,
+}
+
 #[derive(Default)]
 struct InMemoryQueryEventStoreState {
     events: VecDeque<StoredQueryEvent>,
@@ -1699,6 +2149,34 @@ impl InMemoryQueryEventStore {
     pub fn record(&self, event: QueryEventV1) {
         let mut state = self.state.lock().unwrap();
         state.record(event, &self.config);
+    }
+
+    pub fn record_classified(
+        &self,
+        event: QueryEventV1,
+        classifier: &dyn SuspiciousLookupClassifier,
+    ) -> QueryEventV1 {
+        let mut state = self.state.lock().unwrap();
+        let sequence = event.sequence;
+        state.record(event.clone(), &self.config);
+        let retained_events = state.retained_events_through(&event);
+        let window = classifier_window_for_event(&retained_events, &state);
+        let advisory_findings = classifier.classify(SuspiciousLookupClassifierInput {
+            event: &event,
+            retained_events: &retained_events,
+            window,
+        });
+
+        let mut classified_event = event;
+        classified_event.advisory_findings = advisory_findings;
+        if let Some(stored) = state
+            .events
+            .iter_mut()
+            .find(|entry| entry.event.sequence == sequence)
+        {
+            stored.event.advisory_findings = classified_event.advisory_findings.clone();
+        }
+        classified_event
     }
 
     pub fn record_outcome(&self, result: QueryEventRecordResult) {
@@ -1746,7 +2224,304 @@ impl InMemoryQueryEventStore {
     }
 }
 
+impl QueryEventReadModel for InMemoryQueryEventStore {
+    fn recent_query_events(&self, limit: usize) -> Vec<QueryEventV1> {
+        let state = self.state.lock().unwrap();
+        clone_recent_matching(state.events.iter(), limit, |_| true)
+    }
+
+    fn suspicious_query_events(&self, limit: usize) -> Vec<QueryEventV1> {
+        let state = self.state.lock().unwrap();
+        clone_recent_matching(state.events.iter(), limit, is_suspicious_event)
+    }
+
+    fn query_events_for_source(
+        &self,
+        source: &ObservedSourceEndpoint,
+        limit: usize,
+    ) -> Vec<QueryEventV1> {
+        let state = self.state.lock().unwrap();
+        clone_recent_matching(state.events.iter(), limit, |event| {
+            event.observed_source == *source
+        })
+    }
+
+    fn suspicious_summary_for_source(
+        &self,
+        source: &ObservedSourceEndpoint,
+    ) -> QueryEventSuspiciousSourceSummary {
+        let state = self.state.lock().unwrap();
+        let mut summary = QueryEventSuspiciousSourceSummary {
+            observed_source: source.clone(),
+            suspicious_event_count: 0,
+            finding_count: 0,
+            highest_severity: None,
+            last_seen: None,
+            window: read_model_window(&state),
+        };
+        for event in state.events.iter().map(|entry| &entry.event) {
+            if event.observed_source == *source && is_suspicious_event(event) {
+                update_source_summary(&mut summary, event);
+            }
+        }
+        summary
+    }
+
+    fn query_events_for_domain(&self, domain: &str, limit: usize) -> Vec<QueryEventV1> {
+        let domain = normalize_question_name(domain);
+        let state = self.state.lock().unwrap();
+        clone_recent_matching(state.events.iter(), limit, |event| {
+            event
+                .normalized_question
+                .as_ref()
+                .map(|question| question.qname == domain)
+                .unwrap_or(false)
+        })
+    }
+
+    fn top_suspicious_sources(&self, limit: usize) -> Vec<QueryEventSuspiciousSourceSummary> {
+        let state = self.state.lock().unwrap();
+        let mut summaries =
+            HashMap::<ObservedSourceEndpoint, QueryEventSuspiciousSourceSummary>::new();
+        for event in state.events.iter().map(|entry| &entry.event) {
+            if !is_suspicious_event(event) {
+                continue;
+            }
+            let summary = summaries
+                .entry(event.observed_source.clone())
+                .or_insert_with(|| QueryEventSuspiciousSourceSummary {
+                    observed_source: event.observed_source.clone(),
+                    suspicious_event_count: 0,
+                    finding_count: 0,
+                    highest_severity: None,
+                    last_seen: None,
+                    window: read_model_window(&state),
+                });
+            update_source_summary(summary, event);
+        }
+        let mut summaries = summaries.into_values().collect::<Vec<_>>();
+        summaries.sort_by(compare_source_summaries);
+        summaries.truncate(limit);
+        summaries
+    }
+
+    fn top_suspicious_domains(&self, limit: usize) -> Vec<QueryEventSuspiciousDomainSummary> {
+        let state = self.state.lock().unwrap();
+        let mut summaries = HashMap::<String, QueryEventSuspiciousDomainSummary>::new();
+        for event in state.events.iter().map(|entry| &entry.event) {
+            if !is_suspicious_event(event) {
+                continue;
+            }
+            let Some(domain) = event
+                .normalized_question
+                .as_ref()
+                .map(|question| question.qname.clone())
+            else {
+                continue;
+            };
+            let summary = summaries.entry(domain.clone()).or_insert_with(|| {
+                QueryEventSuspiciousDomainSummary {
+                    domain,
+                    suspicious_event_count: 0,
+                    finding_count: 0,
+                    highest_severity: None,
+                    last_seen: None,
+                    window: read_model_window(&state),
+                }
+            });
+            update_domain_summary(summary, event);
+        }
+        let mut summaries = summaries.into_values().collect::<Vec<_>>();
+        summaries.sort_by(compare_domain_summaries);
+        summaries.truncate(limit);
+        summaries
+    }
+}
+
+fn clone_recent_matching<'a>(
+    events: impl DoubleEndedIterator<Item = &'a StoredQueryEvent>,
+    limit: usize,
+    matches: impl Fn(&QueryEventV1) -> bool,
+) -> Vec<QueryEventV1> {
+    let mut events = events
+        .rev()
+        .filter_map(|entry| {
+            if matches(&entry.event) {
+                Some(entry.event.clone())
+            } else {
+                None
+            }
+        })
+        .take(limit)
+        .collect::<Vec<_>>();
+    events.reverse();
+    events
+}
+
+fn is_suspicious_event(event: &QueryEventV1) -> bool {
+    !event.advisory_findings.is_empty()
+}
+
+fn read_model_window(state: &InMemoryQueryEventStoreState) -> QueryEventReadModelWindow {
+    let mut incomplete_reasons = Vec::new();
+    if state.evicted_event_count > 0 {
+        incomplete_reasons.push(QueryEventReadModelIncompleteReason::RetentionEviction);
+    }
+    if state.dropped_newest_event_count > 0 || state.dropped_oldest_event_count > 0 {
+        incomplete_reasons.push(QueryEventReadModelIncompleteReason::DroppedEvents);
+    }
+    if state.sampled_event_count > 0 {
+        incomplete_reasons.push(QueryEventReadModelIncompleteReason::SampledEvents);
+    }
+
+    QueryEventReadModelWindow {
+        retained_event_count: state.events.len(),
+        incomplete_reasons,
+    }
+}
+
+fn classifier_window_for_event(
+    retained_events: &[QueryEventV1],
+    state: &InMemoryQueryEventStoreState,
+) -> QueryEventClassifierWindow {
+    let started_at = retained_events
+        .first()
+        .map(|event| event.timestamp)
+        .unwrap_or(SystemTime::UNIX_EPOCH);
+    let ended_at = retained_events
+        .last()
+        .map(|event| event.timestamp)
+        .unwrap_or(started_at);
+    let mut incomplete_reasons = Vec::new();
+    if retained_events.len() <= 1 {
+        incomplete_reasons.push(QueryEventClassifierWindowIncompleteReason::ColdStart);
+    }
+    if state.evicted_event_count > 0 {
+        incomplete_reasons.push(QueryEventClassifierWindowIncompleteReason::RetentionEviction);
+    }
+    if state.dropped_newest_event_count > 0 || state.dropped_oldest_event_count > 0 {
+        incomplete_reasons.push(QueryEventClassifierWindowIncompleteReason::DroppedEvents);
+    }
+    if state.sampled_event_count > 0 {
+        incomplete_reasons.push(QueryEventClassifierWindowIncompleteReason::SampledEvents);
+    }
+
+    QueryEventClassifierWindow {
+        started_at,
+        ended_at,
+        retained_event_count: retained_events.len(),
+        incomplete_reasons,
+    }
+}
+
+fn update_source_summary(summary: &mut QueryEventSuspiciousSourceSummary, event: &QueryEventV1) {
+    summary.suspicious_event_count = summary.suspicious_event_count.saturating_add(1);
+    update_suspicious_counts(
+        &mut summary.finding_count,
+        &mut summary.highest_severity,
+        &mut summary.last_seen,
+        event,
+    );
+}
+
+fn update_domain_summary(summary: &mut QueryEventSuspiciousDomainSummary, event: &QueryEventV1) {
+    summary.suspicious_event_count = summary.suspicious_event_count.saturating_add(1);
+    update_suspicious_counts(
+        &mut summary.finding_count,
+        &mut summary.highest_severity,
+        &mut summary.last_seen,
+        event,
+    );
+}
+
+fn update_suspicious_counts(
+    finding_count: &mut usize,
+    highest_severity: &mut Option<QueryEventClassifierSeverity>,
+    last_seen: &mut Option<SystemTime>,
+    event: &QueryEventV1,
+) {
+    *finding_count = finding_count.saturating_add(event.advisory_findings.len());
+    for finding in &event.advisory_findings {
+        *highest_severity = Some(
+            highest_severity
+                .map(|current| current.max(finding.severity))
+                .unwrap_or(finding.severity),
+        );
+    }
+    *last_seen = Some(
+        last_seen
+            .map(|current| current.max(event.timestamp))
+            .unwrap_or(event.timestamp),
+    );
+}
+
+fn compare_source_summaries(
+    left: &QueryEventSuspiciousSourceSummary,
+    right: &QueryEventSuspiciousSourceSummary,
+) -> std::cmp::Ordering {
+    compare_suspicious_ranks(
+        left.suspicious_event_count,
+        left.finding_count,
+        left.highest_severity,
+        left.last_seen,
+        &format!("{:?}", left.observed_source),
+        right.suspicious_event_count,
+        right.finding_count,
+        right.highest_severity,
+        right.last_seen,
+        &format!("{:?}", right.observed_source),
+    )
+}
+
+fn compare_domain_summaries(
+    left: &QueryEventSuspiciousDomainSummary,
+    right: &QueryEventSuspiciousDomainSummary,
+) -> std::cmp::Ordering {
+    compare_suspicious_ranks(
+        left.suspicious_event_count,
+        left.finding_count,
+        left.highest_severity,
+        left.last_seen,
+        &left.domain,
+        right.suspicious_event_count,
+        right.finding_count,
+        right.highest_severity,
+        right.last_seen,
+        &right.domain,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn compare_suspicious_ranks(
+    left_event_count: usize,
+    left_finding_count: usize,
+    left_severity: Option<QueryEventClassifierSeverity>,
+    left_last_seen: Option<SystemTime>,
+    left_key: &str,
+    right_event_count: usize,
+    right_finding_count: usize,
+    right_severity: Option<QueryEventClassifierSeverity>,
+    right_last_seen: Option<SystemTime>,
+    right_key: &str,
+) -> std::cmp::Ordering {
+    right_event_count
+        .cmp(&left_event_count)
+        .then_with(|| right_finding_count.cmp(&left_finding_count))
+        .then_with(|| right_severity.cmp(&left_severity))
+        .then_with(|| right_last_seen.cmp(&left_last_seen))
+        .then_with(|| left_key.cmp(right_key))
+}
+
 impl InMemoryQueryEventStoreState {
+    fn retained_events_through(&self, event: &QueryEventV1) -> Vec<QueryEventV1> {
+        let key = event_order_key(event);
+        self.events
+            .iter()
+            .filter(|entry| event_order_key(&entry.event) <= key)
+            .map(|entry| entry.event.clone())
+            .collect()
+    }
+
     fn record(&mut self, event: QueryEventV1, config: &InMemoryQueryEventStoreConfig) {
         let key = event_order_key(&event);
         let appends_to_tail = self
@@ -2344,19 +3119,99 @@ mod tests {
     }
 
     fn event_with(sequence: u64, seconds: u64, source_ip: &str, name: &str) -> QueryEventV1 {
+        event_with_response(
+            sequence,
+            seconds,
+            source_ip,
+            name,
+            1,
+            ResponseCode::NoError as u16,
+        )
+    }
+
+    fn event_with_response(
+        sequence: u64,
+        seconds: u64,
+        source_ip: &str,
+        name: &str,
+        qtype: u16,
+        response_code: u16,
+    ) -> QueryEventV1 {
         let decision = ResolveDecision {
             client_ip: source_ip.parse().unwrap(),
-            question: Some(QuestionKey::new(name, 1, 1)),
+            question: Some(QuestionKey::new(name, qtype, 1)),
             kind: ResolveDecisionKind::Allowed,
         };
         QueryEventV1::from_decision(
             sequence,
             SystemTime::UNIX_EPOCH + Duration::from_secs(seconds),
             &decision,
-            Some(ResponseCode::NoError as u16),
+            Some(response_code),
             Some(QueryEventCacheResult::Miss),
             Some(Duration::from_millis(1)),
         )
+    }
+
+    fn suspicious_event_with(
+        sequence: u64,
+        seconds: u64,
+        source_ip: &str,
+        name: &str,
+        severity: QueryEventClassifierSeverity,
+    ) -> QueryEventV1 {
+        let mut event = event_with(sequence, seconds, source_ip, name);
+        event.advisory_findings.push(QueryEventClassifierFinding {
+            classifier_version: "test".to_string(),
+            config_generation: 1,
+            reason: QueryEventClassifierReason::HighEntropyName,
+            severity,
+            score: 80,
+            evaluated_window: QueryEventClassifierWindow {
+                started_at: SystemTime::UNIX_EPOCH,
+                ended_at: event.timestamp,
+                retained_event_count: 1,
+                incomplete_reasons: Vec::new(),
+            },
+            details: vec![QueryEventClassifierDetail {
+                key: "qname".to_string(),
+                value: name.to_string(),
+            }],
+        });
+        event
+    }
+
+    fn classifier_window(
+        retained_events: &[QueryEventV1],
+        incomplete_reasons: Vec<QueryEventClassifierWindowIncompleteReason>,
+    ) -> QueryEventClassifierWindow {
+        QueryEventClassifierWindow {
+            started_at: retained_events
+                .first()
+                .map(|event| event.timestamp)
+                .unwrap_or(SystemTime::UNIX_EPOCH),
+            ended_at: retained_events
+                .last()
+                .map(|event| event.timestamp)
+                .unwrap_or(SystemTime::UNIX_EPOCH),
+            retained_event_count: retained_events.len(),
+            incomplete_reasons,
+        }
+    }
+
+    fn finding_reasons(
+        classifier: &InMemorySuspiciousLookupClassifier,
+        event: &QueryEventV1,
+        retained_events: &[QueryEventV1],
+    ) -> Vec<QueryEventClassifierReason> {
+        classifier
+            .classify(SuspiciousLookupClassifierInput {
+                event,
+                retained_events,
+                window: classifier_window(retained_events, Vec::new()),
+            })
+            .into_iter()
+            .map(|finding| finding.reason)
+            .collect()
     }
 
     #[tokio::test]
@@ -2564,6 +3419,583 @@ mod tests {
         assert_eq!(summary.dropped_newest_event_count, 1);
         assert_eq!(summary.dropped_oldest_event_count, 1);
         assert_eq!(summary.sampled_event_count, 1);
+    }
+
+    #[test]
+    fn query_event_read_model_limits_recent_source_and_domain_history() {
+        let store = InMemoryQueryEventStore::new(InMemoryQueryEventStoreConfig::default());
+        store.record(event_with(1, 1, "192.0.2.1", "first.example"));
+        store.record(event_with(2, 2, "192.0.2.2", "other.example"));
+        store.record(event_with(3, 3, "192.0.2.1", "second.example"));
+        store.record(event_with(4, 4, "192.0.2.1", "second.example"));
+
+        let source = ObservedSourceEndpoint::ip("192.0.2.1".parse().unwrap());
+        let source_events = store.query_events_for_source(&source, 2);
+        assert_eq!(
+            source_events
+                .iter()
+                .map(|event| event.sequence)
+                .collect::<Vec<_>>(),
+            vec![3, 4]
+        );
+
+        let domain_events = store.query_events_for_domain("Second.Example.", 8);
+        assert_eq!(
+            domain_events
+                .iter()
+                .map(|event| event.sequence)
+                .collect::<Vec<_>>(),
+            vec![3, 4]
+        );
+
+        let recent_events = store.recent_query_events(2);
+        assert_eq!(
+            recent_events
+                .iter()
+                .map(|event| event.sequence)
+                .collect::<Vec<_>>(),
+            vec![3, 4]
+        );
+    }
+
+    #[test]
+    fn query_event_read_model_filters_suspicious_events() {
+        let store = InMemoryQueryEventStore::new(InMemoryQueryEventStoreConfig::default());
+        store.record(event_with(1, 1, "192.0.2.1", "allowed.example"));
+        store.record(suspicious_event_with(
+            2,
+            2,
+            "192.0.2.1",
+            "first-bad.example",
+            QueryEventClassifierSeverity::Low,
+        ));
+        store.record(suspicious_event_with(
+            3,
+            3,
+            "192.0.2.2",
+            "second-bad.example",
+            QueryEventClassifierSeverity::High,
+        ));
+
+        let events = store.suspicious_query_events(8);
+        assert_eq!(
+            events
+                .iter()
+                .map(|event| event.sequence)
+                .collect::<Vec<_>>(),
+            vec![2, 3]
+        );
+    }
+
+    #[test]
+    fn query_event_read_model_summarizes_suspicious_source() {
+        let store = InMemoryQueryEventStore::new(InMemoryQueryEventStoreConfig::default());
+        let source = ObservedSourceEndpoint::ip("192.0.2.1".parse().unwrap());
+        store.record(event_with(1, 1, "192.0.2.1", "allowed.example"));
+        store.record(suspicious_event_with(
+            2,
+            2,
+            "192.0.2.1",
+            "first-bad.example",
+            QueryEventClassifierSeverity::Low,
+        ));
+        let mut high = suspicious_event_with(
+            3,
+            3,
+            "192.0.2.1",
+            "second-bad.example",
+            QueryEventClassifierSeverity::High,
+        );
+        high.advisory_findings.push(QueryEventClassifierFinding {
+            classifier_version: "test".to_string(),
+            config_generation: 1,
+            reason: QueryEventClassifierReason::SuspiciousSelector,
+            severity: QueryEventClassifierSeverity::Medium,
+            score: 70,
+            evaluated_window: QueryEventClassifierWindow {
+                started_at: SystemTime::UNIX_EPOCH,
+                ended_at: high.timestamp,
+                retained_event_count: 2,
+                incomplete_reasons: Vec::new(),
+            },
+            details: Vec::new(),
+        });
+        store.record(high);
+
+        let summary = store.suspicious_summary_for_source(&source);
+        assert_eq!(summary.observed_source, source);
+        assert_eq!(summary.suspicious_event_count, 2);
+        assert_eq!(summary.finding_count, 3);
+        assert_eq!(
+            summary.highest_severity,
+            Some(QueryEventClassifierSeverity::High)
+        );
+        assert_eq!(
+            summary.last_seen,
+            Some(SystemTime::UNIX_EPOCH + Duration::from_secs(3))
+        );
+    }
+
+    #[test]
+    fn query_event_read_model_ranks_top_suspicious_sources_and_domains() {
+        let store = InMemoryQueryEventStore::new(InMemoryQueryEventStoreConfig::default());
+        store.record(suspicious_event_with(
+            1,
+            1,
+            "192.0.2.1",
+            "alpha.example",
+            QueryEventClassifierSeverity::Low,
+        ));
+        store.record(suspicious_event_with(
+            2,
+            2,
+            "192.0.2.2",
+            "beta.example",
+            QueryEventClassifierSeverity::High,
+        ));
+        store.record(suspicious_event_with(
+            3,
+            3,
+            "192.0.2.2",
+            "beta.example",
+            QueryEventClassifierSeverity::Medium,
+        ));
+
+        let sources = store.top_suspicious_sources(1);
+        assert_eq!(sources.len(), 1);
+        assert_eq!(
+            sources[0].observed_source,
+            ObservedSourceEndpoint::ip("192.0.2.2".parse().unwrap())
+        );
+        assert_eq!(sources[0].suspicious_event_count, 2);
+        assert_eq!(
+            sources[0].highest_severity,
+            Some(QueryEventClassifierSeverity::High)
+        );
+
+        let domains = store.top_suspicious_domains(2);
+        assert_eq!(
+            domains
+                .iter()
+                .map(|summary| summary.domain.as_str())
+                .collect::<Vec<_>>(),
+            vec!["beta.example", "alpha.example"]
+        );
+        assert_eq!(domains[0].suspicious_event_count, 2);
+    }
+
+    #[test]
+    fn query_event_read_model_marks_incomplete_summaries() {
+        let store = InMemoryQueryEventStore::new(InMemoryQueryEventStoreConfig {
+            max_retained_events: 1,
+            ..InMemoryQueryEventStoreConfig::default()
+        });
+        store.record(suspicious_event_with(
+            1,
+            1,
+            "192.0.2.1",
+            "old.example",
+            QueryEventClassifierSeverity::Low,
+        ));
+        store.record(suspicious_event_with(
+            2,
+            2,
+            "192.0.2.1",
+            "new.example",
+            QueryEventClassifierSeverity::High,
+        ));
+        store.record_outcome(QueryEventRecordResult::DroppedNewest);
+        store.record_outcome(QueryEventRecordResult::Sampled);
+
+        let source = ObservedSourceEndpoint::ip("192.0.2.1".parse().unwrap());
+        let source_summary = store.suspicious_summary_for_source(&source);
+        assert_eq!(source_summary.window.retained_event_count, 1);
+        assert_eq!(
+            source_summary.window.incomplete_reasons,
+            vec![
+                QueryEventReadModelIncompleteReason::RetentionEviction,
+                QueryEventReadModelIncompleteReason::DroppedEvents,
+                QueryEventReadModelIncompleteReason::SampledEvents,
+            ]
+        );
+
+        let domain_summary = store.top_suspicious_domains(1).remove(0);
+        assert_eq!(
+            domain_summary.window.incomplete_reasons,
+            source_summary.window.incomplete_reasons
+        );
+    }
+
+    #[test]
+    fn noop_suspicious_lookup_classifier_is_advisory_scaffolding() {
+        let classifier = NoopSuspiciousLookupClassifier::new("noop-test", 7);
+        let event = event_with(1, 1, "192.0.2.1", "allowed.example");
+        let retained_events = vec![event.clone()];
+        let window = QueryEventClassifierWindow {
+            started_at: SystemTime::UNIX_EPOCH,
+            ended_at: event.timestamp,
+            retained_event_count: retained_events.len(),
+            incomplete_reasons: vec![QueryEventClassifierWindowIncompleteReason::ColdStart],
+        };
+
+        let findings = classifier.classify(SuspiciousLookupClassifierInput {
+            event: &event,
+            retained_events: &retained_events,
+            window,
+        });
+
+        assert!(findings.is_empty());
+        assert_eq!(classifier.classifier_version, "noop-test");
+        assert_eq!(classifier.config_generation, 7);
+    }
+
+    #[test]
+    fn suspicious_lookup_classifier_flags_response_code_bursts() {
+        let classifier =
+            InMemorySuspiciousLookupClassifier::new(InMemorySuspiciousLookupClassifierConfig {
+                nxdomain_burst_threshold: 3,
+                servfail_burst_threshold: 2,
+                ..InMemorySuspiciousLookupClassifierConfig::default()
+            });
+        let retained_events = vec![
+            event_with_response(
+                1,
+                1,
+                "192.0.2.1",
+                "one.example",
+                1,
+                ResponseCode::NxDomain as u16,
+            ),
+            event_with_response(
+                2,
+                2,
+                "192.0.2.1",
+                "two.example",
+                1,
+                ResponseCode::NxDomain as u16,
+            ),
+            event_with_response(
+                3,
+                3,
+                "192.0.2.1",
+                "three.example",
+                1,
+                ResponseCode::NxDomain as u16,
+            ),
+            event_with_response(
+                4,
+                4,
+                "192.0.2.2",
+                "other.example",
+                1,
+                ResponseCode::NxDomain as u16,
+            ),
+        ];
+
+        let reasons = finding_reasons(&classifier, &retained_events[2], &retained_events);
+
+        assert!(reasons.contains(&QueryEventClassifierReason::NxdomainBurst));
+
+        let retained_events = vec![
+            event_with_response(
+                1,
+                1,
+                "192.0.2.1",
+                "one.example",
+                1,
+                ResponseCode::ServFail as u16,
+            ),
+            event_with_response(
+                2,
+                2,
+                "192.0.2.1",
+                "two.example",
+                1,
+                ResponseCode::ServFail as u16,
+            ),
+        ];
+        let reasons = finding_reasons(&classifier, &retained_events[1], &retained_events);
+
+        assert!(reasons.contains(&QueryEventClassifierReason::ServfailBurst));
+    }
+
+    #[test]
+    fn suspicious_lookup_classifier_ignores_stale_burst_events() {
+        let classifier =
+            InMemorySuspiciousLookupClassifier::new(InMemorySuspiciousLookupClassifierConfig {
+                nxdomain_burst_threshold: 3,
+                repeated_txt_threshold: 3,
+                burst_window: Duration::from_secs(10),
+                repeated_txt_window: Duration::from_secs(10),
+                ..InMemorySuspiciousLookupClassifierConfig::default()
+            });
+        let retained_events = vec![
+            event_with_response(
+                1,
+                1,
+                "192.0.2.1",
+                "old-one.example",
+                1,
+                ResponseCode::NxDomain as u16,
+            ),
+            event_with_response(
+                2,
+                2,
+                "192.0.2.1",
+                "old-two.example",
+                16,
+                ResponseCode::NxDomain as u16,
+            ),
+            event_with_response(
+                3,
+                3,
+                "192.0.2.1",
+                "old-three.example",
+                16,
+                ResponseCode::NxDomain as u16,
+            ),
+            event_with_response(
+                4,
+                30,
+                "192.0.2.1",
+                "current.example",
+                16,
+                ResponseCode::NxDomain as u16,
+            ),
+        ];
+
+        let reasons = finding_reasons(&classifier, &retained_events[3], &retained_events);
+
+        assert!(!reasons.contains(&QueryEventClassifierReason::NxdomainBurst));
+        assert!(!reasons.contains(&QueryEventClassifierReason::RepeatedTxtLookup));
+    }
+
+    #[test]
+    fn suspicious_lookup_classifier_flags_txt_entropy_and_selectors() {
+        let classifier =
+            InMemorySuspiciousLookupClassifier::new(InMemorySuspiciousLookupClassifierConfig {
+                repeated_txt_threshold: 2,
+                high_entropy_min_label_len: 8,
+                high_entropy_score_threshold: 60,
+                suspicious_tlds: vec!["bad".to_string()],
+                suspicious_domains: vec!["blocked.example".to_string()],
+                ..InMemorySuspiciousLookupClassifierConfig::default()
+            });
+        let retained_events = vec![
+            event_with_response(
+                1,
+                1,
+                "192.0.2.1",
+                "txt-one.example",
+                16,
+                ResponseCode::NoError as u16,
+            ),
+            event_with_response(
+                2,
+                2,
+                "192.0.2.1",
+                "a9x4qz7m2p8v.blocked.example",
+                16,
+                ResponseCode::NoError as u16,
+            ),
+        ];
+
+        let reasons = finding_reasons(&classifier, &retained_events[1], &retained_events);
+
+        assert!(reasons.contains(&QueryEventClassifierReason::RepeatedTxtLookup));
+        assert!(reasons.contains(&QueryEventClassifierReason::HighEntropyName));
+        assert!(reasons.contains(&QueryEventClassifierReason::SuspiciousSelector));
+
+        let tld_event = event_with(3, 3, "192.0.2.1", "selector.bad");
+        let retained_events = vec![tld_event];
+        let reasons = finding_reasons(&classifier, &retained_events[0], &retained_events);
+
+        assert!(reasons.contains(&QueryEventClassifierReason::SuspiciousSelector));
+    }
+
+    #[test]
+    fn suspicious_lookup_classifier_flags_new_and_rare_domains() {
+        let classifier =
+            InMemorySuspiciousLookupClassifier::new(InMemorySuspiciousLookupClassifierConfig {
+                rare_domain_threshold: 2,
+                enable_domain_frequency_findings: true,
+                high_entropy_score_threshold: 100,
+                ..InMemorySuspiciousLookupClassifierConfig::default()
+            });
+        let new_domain = event_with(1, 1, "192.0.2.1", "new.example");
+        let retained_events = vec![new_domain];
+        let reasons = finding_reasons(&classifier, &retained_events[0], &retained_events);
+        assert!(reasons.contains(&QueryEventClassifierReason::NewDomain));
+
+        let retained_events = vec![
+            event_with(1, 1, "192.0.2.1", "rare.example"),
+            event_with(2, 2, "192.0.2.2", "rare.example"),
+        ];
+        let reasons = finding_reasons(&classifier, &retained_events[1], &retained_events);
+        assert!(reasons.contains(&QueryEventClassifierReason::RareDomain));
+    }
+
+    #[test]
+    fn suspicious_lookup_classifier_marks_incomplete_windows() {
+        let classifier =
+            InMemorySuspiciousLookupClassifier::new(InMemorySuspiciousLookupClassifierConfig {
+                suspicious_domains: vec!["blocked.example".to_string()],
+                ..InMemorySuspiciousLookupClassifierConfig::default()
+            });
+        let event = event_with(1, 1, "192.0.2.1", "blocked.example");
+        let retained_events = vec![event.clone()];
+
+        let findings = classifier.classify(SuspiciousLookupClassifierInput {
+            event: &event,
+            retained_events: &retained_events,
+            window: classifier_window(
+                &retained_events,
+                vec![
+                    QueryEventClassifierWindowIncompleteReason::RetentionEviction,
+                    QueryEventClassifierWindowIncompleteReason::DroppedEvents,
+                ],
+            ),
+        });
+
+        let incomplete_reasons = findings
+            .iter()
+            .flat_map(|finding| finding.details.iter())
+            .filter(|detail| detail.key == "window_incomplete_reason")
+            .map(|detail| detail.value.as_str())
+            .collect::<Vec<_>>();
+        assert!(incomplete_reasons.contains(&"RetentionEviction"));
+        assert!(incomplete_reasons.contains(&"DroppedEvents"));
+    }
+
+    #[test]
+    fn suspicious_lookup_classifier_marks_baseline_findings_cold_until_horizon() {
+        let classifier =
+            InMemorySuspiciousLookupClassifier::new(InMemorySuspiciousLookupClassifierConfig {
+                repeated_txt_threshold: 2,
+                repeated_txt_window: Duration::from_secs(60),
+                baseline_complete_after_events: 3,
+                ..InMemorySuspiciousLookupClassifierConfig::default()
+            });
+        let retained_events = vec![
+            event_with_response(
+                1,
+                1,
+                "192.0.2.1",
+                "first.example",
+                16,
+                ResponseCode::NoError as u16,
+            ),
+            event_with_response(
+                2,
+                2,
+                "192.0.2.1",
+                "second.example",
+                16,
+                ResponseCode::NoError as u16,
+            ),
+        ];
+
+        let findings = classifier.classify(SuspiciousLookupClassifierInput {
+            event: &retained_events[1],
+            retained_events: &retained_events,
+            window: classifier_window(&retained_events, Vec::new()),
+        });
+
+        let txt_finding = findings
+            .iter()
+            .find(|finding| finding.reason == QueryEventClassifierReason::RepeatedTxtLookup)
+            .unwrap();
+        assert!(txt_finding
+            .evaluated_window
+            .incomplete_reasons
+            .contains(&QueryEventClassifierWindowIncompleteReason::ColdStart));
+        assert!(txt_finding.details.iter().any(|detail| {
+            detail.key == "window_incomplete_reason" && detail.value == "ColdStart"
+        }));
+    }
+
+    #[test]
+    fn record_classified_marks_event_that_triggers_retention_eviction() {
+        let store = InMemoryQueryEventStore::new(InMemoryQueryEventStoreConfig {
+            max_retained_events: 2,
+            ..InMemoryQueryEventStoreConfig::default()
+        });
+        let classifier =
+            InMemorySuspiciousLookupClassifier::new(InMemorySuspiciousLookupClassifierConfig {
+                repeated_txt_threshold: 2,
+                repeated_txt_window: Duration::from_secs(60),
+                baseline_complete_after_events: 1,
+                ..InMemorySuspiciousLookupClassifierConfig::default()
+            });
+        store.record_classified(
+            event_with_response(
+                1,
+                1,
+                "192.0.2.1",
+                "one.example",
+                16,
+                ResponseCode::NoError as u16,
+            ),
+            &classifier,
+        );
+        store.record_classified(
+            event_with_response(
+                2,
+                2,
+                "192.0.2.1",
+                "two.example",
+                16,
+                ResponseCode::NoError as u16,
+            ),
+            &classifier,
+        );
+
+        let event = store.record_classified(
+            event_with_response(
+                3,
+                3,
+                "192.0.2.1",
+                "three.example",
+                16,
+                ResponseCode::NoError as u16,
+            ),
+            &classifier,
+        );
+
+        let txt_finding = event
+            .advisory_findings
+            .iter()
+            .find(|finding| finding.reason == QueryEventClassifierReason::RepeatedTxtLookup)
+            .unwrap();
+        assert!(txt_finding
+            .evaluated_window
+            .incomplete_reasons
+            .contains(&QueryEventClassifierWindowIncompleteReason::RetentionEviction));
+    }
+
+    #[test]
+    fn record_classified_ignores_future_events_for_out_of_order_insert() {
+        let store = InMemoryQueryEventStore::new(InMemoryQueryEventStoreConfig::default());
+        let classifier =
+            InMemorySuspiciousLookupClassifier::new(InMemorySuspiciousLookupClassifierConfig {
+                enable_domain_frequency_findings: true,
+                baseline_complete_after_events: 1,
+                high_entropy_score_threshold: 100,
+                ..InMemorySuspiciousLookupClassifierConfig::default()
+            });
+        store.record_classified(event_with(2, 20, "192.0.2.1", "same.example"), &classifier);
+
+        let event =
+            store.record_classified(event_with(1, 10, "192.0.2.1", "same.example"), &classifier);
+
+        assert!(event
+            .advisory_findings
+            .iter()
+            .any(|finding| finding.reason == QueryEventClassifierReason::NewDomain));
+        assert!(!event
+            .advisory_findings
+            .iter()
+            .any(|finding| finding.reason == QueryEventClassifierReason::RareDomain));
     }
 
     #[derive(Default)]

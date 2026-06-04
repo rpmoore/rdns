@@ -24,8 +24,9 @@ use rdns::delivery::dns::UdpDnsServer;
 use rdns::delivery::upstream::UdpUpstreamResolver;
 use rdns::resolver::{
     BasicResponseFactory, CacheTtlPolicy, ChannelQueryEventSink, Clock, InMemoryDnsCache,
-    InMemoryQueryEventStore, InMemoryQueryEventStoreConfig, MetricsSink, QueryEventRecordResult,
-    QueryEventSink, QueryEventV1, ResolveQuery, ResolverMetric, StandardProtocolCodec,
+    InMemoryQueryEventStore, InMemoryQueryEventStoreConfig, InMemorySuspiciousLookupClassifier,
+    InMemorySuspiciousLookupClassifierConfig, MetricsSink, QueryEventRecordResult, QueryEventSink,
+    QueryEventV1, ResolveQuery, ResolverMetric, StandardProtocolCodec,
 };
 use tokio::task::{JoinError, JoinSet};
 
@@ -52,10 +53,13 @@ async fn main() -> io::Result<()> {
     let event_drain = {
         let stdout_events = Arc::clone(&stdout_events);
         let query_event_store = Arc::clone(&query_event_store);
+        let classifier = InMemorySuspiciousLookupClassifier::new(
+            InMemorySuspiciousLookupClassifierConfig::default(),
+        );
         tokio::spawn(async move {
             while let Some(event) = event_rx.recv().await {
+                let event = query_event_store.record_classified(event, &classifier);
                 stdout_events.record_ref(&event);
-                query_event_store.record(event);
             }
         })
     };
@@ -311,7 +315,7 @@ impl MetricsSink for OpenTelemetryMetrics {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rdns::resolver::{QuestionKey, ResolveDecision, ResolveDecisionKind};
+    use rdns::resolver::{QueryEventReadModel, QuestionKey, ResolveDecision, ResolveDecisionKind};
 
     fn event_for(name: &str) -> QueryEventV1 {
         let decision = ResolveDecision {
@@ -340,5 +344,21 @@ mod tests {
             "queued.example"
         );
         assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn record_classified_attaches_advisory_findings_before_storage() {
+        let store = InMemoryQueryEventStore::new(InMemoryQueryEventStoreConfig::default());
+        let classifier =
+            InMemorySuspiciousLookupClassifier::new(InMemorySuspiciousLookupClassifierConfig {
+                high_entropy_min_label_len: 8,
+                high_entropy_score_threshold: 60,
+                ..InMemorySuspiciousLookupClassifierConfig::default()
+            });
+
+        let event = store.record_classified(event_for("a9x4qz7m2p8v.example"), &classifier);
+
+        assert!(!event.advisory_findings.is_empty());
+        assert_eq!(store.suspicious_query_events(8).len(), 1);
     }
 }
