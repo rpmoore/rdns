@@ -23,9 +23,9 @@ use rdns::config::RuntimeConfig;
 use rdns::delivery::dns::UdpDnsServer;
 use rdns::delivery::upstream::UdpUpstreamResolver;
 use rdns::resolver::{
-    BasicResponseFactory, BoxFuture, CacheTtlPolicy, ChannelQueryEventSink, Clock,
-    InMemoryDnsCache, MetricsSink, QueryEventSink, ResolveDecision, ResolveQuery, ResolverMetric,
-    StandardProtocolCodec,
+    BasicResponseFactory, CacheTtlPolicy, ChannelQueryEventSink, Clock, InMemoryDnsCache,
+    MetricsSink, QueryEventRecordResult, QueryEventSink, QueryEventV1, ResolveQuery,
+    ResolverMetric, StandardProtocolCodec,
 };
 use tokio::task::{JoinError, JoinSet};
 
@@ -44,8 +44,8 @@ async fn main() -> io::Result<()> {
     let event_drain = {
         let stdout_events = Arc::clone(&stdout_events);
         tokio::spawn(async move {
-            while let Some(decision) = event_rx.recv().await {
-                stdout_events.record(decision).await;
+            while let Some(event) = event_rx.recv().await {
+                let _ = stdout_events.record(event);
             }
         })
     };
@@ -143,10 +143,9 @@ impl Clock for SystemClock {
 struct StdoutEvents;
 
 impl QueryEventSink for StdoutEvents {
-    fn record<'a>(&'a self, decision: ResolveDecision) -> BoxFuture<'a, ()> {
-        Box::pin(async move {
-            println!("{decision:?}");
-        })
+    fn record(&self, event: QueryEventV1) -> QueryEventRecordResult {
+        println!("{event:?}");
+        QueryEventRecordResult::Accepted
     }
 }
 
@@ -173,6 +172,11 @@ struct OpenTelemetryMetrics {
     cache_negative_store_total: Counter<u64>,
     cache_response_truncated_total: Counter<u64>,
     cache_coalesced_miss_total: Counter<u64>,
+    query_event_accepted_total: Counter<u64>,
+    query_event_disabled_total: Counter<u64>,
+    query_event_dropped_newest_total: Counter<u64>,
+    query_event_dropped_oldest_total: Counter<u64>,
+    query_event_sampled_total: Counter<u64>,
     upstream_success_total: Counter<u64>,
     upstream_failure_total: Counter<u64>,
     protocol_error_total: Counter<u64>,
@@ -206,6 +210,15 @@ impl OpenTelemetryMetrics {
                 .u64_counter("cache_response_truncated_total")
                 .build(),
             cache_coalesced_miss_total: meter.u64_counter("cache_coalesced_miss_total").build(),
+            query_event_accepted_total: meter.u64_counter("query_event_accepted_total").build(),
+            query_event_disabled_total: meter.u64_counter("query_event_disabled_total").build(),
+            query_event_dropped_newest_total: meter
+                .u64_counter("query_event_dropped_newest_total")
+                .build(),
+            query_event_dropped_oldest_total: meter
+                .u64_counter("query_event_dropped_oldest_total")
+                .build(),
+            query_event_sampled_total: meter.u64_counter("query_event_sampled_total").build(),
             upstream_success_total: meter.u64_counter("upstream_success_total").build(),
             upstream_failure_total: meter.u64_counter("upstream_failure_total").build(),
             protocol_error_total: meter.u64_counter("protocol_error_total").build(),
@@ -232,6 +245,15 @@ impl MetricsSink for OpenTelemetryMetrics {
                 self.cache_response_truncated_total.add(1, &[])
             }
             ResolverMetric::CacheCoalescedMiss => self.cache_coalesced_miss_total.add(1, &[]),
+            ResolverMetric::QueryEventAccepted => self.query_event_accepted_total.add(1, &[]),
+            ResolverMetric::QueryEventDisabled => self.query_event_disabled_total.add(1, &[]),
+            ResolverMetric::QueryEventDroppedNewest => {
+                self.query_event_dropped_newest_total.add(1, &[])
+            }
+            ResolverMetric::QueryEventDroppedOldest => {
+                self.query_event_dropped_oldest_total.add(1, &[])
+            }
+            ResolverMetric::QueryEventSampled => self.query_event_sampled_total.add(1, &[]),
             ResolverMetric::UpstreamSuccess => self.upstream_success_total.add(1, &[]),
             ResolverMetric::UpstreamFailure => self.upstream_failure_total.add(1, &[]),
             ResolverMetric::ProtocolError => self.protocol_error_total.add(1, &[]),

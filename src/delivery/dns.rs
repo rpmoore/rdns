@@ -231,9 +231,9 @@ mod tests {
     use tokio::time;
 
     use crate::resolver::{
-        BasicResponseFactory, BoxFuture, Clock, MetricsSink, QueryEventSink, ResolveDecision,
-        ResolverMetric, StandardProtocolCodec, UpstreamError, UpstreamRequest, UpstreamResolver,
-        UpstreamResponse,
+        BasicResponseFactory, Clock, MetricsSink, QueryEventRecordResult, QueryEventSink,
+        QueryEventV1, ResolverMetric, StandardProtocolCodec, UpstreamError, UpstreamRequest,
+        UpstreamResolver, UpstreamResponse,
     };
 
     fn a_query(id: u16, name: &str) -> Vec<u8> {
@@ -264,14 +264,13 @@ mod tests {
 
     #[derive(Default)]
     struct RecordingEvents {
-        decisions: Mutex<Vec<ResolveDecision>>,
+        events: Mutex<Vec<QueryEventV1>>,
     }
 
     impl QueryEventSink for RecordingEvents {
-        fn record<'a>(&'a self, decision: ResolveDecision) -> BoxFuture<'a, ()> {
-            Box::pin(async move {
-                self.decisions.lock().unwrap().push(decision);
-            })
+        fn record(&self, event: QueryEventV1) -> QueryEventRecordResult {
+            self.events.lock().unwrap().push(event);
+            QueryEventRecordResult::Accepted
         }
     }
 
@@ -417,9 +416,9 @@ mod tests {
             assert_eq!(upstream_requests[0].query.question.qname, "example.com");
         }
         {
-            let decisions = events.decisions.lock().unwrap();
-            assert_eq!(decisions.len(), 1);
-            assert_eq!(decisions[0].client_ip, client_addr.ip());
+            let recorded_events = events.events.lock().unwrap();
+            assert_eq!(recorded_events.len(), 1);
+            assert_eq!(recorded_events[0].observed_source.ip, client_addr.ip());
         }
 
         shutdown_tx.send(()).unwrap();

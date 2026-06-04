@@ -21,7 +21,7 @@ use rdns::delivery::dns::UdpDnsServer;
 use rdns::delivery::upstream::UdpUpstreamResolver;
 use rdns::protocol::Message;
 use rdns::resolver::{
-    BasicResponseFactory, BoxFuture, Clock, MetricsSink, QueryEventSink, ResolveDecision,
+    BasicResponseFactory, Clock, MetricsSink, QueryEventRecordResult, QueryEventSink, QueryEventV1,
     ResolveQuery, ResolverMetric, StandardProtocolCodec,
 };
 use tokio::net::UdpSocket;
@@ -38,8 +38,8 @@ impl Clock for SystemClock {
 struct NoopEvents;
 
 impl QueryEventSink for NoopEvents {
-    fn record<'a>(&'a self, _decision: ResolveDecision) -> BoxFuture<'a, ()> {
-        Box::pin(async {})
+    fn record(&self, _event: QueryEventV1) -> QueryEventRecordResult {
+        QueryEventRecordResult::Accepted
     }
 }
 

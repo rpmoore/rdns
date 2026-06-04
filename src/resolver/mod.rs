@@ -16,7 +16,10 @@ use std::collections::{HashMap, VecDeque};
 use std::future::Future;
 use std::net::{IpAddr, SocketAddr};
 use std::pin::Pin;
-use std::sync::{Arc, Mutex};
+use std::sync::{
+    atomic::{AtomicU64, Ordering},
+    Arc, Mutex,
+};
 use std::time::{Duration, SystemTime};
 
 use bytes::Bytes;
@@ -598,6 +601,7 @@ pub struct ResolveQuery {
     responses: Arc<dyn ResponseFactory>,
     clock: Arc<dyn Clock>,
     events: Arc<dyn QueryEventSink>,
+    event_sequence: AtomicU64,
     metrics: Arc<dyn MetricsSink>,
 }
 
@@ -642,6 +646,7 @@ impl ResolveQuery {
             responses,
             clock,
             events,
+            event_sequence: AtomicU64::new(0),
             metrics,
         }
     }
@@ -1012,8 +1017,18 @@ impl ResolveQuery {
         decision: ResolveDecision,
         response_bytes: Vec<u8>,
     ) -> ResolveOutcome {
-        self.events.record(decision.clone()).await;
-        if let Ok(duration) = self.clock.now().duration_since(started_at) {
+        let finished_at = self.clock.now();
+        let latency = finished_at.duration_since(started_at).ok();
+        let event = QueryEventV1::from_decision(
+            self.event_sequence.fetch_add(1, Ordering::Relaxed),
+            finished_at,
+            &decision,
+            response_code_from_wire(&response_bytes),
+            cache_result_from_decision(&decision.kind),
+            latency,
+        );
+        self.record_query_event(event);
+        if let Some(duration) = latency {
             self.metrics
                 .observe_duration(ResolverMetric::QueryDuration, duration);
         }
@@ -1021,6 +1036,17 @@ impl ResolveQuery {
             response_bytes,
             decision,
         }
+    }
+
+    fn record_query_event(&self, event: QueryEventV1) {
+        let metric = match self.events.record(event) {
+            QueryEventRecordResult::Accepted => ResolverMetric::QueryEventAccepted,
+            QueryEventRecordResult::Disabled => ResolverMetric::QueryEventDisabled,
+            QueryEventRecordResult::DroppedNewest => ResolverMetric::QueryEventDroppedNewest,
+            QueryEventRecordResult::DroppedOldest => ResolverMetric::QueryEventDroppedOldest,
+            QueryEventRecordResult::Sampled => ResolverMetric::QueryEventSampled,
+        };
+        self.metrics.increment(metric);
     }
 }
 
@@ -1141,6 +1167,25 @@ fn response_is_truncated(bytes: &[u8]) -> bool {
         .get(2)
         .map(|flags| (flags & 0x02) != 0)
         .unwrap_or(false)
+}
+
+fn response_code_from_wire(bytes: &[u8]) -> Option<ResponseCode> {
+    match bytes.get(3)? & 0x0f {
+        0 => Some(ResponseCode::NoError),
+        1 => Some(ResponseCode::FormErr),
+        2 => Some(ResponseCode::ServFail),
+        3 => Some(ResponseCode::NxDomain),
+        4 => Some(ResponseCode::NotImp),
+        5 => Some(ResponseCode::Refused),
+        _ => None,
+    }
+}
+
+fn cache_result_from_decision(kind: &ResolveDecisionKind) -> Option<QueryEventCacheResult> {
+    match kind {
+        ResolveDecisionKind::CacheHit => Some(QueryEventCacheResult::Hit),
+        _ => None,
+    }
 }
 
 fn cache_supported(query: &DecodedQuery) -> bool {
@@ -1301,20 +1346,22 @@ impl DnsCache for NoopDnsCache {
 }
 
 pub struct ChannelQueryEventSink {
-    sender: mpsc::Sender<ResolveDecision>,
+    sender: mpsc::Sender<QueryEventV1>,
 }
 
 impl ChannelQueryEventSink {
-    pub fn new(sender: mpsc::Sender<ResolveDecision>) -> Self {
+    pub fn new(sender: mpsc::Sender<QueryEventV1>) -> Self {
         Self { sender }
     }
 }
 
 impl QueryEventSink for ChannelQueryEventSink {
-    fn record<'a>(&'a self, decision: ResolveDecision) -> BoxFuture<'a, ()> {
-        Box::pin(async move {
-            let _ = self.sender.try_send(decision);
-        })
+    fn record(&self, event: QueryEventV1) -> QueryEventRecordResult {
+        match self.sender.try_send(event) {
+            Ok(()) => QueryEventRecordResult::Accepted,
+            Err(mpsc::error::TrySendError::Full(_)) => QueryEventRecordResult::DroppedNewest,
+            Err(mpsc::error::TrySendError::Closed(_)) => QueryEventRecordResult::Disabled,
+        }
     }
 }
 
@@ -1513,7 +1560,16 @@ pub trait Clock: Send + Sync {
 }
 
 pub trait QueryEventSink: Send + Sync {
-    fn record<'a>(&'a self, decision: ResolveDecision) -> BoxFuture<'a, ()>;
+    fn record(&self, event: QueryEventV1) -> QueryEventRecordResult;
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum QueryEventRecordResult {
+    Accepted,
+    Disabled,
+    DroppedNewest,
+    DroppedOldest,
+    Sampled,
 }
 
 pub trait MetricsSink: Send + Sync {
@@ -1537,6 +1593,11 @@ pub enum ResolverMetric {
     CacheNegativeStore,
     CacheResponseTruncated,
     CacheCoalescedMiss,
+    QueryEventAccepted,
+    QueryEventDisabled,
+    QueryEventDroppedNewest,
+    QueryEventDroppedOldest,
+    QueryEventSampled,
     UpstreamSuccess,
     UpstreamFailure,
     QueryDuration,
@@ -1665,23 +1726,23 @@ mod tests {
 
     #[derive(Default)]
     struct RecordingEvents {
-        decisions: Mutex<Vec<ResolveDecision>>,
+        events: Mutex<Vec<QueryEventV1>>,
     }
 
     impl QueryEventSink for RecordingEvents {
-        fn record<'a>(&'a self, decision: ResolveDecision) -> BoxFuture<'a, ()> {
-            Box::pin(async move {
-                self.decisions.lock().unwrap().push(decision);
-            })
+        fn record(&self, event: QueryEventV1) -> QueryEventRecordResult {
+            self.events.lock().unwrap().push(event);
+            QueryEventRecordResult::Accepted
         }
     }
 
-    fn decision_for(name: &str) -> ResolveDecision {
-        ResolveDecision {
+    fn event_for(name: &str) -> QueryEventV1 {
+        let decision = ResolveDecision {
             client_ip: "127.0.0.1".parse().unwrap(),
             question: Some(QuestionKey::new(name, 1, 1)),
             kind: ResolveDecisionKind::Allowed,
-        }
+        };
+        QueryEventV1::from_decision(0, SystemTime::UNIX_EPOCH, &decision, None, None, None)
     }
 
     #[tokio::test]
@@ -1689,28 +1750,42 @@ mod tests {
         let (tx, mut rx) = mpsc::channel(1);
         let sink = ChannelQueryEventSink::new(tx);
 
-        sink.record(decision_for("accepted.example")).await;
+        let result = sink.record(event_for("accepted.example"));
 
+        assert_eq!(result, QueryEventRecordResult::Accepted);
         let received = rx.recv().await.unwrap();
-        assert_eq!(received.question.unwrap().qname, "accepted.example");
+        assert_eq!(
+            received.normalized_question.unwrap().qname,
+            "accepted.example"
+        );
     }
 
     #[tokio::test]
     async fn channel_query_event_sink_drops_promptly_when_full() {
         let (tx, mut rx) = mpsc::channel(1);
-        tx.try_send(decision_for("existing.example")).unwrap();
+        tx.try_send(event_for("existing.example")).unwrap();
         let sink = ChannelQueryEventSink::new(tx);
 
-        tokio::time::timeout(
-            Duration::from_millis(10),
-            sink.record(decision_for("dropped.example")),
-        )
-        .await
-        .unwrap();
+        let result = sink.record(event_for("dropped.example"));
 
+        assert_eq!(result, QueryEventRecordResult::DroppedNewest);
         let received = rx.recv().await.unwrap();
-        assert_eq!(received.question.unwrap().qname, "existing.example");
+        assert_eq!(
+            received.normalized_question.unwrap().qname,
+            "existing.example"
+        );
         assert!(rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn channel_query_event_sink_reports_disabled_when_closed() {
+        let (tx, rx) = mpsc::channel(1);
+        drop(rx);
+        let sink = ChannelQueryEventSink::new(tx);
+
+        let result = sink.record(event_for("disabled.example"));
+
+        assert_eq!(result, QueryEventRecordResult::Disabled);
     }
 
     #[derive(Default)]
@@ -1964,6 +2039,32 @@ mod tests {
             *codec.received_owned_ptr.lock().unwrap(),
             Some(request_ptr as usize)
         );
+    }
+
+    #[tokio::test]
+    async fn resolve_records_accepted_query_event_metric() {
+        let upstream = Arc::new(StaticUpstream::new(Ok(UpstreamResponse {
+            bytes: a_response_with_answer(0x1234, "example.com", 60),
+            received_at: SystemTime::UNIX_EPOCH,
+        })));
+        let events = Arc::new(RecordingEvents::default());
+        let metrics = Arc::new(RecordingMetrics::default());
+        let service = resolve_service(upstream, events.clone(), metrics.clone());
+
+        let _ = service
+            .resolve(ResolveRequest::new(
+                "192.0.2.10".parse().unwrap(),
+                SystemTime::UNIX_EPOCH,
+                a_query(0x1234, "example.com"),
+            ))
+            .await;
+
+        assert_eq!(events.events.lock().unwrap().len(), 1);
+        assert!(metrics
+            .increments
+            .lock()
+            .unwrap()
+            .contains(&ResolverMetric::QueryEventAccepted));
     }
 
     #[test]
@@ -2736,7 +2837,7 @@ mod tests {
         assert_eq!(outcome.decision.question.unwrap().qname, "example.com");
         assert_eq!(outcome.decision.kind, ResolveDecisionKind::Allowed);
         assert_eq!(upstream.requests.lock().unwrap().len(), 1);
-        assert_eq!(events.decisions.lock().unwrap().len(), 1);
+        assert_eq!(events.events.lock().unwrap().len(), 1);
         assert!(metrics
             .increments
             .lock()
@@ -3264,7 +3365,7 @@ mod tests {
             ResolveDecisionKind::ProtocolError(ResponseCode::FormErr)
         );
         assert!(upstream.requests.lock().unwrap().is_empty());
-        assert_eq!(events.decisions.lock().unwrap().len(), 1);
+        assert_eq!(events.events.lock().unwrap().len(), 1);
         assert!(metrics
             .increments
             .lock()
