@@ -70,7 +70,10 @@ async fn main() -> io::Result<()> {
         ),
         Arc::new(BasicResponseFactory),
         Arc::new(SystemClock),
-        Arc::new(ChannelQueryEventSink::new(event_tx)),
+        Arc::new(StoreRecordingQueryEventSink::new(
+            ChannelQueryEventSink::new(event_tx),
+            Arc::clone(&query_event_store),
+        )),
         OpenTelemetryMetrics::new()
             .map(|metrics| Arc::new(metrics) as Arc<dyn MetricsSink>)
             .unwrap_or_else(|error| {
@@ -79,7 +82,7 @@ async fn main() -> io::Result<()> {
             }),
     ));
 
-    let servers = UdpDnsServer::bind_configured(&config, resolver).await?;
+    let servers = UdpDnsServer::bind_configured(&config, Arc::clone(&resolver)).await?;
     if servers.is_empty() {
         return Err(io::Error::other("no DNS listeners configured"));
     }
@@ -124,10 +127,9 @@ async fn main() -> io::Result<()> {
         listener_task_result_to_io(result)?;
     }
 
-    event_drain.abort();
+    drop(resolver);
     match event_drain.await {
         Ok(()) => {}
-        Err(error) if error.is_cancelled() => {}
         Err(error) => {
             return Err(io::Error::other(format!(
                 "query event drain task failed: {error}"
@@ -156,6 +158,27 @@ impl QueryEventSink for StdoutEvents {
     fn record(&self, event: QueryEventV1) -> QueryEventRecordResult {
         println!("{event:?}");
         QueryEventRecordResult::Accepted
+    }
+}
+
+struct StoreRecordingQueryEventSink {
+    inner: ChannelQueryEventSink,
+    store: Arc<InMemoryQueryEventStore>,
+}
+
+impl StoreRecordingQueryEventSink {
+    fn new(inner: ChannelQueryEventSink, store: Arc<InMemoryQueryEventStore>) -> Self {
+        Self { inner, store }
+    }
+}
+
+impl QueryEventSink for StoreRecordingQueryEventSink {
+    fn record(&self, event: QueryEventV1) -> QueryEventRecordResult {
+        let result = self.inner.record(event);
+        if !matches!(result, QueryEventRecordResult::Accepted) {
+            self.store.record_outcome(result);
+        }
+        result
     }
 }
 
@@ -276,5 +299,40 @@ impl MetricsSink for OpenTelemetryMetrics {
             self.query_duration_seconds
                 .record(duration.as_secs_f64(), &[]);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rdns::resolver::{QuestionKey, ResolveDecision, ResolveDecisionKind};
+
+    fn event_for(name: &str) -> QueryEventV1 {
+        let decision = ResolveDecision {
+            client_ip: "127.0.0.1".parse().unwrap(),
+            question: Some(QuestionKey::new(name, 1, 1)),
+            kind: ResolveDecisionKind::Allowed,
+        };
+        QueryEventV1::from_decision(0, SystemTime::UNIX_EPOCH, &decision, None, None, None)
+    }
+
+    #[tokio::test]
+    async fn store_recording_query_event_sink_counts_channel_drops() {
+        let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+        tx.try_send(event_for("queued.example")).unwrap();
+        let store = Arc::new(InMemoryQueryEventStore::new(
+            InMemoryQueryEventStoreConfig::default(),
+        ));
+        let sink = StoreRecordingQueryEventSink::new(ChannelQueryEventSink::new(tx), store.clone());
+
+        let result = sink.record(event_for("dropped.example"));
+
+        assert_eq!(result, QueryEventRecordResult::DroppedNewest);
+        assert_eq!(store.summary().dropped_newest_event_count, 1);
+        assert_eq!(
+            rx.recv().await.unwrap().normalized_question.unwrap().qname,
+            "queued.example"
+        );
+        assert!(rx.try_recv().is_err());
     }
 }

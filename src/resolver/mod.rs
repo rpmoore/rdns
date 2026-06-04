@@ -45,11 +45,32 @@ pub struct ReceivedAt(pub SystemTime);
 pub struct ObservedSourceEndpoint {
     pub ip: IpAddr,
     pub port: Option<u16>,
+    pub transport: Option<QueryTransport>,
+    pub listener: Option<SocketAddr>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum QueryTransport {
+    Udp,
 }
 
 impl ObservedSourceEndpoint {
     pub fn ip(ip: IpAddr) -> Self {
-        Self { ip, port: None }
+        Self {
+            ip,
+            port: None,
+            transport: None,
+            listener: None,
+        }
+    }
+
+    pub fn udp(source: SocketAddr, listener: SocketAddr) -> Self {
+        Self {
+            ip: source.ip(),
+            port: Some(source.port()),
+            transport: Some(QueryTransport::Udp),
+            listener: Some(listener),
+        }
     }
 }
 
@@ -58,6 +79,8 @@ impl From<SocketAddr> for ObservedSourceEndpoint {
         Self {
             ip: endpoint.ip(),
             port: Some(endpoint.port()),
+            transport: None,
+            listener: None,
         }
     }
 }
@@ -476,7 +499,7 @@ pub struct QueryEventV1 {
     pub qtype: Option<u16>,
     pub qclass: Option<u16>,
     pub terminal_outcome: QueryEventOutcome,
-    pub response_code: Option<ResponseCode>,
+    pub response_code: Option<u16>,
     pub cache_result: Option<QueryEventCacheResult>,
     pub latency: Option<Duration>,
     pub advisory_findings: Vec<QueryEventClassifierFinding>,
@@ -489,7 +512,7 @@ impl QueryEventV1 {
         sequence: u64,
         timestamp: SystemTime,
         decision: &ResolveDecision,
-        response_code: Option<ResponseCode>,
+        response_code: Option<u16>,
         cache_result: Option<QueryEventCacheResult>,
         latency: Option<Duration>,
     ) -> Self {
@@ -515,7 +538,7 @@ impl QueryEventV1 {
         observed_source: ObservedSourceEndpoint,
         original_question_name: Option<String>,
         decision: &ResolveDecision,
-        response_code: Option<ResponseCode>,
+        response_code: Option<u16>,
         cache_result: Option<QueryEventCacheResult>,
         latency: Option<Duration>,
     ) -> Self {
@@ -1275,16 +1298,20 @@ fn response_is_truncated(bytes: &[u8]) -> bool {
         .unwrap_or(false)
 }
 
-fn response_code_from_wire(bytes: &[u8]) -> Option<ResponseCode> {
-    match bytes.get(3)? & 0x0f {
-        0 => Some(ResponseCode::NoError),
-        1 => Some(ResponseCode::FormErr),
-        2 => Some(ResponseCode::ServFail),
-        3 => Some(ResponseCode::NxDomain),
-        4 => Some(ResponseCode::NotImp),
-        5 => Some(ResponseCode::Refused),
-        _ => None,
-    }
+fn response_code_from_wire(bytes: &[u8]) -> Option<u16> {
+    Message::parse(bytes)
+        .ok()
+        .map(|message| full_response_code(&message))
+        .or_else(|| bytes.get(3).map(|flags| u16::from(flags & 0x0f)))
+}
+
+fn full_response_code(message: &Message) -> u16 {
+    let extended = message
+        .edns
+        .as_ref()
+        .map(|edns| u16::from(edns.extended_rcode))
+        .unwrap_or(0);
+    (extended << 4) | u16::from(message.header.r_code())
 }
 
 fn decoded_original_question_name(decoded: &DecodedQuery) -> Option<String> {
@@ -1511,7 +1538,7 @@ pub struct InMemoryQueryEventStore {
 
 #[derive(Default)]
 struct InMemoryQueryEventStoreState {
-    events: VecDeque<QueryEventV1>,
+    events: VecDeque<StoredQueryEvent>,
     indexed_sources: HashMap<ObservedSourceEndpoint, usize>,
     indexed_domains: HashMap<String, usize>,
     evicted_event_count: u64,
@@ -1520,6 +1547,12 @@ struct InMemoryQueryEventStoreState {
     dropped_newest_event_count: u64,
     dropped_oldest_event_count: u64,
     sampled_event_count: u64,
+}
+
+struct StoredQueryEvent {
+    event: QueryEventV1,
+    indexed_source: bool,
+    indexed_domain: bool,
 }
 
 impl InMemoryQueryEventStore {
@@ -1532,10 +1565,7 @@ impl InMemoryQueryEventStore {
 
     pub fn record(&self, event: QueryEventV1) {
         let mut state = self.state.lock().unwrap();
-        state.insert_ordered(event);
-        state.evict_expired(self.config.retention);
-        state.evict_to_bound(self.config.max_retained_events);
-        state.rebuild_indexes(&self.config);
+        state.record(event, &self.config);
     }
 
     pub fn record_outcome(&self, result: QueryEventRecordResult) {
@@ -1557,7 +1587,13 @@ impl InMemoryQueryEventStore {
     }
 
     pub fn recent_events(&self) -> Vec<QueryEventV1> {
-        self.state.lock().unwrap().events.iter().cloned().collect()
+        self.state
+            .lock()
+            .unwrap()
+            .events
+            .iter()
+            .map(|entry| entry.event.clone())
+            .collect()
     }
 
     pub fn summary(&self) -> QueryEventStoreSummary {
@@ -1577,15 +1613,99 @@ impl InMemoryQueryEventStore {
 }
 
 impl InMemoryQueryEventStoreState {
+    fn record(&mut self, event: QueryEventV1, config: &InMemoryQueryEventStoreConfig) {
+        let key = event_order_key(&event);
+        let appends_to_tail = self
+            .events
+            .back()
+            .map(|existing| event_order_key(&existing.event) <= key)
+            .unwrap_or(true);
+
+        if appends_to_tail {
+            self.evict_expired_before(event.timestamp, config.retention);
+            if config.max_retained_events == 0 {
+                self.evicted_event_count = self.evicted_event_count.saturating_add(1);
+                return;
+            }
+            while self.events.len() >= config.max_retained_events {
+                self.evict_front();
+            }
+            let (indexed_source, indexed_domain) = self.record_index_membership(&event, config);
+            self.events.push_back(StoredQueryEvent {
+                event,
+                indexed_source,
+                indexed_domain,
+            });
+            return;
+        }
+
+        self.insert_ordered(event);
+        self.evict_expired(config.retention);
+        self.evict_to_bound(config.max_retained_events);
+        self.rebuild_indexes(config);
+    }
+
+    fn record_index_membership(
+        &mut self,
+        event: &QueryEventV1,
+        config: &InMemoryQueryEventStoreConfig,
+    ) -> (bool, bool) {
+        let indexed_source = if let Some(count) =
+            self.indexed_sources.get_mut(&event.observed_source)
+        {
+            *count = count.saturating_add(1);
+            true
+        } else if self.indexed_sources.len() < config.max_indexed_sources {
+            self.indexed_sources
+                .insert(event.observed_source.clone(), 1);
+            true
+        } else {
+            self.unindexed_source_event_count = self.unindexed_source_event_count.saturating_add(1);
+            false
+        };
+
+        let indexed_domain = self.record_domain_index_membership(event, config);
+        (indexed_source, indexed_domain)
+    }
+
+    fn record_domain_index_membership(
+        &mut self,
+        event: &QueryEventV1,
+        config: &InMemoryQueryEventStoreConfig,
+    ) -> bool {
+        let Some(domain) = event
+            .normalized_question
+            .as_ref()
+            .map(|question| &question.qname)
+        else {
+            return false;
+        };
+        if let Some(count) = self.indexed_domains.get_mut(domain) {
+            *count = count.saturating_add(1);
+            true
+        } else if self.indexed_domains.len() < config.max_indexed_domains {
+            self.indexed_domains.insert(domain.clone(), 1);
+            true
+        } else {
+            self.unindexed_domain_event_count = self.unindexed_domain_event_count.saturating_add(1);
+            false
+        }
+    }
+
     fn insert_ordered(&mut self, event: QueryEventV1) {
-        let key = (event.timestamp, event.sequence);
+        let key = event_order_key(&event);
         let position = self
             .events
             .iter()
-            .position(|existing| (existing.timestamp, existing.sequence) > key);
+            .position(|existing| event_order_key(&existing.event) > key);
+        let entry = StoredQueryEvent {
+            event,
+            indexed_source: false,
+            indexed_domain: false,
+        };
         match position {
-            Some(position) => self.events.insert(position, event),
-            None => self.events.push_back(event),
+            Some(position) => self.events.insert(position, entry),
+            None => self.events.push_back(entry),
         }
     }
 
@@ -1593,13 +1713,20 @@ impl InMemoryQueryEventStoreState {
         let Some(retention) = retention else {
             return;
         };
-        let Some(newest_timestamp) = self.events.back().map(|event| event.timestamp) else {
+        let Some(newest_timestamp) = self.events.back().map(|entry| entry.event.timestamp) else {
+            return;
+        };
+        self.evict_expired_before(newest_timestamp, Some(retention));
+    }
+
+    fn evict_expired_before(&mut self, newest_timestamp: SystemTime, retention: Option<Duration>) {
+        let Some(retention) = retention else {
             return;
         };
         while self
             .events
             .front()
-            .and_then(|event| event.timestamp.checked_add(retention))
+            .and_then(|entry| entry.event.timestamp.checked_add(retention))
             .map(|expires_at| expires_at <= newest_timestamp)
             .unwrap_or(false)
         {
@@ -1614,8 +1741,43 @@ impl InMemoryQueryEventStoreState {
     }
 
     fn evict_front(&mut self) {
-        self.events.pop_front();
+        let Some(entry) = self.events.pop_front() else {
+            return;
+        };
+        self.remove_index_membership(&entry);
         self.evicted_event_count = self.evicted_event_count.saturating_add(1);
+    }
+
+    fn remove_index_membership(&mut self, entry: &StoredQueryEvent) {
+        let event = &entry.event;
+        if entry.indexed_source {
+            if let Some(count) = self.indexed_sources.get_mut(&event.observed_source) {
+                *count = count.saturating_sub(1);
+                if *count == 0 {
+                    self.indexed_sources.remove(&event.observed_source);
+                }
+            }
+        } else {
+            self.unindexed_source_event_count = self.unindexed_source_event_count.saturating_sub(1);
+        }
+
+        let Some(domain) = event
+            .normalized_question
+            .as_ref()
+            .map(|question| &question.qname)
+        else {
+            return;
+        };
+        if entry.indexed_domain {
+            if let Some(count) = self.indexed_domains.get_mut(domain) {
+                *count = count.saturating_sub(1);
+                if *count == 0 {
+                    self.indexed_domains.remove(domain);
+                }
+            }
+        } else {
+            self.unindexed_domain_event_count = self.unindexed_domain_event_count.saturating_sub(1);
+        }
     }
 
     fn rebuild_indexes(&mut self, config: &InMemoryQueryEventStoreConfig) {
@@ -1624,34 +1786,47 @@ impl InMemoryQueryEventStoreState {
         self.unindexed_source_event_count = 0;
         self.unindexed_domain_event_count = 0;
 
-        for event in &self.events {
-            if let Some(count) = self.indexed_sources.get_mut(&event.observed_source) {
-                *count = count.saturating_add(1);
-            } else if self.indexed_sources.len() < config.max_indexed_sources {
-                self.indexed_sources
-                    .insert(event.observed_source.clone(), 1);
-            } else {
-                self.unindexed_source_event_count =
-                    self.unindexed_source_event_count.saturating_add(1);
-            }
+        for entry in &mut self.events {
+            entry.indexed_source =
+                if let Some(count) = self.indexed_sources.get_mut(&entry.event.observed_source) {
+                    *count = count.saturating_add(1);
+                    true
+                } else if self.indexed_sources.len() < config.max_indexed_sources {
+                    self.indexed_sources
+                        .insert(entry.event.observed_source.clone(), 1);
+                    true
+                } else {
+                    self.unindexed_source_event_count =
+                        self.unindexed_source_event_count.saturating_add(1);
+                    false
+                };
 
-            let Some(domain) = event
+            entry.indexed_domain = if let Some(domain) = entry
+                .event
                 .normalized_question
                 .as_ref()
                 .map(|question| &question.qname)
-            else {
-                continue;
-            };
-            if let Some(count) = self.indexed_domains.get_mut(domain) {
-                *count = count.saturating_add(1);
-            } else if self.indexed_domains.len() < config.max_indexed_domains {
-                self.indexed_domains.insert(domain.clone(), 1);
+            {
+                if let Some(count) = self.indexed_domains.get_mut(domain) {
+                    *count = count.saturating_add(1);
+                    true
+                } else if self.indexed_domains.len() < config.max_indexed_domains {
+                    self.indexed_domains.insert(domain.clone(), 1);
+                    true
+                } else {
+                    self.unindexed_domain_event_count =
+                        self.unindexed_domain_event_count.saturating_add(1);
+                    false
+                }
             } else {
-                self.unindexed_domain_event_count =
-                    self.unindexed_domain_event_count.saturating_add(1);
-            }
+                false
+            };
         }
     }
+}
+
+fn event_order_key(event: &QueryEventV1) -> (SystemTime, u64) {
+    (event.timestamp, event.sequence)
 }
 
 pub struct InMemoryDnsCache {
@@ -2044,7 +2219,7 @@ mod tests {
             sequence,
             SystemTime::UNIX_EPOCH + Duration::from_secs(seconds),
             &decision,
-            Some(ResponseCode::NoError),
+            Some(ResponseCode::NoError as u16),
             Some(QueryEventCacheResult::Miss),
             Some(Duration::from_millis(1)),
         )
@@ -2172,6 +2347,48 @@ mod tests {
     }
 
     #[test]
+    fn in_memory_query_event_store_releases_unindexed_counts_after_eviction() {
+        let store = InMemoryQueryEventStore::new(InMemoryQueryEventStoreConfig {
+            max_retained_events: 1,
+            max_indexed_sources: 0,
+            max_indexed_domains: 0,
+            ..InMemoryQueryEventStoreConfig::default()
+        });
+
+        store.record(event_with(1, 1, "192.0.2.1", "first.example"));
+        store.record(event_with(2, 2, "192.0.2.2", "second.example"));
+
+        let summary = store.summary();
+        assert_eq!(summary.retained_event_count, 1);
+        assert_eq!(summary.unindexed_source_event_count, 1);
+        assert_eq!(summary.unindexed_domain_event_count, 1);
+        assert_eq!(store.recent_events()[0].sequence, 2);
+    }
+
+    #[test]
+    fn in_memory_query_event_store_evicts_unindexed_event_without_removing_later_indexed_key() {
+        let store = InMemoryQueryEventStore::new(InMemoryQueryEventStoreConfig {
+            max_retained_events: 3,
+            max_indexed_sources: 1,
+            max_indexed_domains: 1,
+            ..InMemoryQueryEventStoreConfig::default()
+        });
+
+        store.record(event_with(1, 1, "192.0.2.1", "first.example"));
+        store.record(event_with(2, 2, "192.0.2.2", "second.example"));
+        store.record(event_with(3, 3, "192.0.2.3", "third.example"));
+        store.record(event_with(4, 4, "192.0.2.2", "second.example"));
+        store.record(event_with(5, 5, "192.0.2.4", "fourth.example"));
+
+        let indexed_source = ObservedSourceEndpoint::ip("192.0.2.2".parse().unwrap());
+        let state = store.state.lock().unwrap();
+        assert_eq!(state.indexed_sources.get(&indexed_source), Some(&1));
+        assert_eq!(state.indexed_domains.get("second.example"), Some(&1));
+        assert_eq!(state.unindexed_source_event_count, 2);
+        assert_eq!(state.unindexed_domain_event_count, 2);
+    }
+
+    #[test]
     fn query_event_context_preserves_observed_source_and_original_question() {
         let decision = ResolveDecision {
             client_ip: "192.0.2.10".parse().unwrap(),
@@ -2186,7 +2403,7 @@ mod tests {
             source.into(),
             Some("Example.COM.".to_string()),
             &decision,
-            Some(ResponseCode::NoError),
+            Some(ResponseCode::NoError as u16),
             Some(QueryEventCacheResult::Miss),
             Some(Duration::from_millis(1)),
         );
@@ -2963,7 +3180,7 @@ mod tests {
             7,
             timestamp,
             &decision,
-            Some(ResponseCode::NoError),
+            Some(ResponseCode::NoError as u16),
             Some(QueryEventCacheResult::Hit),
             Some(Duration::from_millis(12)),
         );
@@ -2980,10 +3197,19 @@ mod tests {
         assert_eq!(event.qtype, Some(1));
         assert_eq!(event.qclass, Some(1));
         assert_eq!(event.terminal_outcome, QueryEventOutcome::AllowedFromCache);
-        assert_eq!(event.response_code, Some(ResponseCode::NoError));
+        assert_eq!(event.response_code, Some(ResponseCode::NoError as u16));
         assert_eq!(event.cache_result, Some(QueryEventCacheResult::Hit));
         assert_eq!(event.latency, Some(Duration::from_millis(12)));
         assert!(event.advisory_findings.is_empty());
+    }
+
+    #[test]
+    fn response_code_from_wire_includes_edns_extended_rcode() {
+        let mut response = a_query_with_edns_details(0x1234, "example.com", 1232, false, 1, 0, &[]);
+        response[2] = 0x81;
+        response[3] = 0x80;
+
+        assert_eq!(response_code_from_wire(&response), Some(16));
     }
 
     #[test]
@@ -3284,7 +3510,7 @@ mod tests {
             );
             assert_eq!(
                 recorded_events[0].response_code,
-                Some(ResponseCode::NoError)
+                Some(ResponseCode::NoError as u16)
             );
             assert_eq!(
                 recorded_events[0].cache_result,
@@ -3344,7 +3570,7 @@ mod tests {
             );
             assert_eq!(
                 recorded_events[0].response_code,
-                Some(ResponseCode::NoError)
+                Some(ResponseCode::NoError as u16)
             );
             assert_eq!(
                 recorded_events[0].cache_result,
@@ -3848,7 +4074,7 @@ mod tests {
             );
             assert_eq!(
                 recorded_events[0].response_code,
-                Some(ResponseCode::FormErr)
+                Some(ResponseCode::FormErr as u16)
             );
             assert_eq!(recorded_events[0].cache_result, None);
         }
@@ -3888,7 +4114,7 @@ mod tests {
             );
             assert_eq!(
                 recorded_events[0].response_code,
-                Some(ResponseCode::ServFail)
+                Some(ResponseCode::ServFail as u16)
             );
             assert_eq!(
                 recorded_events[0].cache_result,

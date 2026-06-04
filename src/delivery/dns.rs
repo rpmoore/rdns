@@ -23,7 +23,7 @@ use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tokio::task::JoinSet;
 
 use crate::config::RuntimeConfig;
-use crate::resolver::{ResolveQuery, ResolveRequest};
+use crate::resolver::{ObservedSourceEndpoint, ResolveQuery, ResolveRequest};
 
 const DEFAULT_MAX_IN_FLIGHT_REQUESTS: usize = 1024;
 
@@ -201,9 +201,10 @@ async fn handle_datagram(
     datagram: ReceivedDatagram,
 ) -> io::Result<()> {
     let _permit = datagram.permit;
+    let listener = socket.local_addr()?;
     let outcome = resolver
         .resolve(ResolveRequest::new_with_observed_source(
-            datagram.source,
+            ObservedSourceEndpoint::udp(datagram.source, listener),
             SystemTime::now(),
             datagram.request_bytes,
         ))
@@ -232,8 +233,8 @@ mod tests {
 
     use crate::resolver::{
         BasicResponseFactory, Clock, MetricsSink, QueryEventRecordResult, QueryEventSink,
-        QueryEventV1, ResolverMetric, StandardProtocolCodec, UpstreamError, UpstreamRequest,
-        UpstreamResolver, UpstreamResponse,
+        QueryEventV1, QueryTransport, ResolverMetric, StandardProtocolCodec, UpstreamError,
+        UpstreamRequest, UpstreamResolver, UpstreamResponse,
     };
 
     fn a_query(id: u16, name: &str) -> Vec<u8> {
@@ -422,6 +423,14 @@ mod tests {
             assert_eq!(
                 recorded_events[0].observed_source.port,
                 Some(client_addr.port())
+            );
+            assert_eq!(
+                recorded_events[0].observed_source.transport,
+                Some(QueryTransport::Udp)
+            );
+            assert_eq!(
+                recorded_events[0].observed_source.listener,
+                Some(server_addr)
             );
         }
 
