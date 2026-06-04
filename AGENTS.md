@@ -41,6 +41,7 @@ Guidance for Codex and other coding agents working in this repository.
 - Keep edits scoped to the requested behavior.
 - When adding behavior, add or update tests that would fail without the change.
 - When fixing a bug, include a regression test whenever practical.
+- When working on a step in `docs/steps.md` that links to a GitHub issue, update that issue's status as work progresses. Leave a concise progress comment when starting or materially changing scope, and close the issue only after the step's acceptance criteria and verification are complete.
 - After changes, summarize what changed and which verification commands were run.
 
 ## Directory Summary Instructions
