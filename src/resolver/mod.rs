@@ -2176,17 +2176,19 @@ impl InMemoryQueryEventStore {
         event: QueryEventV1,
         classifier: &dyn SuspiciousLookupClassifier,
     ) -> QueryEventV1 {
-        self.record_classified_with_lock_hook(event, classifier, || {})
+        self.record_classified_with_lock_hooks(event, classifier, || {}, || {})
     }
 
-    fn record_classified_with_lock_hook(
+    fn record_classified_with_lock_hooks(
         &self,
         event: QueryEventV1,
         classifier: &dyn SuspiciousLookupClassifier,
         before_classification_lock: impl FnOnce(),
+        after_classification_lock: impl FnOnce(),
     ) -> QueryEventV1 {
         before_classification_lock();
         let _classification = self.classification.lock().unwrap();
+        after_classification_lock();
         let (retained_events, window) = {
             let state = self.state.lock().unwrap();
             let (retained_events, retention_evicted_for_event) =
@@ -4314,10 +4316,11 @@ mod tests {
         first_entered_rx.recv().unwrap();
 
         let (second_attempting_tx, second_attempting_rx) = std_mpsc::channel();
+        let (second_acquired_tx, second_acquired_rx) = std_mpsc::channel();
         let second_store = Arc::clone(&store);
         let second_classifier = Arc::clone(&classifier);
         let second = thread::spawn(move || {
-            second_store.record_classified_with_lock_hook(
+            second_store.record_classified_with_lock_hooks(
                 event_with_response(
                     2,
                     2,
@@ -4328,11 +4331,14 @@ mod tests {
                 ),
                 second_classifier.as_ref(),
                 || second_attempting_tx.send(()).unwrap(),
+                || second_acquired_tx.send(()).unwrap(),
             )
         });
 
         second_attempting_rx.recv().unwrap();
+        assert!(second_acquired_rx.try_recv().is_err());
         release_first_tx.send(()).unwrap();
+        second_acquired_rx.recv().unwrap();
 
         let _first_event = first.join().unwrap();
         let second_event = second.join().unwrap();
