@@ -1296,10 +1296,18 @@ fn response_is_truncated(bytes: &[u8]) -> bool {
 }
 
 fn response_code_from_wire(bytes: &[u8]) -> Option<u16> {
+    let base = bytes.get(3).map(|flags| u16::from(flags & 0x0f))?;
+    let additional_count = bytes
+        .get(10..12)
+        .map(|count| u16::from_be_bytes([count[0], count[1]]))
+        .unwrap_or(0);
+    if additional_count == 0 {
+        return Some(base);
+    }
     Message::parse(bytes)
         .ok()
         .map(|message| full_response_code(&message))
-        .or_else(|| bytes.get(3).map(|flags| u16::from(flags & 0x0f)))
+        .or(Some(base))
 }
 
 fn full_response_code(message: &Message) -> u16 {
@@ -3208,6 +3216,16 @@ mod tests {
         response[3] = 0x80;
 
         assert_eq!(response_code_from_wire(&response), Some(16));
+    }
+
+    #[test]
+    fn response_code_from_wire_returns_base_rcode_when_additional_parse_fails() {
+        let mut response = a_query(0x1234, "example.com");
+        response[2] = 0x81;
+        response[3] = 0x82;
+        response[10..12].copy_from_slice(&1u16.to_be_bytes());
+
+        assert_eq!(response_code_from_wire(&response), Some(2));
     }
 
     #[test]
