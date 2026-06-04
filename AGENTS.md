@@ -18,6 +18,7 @@ Guidance for Codex and other coding agents working in this repository.
 - Preserve existing copyright and license headers in Rust source files.
 - Add dependencies conservatively. A new crate should improve correctness, reduce real complexity, or match an established project pattern.
 - Prefer deterministic tests. Avoid sleeps, wall-clock dependence, and real network access unless the test is intentionally integration-level.
+- Avoid unnecessary data copying; prefer borrowing or sharing buffers when possible.
 
 ## Software Development Practices
 
