@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::future::Future;
 use std::net::{IpAddr, SocketAddr};
 use std::pin::Pin;
@@ -1401,6 +1401,181 @@ impl QueryEventSink for ChannelQueryEventSink {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InMemoryQueryEventStoreConfig {
+    pub max_retained_events: usize,
+    pub max_indexed_sources: usize,
+    pub max_indexed_domains: usize,
+    pub retention: Option<Duration>,
+}
+
+impl Default for InMemoryQueryEventStoreConfig {
+    fn default() -> Self {
+        Self {
+            max_retained_events: 10_000,
+            max_indexed_sources: 1_024,
+            max_indexed_domains: 10_000,
+            retention: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct QueryEventStoreSummary {
+    pub retained_event_count: usize,
+    pub indexed_source_count: usize,
+    pub indexed_domain_count: usize,
+    pub evicted_event_count: u64,
+    pub unindexed_source_event_count: u64,
+    pub unindexed_domain_event_count: u64,
+    pub dropped_newest_event_count: u64,
+    pub dropped_oldest_event_count: u64,
+    pub sampled_event_count: u64,
+}
+
+pub struct InMemoryQueryEventStore {
+    config: InMemoryQueryEventStoreConfig,
+    state: Mutex<InMemoryQueryEventStoreState>,
+}
+
+#[derive(Default)]
+struct InMemoryQueryEventStoreState {
+    events: VecDeque<QueryEventV1>,
+    indexed_sources: HashSet<ObservedSourceEndpoint>,
+    indexed_domains: HashSet<String>,
+    evicted_event_count: u64,
+    unindexed_source_event_count: u64,
+    unindexed_domain_event_count: u64,
+    dropped_newest_event_count: u64,
+    dropped_oldest_event_count: u64,
+    sampled_event_count: u64,
+}
+
+impl InMemoryQueryEventStore {
+    pub fn new(config: InMemoryQueryEventStoreConfig) -> Self {
+        Self {
+            config,
+            state: Mutex::new(InMemoryQueryEventStoreState::default()),
+        }
+    }
+
+    pub fn record(&self, event: QueryEventV1) {
+        let mut state = self.state.lock().unwrap();
+        state.record_index_membership(&event, &self.config);
+        state.insert_ordered(event);
+        state.evict_expired(self.config.retention);
+        state.evict_to_bound(self.config.max_retained_events);
+    }
+
+    pub fn record_outcome(&self, result: QueryEventRecordResult) {
+        let mut state = self.state.lock().unwrap();
+        match result {
+            QueryEventRecordResult::Accepted | QueryEventRecordResult::Disabled => {}
+            QueryEventRecordResult::DroppedNewest => {
+                state.dropped_newest_event_count =
+                    state.dropped_newest_event_count.saturating_add(1);
+            }
+            QueryEventRecordResult::DroppedOldest => {
+                state.dropped_oldest_event_count =
+                    state.dropped_oldest_event_count.saturating_add(1);
+            }
+            QueryEventRecordResult::Sampled => {
+                state.sampled_event_count = state.sampled_event_count.saturating_add(1);
+            }
+        }
+    }
+
+    pub fn recent_events(&self) -> Vec<QueryEventV1> {
+        self.state.lock().unwrap().events.iter().cloned().collect()
+    }
+
+    pub fn summary(&self) -> QueryEventStoreSummary {
+        let state = self.state.lock().unwrap();
+        QueryEventStoreSummary {
+            retained_event_count: state.events.len(),
+            indexed_source_count: state.indexed_sources.len(),
+            indexed_domain_count: state.indexed_domains.len(),
+            evicted_event_count: state.evicted_event_count,
+            unindexed_source_event_count: state.unindexed_source_event_count,
+            unindexed_domain_event_count: state.unindexed_domain_event_count,
+            dropped_newest_event_count: state.dropped_newest_event_count,
+            dropped_oldest_event_count: state.dropped_oldest_event_count,
+            sampled_event_count: state.sampled_event_count,
+        }
+    }
+}
+
+impl InMemoryQueryEventStoreState {
+    fn record_index_membership(
+        &mut self,
+        event: &QueryEventV1,
+        config: &InMemoryQueryEventStoreConfig,
+    ) {
+        if !self.indexed_sources.contains(&event.observed_source) {
+            if self.indexed_sources.len() < config.max_indexed_sources {
+                self.indexed_sources.insert(event.observed_source.clone());
+            } else {
+                self.unindexed_source_event_count =
+                    self.unindexed_source_event_count.saturating_add(1);
+            }
+        }
+
+        let Some(domain) = event
+            .normalized_question
+            .as_ref()
+            .map(|question| &question.qname)
+        else {
+            return;
+        };
+        if !self.indexed_domains.contains(domain) {
+            if self.indexed_domains.len() < config.max_indexed_domains {
+                self.indexed_domains.insert(domain.clone());
+            } else {
+                self.unindexed_domain_event_count =
+                    self.unindexed_domain_event_count.saturating_add(1);
+            }
+        }
+    }
+
+    fn insert_ordered(&mut self, event: QueryEventV1) {
+        let key = (event.timestamp, event.sequence);
+        let position = self
+            .events
+            .iter()
+            .position(|existing| (existing.timestamp, existing.sequence) > key);
+        match position {
+            Some(position) => self.events.insert(position, event),
+            None => self.events.push_back(event),
+        }
+    }
+
+    fn evict_expired(&mut self, retention: Option<Duration>) {
+        let Some(retention) = retention else {
+            return;
+        };
+        let Some(newest_timestamp) = self.events.back().map(|event| event.timestamp) else {
+            return;
+        };
+        while self
+            .events
+            .front()
+            .and_then(|event| event.timestamp.checked_add(retention))
+            .map(|expires_at| expires_at <= newest_timestamp)
+            .unwrap_or(false)
+        {
+            self.events.pop_front();
+            self.evicted_event_count = self.evicted_event_count.saturating_add(1);
+        }
+    }
+
+    fn evict_to_bound(&mut self, max_retained_events: usize) {
+        while self.events.len() > max_retained_events {
+            self.events.pop_front();
+            self.evicted_event_count = self.evicted_event_count.saturating_add(1);
+        }
+    }
+}
+
 pub struct InMemoryDnsCache {
     max_entries: usize,
     state: Mutex<InMemoryDnsCacheState>,
@@ -1781,6 +1956,22 @@ mod tests {
         QueryEventV1::from_decision(0, SystemTime::UNIX_EPOCH, &decision, None, None, None)
     }
 
+    fn event_with(sequence: u64, seconds: u64, source_ip: &str, name: &str) -> QueryEventV1 {
+        let decision = ResolveDecision {
+            client_ip: source_ip.parse().unwrap(),
+            question: Some(QuestionKey::new(name, 1, 1)),
+            kind: ResolveDecisionKind::Allowed,
+        };
+        QueryEventV1::from_decision(
+            sequence,
+            SystemTime::UNIX_EPOCH + Duration::from_secs(seconds),
+            &decision,
+            Some(ResponseCode::NoError),
+            Some(QueryEventCacheResult::Miss),
+            Some(Duration::from_millis(1)),
+        )
+    }
+
     #[tokio::test]
     async fn channel_query_event_sink_enqueues_when_capacity_is_available() {
         let (tx, mut rx) = mpsc::channel(1);
@@ -1822,6 +2013,78 @@ mod tests {
         let result = sink.record(event_for("disabled.example"));
 
         assert_eq!(result, QueryEventRecordResult::Disabled);
+    }
+
+    #[test]
+    fn in_memory_query_event_store_orders_and_bounds_recent_events() {
+        let store = InMemoryQueryEventStore::new(InMemoryQueryEventStoreConfig {
+            max_retained_events: 2,
+            ..InMemoryQueryEventStoreConfig::default()
+        });
+
+        store.record(event_with(2, 2, "192.0.2.2", "second.example"));
+        store.record(event_with(1, 1, "192.0.2.1", "first.example"));
+        store.record(event_with(3, 3, "192.0.2.3", "third.example"));
+
+        let events = store.recent_events();
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0].sequence, 2);
+        assert_eq!(events[1].sequence, 3);
+        assert_eq!(store.summary().evicted_event_count, 1);
+    }
+
+    #[test]
+    fn in_memory_query_event_store_applies_retention_duration() {
+        let store = InMemoryQueryEventStore::new(InMemoryQueryEventStoreConfig {
+            max_retained_events: 16,
+            retention: Some(Duration::from_secs(10)),
+            ..InMemoryQueryEventStoreConfig::default()
+        });
+
+        store.record(event_with(1, 0, "192.0.2.1", "old.example"));
+        store.record(event_with(2, 5, "192.0.2.1", "kept.example"));
+        store.record(event_with(3, 11, "192.0.2.1", "new.example"));
+
+        let events = store.recent_events();
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0].sequence, 2);
+        assert_eq!(events[1].sequence, 3);
+        assert_eq!(store.summary().evicted_event_count, 1);
+    }
+
+    #[test]
+    fn in_memory_query_event_store_caps_source_and_domain_indexes() {
+        let store = InMemoryQueryEventStore::new(InMemoryQueryEventStoreConfig {
+            max_retained_events: 16,
+            max_indexed_sources: 1,
+            max_indexed_domains: 1,
+            ..InMemoryQueryEventStoreConfig::default()
+        });
+
+        store.record(event_with(1, 1, "192.0.2.1", "first.example"));
+        store.record(event_with(2, 2, "192.0.2.2", "second.example"));
+
+        let summary = store.summary();
+        assert_eq!(summary.retained_event_count, 2);
+        assert_eq!(summary.indexed_source_count, 1);
+        assert_eq!(summary.indexed_domain_count, 1);
+        assert_eq!(summary.unindexed_source_event_count, 1);
+        assert_eq!(summary.unindexed_domain_event_count, 1);
+    }
+
+    #[test]
+    fn in_memory_query_event_store_tracks_dropped_and_sampled_indicators() {
+        let store = InMemoryQueryEventStore::new(InMemoryQueryEventStoreConfig::default());
+
+        store.record_outcome(QueryEventRecordResult::DroppedNewest);
+        store.record_outcome(QueryEventRecordResult::DroppedOldest);
+        store.record_outcome(QueryEventRecordResult::Sampled);
+        store.record_outcome(QueryEventRecordResult::Accepted);
+
+        let summary = store.summary();
+        assert_eq!(summary.dropped_newest_event_count, 1);
+        assert_eq!(summary.dropped_oldest_event_count, 1);
+        assert_eq!(summary.sampled_event_count, 1);
     }
 
     #[derive(Default)]
