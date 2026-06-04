@@ -202,8 +202,8 @@ async fn handle_datagram(
 ) -> io::Result<()> {
     let _permit = datagram.permit;
     let outcome = resolver
-        .resolve(ResolveRequest::new(
-            datagram.source.ip(),
+        .resolve(ResolveRequest::new_with_observed_source(
+            datagram.source,
             SystemTime::now(),
             datagram.request_bytes,
         ))
@@ -419,6 +419,10 @@ mod tests {
             let recorded_events = events.events.lock().unwrap();
             assert_eq!(recorded_events.len(), 1);
             assert_eq!(recorded_events[0].observed_source.ip, client_addr.ip());
+            assert_eq!(
+                recorded_events[0].observed_source.port,
+                Some(client_addr.port())
+            );
         }
 
         shutdown_tx.send(()).unwrap();

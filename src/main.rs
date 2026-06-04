@@ -24,12 +24,13 @@ use rdns::delivery::dns::UdpDnsServer;
 use rdns::delivery::upstream::UdpUpstreamResolver;
 use rdns::resolver::{
     BasicResponseFactory, CacheTtlPolicy, ChannelQueryEventSink, Clock, InMemoryDnsCache,
-    MetricsSink, QueryEventRecordResult, QueryEventSink, QueryEventV1, ResolveQuery,
-    ResolverMetric, StandardProtocolCodec,
+    InMemoryQueryEventStore, InMemoryQueryEventStoreConfig, MetricsSink, QueryEventRecordResult,
+    QueryEventSink, QueryEventV1, ResolveQuery, ResolverMetric, StandardProtocolCodec,
 };
 use tokio::task::{JoinError, JoinSet};
 
 const DEFAULT_CACHE_ENTRIES: usize = 10_000;
+const DEFAULT_QUERY_EVENT_STORE_ENTRIES: usize = 10_000;
 const QUERY_EVENT_QUEUE_CAPACITY: usize = 1024;
 
 #[tokio::main]
@@ -40,11 +41,20 @@ async fn main() -> io::Result<()> {
         .map_err(|error| io::Error::other(format!("invalid runtime config: {error:?}")))?;
 
     let stdout_events = Arc::new(StdoutEvents);
-    let (event_tx, mut event_rx) = tokio::sync::mpsc::channel(QUERY_EVENT_QUEUE_CAPACITY);
+    let query_event_store = Arc::new(InMemoryQueryEventStore::new(
+        InMemoryQueryEventStoreConfig {
+            max_retained_events: DEFAULT_QUERY_EVENT_STORE_ENTRIES,
+            ..InMemoryQueryEventStoreConfig::default()
+        },
+    ));
+    let (event_tx, mut event_rx) =
+        tokio::sync::mpsc::channel::<QueryEventV1>(QUERY_EVENT_QUEUE_CAPACITY);
     let event_drain = {
         let stdout_events = Arc::clone(&stdout_events);
+        let query_event_store = Arc::clone(&query_event_store);
         tokio::spawn(async move {
             while let Some(event) = event_rx.recv().await {
+                query_event_store.record(event.clone());
                 let _ = stdout_events.record(event);
             }
         })

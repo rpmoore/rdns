@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{HashMap, VecDeque};
 use std::future::Future;
 use std::net::{IpAddr, SocketAddr};
 use std::pin::Pin;
@@ -41,9 +41,31 @@ pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ReceivedAt(pub SystemTime);
 
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct ObservedSourceEndpoint {
+    pub ip: IpAddr,
+    pub port: Option<u16>,
+}
+
+impl ObservedSourceEndpoint {
+    pub fn ip(ip: IpAddr) -> Self {
+        Self { ip, port: None }
+    }
+}
+
+impl From<SocketAddr> for ObservedSourceEndpoint {
+    fn from(endpoint: SocketAddr) -> Self {
+        Self {
+            ip: endpoint.ip(),
+            port: Some(endpoint.port()),
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ResolveRequest {
     pub client_ip: IpAddr,
+    pub observed_source: ObservedSourceEndpoint,
     pub received_at: ReceivedAt,
     pub bytes: Vec<u8>,
 }
@@ -52,6 +74,21 @@ impl ResolveRequest {
     pub fn new(client_ip: IpAddr, received_at: SystemTime, bytes: Vec<u8>) -> Self {
         Self {
             client_ip,
+            observed_source: ObservedSourceEndpoint::ip(client_ip),
+            received_at: ReceivedAt(received_at),
+            bytes,
+        }
+    }
+
+    pub fn new_with_observed_source(
+        observed_source: impl Into<ObservedSourceEndpoint>,
+        received_at: SystemTime,
+        bytes: Vec<u8>,
+    ) -> Self {
+        let observed_source = observed_source.into();
+        Self {
+            client_ip: observed_source.ip,
+            observed_source,
             received_at: ReceivedAt(received_at),
             bytes,
         }
@@ -456,15 +493,39 @@ impl QueryEventV1 {
         cache_result: Option<QueryEventCacheResult>,
         latency: Option<Duration>,
     ) -> Self {
+        Self::from_decision_context(
+            sequence,
+            timestamp,
+            ObservedSourceEndpoint::ip(decision.client_ip),
+            decision
+                .question
+                .as_ref()
+                .map(|question| question.qname.clone()),
+            decision,
+            response_code,
+            cache_result,
+            latency,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn from_decision_context(
+        sequence: u64,
+        timestamp: SystemTime,
+        observed_source: ObservedSourceEndpoint,
+        original_question_name: Option<String>,
+        decision: &ResolveDecision,
+        response_code: Option<ResponseCode>,
+        cache_result: Option<QueryEventCacheResult>,
+        latency: Option<Duration>,
+    ) -> Self {
         let normalized_question = decision.question.clone();
         Self {
             schema_version: Self::SCHEMA_VERSION,
             sequence,
             timestamp,
-            observed_source: ObservedSourceEndpoint::ip(decision.client_ip),
-            original_question_name: normalized_question
-                .as_ref()
-                .map(|question| question.qname.clone()),
+            observed_source,
+            original_question_name,
             qtype: normalized_question.as_ref().map(|question| question.qtype),
             qclass: normalized_question.as_ref().map(|question| question.qclass),
             normalized_question,
@@ -473,27 +534,6 @@ impl QueryEventV1 {
             cache_result,
             latency,
             advisory_findings: Vec::new(),
-        }
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub struct ObservedSourceEndpoint {
-    pub ip: IpAddr,
-    pub port: Option<u16>,
-}
-
-impl ObservedSourceEndpoint {
-    pub fn ip(ip: IpAddr) -> Self {
-        Self { ip, port: None }
-    }
-}
-
-impl From<SocketAddr> for ObservedSourceEndpoint {
-    fn from(endpoint: SocketAddr) -> Self {
-        Self {
-            ip: endpoint.ip(),
-            port: Some(endpoint.port()),
         }
     }
 }
@@ -669,7 +709,7 @@ impl ResolveQuery {
                 };
                 let response_bytes = self.responses.protocol_error(request_id, &error);
                 return self
-                    .finish(started_at, decision, response_bytes, None)
+                    .finish(started_at, &request, None, decision, response_bytes, None)
                     .await;
             }
         };
@@ -687,6 +727,8 @@ impl ResolveQuery {
             return self
                 .finish(
                     started_at,
+                    &request,
+                    decoded_original_question_name(&decoded),
                     decision,
                     response_bytes,
                     cache_probe.event_cache_result,
@@ -744,8 +786,15 @@ impl ResolveQuery {
                     )
                     .await;
                 guard.complete(upstream_result);
-                self.finish(started_at, decision, response_bytes, event_cache_result)
-                    .await
+                self.finish(
+                    started_at,
+                    request,
+                    decoded_original_question_name(decoded),
+                    decision,
+                    response_bytes,
+                    event_cache_result,
+                )
+                .await
             }
             SingleFlightTicket::Follower { flight } => {
                 self.metrics.increment(ResolverMetric::CacheCoalescedMiss);
@@ -762,6 +811,8 @@ impl ResolveQuery {
                     return self
                         .finish(
                             started_at,
+                            request,
+                            decoded_original_question_name(decoded),
                             decision,
                             response_bytes,
                             Some(QueryEventCacheResult::Hit),
@@ -946,8 +997,15 @@ impl ResolveQuery {
                 upstream_result,
             )
             .await;
-        self.finish(started_at, decision, response_bytes, event_cache_result)
-            .await
+        self.finish(
+            started_at,
+            request,
+            decoded_original_question_name(decoded),
+            decision,
+            response_bytes,
+            event_cache_result,
+        )
+        .await
     }
 
     async fn prepare_upstream_result(
@@ -1056,15 +1114,19 @@ impl ResolveQuery {
     async fn finish(
         &self,
         started_at: SystemTime,
+        request: &ResolveRequest,
+        original_question_name: Option<String>,
         decision: ResolveDecision,
         response_bytes: Vec<u8>,
         cache_result: Option<QueryEventCacheResult>,
     ) -> ResolveOutcome {
         let finished_at = self.clock.now();
         let latency = finished_at.duration_since(started_at).ok();
-        let event = QueryEventV1::from_decision(
+        let event = QueryEventV1::from_decision_context(
             self.event_sequence.fetch_add(1, Ordering::Relaxed),
             finished_at,
+            request.observed_source.clone(),
+            original_question_name,
             &decision,
             response_code_from_wire(&response_bytes),
             cache_result,
@@ -1222,6 +1284,14 @@ fn response_code_from_wire(bytes: &[u8]) -> Option<ResponseCode> {
         5 => Some(ResponseCode::Refused),
         _ => None,
     }
+}
+
+fn decoded_original_question_name(decoded: &DecodedQuery) -> Option<String> {
+    decoded
+        .message
+        .questions
+        .first()
+        .map(|question| question.qname.clone())
 }
 
 fn cache_supported(query: &DecodedQuery) -> bool {
@@ -1441,8 +1511,8 @@ pub struct InMemoryQueryEventStore {
 #[derive(Default)]
 struct InMemoryQueryEventStoreState {
     events: VecDeque<QueryEventV1>,
-    indexed_sources: HashSet<ObservedSourceEndpoint>,
-    indexed_domains: HashSet<String>,
+    indexed_sources: HashMap<ObservedSourceEndpoint, usize>,
+    indexed_domains: HashMap<String, usize>,
     evicted_event_count: u64,
     unindexed_source_event_count: u64,
     unindexed_domain_event_count: u64,
@@ -1461,10 +1531,10 @@ impl InMemoryQueryEventStore {
 
     pub fn record(&self, event: QueryEventV1) {
         let mut state = self.state.lock().unwrap();
-        state.record_index_membership(&event, &self.config);
         state.insert_ordered(event);
         state.evict_expired(self.config.retention);
         state.evict_to_bound(self.config.max_retained_events);
+        state.rebuild_indexes(&self.config);
     }
 
     pub fn record_outcome(&self, result: QueryEventRecordResult) {
@@ -1506,37 +1576,6 @@ impl InMemoryQueryEventStore {
 }
 
 impl InMemoryQueryEventStoreState {
-    fn record_index_membership(
-        &mut self,
-        event: &QueryEventV1,
-        config: &InMemoryQueryEventStoreConfig,
-    ) {
-        if !self.indexed_sources.contains(&event.observed_source) {
-            if self.indexed_sources.len() < config.max_indexed_sources {
-                self.indexed_sources.insert(event.observed_source.clone());
-            } else {
-                self.unindexed_source_event_count =
-                    self.unindexed_source_event_count.saturating_add(1);
-            }
-        }
-
-        let Some(domain) = event
-            .normalized_question
-            .as_ref()
-            .map(|question| &question.qname)
-        else {
-            return;
-        };
-        if !self.indexed_domains.contains(domain) {
-            if self.indexed_domains.len() < config.max_indexed_domains {
-                self.indexed_domains.insert(domain.clone());
-            } else {
-                self.unindexed_domain_event_count =
-                    self.unindexed_domain_event_count.saturating_add(1);
-            }
-        }
-    }
-
     fn insert_ordered(&mut self, event: QueryEventV1) {
         let key = (event.timestamp, event.sequence);
         let position = self
@@ -1563,15 +1602,53 @@ impl InMemoryQueryEventStoreState {
             .map(|expires_at| expires_at <= newest_timestamp)
             .unwrap_or(false)
         {
-            self.events.pop_front();
-            self.evicted_event_count = self.evicted_event_count.saturating_add(1);
+            self.evict_front();
         }
     }
 
     fn evict_to_bound(&mut self, max_retained_events: usize) {
         while self.events.len() > max_retained_events {
-            self.events.pop_front();
-            self.evicted_event_count = self.evicted_event_count.saturating_add(1);
+            self.evict_front();
+        }
+    }
+
+    fn evict_front(&mut self) {
+        self.events.pop_front();
+        self.evicted_event_count = self.evicted_event_count.saturating_add(1);
+    }
+
+    fn rebuild_indexes(&mut self, config: &InMemoryQueryEventStoreConfig) {
+        self.indexed_sources.clear();
+        self.indexed_domains.clear();
+        self.unindexed_source_event_count = 0;
+        self.unindexed_domain_event_count = 0;
+
+        for event in &self.events {
+            if let Some(count) = self.indexed_sources.get_mut(&event.observed_source) {
+                *count = count.saturating_add(1);
+            } else if self.indexed_sources.len() < config.max_indexed_sources {
+                self.indexed_sources
+                    .insert(event.observed_source.clone(), 1);
+            } else {
+                self.unindexed_source_event_count =
+                    self.unindexed_source_event_count.saturating_add(1);
+            }
+
+            let Some(domain) = event
+                .normalized_question
+                .as_ref()
+                .map(|question| &question.qname)
+            else {
+                continue;
+            };
+            if let Some(count) = self.indexed_domains.get_mut(domain) {
+                *count = count.saturating_add(1);
+            } else if self.indexed_domains.len() < config.max_indexed_domains {
+                self.indexed_domains.insert(domain.clone(), 1);
+            } else {
+                self.unindexed_domain_event_count =
+                    self.unindexed_domain_event_count.saturating_add(1);
+            }
         }
     }
 }
@@ -2070,6 +2147,56 @@ mod tests {
         assert_eq!(summary.indexed_domain_count, 1);
         assert_eq!(summary.unindexed_source_event_count, 1);
         assert_eq!(summary.unindexed_domain_event_count, 1);
+    }
+
+    #[test]
+    fn in_memory_query_event_store_releases_index_slots_after_eviction() {
+        let store = InMemoryQueryEventStore::new(InMemoryQueryEventStoreConfig {
+            max_retained_events: 1,
+            max_indexed_sources: 1,
+            max_indexed_domains: 1,
+            ..InMemoryQueryEventStoreConfig::default()
+        });
+
+        store.record(event_with(1, 1, "192.0.2.1", "first.example"));
+        store.record(event_with(2, 2, "192.0.2.2", "second.example"));
+
+        let summary = store.summary();
+        assert_eq!(summary.retained_event_count, 1);
+        assert_eq!(summary.indexed_source_count, 1);
+        assert_eq!(summary.indexed_domain_count, 1);
+        assert_eq!(summary.unindexed_source_event_count, 0);
+        assert_eq!(summary.unindexed_domain_event_count, 0);
+        assert_eq!(store.recent_events()[0].sequence, 2);
+    }
+
+    #[test]
+    fn query_event_context_preserves_observed_source_and_original_question() {
+        let decision = ResolveDecision {
+            client_ip: "192.0.2.10".parse().unwrap(),
+            question: Some(QuestionKey::new("example.com", 1, 1)),
+            kind: ResolveDecisionKind::Allowed,
+        };
+        let source: SocketAddr = "192.0.2.10:53000".parse().unwrap();
+
+        let event = QueryEventV1::from_decision_context(
+            1,
+            SystemTime::UNIX_EPOCH,
+            source.into(),
+            Some("Example.COM.".to_string()),
+            &decision,
+            Some(ResponseCode::NoError),
+            Some(QueryEventCacheResult::Miss),
+            Some(Duration::from_millis(1)),
+        );
+
+        assert_eq!(event.observed_source.ip, decision.client_ip);
+        assert_eq!(event.observed_source.port, Some(53000));
+        assert_eq!(
+            event.original_question_name.as_deref(),
+            Some("Example.COM.")
+        );
+        assert_eq!(event.normalized_question.unwrap().qname, "example.com");
     }
 
     #[test]
@@ -3142,6 +3269,17 @@ mod tests {
             assert_eq!(
                 recorded_events[0].terminal_outcome,
                 QueryEventOutcome::AllowedFromBackend
+            );
+            assert_eq!(
+                recorded_events[0].original_question_name.as_deref(),
+                Some("Example.COM")
+            );
+            assert_eq!(
+                recorded_events[0]
+                    .normalized_question
+                    .as_ref()
+                    .map(|question| question.qname.as_str()),
+                Some("example.com")
             );
             assert_eq!(
                 recorded_events[0].response_code,
