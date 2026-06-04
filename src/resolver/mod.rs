@@ -939,7 +939,7 @@ impl InMemorySuspiciousLookupClassifier {
         for incomplete_reason in &evaluated_window.incomplete_reasons {
             details.push(detail(
                 "window_incomplete_reason",
-                format!("{incomplete_reason:?}"),
+                classifier_window_incomplete_reason_value(*incomplete_reason),
             ));
         }
         QueryEventClassifierFinding {
@@ -951,6 +951,17 @@ impl InMemorySuspiciousLookupClassifier {
             evaluated_window,
             details,
         }
+    }
+}
+
+fn classifier_window_incomplete_reason_value(
+    reason: QueryEventClassifierWindowIncompleteReason,
+) -> &'static str {
+    match reason {
+        QueryEventClassifierWindowIncompleteReason::ColdStart => "cold_start",
+        QueryEventClassifierWindowIncompleteReason::RetentionEviction => "retention_eviction",
+        QueryEventClassifierWindowIncompleteReason::SampledEvents => "sampled_events",
+        QueryEventClassifierWindowIncompleteReason::DroppedEvents => "dropped_events",
     }
 }
 
@@ -1013,7 +1024,12 @@ fn matching_suspicious_selector(
     for domain in suspicious_domains {
         let domain = normalize_question_name(domain);
         let domain = domain.trim_start_matches('.');
-        if qname == domain || qname.ends_with(&format!(".{domain}")) {
+        if qname == domain
+            || qname
+                .strip_suffix(domain)
+                .map(|prefix| prefix.ends_with('.'))
+                .unwrap_or(false)
+        {
             return Some(domain.to_string());
         }
     }
@@ -2160,6 +2176,16 @@ impl InMemoryQueryEventStore {
         event: QueryEventV1,
         classifier: &dyn SuspiciousLookupClassifier,
     ) -> QueryEventV1 {
+        self.record_classified_with_lock_hook(event, classifier, || {})
+    }
+
+    fn record_classified_with_lock_hook(
+        &self,
+        event: QueryEventV1,
+        classifier: &dyn SuspiciousLookupClassifier,
+        before_classification_lock: impl FnOnce(),
+    ) -> QueryEventV1 {
+        before_classification_lock();
         let _classification = self.classification.lock().unwrap();
         let (retained_events, window) = {
             let state = self.state.lock().unwrap();
@@ -4013,8 +4039,8 @@ mod tests {
             .filter(|detail| detail.key == "window_incomplete_reason")
             .map(|detail| detail.value.as_str())
             .collect::<Vec<_>>();
-        assert!(incomplete_reasons.contains(&"RetentionEviction"));
-        assert!(incomplete_reasons.contains(&"DroppedEvents"));
+        assert!(incomplete_reasons.contains(&"retention_eviction"));
+        assert!(incomplete_reasons.contains(&"dropped_events"));
     }
 
     #[test]
@@ -4061,7 +4087,7 @@ mod tests {
             .incomplete_reasons
             .contains(&QueryEventClassifierWindowIncompleteReason::ColdStart));
         assert!(txt_finding.details.iter().any(|detail| {
-            detail.key == "window_incomplete_reason" && detail.value == "ColdStart"
+            detail.key == "window_incomplete_reason" && detail.value == "cold_start"
         }));
     }
 
@@ -4287,10 +4313,11 @@ mod tests {
 
         first_entered_rx.recv().unwrap();
 
+        let (second_attempting_tx, second_attempting_rx) = std_mpsc::channel();
         let second_store = Arc::clone(&store);
         let second_classifier = Arc::clone(&classifier);
         let second = thread::spawn(move || {
-            second_store.record_classified(
+            second_store.record_classified_with_lock_hook(
                 event_with_response(
                     2,
                     2,
@@ -4300,10 +4327,11 @@ mod tests {
                     ResponseCode::NoError as u16,
                 ),
                 second_classifier.as_ref(),
+                || second_attempting_tx.send(()).unwrap(),
             )
         });
 
-        thread::sleep(Duration::from_millis(20));
+        second_attempting_rx.recv().unwrap();
         release_first_tx.send(()).unwrap();
 
         let _first_event = first.join().unwrap();
