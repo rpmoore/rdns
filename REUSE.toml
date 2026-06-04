@@ -5,6 +5,7 @@ path = [
     ".agents/**",
     ".github/**",
     ".gitignore",
+    "AGENTS.md",
     "Cargo.lock",
     "Cargo.toml",
     "LICENSE",
