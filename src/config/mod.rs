@@ -126,20 +126,25 @@ impl RuntimeConfig {
         let mut upstreams: Vec<_> = self
             .upstreams
             .iter()
-            .filter(|upstream| upstream.enabled)
+            .enumerate()
+            .filter(|(_, upstream)| upstream.enabled)
             .collect();
-        upstreams.sort_by_key(|upstream| upstream.priority);
-        upstreams.into_iter()
+        upstreams.sort_by_key(|(index, upstream)| (upstream.priority, *index));
+        upstreams.into_iter().map(|(_, upstream)| upstream)
     }
 
     fn enabled_udp_upstreams(&self) -> Vec<&UpstreamConfig> {
         let mut upstreams: Vec<_> = self
             .upstreams
             .iter()
-            .filter(|upstream| upstream.enabled && upstream.protocol == UpstreamProtocol::Udp)
+            .enumerate()
+            .filter(|(_, upstream)| upstream.enabled && upstream.protocol == UpstreamProtocol::Udp)
             .collect();
-        upstreams.sort_by_key(|upstream| upstream.priority);
+        upstreams.sort_by_key(|(index, upstream)| (upstream.priority, *index));
         upstreams
+            .into_iter()
+            .map(|(_, upstream)| upstream)
+            .collect()
     }
 
     pub fn backend_cache_namespace(&self) -> String {

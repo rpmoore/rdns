@@ -3069,7 +3069,7 @@ fn decoded_original_question_name(decoded: &DecodedQuery) -> Option<String> {
 
 fn backend_cache_namespace(mode: ResolutionMode, backend_generation: u64) -> Option<String> {
     Some(format!(
-        "mode:{};backend-generation:{backend_generation}",
+        "mode:{};generation:{backend_generation}",
         mode.cache_namespace_label()
     ))
 }
@@ -7958,7 +7958,7 @@ mod tests {
                 ResolutionMode::Recursive,
                 7,
                 BackendHealth::Healthy,
-                Some("mode:recursive;backend-generation:7".to_string()),
+                Some("mode:recursive;generation:7".to_string()),
             ),
             Arc::new(BasicResponseFactory),
             Arc::new(FixedClock(SystemTime::UNIX_EPOCH)),
@@ -7988,7 +7988,7 @@ mod tests {
                 mode: ResolutionMode::Recursive,
                 generation: 7,
                 health: BackendHealth::Healthy,
-                cache_namespace: Some("mode:recursive;backend-generation:7".to_string()),
+                cache_namespace: Some("mode:recursive;generation:7".to_string()),
                 dnssec_validation: DnssecValidationStatus::Disabled,
             })
         );
@@ -8021,7 +8021,7 @@ mod tests {
                 ResolutionMode::Recursive,
                 7,
                 BackendHealth::Healthy,
-                Some("mode:recursive;backend-generation:7".to_string()),
+                Some("mode:recursive;generation:7".to_string()),
             ),
             Arc::new(BasicResponseFactory),
             Arc::new(FixedClock(SystemTime::UNIX_EPOCH)),
@@ -8067,7 +8067,7 @@ mod tests {
                 ResolutionMode::Recursive,
                 7,
                 BackendHealth::Healthy,
-                Some("mode:recursive;backend-generation:7".to_string()),
+                Some("mode:recursive;generation:7".to_string()),
             ),
             Arc::new(BasicResponseFactory),
             Arc::new(FixedClock(SystemTime::UNIX_EPOCH)),
@@ -8121,7 +8121,7 @@ mod tests {
                 ResolutionMode::Recursive,
                 7,
                 BackendHealth::Healthy,
-                Some("mode:recursive;backend-generation:7".to_string()),
+                Some("mode:recursive;generation:7".to_string()),
             ),
             Arc::new(BasicResponseFactory),
             Arc::new(FixedClock(SystemTime::UNIX_EPOCH)),
@@ -10237,7 +10237,7 @@ mod tests {
             ResolutionMode::Forward,
             2,
             BackendHealth::Degraded,
-            Some("mode:forward;backend-generation:2".to_string()),
+            Some("mode:forward;generation:2".to_string()),
         ));
         assert_eq!(metrics.backend_statuses.lock().unwrap().len(), 2);
         let outcome = service
