@@ -3287,6 +3287,14 @@ mod tests {
         }
     }
 
+    struct DisabledEvents;
+
+    impl QueryEventSink for DisabledEvents {
+        fn record(&self, _event: QueryEventV1) -> QueryEventRecordResult {
+            QueryEventRecordResult::Disabled
+        }
+    }
+
     fn event_for(name: &str) -> QueryEventV1 {
         let decision = ResolveDecision {
             client_ip: "127.0.0.1".parse().unwrap(),
@@ -3395,6 +3403,14 @@ mod tests {
             .into_iter()
             .map(|finding| finding.reason)
             .collect()
+    }
+
+    fn detail_value<'a>(finding: &'a QueryEventClassifierFinding, key: &str) -> Option<&'a str> {
+        finding
+            .details
+            .iter()
+            .find(|detail| detail.key == key)
+            .map(|detail| detail.value.as_str())
     }
 
     #[tokio::test]
@@ -3602,6 +3618,15 @@ mod tests {
         assert_eq!(summary.dropped_newest_event_count, 1);
         assert_eq!(summary.dropped_oldest_event_count, 1);
         assert_eq!(summary.sampled_event_count, 1);
+    }
+
+    #[test]
+    fn in_memory_query_event_store_ignores_disabled_outcome_for_retention_state() {
+        let store = InMemoryQueryEventStore::new(InMemoryQueryEventStoreConfig::default());
+
+        store.record_outcome(QueryEventRecordResult::Disabled);
+
+        assert_eq!(store.summary(), QueryEventStoreSummary::default());
     }
 
     #[test]
@@ -3901,6 +3926,225 @@ mod tests {
         let reasons = finding_reasons(&classifier, &retained_events[1], &retained_events);
 
         assert!(reasons.contains(&QueryEventClassifierReason::ServfailBurst));
+    }
+
+    #[test]
+    fn suspicious_lookup_classifier_respects_threshold_boundaries() {
+        let classifier =
+            InMemorySuspiciousLookupClassifier::new(InMemorySuspiciousLookupClassifierConfig {
+                nxdomain_burst_threshold: 3,
+                servfail_burst_threshold: 2,
+                repeated_txt_threshold: 3,
+                high_entropy_min_label_len: 8,
+                high_entropy_score_threshold: 60,
+                rare_domain_threshold: 2,
+                enable_domain_frequency_findings: true,
+                baseline_complete_after_events: 1,
+                ..InMemorySuspiciousLookupClassifierConfig::default()
+            });
+
+        let below_nxdomain = vec![
+            event_with_response(
+                1,
+                1,
+                "192.0.2.1",
+                "one.example",
+                1,
+                ResponseCode::NxDomain as u16,
+            ),
+            event_with_response(
+                2,
+                2,
+                "192.0.2.1",
+                "two.example",
+                1,
+                ResponseCode::NxDomain as u16,
+            ),
+        ];
+        let at_nxdomain = vec![
+            below_nxdomain[0].clone(),
+            below_nxdomain[1].clone(),
+            event_with_response(
+                3,
+                3,
+                "192.0.2.1",
+                "three.example",
+                1,
+                ResponseCode::NxDomain as u16,
+            ),
+        ];
+
+        assert!(
+            !finding_reasons(&classifier, &below_nxdomain[1], &below_nxdomain)
+                .contains(&QueryEventClassifierReason::NxdomainBurst)
+        );
+        assert!(finding_reasons(&classifier, &at_nxdomain[2], &at_nxdomain)
+            .contains(&QueryEventClassifierReason::NxdomainBurst));
+
+        let below_servfail = vec![event_with_response(
+            4,
+            4,
+            "192.0.2.1",
+            "one.example",
+            1,
+            ResponseCode::ServFail as u16,
+        )];
+        let at_servfail = vec![
+            below_servfail[0].clone(),
+            event_with_response(
+                5,
+                5,
+                "192.0.2.1",
+                "two.example",
+                1,
+                ResponseCode::ServFail as u16,
+            ),
+        ];
+
+        assert!(
+            !finding_reasons(&classifier, &below_servfail[0], &below_servfail)
+                .contains(&QueryEventClassifierReason::ServfailBurst)
+        );
+        assert!(finding_reasons(&classifier, &at_servfail[1], &at_servfail)
+            .contains(&QueryEventClassifierReason::ServfailBurst));
+
+        let below_txt = vec![
+            event_with_response(
+                6,
+                6,
+                "192.0.2.1",
+                "one.example",
+                16,
+                ResponseCode::NoError as u16,
+            ),
+            event_with_response(
+                7,
+                7,
+                "192.0.2.1",
+                "two.example",
+                16,
+                ResponseCode::NoError as u16,
+            ),
+        ];
+        let at_txt = vec![
+            below_txt[0].clone(),
+            below_txt[1].clone(),
+            event_with_response(
+                8,
+                8,
+                "192.0.2.1",
+                "three.example",
+                16,
+                ResponseCode::NoError as u16,
+            ),
+        ];
+
+        assert!(!finding_reasons(&classifier, &below_txt[1], &below_txt)
+            .contains(&QueryEventClassifierReason::RepeatedTxtLookup));
+        assert!(finding_reasons(&classifier, &at_txt[2], &at_txt)
+            .contains(&QueryEventClassifierReason::RepeatedTxtLookup));
+
+        let short_entropy = vec![event_with(9, 9, "192.0.2.1", "a9x4qz7.example")];
+        let long_entropy = vec![event_with(10, 10, "192.0.2.1", "a9x4qz7m.example")];
+        assert!(
+            !finding_reasons(&classifier, &short_entropy[0], &short_entropy)
+                .contains(&QueryEventClassifierReason::HighEntropyName)
+        );
+        assert!(
+            finding_reasons(&classifier, &long_entropy[0], &long_entropy)
+                .contains(&QueryEventClassifierReason::HighEntropyName)
+        );
+
+        let rare_at_threshold = vec![
+            event_with(11, 11, "192.0.2.1", "rare.example"),
+            event_with(12, 12, "192.0.2.2", "rare.example"),
+        ];
+        let rare_above_threshold = vec![
+            rare_at_threshold[0].clone(),
+            rare_at_threshold[1].clone(),
+            event_with(13, 13, "192.0.2.3", "rare.example"),
+        ];
+        assert!(
+            finding_reasons(&classifier, &rare_at_threshold[1], &rare_at_threshold)
+                .contains(&QueryEventClassifierReason::RareDomain)
+        );
+        assert!(
+            !finding_reasons(&classifier, &rare_above_threshold[2], &rare_above_threshold)
+                .contains(&QueryEventClassifierReason::RareDomain)
+        );
+    }
+
+    #[test]
+    fn suspicious_lookup_classifier_records_explanatory_finding_details() {
+        let classifier =
+            InMemorySuspiciousLookupClassifier::new(InMemorySuspiciousLookupClassifierConfig {
+                classifier_version: "test-classifier".to_string(),
+                config_generation: 42,
+                repeated_txt_threshold: 2,
+                repeated_txt_window: Duration::from_secs(60),
+                high_entropy_min_label_len: 8,
+                high_entropy_score_threshold: 60,
+                suspicious_domains: vec!["blocked.example".to_string()],
+                baseline_complete_after_events: 1,
+                ..InMemorySuspiciousLookupClassifierConfig::default()
+            });
+        let retained_events = vec![
+            event_with_response(
+                1,
+                1,
+                "192.0.2.1",
+                "txt-one.example",
+                16,
+                ResponseCode::NoError as u16,
+            ),
+            event_with_response(
+                2,
+                2,
+                "192.0.2.1",
+                "a9x4qz7m2p8v.blocked.example",
+                16,
+                ResponseCode::NoError as u16,
+            ),
+        ];
+        let retained_event_refs = arc_events(&retained_events);
+
+        let findings = classifier.classify(SuspiciousLookupClassifierInput {
+            event: &retained_events[1],
+            retained_events: &retained_event_refs,
+            window: classifier_window(
+                &retained_event_refs,
+                vec![QueryEventClassifierWindowIncompleteReason::SampledEvents],
+            ),
+        });
+
+        let txt = findings
+            .iter()
+            .find(|finding| finding.reason == QueryEventClassifierReason::RepeatedTxtLookup)
+            .unwrap();
+        assert_eq!(txt.classifier_version, "test-classifier");
+        assert_eq!(txt.config_generation, 42);
+        assert_eq!(txt.score, 55);
+        assert_eq!(detail_value(txt, "source_txt_count"), Some("2"));
+        assert_eq!(detail_value(txt, "threshold"), Some("2"));
+        assert_eq!(
+            detail_value(txt, "window_incomplete_reason"),
+            Some("sampled_events")
+        );
+
+        let entropy = findings
+            .iter()
+            .find(|finding| finding.reason == QueryEventClassifierReason::HighEntropyName)
+            .unwrap();
+        assert_eq!(detail_value(entropy, "label"), Some("a9x4qz7m2p8v"));
+        assert_eq!(detail_value(entropy, "threshold"), Some("60"));
+
+        let selector = findings
+            .iter()
+            .find(|finding| finding.reason == QueryEventClassifierReason::SuspiciousSelector)
+            .unwrap();
+        assert_eq!(selector.severity, QueryEventClassifierSeverity::High);
+        assert_eq!(selector.score, 90);
+        assert_eq!(detail_value(selector, "selector"), Some("blocked.example"));
     }
 
     #[test]
@@ -4709,6 +4953,37 @@ mod tests {
             .lock()
             .unwrap()
             .contains(&ResolverMetric::QueryEventAccepted));
+    }
+
+    #[tokio::test]
+    async fn resolve_isolates_disabled_query_event_sink() {
+        let upstream = Arc::new(StaticUpstream::new(Ok(UpstreamResponse {
+            bytes: a_response_with_answer(0x1234, "example.com", 60),
+            received_at: SystemTime::UNIX_EPOCH,
+        })));
+        let metrics = Arc::new(RecordingMetrics::default());
+        let service = ResolveQuery::new(
+            Arc::new(StandardProtocolCodec::new(1232)),
+            upstream.clone(),
+            Arc::new(BasicResponseFactory),
+            Arc::new(FixedClock(SystemTime::UNIX_EPOCH)),
+            Arc::new(DisabledEvents),
+            metrics.clone(),
+        );
+
+        let outcome = service
+            .resolve(ResolveRequest::new(
+                "192.0.2.10".parse().unwrap(),
+                SystemTime::UNIX_EPOCH,
+                a_query(0x1234, "example.com"),
+            ))
+            .await;
+
+        assert_eq!(outcome.decision.kind, ResolveDecisionKind::Allowed);
+        assert_eq!(upstream.requests.lock().unwrap().len(), 1);
+        assert_eq!(metrics.count(ResolverMetric::QueryEventDisabled), 1);
+        assert_eq!(metrics.count(ResolverMetric::QueryEventAccepted), 0);
+        assert_eq!(metrics.count(ResolverMetric::UpstreamSuccess), 1);
     }
 
     #[test]
