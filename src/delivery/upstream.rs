@@ -1270,6 +1270,63 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn recursive_authority_tcp_fallback_timeout_records_metric() {
+        let (udp_socket, tcp_listener, authority_addr) = bind_udp_tcp_pair();
+        let (tcp_query_seen_tx, tcp_query_seen_rx) = tokio::sync::oneshot::channel();
+        let authority_task = tokio::spawn(async move {
+            let mut request = [0u8; 512];
+            let (_, source) = udp_socket.recv_from(&mut request).await.unwrap();
+            udp_socket
+                .send_to(&truncated_response(0xbeef, "example.com"), source)
+                .await
+                .unwrap();
+            let (mut stream, _) = tcp_listener.accept().await.unwrap();
+            let tcp_query = read_tcp_query(&mut stream).await;
+            assert_eq!(&tcp_query[0..2], &[0xbe, 0xef]);
+            let _ = tcp_query_seen_tx.send(());
+            std::future::pending::<()>().await;
+        });
+        let transport = recursive_transport_with(
+            vec![RecursiveTransport::Udp, RecursiveTransport::Tcp],
+            Arc::new(FixedTransactionId(0xbeef)),
+        );
+        let metrics = Arc::new(RecordingMetrics::default());
+        let transport = transport.with_metrics(metrics.clone());
+
+        let query_task = tokio::spawn(async move {
+            transport
+                .query(
+                    authority_addr,
+                    authority_question("example.com"),
+                    false,
+                    Duration::from_millis(250),
+                )
+                .await
+        });
+        tcp_query_seen_rx.await.unwrap();
+        let error = query_task.await.unwrap().unwrap_err();
+
+        authority_task.abort();
+        assert_eq!(error, UpstreamError::Timeout);
+        assert_eq!(
+            metrics.count(ResolverMetric::RecursiveTcpFallbackAttempt),
+            1
+        );
+        assert_eq!(
+            metrics.count(ResolverMetric::RecursiveTcpFallbackTimeout),
+            1
+        );
+        assert_eq!(
+            metrics.count(ResolverMetric::RecursiveTcpFallbackSuccess),
+            0
+        );
+        assert_eq!(
+            metrics.count(ResolverMetric::RecursiveTcpFallbackFailure),
+            0
+        );
+    }
+
+    #[tokio::test]
     async fn recursive_authority_tcp_only_skips_udp() {
         let (udp_socket, tcp_listener, authority_addr) = bind_udp_tcp_pair();
         let authority_task = tokio::spawn(async move {

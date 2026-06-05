@@ -6705,6 +6705,137 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn recursive_backend_walks_root_tld_and_authority_for_answer() {
+        let question = QuestionKey::new("www.example.com", 1, 1);
+        let tld_authority = "203.0.113.10:53".parse().unwrap();
+        let domain_authority = "203.0.113.20:53".parse().unwrap();
+        let transport = Arc::new(ScriptedAuthorityTransport::new([
+            Ok(response_message_for_question(
+                question.clone(),
+                ResponseCode::NoError,
+                Vec::new(),
+                vec![ns_record("com", 300, "a.gtld.com")],
+                vec![glue_a_record(
+                    "a.gtld.com",
+                    300,
+                    "203.0.113.10".parse().unwrap(),
+                )],
+                false,
+            )),
+            Ok(response_message_for_question(
+                question.clone(),
+                ResponseCode::NoError,
+                Vec::new(),
+                vec![ns_record("example.com", 300, "ns1.example.com")],
+                vec![glue_a_record(
+                    "ns1.example.com",
+                    300,
+                    "203.0.113.20".parse().unwrap(),
+                )],
+                false,
+            )),
+            Ok(response_message_for_question(
+                question.clone(),
+                ResponseCode::NoError,
+                vec![a_record("www.example.com", 60)],
+                Vec::new(),
+                Vec::new(),
+                true,
+            )),
+        ]));
+        let backend = recursive_backend(transport.clone());
+
+        let response = backend
+            .resolve(recursive_request("www.example.com"))
+            .await
+            .unwrap();
+
+        assert_eq!(response.answers().len(), 1);
+        assert_eq!(
+            response.source_credibility,
+            SourceCredibility::Authoritative
+        );
+        let requests = transport.requests.lock().unwrap();
+        assert_eq!(
+            requests.as_slice(),
+            &[
+                ("198.51.100.53:53".parse().unwrap(), question.clone(), false),
+                (tld_authority, question.clone(), false),
+                (domain_authority, question, false),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn recursive_backend_walks_root_tld_and_authority_for_negative_answer() {
+        let question = QuestionKey::new("missing.example.com", 1, 1);
+        let tld_authority = "203.0.113.10:53".parse().unwrap();
+        let domain_authority = "203.0.113.20:53".parse().unwrap();
+        let transport = Arc::new(ScriptedAuthorityTransport::new([
+            Ok(response_message_for_question(
+                question.clone(),
+                ResponseCode::NoError,
+                Vec::new(),
+                vec![ns_record("com", 300, "a.gtld.com")],
+                vec![glue_a_record(
+                    "a.gtld.com",
+                    300,
+                    "203.0.113.10".parse().unwrap(),
+                )],
+                false,
+            )),
+            Ok(response_message_for_question(
+                question.clone(),
+                ResponseCode::NoError,
+                Vec::new(),
+                vec![ns_record("example.com", 300, "ns1.example.com")],
+                vec![glue_a_record(
+                    "ns1.example.com",
+                    300,
+                    "203.0.113.20".parse().unwrap(),
+                )],
+                false,
+            )),
+            Ok(response_message_for_question(
+                question.clone(),
+                ResponseCode::NxDomain,
+                Vec::new(),
+                vec![soa_record("example.com", 300, 60)],
+                Vec::new(),
+                true,
+            )),
+        ]));
+        let backend = recursive_backend(transport.clone());
+
+        let response = backend
+            .resolve(recursive_request("missing.example.com"))
+            .await
+            .unwrap();
+
+        assert_eq!(response.response_code, Some(ResponseCode::NxDomain));
+        assert_eq!(
+            response.negative_cache,
+            Some(negative_metadata(
+                "example.com",
+                "missing.example.com",
+                1,
+                1,
+                NegativeCacheKind::NxDomain,
+                Duration::from_secs(60),
+            ))
+        );
+        let requests = transport.requests.lock().unwrap();
+        assert_eq!(
+            requests.as_slice(),
+            &[
+                ("198.51.100.53:53".parse().unwrap(), question.clone(), false),
+                (tld_authority, question.clone(), false),
+                (domain_authority, question, false),
+            ]
+        );
+    }
+
+    #[tokio::test]
     async fn recursive_backend_rejects_unrelated_referral() {
         let question = QuestionKey::new("www.example.com", 1, 1);
         let transport = Arc::new(ScriptedAuthorityTransport::new([Ok(
@@ -6979,6 +7110,44 @@ mod tests {
             .unwrap()
             .iter()
             .any(|(metric, _)| *metric == ResolverMetric::RecursiveQueryDuration));
+    }
+
+    #[tokio::test]
+    async fn recursive_backend_records_lame_delegation_metric() {
+        let question = QuestionKey::new("www.example.com", 1, 1);
+        let transport = Arc::new(ScriptedAuthorityTransport::new([Ok(
+            response_message_for_question(
+                question,
+                ResponseCode::NoError,
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+                false,
+            ),
+        )]));
+        let metrics = Arc::new(RecordingMetrics::default());
+        let backend = RecursiveResolutionBackend::with_metrics(
+            RecursiveResolverConfig {
+                root_hints: vec![RecursiveRootHint {
+                    name: "a.root-servers.example".to_string(),
+                    endpoints: vec!["198.51.100.53:53".parse().unwrap()],
+                }],
+                per_authority_timeout: Duration::from_millis(500),
+                per_query_deadline: Duration::from_secs(2),
+                max_recursion_depth: 8,
+                max_cname_restarts: 4,
+            },
+            transport,
+            metrics.clone(),
+        );
+
+        assert_eq!(
+            backend.resolve(recursive_request("www.example.com")).await,
+            Err(ResolutionBackendError::NoBackendsAvailable)
+        );
+
+        assert_eq!(metrics.count(ResolverMetric::RecursiveLameDelegation), 1);
+        assert_eq!(metrics.count(ResolverMetric::RecursiveBailiwickReject), 0);
     }
 
     #[tokio::test]
