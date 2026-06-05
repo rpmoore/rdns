@@ -522,7 +522,7 @@ impl BackendSnapshot {
         }
     }
 
-    pub fn forwarding(backend: Arc<dyn ResolutionBackend>, generation: u64) -> Self {
+    fn forwarding(backend: Arc<dyn ResolutionBackend>, generation: u64) -> Self {
         Self::new(
             backend,
             ResolutionMode::Forward,

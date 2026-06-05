@@ -156,24 +156,13 @@ fn build_backend_snapshot(config: &RuntimeConfig) -> io::Result<BackendSnapshot>
                 ResolverResolutionMode::Forward,
                 config.resolution.generation,
                 BackendHealth::Healthy,
-                backend_cache_namespace(config),
+                Some(config.backend_cache_namespace()),
             ))
         }
         ConfigResolutionMode::Recursive => Err(io::Error::other(
             "recursive resolution mode is configured but no recursive backend is available yet",
         )),
     }
-}
-
-fn backend_cache_namespace(config: &RuntimeConfig) -> Option<String> {
-    Some(format!(
-        "mode:{};backend-generation:{}",
-        match config.resolution.mode {
-            ConfigResolutionMode::Forward => "forward",
-            ConfigResolutionMode::Recursive => "recursive",
-        },
-        config.resolution.generation
-    ))
 }
 
 fn listener_task_result_to_io(result: Result<io::Result<()>, JoinError>) -> io::Result<()> {

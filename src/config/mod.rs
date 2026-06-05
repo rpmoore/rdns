@@ -131,6 +131,56 @@ impl RuntimeConfig {
         upstreams.sort_by_key(|upstream| upstream.priority);
         upstreams.into_iter()
     }
+
+    pub fn backend_cache_namespace(&self) -> String {
+        match self.resolution.mode {
+            ResolutionMode::Forward => format!(
+                "mode:forward;generation:{};upstreams:{:016x}",
+                self.resolution.generation,
+                self.forwarding_upstream_set_hash()
+            ),
+            ResolutionMode::Recursive => {
+                let recursive = self.resolution.recursive.as_ref();
+                format!(
+                    "mode:recursive;generation:{};root-hints:{};dnssec:{}",
+                    self.resolution.generation,
+                    recursive
+                        .map(|recursive| recursive.root_hints_version.as_str())
+                        .unwrap_or("missing"),
+                    recursive
+                        .map(|recursive| recursive.dnssec_validation.cache_namespace_label())
+                        .unwrap_or("missing")
+                )
+            }
+        }
+    }
+
+    fn forwarding_upstream_set_hash(&self) -> u64 {
+        let mut upstreams: Vec<_> = self
+            .upstreams
+            .iter()
+            .filter(|upstream| upstream.enabled && upstream.protocol == UpstreamProtocol::Udp)
+            .collect();
+        upstreams.sort_by_key(|upstream| upstream.priority);
+
+        let mut hash = FNV1A64_OFFSET;
+        for upstream in upstreams {
+            hash_namespace_field(&mut hash, "name", &upstream.name);
+            hash_namespace_field(&mut hash, "endpoint", &upstream.endpoint.to_string());
+            hash_namespace_field(
+                &mut hash,
+                "protocol",
+                upstream.protocol.cache_namespace_label(),
+            );
+            hash_namespace_field(&mut hash, "priority", &upstream.priority.to_string());
+            hash_namespace_field(
+                &mut hash,
+                "timeout-nanos",
+                &upstream.timeout.as_nanos().to_string(),
+            );
+        }
+        hash
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -209,6 +259,14 @@ pub enum DnssecValidationMode {
     Disabled,
 }
 
+impl DnssecValidationMode {
+    fn cache_namespace_label(self) -> &'static str {
+        match self {
+            Self::Disabled => "disabled",
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UpstreamConfig {
     pub name: String,
@@ -242,6 +300,15 @@ impl UpstreamConfig {
 pub enum UpstreamProtocol {
     Udp,
     Tcp,
+}
+
+impl UpstreamProtocol {
+    fn cache_namespace_label(self) -> &'static str {
+        match self {
+            Self::Udp => "udp",
+            Self::Tcp => "tcp",
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -284,6 +351,8 @@ const MIN_PER_QUERY_DEADLINE: Duration = Duration::from_millis(100);
 const MAX_PER_QUERY_DEADLINE: Duration = Duration::from_secs(30);
 const MIN_UDP_PAYLOAD_SIZE: usize = 512;
 const MAX_UDP_PAYLOAD_SIZE: usize = 4096;
+const FNV1A64_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
+const FNV1A64_PRIME: u64 = 0x0000_0100_0000_01b3;
 
 fn validate_listen_address(address: SocketAddr) -> Result<(), ConfigError> {
     if address.port() <= 1024 {
@@ -307,6 +376,20 @@ fn validate_duration(
         });
     }
     Ok(())
+}
+
+fn hash_namespace_field(hash: &mut u64, name: &str, value: &str) {
+    fn write(hash: &mut u64, bytes: &[u8]) {
+        for byte in bytes {
+            *hash ^= u64::from(*byte);
+            *hash = hash.wrapping_mul(FNV1A64_PRIME);
+        }
+    }
+
+    write(hash, name.as_bytes());
+    write(hash, b"=");
+    write(hash, value.as_bytes());
+    write(hash, b";");
 }
 
 #[cfg(test)]
@@ -513,6 +596,89 @@ mod tests {
             .collect();
 
         assert_eq!(names, vec!["primary", "tertiary"]);
+    }
+
+    #[test]
+    fn forwarding_cache_namespace_includes_active_upstream_set() {
+        let base = RuntimeConfig::new(
+            vec![SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 5300)],
+            vec![upstream("primary", 10, true)],
+            Duration::from_secs(2),
+            1232,
+        )
+        .unwrap();
+        let same_active_set = RuntimeConfig::new(
+            vec![SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 5300)],
+            vec![
+                upstream("disabled", 1, false),
+                upstream("primary", 10, true),
+            ],
+            Duration::from_secs(2),
+            1232,
+        )
+        .unwrap();
+        let changed_active_set = RuntimeConfig::new(
+            vec![SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 5300)],
+            vec![upstream("secondary", 10, true)],
+            Duration::from_secs(2),
+            1232,
+        )
+        .unwrap();
+
+        assert!(base
+            .backend_cache_namespace()
+            .starts_with("mode:forward;generation:0;upstreams:"));
+        assert_eq!(
+            base.backend_cache_namespace(),
+            same_active_set.backend_cache_namespace()
+        );
+        assert_ne!(
+            base.backend_cache_namespace(),
+            changed_active_set.backend_cache_namespace()
+        );
+    }
+
+    #[test]
+    fn forwarding_cache_namespace_preserves_equal_priority_backend_order() {
+        let corp_first = RuntimeConfig::new(
+            vec![SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 5300)],
+            vec![upstream("corp", 10, true), upstream("public", 10, true)],
+            Duration::from_secs(2),
+            1232,
+        )
+        .unwrap();
+        let public_first = RuntimeConfig::new(
+            vec![SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 5300)],
+            vec![upstream("public", 10, true), upstream("corp", 10, true)],
+            Duration::from_secs(2),
+            1232,
+        )
+        .unwrap();
+
+        assert_ne!(
+            corp_first.backend_cache_namespace(),
+            public_first.backend_cache_namespace()
+        );
+    }
+
+    #[test]
+    fn recursive_cache_namespace_includes_root_hints_and_dnssec_mode() {
+        let config = RuntimeConfig::new_with_resolution(
+            vec![SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 5300)],
+            ResolutionConfig::recursive(
+                3,
+                RecursiveResolutionConfig::new("root-hints:v1", DnssecValidationMode::Disabled),
+            ),
+            Vec::new(),
+            Duration::from_secs(2),
+            1232,
+        )
+        .unwrap();
+
+        assert_eq!(
+            config.backend_cache_namespace(),
+            "mode:recursive;generation:3;root-hints:root-hints:v1;dnssec:disabled"
+        );
     }
 
     #[test]
