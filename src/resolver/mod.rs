@@ -28,7 +28,7 @@ use tokio::sync::{mpsc, Notify};
 use crate::protocol::{
     age_response_ttls, build_formerr_response, build_refused_response, build_servfail_response,
     cap_response_ttls, message_question_wire, rewrite_response_id, rewrite_response_request_fields,
-    Message, QueryValidationError, RecordData, ResponseCode,
+    Message, QueryValidationError, Record, RecordData, ResponseCode,
 };
 
 const EDNS_DO_FLAG: u16 = 0x8000;
@@ -452,23 +452,148 @@ fn apply_ttl_bounds(ttl: Duration, min_ttl: Option<Duration>, max_ttl: Duration)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct UpstreamRequest {
+pub struct ResolutionRequest {
     pub query: DecodedQuery,
+    pub backend_generation: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct UpstreamResponse {
+pub struct ResolutionResponse {
     pub bytes: Vec<u8>,
     pub received_at: SystemTime,
+    pub response_message: Option<Message>,
+    pub response_code: Option<ResponseCode>,
+    pub final_question: Option<QuestionKey>,
+    pub answers: Vec<Record>,
+    pub authorities: Vec<Record>,
+    pub additionals: Vec<Record>,
+    pub canonical_chain: Vec<String>,
+    pub negative_cache: Option<NegativeCacheMetadata>,
+    pub source_credibility: SourceCredibility,
+    pub backend_provenance: BackendProvenance,
+    pub cache_directive: ResolutionCacheDirective,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum UpstreamError {
+pub enum ResolutionBackendError {
     Timeout,
     MalformedResponse,
     QuestionMismatch,
     NoUpstreamsAvailable,
     Transport(String),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ResolutionMode {
+    Forward,
+    Recursive,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SourceCredibility {
+    ForwarderValidated,
+    Authoritative,
+    InsecureReferral,
+    Unknown,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BackendProvenance {
+    pub mode: ResolutionMode,
+    pub generation: u64,
+    pub backend_name: Option<String>,
+}
+
+impl BackendProvenance {
+    pub fn forwarding(generation: u64, backend_name: impl Into<String>) -> Self {
+        Self {
+            mode: ResolutionMode::Forward,
+            generation,
+            backend_name: Some(backend_name.into()),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ResolutionCacheDirective {
+    Cacheable,
+    DoNotCache(ResolutionNoCacheReason),
+}
+
+impl ResolutionCacheDirective {
+    fn is_cacheable(&self) -> bool {
+        matches!(self, Self::Cacheable)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ResolutionNoCacheReason {
+    BackendPolicy,
+    UnsupportedResponseSemantics,
+    ValidationIncomplete,
+}
+
+impl ResolutionResponse {
+    pub fn forwarded_bytes(
+        bytes: Vec<u8>,
+        received_at: SystemTime,
+        backend_generation: u64,
+        backend_name: impl Into<String>,
+    ) -> Self {
+        let parsed = Message::parse(&bytes).ok();
+        let response_code = parsed.as_ref().and_then(response_code);
+        let final_question = parsed.as_ref().and_then(QuestionKey::from_message);
+        let answers = parsed
+            .as_ref()
+            .map(|message| message.answers.clone())
+            .unwrap_or_default();
+        let authorities = parsed
+            .as_ref()
+            .map(|message| message.authorities.clone())
+            .unwrap_or_default();
+        let additionals = parsed
+            .as_ref()
+            .map(|message| message.additionals.clone())
+            .unwrap_or_default();
+        let canonical_chain = parsed
+            .as_ref()
+            .map(canonical_chain_from_response)
+            .unwrap_or_default();
+        let negative_cache = parsed.as_ref().and_then(negative_ttl);
+        Self {
+            bytes,
+            received_at,
+            response_message: parsed,
+            response_code,
+            final_question,
+            answers,
+            authorities,
+            additionals,
+            canonical_chain,
+            negative_cache,
+            source_credibility: SourceCredibility::ForwarderValidated,
+            backend_provenance: BackendProvenance::forwarding(backend_generation, backend_name),
+            cache_directive: ResolutionCacheDirective::Cacheable,
+        }
+    }
+}
+
+pub type UpstreamRequest = ResolutionRequest;
+pub type UpstreamResponse = ResolutionResponse;
+pub type UpstreamError = ResolutionBackendError;
+
+fn canonical_chain_from_response(response: &Message) -> Vec<String> {
+    response
+        .answers
+        .iter()
+        .filter_map(|record| {
+            if let RecordData::CNAME(cname) = &record.record {
+                Some(normalize_question_name(cname))
+            } else {
+                None
+            }
+        })
+        .collect()
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -478,7 +603,7 @@ pub enum ResolveDecisionKind {
     CacheHit,
     CacheMiss,
     ProtocolError(ResponseCode),
-    UpstreamFailure,
+    BackendFailure,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -575,7 +700,7 @@ impl QueryEventOutcome {
             ResolveDecisionKind::CacheHit => Self::AllowedFromCache,
             ResolveDecisionKind::CacheMiss => Self::AllowedFromBackend,
             ResolveDecisionKind::ProtocolError(code) => Self::ProtocolError(*code),
-            ResolveDecisionKind::UpstreamFailure => Self::BackendFailure,
+            ResolveDecisionKind::BackendFailure => Self::BackendFailure,
         }
     }
 }
@@ -1092,7 +1217,8 @@ pub struct ResolveQuery {
     cache: Arc<dyn DnsCache>,
     ttl_policy: CacheTtlPolicy,
     miss_coalescer: Arc<SingleFlightMisses>,
-    upstream: Arc<dyn UpstreamResolver>,
+    backend: Arc<dyn ResolutionBackend>,
+    backend_generation: u64,
     responses: Arc<dyn ResponseFactory>,
     clock: Arc<dyn Clock>,
     events: Arc<dyn QueryEventSink>,
@@ -1103,7 +1229,7 @@ pub struct ResolveQuery {
 impl ResolveQuery {
     pub fn new(
         protocol: Arc<dyn ProtocolCodec>,
-        upstream: Arc<dyn UpstreamResolver>,
+        backend: Arc<dyn ResolutionBackend>,
         responses: Arc<dyn ResponseFactory>,
         clock: Arc<dyn Clock>,
         events: Arc<dyn QueryEventSink>,
@@ -1113,7 +1239,7 @@ impl ResolveQuery {
             protocol,
             Arc::new(NoopDnsCache),
             CacheTtlPolicy::default(),
-            upstream,
+            backend,
             responses,
             clock,
             events,
@@ -1126,7 +1252,24 @@ impl ResolveQuery {
         protocol: Arc<dyn ProtocolCodec>,
         cache: Arc<dyn DnsCache>,
         ttl_policy: CacheTtlPolicy,
-        upstream: Arc<dyn UpstreamResolver>,
+        backend: Arc<dyn ResolutionBackend>,
+        responses: Arc<dyn ResponseFactory>,
+        clock: Arc<dyn Clock>,
+        events: Arc<dyn QueryEventSink>,
+        metrics: Arc<dyn MetricsSink>,
+    ) -> Self {
+        Self::with_cache_and_backend_generation(
+            protocol, cache, ttl_policy, backend, 0, responses, clock, events, metrics,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn with_cache_and_backend_generation(
+        protocol: Arc<dyn ProtocolCodec>,
+        cache: Arc<dyn DnsCache>,
+        ttl_policy: CacheTtlPolicy,
+        backend: Arc<dyn ResolutionBackend>,
+        backend_generation: u64,
         responses: Arc<dyn ResponseFactory>,
         clock: Arc<dyn Clock>,
         events: Arc<dyn QueryEventSink>,
@@ -1137,7 +1280,8 @@ impl ResolveQuery {
             cache,
             ttl_policy,
             miss_coalescer: Arc::new(SingleFlightMisses::default()),
-            upstream,
+            backend,
+            backend_generation,
             responses,
             clock,
             events,
@@ -1203,7 +1347,7 @@ impl ResolveQuery {
                 .await;
         }
 
-        self.resolve_upstream_and_finish(
+        self.resolve_backend_and_finish(
             started_at,
             &request,
             &decoded,
@@ -1228,18 +1372,18 @@ impl ResolveQuery {
         match self.miss_coalescer.begin(cache_key.clone()) {
             SingleFlightTicket::Leader { key, flight } => {
                 let guard = SingleFlightLeader::new(Arc::clone(&self.miss_coalescer), key, flight);
-                let upstream_result = self.resolve_upstream(decoded).await;
+                let backend_result = self.resolve_backend(decoded).await;
                 let (decision, response_bytes) = self
-                    .prepare_upstream_result(
+                    .prepare_backend_result(
                         request,
                         decoded,
                         question,
                         Some(cache_key),
                         true,
-                        upstream_result.clone(),
+                        backend_result.clone(),
                     )
                     .await;
-                guard.complete(upstream_result);
+                guard.complete(backend_result);
                 self.finish(
                     started_at,
                     request,
@@ -1252,7 +1396,7 @@ impl ResolveQuery {
             }
             SingleFlightTicket::Follower { flight } => {
                 self.metrics.increment(ResolverMetric::CacheCoalescedMiss);
-                let upstream_result = flight.wait().await;
+                let backend_result = flight.wait().await;
                 if let Some(response_bytes) = self
                     .cache_hit_after_coalesced_miss(request, decoded, &cache_key)
                     .await
@@ -1273,7 +1417,7 @@ impl ResolveQuery {
                         )
                         .await;
                 }
-                self.finish_upstream_result(
+                self.finish_backend_result(
                     started_at,
                     request,
                     decoded,
@@ -1281,7 +1425,7 @@ impl ResolveQuery {
                     Some(cache_key),
                     false,
                     event_cache_result,
-                    upstream_result,
+                    backend_result,
                 )
                 .await
             }
@@ -1289,7 +1433,7 @@ impl ResolveQuery {
     }
 
     #[allow(clippy::too_many_arguments)]
-    async fn resolve_upstream_and_finish(
+    async fn resolve_backend_and_finish(
         &self,
         started_at: SystemTime,
         request: &ResolveRequest,
@@ -1299,8 +1443,8 @@ impl ResolveQuery {
         cache_store_allowed: bool,
         event_cache_result: Option<QueryEventCacheResult>,
     ) -> ResolveOutcome {
-        let upstream_result = self.resolve_upstream(decoded).await;
-        self.finish_upstream_result(
+        let backend_result = self.resolve_backend(decoded).await;
+        self.finish_backend_result(
             started_at,
             request,
             decoded,
@@ -1308,18 +1452,19 @@ impl ResolveQuery {
             cache_key,
             cache_store_allowed,
             event_cache_result,
-            upstream_result,
+            backend_result,
         )
         .await
     }
 
-    async fn resolve_upstream(
+    async fn resolve_backend(
         &self,
         decoded: &DecodedQuery,
-    ) -> Result<UpstreamResponse, UpstreamError> {
-        self.upstream
-            .resolve(UpstreamRequest {
+    ) -> Result<ResolutionResponse, ResolutionBackendError> {
+        self.backend
+            .resolve(ResolutionRequest {
                 query: decoded.clone(),
+                backend_generation: self.backend_generation,
             })
             .await
     }
@@ -1431,7 +1576,7 @@ impl ResolveQuery {
     }
 
     #[allow(clippy::too_many_arguments)]
-    async fn finish_upstream_result(
+    async fn finish_backend_result(
         &self,
         started_at: SystemTime,
         request: &ResolveRequest,
@@ -1440,16 +1585,16 @@ impl ResolveQuery {
         cache_key: Option<CacheKey>,
         cache_store_allowed: bool,
         event_cache_result: Option<QueryEventCacheResult>,
-        upstream_result: Result<UpstreamResponse, UpstreamError>,
+        backend_result: Result<ResolutionResponse, ResolutionBackendError>,
     ) -> ResolveOutcome {
         let (decision, response_bytes) = self
-            .prepare_upstream_result(
+            .prepare_backend_result(
                 request,
                 decoded,
                 question,
                 cache_key,
                 cache_store_allowed,
-                upstream_result,
+                backend_result,
             )
             .await;
         self.finish(
@@ -1463,32 +1608,42 @@ impl ResolveQuery {
         .await
     }
 
-    async fn prepare_upstream_result(
+    async fn prepare_backend_result(
         &self,
         request: &ResolveRequest,
         decoded: &DecodedQuery,
         question: QuestionKey,
         cache_key: Option<CacheKey>,
         cache_store_allowed: bool,
-        upstream_result: Result<UpstreamResponse, UpstreamError>,
+        backend_result: Result<ResolutionResponse, ResolutionBackendError>,
     ) -> (ResolveDecision, Vec<u8>) {
-        let Ok(response) = upstream_result else {
-            return self.upstream_failure_response(request, decoded, question);
+        let Ok(response) = backend_result else {
+            return self.backend_failure_response(request, decoded, question);
         };
 
         self.metrics.increment(ResolverMetric::UpstreamSuccess);
-        let mut response_bytes = response.bytes;
+        let mut response_bytes = response.bytes.clone();
         if self
             .protocol
             .rewrite_response_id(&mut response_bytes, decoded.message.header.id)
             .is_err()
         {
-            return self.upstream_failure_response(request, decoded, decoded.question.clone());
+            return self.backend_failure_response(request, decoded, decoded.question.clone());
         }
 
         if let (true, Some(cache_key)) = (cache_store_allowed, cache_key) {
-            self.store_cache_response(cache_key, response_bytes.clone(), decoded, request)
+            if response.cache_directive.is_cacheable() {
+                self.store_cache_response(
+                    cache_key,
+                    response_bytes.clone(),
+                    &response,
+                    decoded,
+                    request,
+                )
                 .await;
+            } else {
+                self.metrics.increment(ResolverMetric::CacheStoreSkipped);
+            }
         }
 
         let decision = ResolveDecision {
@@ -1499,7 +1654,7 @@ impl ResolveQuery {
         (decision, response_bytes)
     }
 
-    fn upstream_failure_response(
+    fn backend_failure_response(
         &self,
         request: &ResolveRequest,
         decoded: &DecodedQuery,
@@ -1509,7 +1664,7 @@ impl ResolveQuery {
         let decision = ResolveDecision {
             client_ip: request.client_ip,
             question: Some(question),
-            kind: ResolveDecisionKind::UpstreamFailure,
+            kind: ResolveDecisionKind::BackendFailure,
         };
         let response_bytes = self.responses.servfail(Some(decoded));
         (decision, response_bytes)
@@ -1519,12 +1674,17 @@ impl ResolveQuery {
         &self,
         cache_key: CacheKey,
         response_bytes: Vec<u8>,
+        response: &ResolutionResponse,
         decoded: &DecodedQuery,
         request: &ResolveRequest,
     ) {
-        if let Some(store) =
-            self.cache_store_for_response(cache_key, response_bytes, decoded, request.received_at.0)
-        {
+        if let Some(store) = self.cache_store_for_response(
+            cache_key,
+            response_bytes,
+            response,
+            decoded,
+            request.received_at.0,
+        ) {
             if store.negative_cache.is_some() {
                 self.metrics.increment(ResolverMetric::CacheNegativeStore);
             }
@@ -1539,19 +1699,20 @@ impl ResolveQuery {
         &self,
         key: CacheKey,
         mut response_template: Vec<u8>,
+        response: &ResolutionResponse,
         query: &DecodedQuery,
         stored_at: SystemTime,
     ) -> Option<CacheStore> {
-        let response = Message::parse(&response_template).ok()?;
-        if !response.header.qr()
-            || response.questions.len() != 1
+        let message = response.response_message.as_ref()?;
+        if !message.header.qr()
+            || message.questions.len() != 1
             || query.message.questions.len() != 1
-            || response.questions[0] != query.message.questions[0]
+            || message.questions[0] != query.message.questions[0]
         {
             return None;
         }
-        let response_code = response_code(&response)?;
-        let (ttl, negative_cache) = self.ttl_policy.ttl_for_response(&response)?;
+        let response_code = response.response_code?;
+        let (ttl, negative_cache) = self.ttl_policy.ttl_for_response(message)?;
         self.protocol
             .rewrite_response_id(&mut response_template, 0)
             .ok()?;
@@ -1626,7 +1787,7 @@ enum SingleFlightTicket {
 }
 
 struct InFlightMiss {
-    result: Mutex<Option<Result<UpstreamResponse, UpstreamError>>>,
+    result: Mutex<Option<Result<ResolutionResponse, ResolutionBackendError>>>,
     notify: Notify,
 }
 
@@ -1657,7 +1818,7 @@ impl SingleFlightMisses {
         &self,
         key: &CacheKey,
         flight: &Arc<InFlightMiss>,
-        result: Result<UpstreamResponse, UpstreamError>,
+        result: Result<ResolutionResponse, ResolutionBackendError>,
     ) {
         *flight.result.lock().unwrap() = Some(result);
         let mut flights = self.flights.lock().unwrap();
@@ -1683,7 +1844,7 @@ impl SingleFlightLeader {
         }
     }
 
-    fn complete(mut self, result: Result<UpstreamResponse, UpstreamError>) {
+    fn complete(mut self, result: Result<ResolutionResponse, ResolutionBackendError>) {
         self.coalescer.finish(&self.key, &self.flight, result);
         self.completed = true;
     }
@@ -1697,7 +1858,7 @@ impl Drop for SingleFlightLeader {
         self.coalescer.finish(
             &self.key,
             &self.flight,
-            Err(UpstreamError::Transport(
+            Err(ResolutionBackendError::Transport(
                 "single-flight leader cancelled".to_string(),
             )),
         );
@@ -1705,7 +1866,7 @@ impl Drop for SingleFlightLeader {
 }
 
 impl InFlightMiss {
-    async fn wait(&self) -> Result<UpstreamResponse, UpstreamError> {
+    async fn wait(&self) -> Result<ResolutionResponse, ResolutionBackendError> {
         loop {
             let notified = self.notify.notified();
             tokio::pin!(notified);
@@ -3089,11 +3250,11 @@ impl DnsCache for InMemoryDnsCache {
     }
 }
 
-pub trait UpstreamResolver: Send + Sync {
+pub trait ResolutionBackend: Send + Sync {
     fn resolve<'a>(
         &'a self,
-        request: UpstreamRequest,
-    ) -> BoxFuture<'a, Result<UpstreamResponse, UpstreamError>>;
+        request: ResolutionRequest,
+    ) -> BoxFuture<'a, Result<ResolutionResponse, ResolutionBackendError>>;
 }
 
 pub trait ResponseFactory: Send + Sync {
@@ -4771,7 +4932,7 @@ mod tests {
         }
     }
 
-    impl UpstreamResolver for StaticUpstream {
+    impl ResolutionBackend for StaticUpstream {
         fn resolve<'a>(
             &'a self,
             request: UpstreamRequest,
@@ -4809,7 +4970,7 @@ mod tests {
         }
     }
 
-    impl UpstreamResolver for BlockingUpstream {
+    impl ResolutionBackend for BlockingUpstream {
         fn resolve<'a>(
             &'a self,
             request: UpstreamRequest,
@@ -4869,7 +5030,7 @@ mod tests {
     }
 
     fn resolve_service_with_cache(
-        upstream: Arc<dyn UpstreamResolver>,
+        upstream: Arc<dyn ResolutionBackend>,
         cache: Arc<dyn DnsCache>,
         events: Arc<RecordingEvents>,
         metrics: Arc<RecordingMetrics>,
@@ -4892,15 +5053,18 @@ mod tests {
         build_a_block_response(&query, "192.0.2.10".parse().unwrap(), ttl)
     }
 
+    fn upstream_response(bytes: Vec<u8>) -> UpstreamResponse {
+        UpstreamResponse::forwarded_bytes(bytes, SystemTime::UNIX_EPOCH, 0, "test-forwarder")
+    }
+
     #[tokio::test]
     async fn resolve_decodes_owned_request_bytes() {
         let request_bytes = a_query(0x1234, "example.com");
         let request_ptr = request_bytes.as_ptr();
         let codec = Arc::new(OwnedOnlyProtocolCodec::expect_owned_ptr(request_ptr));
-        let upstream = Arc::new(StaticUpstream::new(Ok(UpstreamResponse {
-            bytes: a_response_with_answer(0x1234, "example.com", 60),
-            received_at: SystemTime::UNIX_EPOCH,
-        })));
+        let upstream = Arc::new(StaticUpstream::new(Ok(upstream_response(
+            a_response_with_answer(0x1234, "example.com", 60),
+        ))));
         let events = Arc::new(RecordingEvents::default());
         let metrics = Arc::new(RecordingMetrics::default());
         let service = ResolveQuery::new(
@@ -4931,10 +5095,9 @@ mod tests {
 
     #[tokio::test]
     async fn resolve_records_accepted_query_event_metric() {
-        let upstream = Arc::new(StaticUpstream::new(Ok(UpstreamResponse {
-            bytes: a_response_with_answer(0x1234, "example.com", 60),
-            received_at: SystemTime::UNIX_EPOCH,
-        })));
+        let upstream = Arc::new(StaticUpstream::new(Ok(upstream_response(
+            a_response_with_answer(0x1234, "example.com", 60),
+        ))));
         let events = Arc::new(RecordingEvents::default());
         let metrics = Arc::new(RecordingMetrics::default());
         let service = resolve_service(upstream, events.clone(), metrics.clone());
@@ -4957,10 +5120,9 @@ mod tests {
 
     #[tokio::test]
     async fn resolve_isolates_disabled_query_event_sink() {
-        let upstream = Arc::new(StaticUpstream::new(Ok(UpstreamResponse {
-            bytes: a_response_with_answer(0x1234, "example.com", 60),
-            received_at: SystemTime::UNIX_EPOCH,
-        })));
+        let upstream = Arc::new(StaticUpstream::new(Ok(upstream_response(
+            a_response_with_answer(0x1234, "example.com", 60),
+        ))));
         let metrics = Arc::new(RecordingMetrics::default());
         let service = ResolveQuery::new(
             Arc::new(StandardProtocolCodec::new(1232)),
@@ -5056,6 +5218,47 @@ mod tests {
         response.extend_from_slice(&(rdata.len() as u16).to_be_bytes());
         response.extend_from_slice(&rdata);
         response
+    }
+
+    #[test]
+    fn forwarded_resolution_response_exposes_backend_metadata() {
+        let response = ResolutionResponse::forwarded_bytes(
+            nxdomain_response_with_soa(0x1234, "example.com", 30, 120),
+            SystemTime::UNIX_EPOCH,
+            42,
+            "forward-primary",
+        );
+
+        assert_eq!(response.response_code, Some(ResponseCode::NxDomain));
+        assert!(response.response_message.is_some());
+        assert_eq!(
+            response.final_question,
+            Some(QuestionKey::new("example.com", 1, 1))
+        );
+        assert!(response.answers.is_empty());
+        assert_eq!(response.authorities.len(), 1);
+        assert!(response.additionals.is_empty());
+        assert_eq!(
+            response.negative_cache,
+            Some(NegativeCacheMetadata {
+                authority_name: "example.com".to_string(),
+                soa_minimum_ttl: Duration::from_secs(30),
+            })
+        );
+        assert_eq!(
+            response.source_credibility,
+            SourceCredibility::ForwarderValidated
+        );
+        assert_eq!(response.backend_provenance.mode, ResolutionMode::Forward);
+        assert_eq!(response.backend_provenance.generation, 42);
+        assert_eq!(
+            response.backend_provenance.backend_name.as_deref(),
+            Some("forward-primary")
+        );
+        assert_eq!(
+            response.cache_directive,
+            ResolutionCacheDirective::Cacheable
+        );
     }
 
     #[test]
@@ -5818,10 +6021,7 @@ mod tests {
     #[tokio::test]
     async fn resolve_forwards_valid_query_to_upstream() {
         let response = vec![0xab, 0xcd, 0x81, 0x80];
-        let upstream = Arc::new(StaticUpstream::new(Ok(UpstreamResponse {
-            bytes: response.clone(),
-            received_at: SystemTime::UNIX_EPOCH,
-        })));
+        let upstream = Arc::new(StaticUpstream::new(Ok(upstream_response(response.clone()))));
         let events = Arc::new(RecordingEvents::default());
         let metrics = Arc::new(RecordingMetrics::default());
         let service = resolve_service(upstream.clone(), events.clone(), metrics.clone());
@@ -6076,10 +6276,9 @@ mod tests {
             expires_at: SystemTime::UNIX_EPOCH + Duration::from_secs(30),
         };
         let cache = Arc::new(RecordingCache::with_lookup(CacheLookup::Hit(cached)));
-        let upstream = Arc::new(StaticUpstream::new(Ok(UpstreamResponse {
-            bytes: a_response_with_answer(0x8888, "example.com", 60),
-            received_at: SystemTime::UNIX_EPOCH,
-        })));
+        let upstream = Arc::new(StaticUpstream::new(Ok(upstream_response(
+            a_response_with_answer(0x8888, "example.com", 60),
+        ))));
         let events = Arc::new(RecordingEvents::default());
         let metrics = Arc::new(RecordingMetrics::default());
         let service = resolve_service_with_cache(
@@ -6109,10 +6308,9 @@ mod tests {
     #[tokio::test]
     async fn resolve_coalesces_duplicate_cache_misses() {
         let cache = Arc::new(InMemoryDnsCache::new(16));
-        let upstream = Arc::new(BlockingUpstream::new(Ok(UpstreamResponse {
-            bytes: a_response_with_answer(0xaaaa, "example.com", 60),
-            received_at: SystemTime::UNIX_EPOCH,
-        })));
+        let upstream = Arc::new(BlockingUpstream::new(Ok(upstream_response(
+            a_response_with_answer(0xaaaa, "example.com", 60),
+        ))));
         let events = Arc::new(RecordingEvents::default());
         let metrics = Arc::new(RecordingMetrics::default());
         let service = Arc::new(resolve_service_with_cache(
@@ -6192,10 +6390,9 @@ mod tests {
     #[tokio::test]
     async fn resolve_stores_upstream_response_as_neutral_id_template() {
         let cache = Arc::new(RecordingCache::with_lookup(CacheLookup::Miss));
-        let upstream = Arc::new(StaticUpstream::new(Ok(UpstreamResponse {
-            bytes: a_response_with_answer(0xbeef, "example.com", 45),
-            received_at: SystemTime::UNIX_EPOCH,
-        })));
+        let upstream = Arc::new(StaticUpstream::new(Ok(upstream_response(
+            a_response_with_answer(0xbeef, "example.com", 45),
+        ))));
         let events = Arc::new(RecordingEvents::default());
         let metrics = Arc::new(RecordingMetrics::default());
         let service =
@@ -6229,10 +6426,9 @@ mod tests {
     #[tokio::test]
     async fn resolve_records_negative_cache_store_metrics() {
         let cache = Arc::new(RecordingCache::with_lookup(CacheLookup::Miss));
-        let upstream = Arc::new(StaticUpstream::new(Ok(UpstreamResponse {
-            bytes: nxdomain_response_with_soa(0xabcd, "example.com", 30, 120),
-            received_at: SystemTime::UNIX_EPOCH,
-        })));
+        let upstream = Arc::new(StaticUpstream::new(Ok(upstream_response(
+            nxdomain_response_with_soa(0xabcd, "example.com", 30, 120),
+        ))));
         let events = Arc::new(RecordingEvents::default());
         let metrics = Arc::new(RecordingMetrics::default());
         let service =
@@ -6263,6 +6459,64 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn resolve_honors_backend_do_not_cache_directive() {
+        let cache = Arc::new(RecordingCache::with_lookup(CacheLookup::Miss));
+        let mut response = upstream_response(a_response_with_answer(0x6666, "example.com", 60));
+        response.cache_directive =
+            ResolutionCacheDirective::DoNotCache(ResolutionNoCacheReason::BackendPolicy);
+        let upstream = Arc::new(StaticUpstream::new(Ok(response)));
+        let events = Arc::new(RecordingEvents::default());
+        let metrics = Arc::new(RecordingMetrics::default());
+        let service =
+            resolve_service_with_cache(upstream, cache.clone(), events, metrics.clone(), 1232);
+
+        let outcome = service
+            .resolve(ResolveRequest::new(
+                "192.0.2.10".parse().unwrap(),
+                SystemTime::UNIX_EPOCH,
+                a_query(0x6666, "example.com"),
+            ))
+            .await;
+
+        assert_eq!(outcome.decision.kind, ResolveDecisionKind::Allowed);
+        assert!(cache.stores.lock().unwrap().is_empty());
+        assert_eq!(metrics.count(ResolverMetric::CacheStoreSkipped), 1);
+    }
+
+    #[tokio::test]
+    async fn resolve_passes_backend_generation_to_backend_request() {
+        let upstream = Arc::new(StaticUpstream::new(Ok(upstream_response(
+            a_response_with_answer(0x1234, "example.com", 60),
+        ))));
+        let events = Arc::new(RecordingEvents::default());
+        let metrics = Arc::new(RecordingMetrics::default());
+        let service = ResolveQuery::with_cache_and_backend_generation(
+            Arc::new(StandardProtocolCodec::new(1232)),
+            Arc::new(NoopDnsCache),
+            CacheTtlPolicy::default(),
+            upstream.clone(),
+            99,
+            Arc::new(BasicResponseFactory),
+            Arc::new(FixedClock(SystemTime::UNIX_EPOCH)),
+            events,
+            metrics,
+        );
+
+        let outcome = service
+            .resolve(ResolveRequest::new(
+                "192.0.2.10".parse().unwrap(),
+                SystemTime::UNIX_EPOCH,
+                a_query(0x1234, "example.com"),
+            ))
+            .await;
+
+        assert_eq!(outcome.decision.kind, ResolveDecisionKind::Allowed);
+        let requests = upstream.requests.lock().unwrap();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].backend_generation, 99);
+    }
+
+    #[tokio::test]
     async fn resolve_does_not_store_malformed_or_question_mismatched_upstream_response() {
         for (response, skipped_store_count) in [
             (vec![0x12], 0),
@@ -6274,10 +6528,7 @@ mod tests {
             ),
         ] {
             let cache = Arc::new(RecordingCache::with_lookup(CacheLookup::Miss));
-            let upstream = Arc::new(StaticUpstream::new(Ok(UpstreamResponse {
-                bytes: response,
-                received_at: SystemTime::UNIX_EPOCH,
-            })));
+            let upstream = Arc::new(StaticUpstream::new(Ok(upstream_response(response))));
             let events = Arc::new(RecordingEvents::default());
             let metrics = Arc::new(RecordingMetrics::default());
             let service =
@@ -6309,10 +6560,9 @@ mod tests {
             (CacheLookup::Unavailable, ResolverMetric::CacheUnavailable),
         ] {
             let cache = Arc::new(RecordingCache::with_lookup(lookup));
-            let upstream = Arc::new(StaticUpstream::new(Ok(UpstreamResponse {
-                bytes: a_response_with_answer(0x6666, "example.com", 60),
-                received_at: SystemTime::UNIX_EPOCH,
-            })));
+            let upstream = Arc::new(StaticUpstream::new(Ok(upstream_response(
+                a_response_with_answer(0x6666, "example.com", 60),
+            ))));
             let events = Arc::new(RecordingEvents::default());
             let metrics = Arc::new(RecordingMetrics::default());
             let service =
@@ -6335,10 +6585,9 @@ mod tests {
     #[tokio::test]
     async fn resolve_bypasses_cache_for_unsupported_edns_options() {
         let cache = Arc::new(RecordingCache::with_lookup(CacheLookup::Miss));
-        let upstream = Arc::new(StaticUpstream::new(Ok(UpstreamResponse {
-            bytes: a_response_with_answer(0x7777, "example.com", 60),
-            received_at: SystemTime::UNIX_EPOCH,
-        })));
+        let upstream = Arc::new(StaticUpstream::new(Ok(upstream_response(
+            a_response_with_answer(0x7777, "example.com", 60),
+        ))));
         let events = Arc::new(RecordingEvents::default());
         let metrics = Arc::new(RecordingMetrics::default());
         let service =
@@ -6367,10 +6616,9 @@ mod tests {
             a_query_with_edns_flags(0x7777, "example.com", 1232, false, 0, 0, 0x4000, &[]),
         ] {
             let cache = Arc::new(RecordingCache::with_lookup(CacheLookup::Miss));
-            let upstream = Arc::new(StaticUpstream::new(Ok(UpstreamResponse {
-                bytes: a_response_with_answer(0x7777, "example.com", 60),
-                received_at: SystemTime::UNIX_EPOCH,
-            })));
+            let upstream = Arc::new(StaticUpstream::new(Ok(upstream_response(
+                a_response_with_answer(0x7777, "example.com", 60),
+            ))));
             let events = Arc::new(RecordingEvents::default());
             let metrics = Arc::new(RecordingMetrics::default());
             let service =
@@ -6435,7 +6683,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn resolve_maps_upstream_failure_to_servfail() {
+    async fn resolve_maps_backend_failure_to_servfail() {
         let upstream = Arc::new(StaticUpstream::new(Err(UpstreamError::Timeout)));
         let events = Arc::new(RecordingEvents::default());
         let metrics = Arc::new(RecordingMetrics::default());
@@ -6453,7 +6701,7 @@ mod tests {
             outcome.response_bytes[3] & 0x0f,
             ResponseCode::ServFail as u8
         );
-        assert_eq!(outcome.decision.kind, ResolveDecisionKind::UpstreamFailure);
+        assert_eq!(outcome.decision.kind, ResolveDecisionKind::BackendFailure);
         {
             let recorded_events = events.events.lock().unwrap();
             assert_eq!(recorded_events.len(), 1);
@@ -6478,7 +6726,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn resolve_maps_no_upstreams_to_servfail() {
+    async fn resolve_maps_no_backends_to_servfail() {
         let upstream = Arc::new(StaticUpstream::new(Err(
             UpstreamError::NoUpstreamsAvailable,
         )));
@@ -6498,7 +6746,7 @@ mod tests {
             outcome.response_bytes[3] & 0x0f,
             ResponseCode::ServFail as u8
         );
-        assert_eq!(outcome.decision.kind, ResolveDecisionKind::UpstreamFailure);
+        assert_eq!(outcome.decision.kind, ResolveDecisionKind::BackendFailure);
         assert!(metrics
             .increments
             .lock()

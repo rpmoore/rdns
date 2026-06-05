@@ -26,7 +26,7 @@ use tokio::time::{self, Instant};
 
 use crate::config::{RuntimeConfig, UpstreamConfig, UpstreamProtocol};
 use crate::protocol::{encode_tcp_frame, first_question, rewrite_response_id, Message};
-use crate::resolver::{UpstreamError, UpstreamRequest, UpstreamResolver, UpstreamResponse};
+use crate::resolver::{ResolutionBackend, UpstreamError, UpstreamRequest, UpstreamResponse};
 
 const DEGRADED_FAILURE_THRESHOLD: u32 = 2;
 const DEGRADED_RETRY_AFTER: Duration = Duration::from_secs(30);
@@ -270,10 +270,12 @@ impl UdpUpstreamResolver {
         rewrite_response_id(&mut response_bytes, attempt.client_id)
             .map_err(|_| UpstreamError::MalformedResponse)?;
 
-        Ok(UpstreamResponse {
-            bytes: response_bytes,
-            received_at: SystemTime::now(),
-        })
+        Ok(UpstreamResponse::forwarded_bytes(
+            response_bytes,
+            SystemTime::now(),
+            request.backend_generation,
+            upstream.name.clone(),
+        ))
     }
 
     async fn resolve_with_failover(
@@ -425,10 +427,12 @@ async fn resolve_tcp_fallback(
     validate_upstream_response(request, &response_bytes, upstream_id)?;
     rewrite_response_id(&mut response_bytes, client_id)
         .map_err(|_| UpstreamError::MalformedResponse)?;
-    Ok(UpstreamResponse {
-        bytes: response_bytes,
-        received_at: SystemTime::now(),
-    })
+    Ok(UpstreamResponse::forwarded_bytes(
+        response_bytes,
+        SystemTime::now(),
+        request.backend_generation,
+        upstream.name.clone(),
+    ))
 }
 
 fn remaining_until(deadline: Instant) -> Result<Duration, UpstreamError> {
@@ -493,7 +497,7 @@ fn validate_response_question_prefix(
     Ok(())
 }
 
-impl UpstreamResolver for UdpUpstreamResolver {
+impl ResolutionBackend for UdpUpstreamResolver {
     fn resolve<'a>(
         &'a self,
         request: UpstreamRequest,
@@ -653,7 +657,10 @@ mod tests {
     fn upstream_request(id: u16, name: &str) -> UpstreamRequest {
         let message = Message::parse_standard_query(&a_query(id, name)).unwrap();
         let query = DecodedQuery::new(message).unwrap();
-        UpstreamRequest { query }
+        UpstreamRequest {
+            query,
+            backend_generation: 0,
+        }
     }
 
     async fn read_tcp_query(stream: &mut TcpStream) -> Vec<u8> {

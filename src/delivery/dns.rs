@@ -237,8 +237,8 @@ mod tests {
 
     use crate::resolver::{
         BasicResponseFactory, Clock, MetricsSink, QueryEventRecordResult, QueryEventSink,
-        QueryEventV1, QueryTransport, ResolverMetric, StandardProtocolCodec, UpstreamError,
-        UpstreamRequest, UpstreamResolver, UpstreamResponse,
+        QueryEventV1, QueryTransport, ResolutionBackend, ResolverMetric, StandardProtocolCodec,
+        UpstreamError, UpstreamRequest, UpstreamResponse,
     };
 
     fn a_query(id: u16, name: &str) -> Vec<u8> {
@@ -302,7 +302,7 @@ mod tests {
         }
     }
 
-    impl UpstreamResolver for StaticUpstream {
+    impl ResolutionBackend for StaticUpstream {
         fn resolve<'a>(
             &'a self,
             request: UpstreamRequest,
@@ -313,6 +313,10 @@ mod tests {
                 self.response.clone()
             })
         }
+    }
+
+    fn upstream_response(bytes: Vec<u8>) -> UpstreamResponse {
+        UpstreamResponse::forwarded_bytes(bytes, SystemTime::UNIX_EPOCH, 0, "test-forwarder")
     }
 
     struct DelayedFirstUpstream {
@@ -331,7 +335,7 @@ mod tests {
         }
     }
 
-    impl UpstreamResolver for DelayedFirstUpstream {
+    impl ResolutionBackend for DelayedFirstUpstream {
         fn resolve<'a>(
             &'a self,
             _request: UpstreamRequest,
@@ -347,10 +351,7 @@ mod tests {
                     self.first_started.notify_waiters();
                     self.first_release.notified().await;
                 }
-                Ok(UpstreamResponse {
-                    bytes: vec![0, 0, 0x81, 0x80],
-                    received_at: SystemTime::UNIX_EPOCH,
-                })
+                Ok(upstream_response(vec![0, 0, 0x81, 0x80]))
             })
         }
     }
@@ -384,11 +385,8 @@ mod tests {
 
     #[tokio::test]
     async fn udp_server_passes_raw_query_and_client_ip_to_resolver() {
-        let upstream_response = vec![0xab, 0xcd, 0x81, 0x80];
-        let upstream = Arc::new(StaticUpstream::new(Ok(UpstreamResponse {
-            bytes: upstream_response,
-            received_at: SystemTime::UNIX_EPOCH,
-        })));
+        let backend_bytes = vec![0xab, 0xcd, 0x81, 0x80];
+        let upstream = Arc::new(StaticUpstream::new(Ok(upstream_response(backend_bytes))));
         let events = Arc::new(RecordingEvents::default());
         let resolver = resolve_service(upstream.clone(), events.clone());
         let server = UdpDnsServer::bind("127.0.0.1:0".parse().unwrap(), resolver, 1232)
