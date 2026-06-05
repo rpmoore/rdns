@@ -2568,6 +2568,7 @@ impl ResolveQuery {
         })
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn finish(
         &self,
         started_at: SystemTime,
@@ -4303,14 +4304,14 @@ impl RecursiveResolutionBackend {
                 if (message.header.aa() && has_requested_answer_for(message, &question))
                     || is_negative_answer(message)
                 {
-                    return Ok(ResolutionResponse::recursive_response(
+                    return ResolutionResponse::recursive_response(
                         &request.query,
                         response,
                         &cname_chain,
                         SystemTime::now(),
                         request.backend_generation,
                         authority,
-                    )?);
+                    );
                 }
 
                 if message.header.aa() {
@@ -4321,14 +4322,14 @@ impl RecursiveResolutionBackend {
                         let target_question =
                             QuestionKey::new(cname_target, question.qtype, question.qclass);
                         if has_requested_answer_for(message, &target_question) {
-                            return Ok(ResolutionResponse::recursive_response(
+                            return ResolutionResponse::recursive_response(
                                 &request.query,
                                 response,
                                 &cname_chain,
                                 SystemTime::now(),
                                 request.backend_generation,
                                 authority,
-                            )?);
+                            );
                         }
                         let next_name = normalize_question_name(cname_target);
                         if cname_restarts >= self.config.max_cname_restarts
