@@ -21,7 +21,7 @@ use opentelemetry_otlp::MetricExporter;
 use opentelemetry_sdk::metrics::{PeriodicReader, SdkMeterProvider};
 use rdns::config::{ResolutionMode as ConfigResolutionMode, RuntimeConfig};
 use rdns::delivery::dns::UdpDnsServer;
-use rdns::delivery::upstream::UdpUpstreamResolver;
+use rdns::delivery::upstream::ForwardingResolutionBackend;
 use rdns::resolver::{
     BackendHealth, BackendSnapshot, BasicResponseFactory, CacheTtlPolicy, ChannelQueryEventSink,
     Clock, InMemoryDnsCache, InMemoryQueryEventStore, InMemoryQueryEventStoreConfig,
@@ -146,9 +146,11 @@ async fn main() -> io::Result<()> {
 fn build_backend_snapshot(config: &RuntimeConfig) -> io::Result<BackendSnapshot> {
     match config.resolution.mode {
         ConfigResolutionMode::Forward => {
-            let backend = Arc::new(UdpUpstreamResolver::from_runtime_config(config).map_err(
-                |error| io::Error::other(format!("invalid upstream config: {error:?}")),
-            )?);
+            let backend = Arc::new(
+                ForwardingResolutionBackend::from_runtime_config(config).map_err(|error| {
+                    io::Error::other(format!("invalid upstream config: {error:?}"))
+                })?,
+            );
             Ok(BackendSnapshot::new(
                 backend,
                 ResolverResolutionMode::Forward,

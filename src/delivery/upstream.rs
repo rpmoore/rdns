@@ -104,7 +104,7 @@ fn splitmix64(value: u64) -> u64 {
     mixed ^ (mixed >> 31)
 }
 
-pub struct UdpUpstreamResolver {
+pub struct ForwardingResolutionBackend {
     upstreams: Vec<UpstreamConfig>,
     id_generator: Arc<dyn TransactionIdGenerator>,
     per_query_deadline: Duration,
@@ -133,7 +133,7 @@ struct UpstreamAttempt {
     deadline: Instant,
 }
 
-impl UdpUpstreamResolver {
+impl ForwardingResolutionBackend {
     pub fn new(upstream: UpstreamConfig) -> Self {
         Self::with_id_generator(
             upstream,
@@ -508,7 +508,7 @@ fn validate_response_question_prefix(
     Ok(())
 }
 
-impl ResolutionBackend for UdpUpstreamResolver {
+impl ResolutionBackend for ForwardingResolutionBackend {
     fn resolve<'a>(
         &'a self,
         request: UpstreamRequest,
@@ -761,7 +761,7 @@ mod tests {
         )
         .unwrap();
 
-        let resolver = UdpUpstreamResolver::from_runtime_config(&config).unwrap();
+        let resolver = ForwardingResolutionBackend::from_runtime_config(&config).unwrap();
         let health = resolver.health_snapshots();
 
         assert_eq!(
@@ -793,7 +793,7 @@ mod tests {
         )
         .unwrap();
 
-        let error = match UdpUpstreamResolver::from_runtime_config(&config) {
+        let error = match ForwardingResolutionBackend::from_runtime_config(&config) {
             Ok(_) => panic!("expected no enabled UDP upstreams"),
             Err(error) => error,
         };
@@ -819,7 +819,7 @@ mod tests {
                 .await
                 .unwrap();
         });
-        let resolver = UdpUpstreamResolver::with_id_generator(
+        let resolver = ForwardingResolutionBackend::with_id_generator(
             upstream_config(upstream_addr),
             Arc::new(FixedTransactionId(0xbeef)),
         );
@@ -846,7 +846,7 @@ mod tests {
                 .await
                 .unwrap();
         });
-        let resolver = UdpUpstreamResolver::with_id_generator(
+        let resolver = ForwardingResolutionBackend::with_id_generator(
             upstream_config(upstream_addr),
             Arc::new(FixedTransactionId(0xbeef)),
         );
@@ -872,7 +872,7 @@ mod tests {
                 .await
                 .unwrap();
         });
-        let resolver = UdpUpstreamResolver::with_id_generator(
+        let resolver = ForwardingResolutionBackend::with_id_generator(
             upstream_config(upstream_addr),
             Arc::new(FixedTransactionId(0xbeef)),
         );
@@ -898,7 +898,7 @@ mod tests {
                 .await
                 .unwrap();
         });
-        let resolver = UdpUpstreamResolver::with_id_generator(
+        let resolver = ForwardingResolutionBackend::with_id_generator(
             upstream_config(upstream_addr),
             Arc::new(FixedTransactionId(0xbeef)),
         );
@@ -924,7 +924,7 @@ mod tests {
                 .await
                 .unwrap();
         });
-        let resolver = UdpUpstreamResolver::with_id_generator(
+        let resolver = ForwardingResolutionBackend::with_id_generator(
             upstream_config(upstream_addr),
             Arc::new(FixedTransactionId(0xbeef)),
         );
@@ -966,7 +966,7 @@ mod tests {
             stream.write_all(&response).await.unwrap();
         });
 
-        let resolver = UdpUpstreamResolver::with_id_generator(
+        let resolver = ForwardingResolutionBackend::with_id_generator(
             upstream_config(upstream_addr),
             Arc::new(FixedTransactionId(0xbeef)),
         );
@@ -1005,7 +1005,7 @@ mod tests {
             stream.write_all(&response).await.unwrap();
         });
 
-        let resolver = UdpUpstreamResolver::with_id_generator(
+        let resolver = ForwardingResolutionBackend::with_id_generator(
             upstream_config(upstream_addr),
             Arc::new(FixedTransactionId(0xbeef)),
         );
@@ -1039,7 +1039,7 @@ mod tests {
             let response = encode_tcp_frame(&a_response(0xabcd, "example.com"), 512).unwrap();
             stream.write_all(&response).await.unwrap();
         });
-        let resolver = UdpUpstreamResolver::with_id_generator(
+        let resolver = ForwardingResolutionBackend::with_id_generator(
             upstream_config(upstream_addr),
             Arc::new(FixedTransactionId(0xbeef)),
         );
@@ -1071,7 +1071,7 @@ mod tests {
             let _query = read_tcp_query(&mut stream).await;
             time::sleep(Duration::from_millis(80)).await;
         });
-        let resolver = UdpUpstreamResolver::with_upstreams_and_id_generator(
+        let resolver = ForwardingResolutionBackend::with_upstreams_and_id_generator(
             vec![upstream_config_with(
                 "primary",
                 upstream_addr,
@@ -1130,7 +1130,7 @@ mod tests {
                 .unwrap();
         });
 
-        let resolver = UdpUpstreamResolver::with_upstreams_and_id_generator(
+        let resolver = ForwardingResolutionBackend::with_upstreams_and_id_generator(
             vec![
                 upstream_config_with("secondary", second_addr, 20, Duration::from_secs(1)),
                 upstream_config_with("primary", first_addr, 10, Duration::from_secs(1)),
@@ -1202,7 +1202,7 @@ mod tests {
             stream.write_all(&response).await.unwrap();
         });
 
-        let resolver = UdpUpstreamResolver::with_upstreams_and_id_generator(
+        let resolver = ForwardingResolutionBackend::with_upstreams_and_id_generator(
             vec![
                 upstream_config_with("primary", first_addr, 10, Duration::from_secs(1)),
                 upstream_config_with("secondary", second_addr, 20, Duration::from_secs(1)),
@@ -1254,7 +1254,7 @@ mod tests {
                 .unwrap();
         });
 
-        let resolver = UdpUpstreamResolver::with_upstreams_and_id_generator(
+        let resolver = ForwardingResolutionBackend::with_upstreams_and_id_generator(
             vec![
                 upstream_config_with("primary", first_addr, 10, Duration::from_secs(1)),
                 upstream_config_with("secondary", second_addr, 20, Duration::from_secs(1)),
@@ -1289,7 +1289,7 @@ mod tests {
             let _ = first_socket.recv_from(&mut request).await.unwrap();
         });
 
-        let resolver = UdpUpstreamResolver::with_upstreams_and_id_generator(
+        let resolver = ForwardingResolutionBackend::with_upstreams_and_id_generator(
             vec![
                 upstream_config_with("primary", first_addr, 10, Duration::from_millis(40)),
                 upstream_config_with("secondary", second_addr, 20, Duration::from_millis(40)),
@@ -1329,7 +1329,7 @@ mod tests {
             let mut request = [0u8; 512];
             let _ = second_socket.recv_from(&mut request).await.unwrap();
         });
-        let resolver = UdpUpstreamResolver::with_upstreams_and_id_generator(
+        let resolver = ForwardingResolutionBackend::with_upstreams_and_id_generator(
             vec![
                 upstream_config_with("primary", first_addr, 10, Duration::from_millis(20)),
                 upstream_config_with("secondary", second_addr, 20, Duration::from_millis(20)),
@@ -1369,7 +1369,7 @@ mod tests {
                 upstream_socket.send_to(&response, source).await.unwrap();
             }
         });
-        let resolver = UdpUpstreamResolver::with_id_generator(
+        let resolver = ForwardingResolutionBackend::with_id_generator(
             upstream_config(upstream_addr),
             Arc::new(FixedTransactionId(0xbeef)),
         );
@@ -1419,7 +1419,7 @@ mod tests {
                 .await
                 .unwrap();
         });
-        let resolver = UdpUpstreamResolver::with_upstreams_and_id_generator(
+        let resolver = ForwardingResolutionBackend::with_upstreams_and_id_generator(
             vec![
                 upstream_config_with("primary", primary_addr, 10, Duration::from_millis(50)),
                 upstream_config_with("secondary", secondary_addr, 20, Duration::from_millis(50)),
@@ -1454,7 +1454,7 @@ mod tests {
     fn udp_upstream_attempt_order_preserves_original_indices() {
         let primary: SocketAddr = "192.0.2.10:53".parse().unwrap();
         let secondary: SocketAddr = "192.0.2.11:53".parse().unwrap();
-        let resolver = UdpUpstreamResolver::with_upstreams_and_id_generator(
+        let resolver = ForwardingResolutionBackend::with_upstreams_and_id_generator(
             vec![
                 upstream_config_with("secondary", secondary, 20, Duration::from_millis(50)),
                 upstream_config_with("primary", primary, 10, Duration::from_millis(50)),

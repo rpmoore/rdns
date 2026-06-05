@@ -18,7 +18,7 @@ use std::time::{Duration, SystemTime};
 
 use rdns::config::{RuntimeConfig, UpstreamConfig, UpstreamProtocol};
 use rdns::delivery::dns::UdpDnsServer;
-use rdns::delivery::upstream::UdpUpstreamResolver;
+use rdns::delivery::upstream::ForwardingResolutionBackend;
 use rdns::protocol::Message;
 use rdns::resolver::{
     BasicResponseFactory, Clock, MetricsSink, QueryEventRecordResult, QueryEventSink, QueryEventV1,
@@ -96,7 +96,7 @@ async fn run_live_server(
     .unwrap();
     let resolver = Arc::new(ResolveQuery::new(
         Arc::new(StandardProtocolCodec::new(config.max_udp_payload_size)),
-        Arc::new(UdpUpstreamResolver::from_runtime_config(&config).unwrap()),
+        Arc::new(ForwardingResolutionBackend::from_runtime_config(&config).unwrap()),
         Arc::new(BasicResponseFactory),
         Arc::new(SystemClock),
         Arc::new(NoopEvents),
