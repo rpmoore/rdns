@@ -719,11 +719,35 @@ impl Default for InMemorySuspiciousLookupClassifierConfig {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct InMemorySuspiciousLookupClassifier {
     config: InMemorySuspiciousLookupClassifierConfig,
+    suspicious_tlds: Vec<String>,
+    suspicious_domains: Vec<String>,
 }
 
 impl InMemorySuspiciousLookupClassifier {
     pub fn new(config: InMemorySuspiciousLookupClassifierConfig) -> Self {
-        Self { config }
+        let suspicious_tlds = config
+            .suspicious_tlds
+            .iter()
+            .map(|tld| {
+                normalize_question_name(tld)
+                    .trim_start_matches('.')
+                    .to_string()
+            })
+            .collect();
+        let suspicious_domains = config
+            .suspicious_domains
+            .iter()
+            .map(|domain| {
+                normalize_question_name(domain)
+                    .trim_start_matches('.')
+                    .to_string()
+            })
+            .collect();
+        Self {
+            config,
+            suspicious_tlds,
+            suspicious_domains,
+        }
     }
 }
 
@@ -904,8 +928,8 @@ impl InMemorySuspiciousLookupClassifier {
     ) {
         if let Some(selector) = matching_suspicious_selector(
             &question.qname,
-            &self.config.suspicious_tlds,
-            &self.config.suspicious_domains,
+            &self.suspicious_tlds,
+            &self.suspicious_domains,
         ) {
             findings.push(self.finding(
                 QueryEventClassifierReason::SuspiciousSelector,
@@ -1005,10 +1029,12 @@ fn entropy_score(label: &str) -> u8 {
         return 0;
     }
     let mut counts = HashMap::<char, usize>::new();
+    let mut len = 0usize;
     for ch in label.chars() {
         *counts.entry(ch).or_insert(0) += 1;
+        len = len.saturating_add(1);
     }
-    let len = label.chars().count() as f64;
+    let len = len as f64;
     let entropy = counts.values().fold(0.0, |sum, count| {
         let probability = *count as f64 / len;
         sum - probability * probability.log2()
@@ -1022,22 +1048,19 @@ fn matching_suspicious_selector(
     suspicious_domains: &[String],
 ) -> Option<String> {
     for domain in suspicious_domains {
-        let domain = normalize_question_name(domain);
-        let domain = domain.trim_start_matches('.');
         if qname == domain
             || qname
                 .strip_suffix(domain)
                 .map(|prefix| prefix.ends_with('.'))
                 .unwrap_or(false)
         {
-            return Some(domain.to_string());
+            return Some(domain.clone());
         }
     }
 
     let tld = qname.rsplit('.').next()?;
     for configured_tld in suspicious_tlds {
-        let configured_tld = normalize_question_name(configured_tld);
-        if tld == configured_tld.trim_start_matches('.') {
+        if tld == configured_tld {
             return Some(format!(".{tld}"));
         }
     }
