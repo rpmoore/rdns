@@ -18,7 +18,7 @@ use std::net::{IpAddr, SocketAddr};
 use std::pin::Pin;
 use std::sync::{
     atomic::{AtomicU64, Ordering},
-    Arc, Mutex,
+    Arc, Mutex, RwLock,
 };
 use std::time::{Duration, SystemTime};
 
@@ -486,6 +486,80 @@ pub enum ResolutionBackendError {
 pub enum ResolutionMode {
     Forward,
     Recursive,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BackendHealth {
+    Healthy,
+    Degraded,
+    Unavailable,
+    Unknown,
+}
+
+#[derive(Clone)]
+pub struct BackendSnapshot {
+    pub backend: Arc<dyn ResolutionBackend>,
+    pub mode: ResolutionMode,
+    pub generation: u64,
+    pub health: BackendHealth,
+    pub cache_namespace: Option<String>,
+}
+
+impl BackendSnapshot {
+    pub fn new(
+        backend: Arc<dyn ResolutionBackend>,
+        mode: ResolutionMode,
+        generation: u64,
+        health: BackendHealth,
+        cache_namespace: Option<String>,
+    ) -> Self {
+        Self {
+            backend,
+            mode,
+            generation,
+            health,
+            cache_namespace,
+        }
+    }
+
+    pub fn forwarding(backend: Arc<dyn ResolutionBackend>, generation: u64) -> Self {
+        Self::new(
+            backend,
+            ResolutionMode::Forward,
+            generation,
+            BackendHealth::Healthy,
+            backend_cache_namespace(ResolutionMode::Forward, generation),
+        )
+    }
+}
+
+#[derive(Clone)]
+pub struct BackendHandle {
+    snapshot: Arc<RwLock<Arc<BackendSnapshot>>>,
+}
+
+impl BackendHandle {
+    pub fn new(snapshot: BackendSnapshot) -> Self {
+        Self {
+            snapshot: Arc::new(RwLock::new(Arc::new(snapshot))),
+        }
+    }
+
+    pub fn current(&self) -> Arc<BackendSnapshot> {
+        let snapshot = self
+            .snapshot
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        Arc::clone(&snapshot)
+    }
+
+    pub fn publish(&self, snapshot: BackendSnapshot) {
+        let mut current = self
+            .snapshot
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        *current = Arc::new(snapshot);
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1286,9 +1360,7 @@ pub struct ResolveQuery {
     cache: Arc<dyn DnsCache>,
     ttl_policy: CacheTtlPolicy,
     miss_coalescer: Arc<SingleFlightMisses>,
-    backend: Arc<dyn ResolutionBackend>,
-    backend_generation: u64,
-    backend_cache_namespace: Option<String>,
+    backend: BackendHandle,
     responses: Arc<dyn ResponseFactory>,
     clock: Arc<dyn Clock>,
     events: Arc<dyn QueryEventSink>,
@@ -1328,9 +1400,60 @@ impl ResolveQuery {
         events: Arc<dyn QueryEventSink>,
         metrics: Arc<dyn MetricsSink>,
     ) -> Self {
-        Self::with_cache_and_backend_generation(
-            protocol, cache, ttl_policy, backend, 0, responses, clock, events, metrics,
+        let snapshot = BackendSnapshot::forwarding(backend, 0);
+        Self::with_cache_and_backend_snapshot(
+            protocol, cache, ttl_policy, snapshot, responses, clock, events, metrics,
         )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn with_cache_and_backend_snapshot(
+        protocol: Arc<dyn ProtocolCodec>,
+        cache: Arc<dyn DnsCache>,
+        ttl_policy: CacheTtlPolicy,
+        backend_snapshot: BackendSnapshot,
+        responses: Arc<dyn ResponseFactory>,
+        clock: Arc<dyn Clock>,
+        events: Arc<dyn QueryEventSink>,
+        metrics: Arc<dyn MetricsSink>,
+    ) -> Self {
+        Self {
+            protocol,
+            cache,
+            ttl_policy,
+            miss_coalescer: Arc::new(SingleFlightMisses::default()),
+            backend: BackendHandle::new(backend_snapshot),
+            responses,
+            clock,
+            events,
+            event_sequence: AtomicU64::new(0),
+            metrics,
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn with_cache_and_backend_handle(
+        protocol: Arc<dyn ProtocolCodec>,
+        cache: Arc<dyn DnsCache>,
+        ttl_policy: CacheTtlPolicy,
+        backend_handle: BackendHandle,
+        responses: Arc<dyn ResponseFactory>,
+        clock: Arc<dyn Clock>,
+        events: Arc<dyn QueryEventSink>,
+        metrics: Arc<dyn MetricsSink>,
+    ) -> Self {
+        Self {
+            protocol,
+            cache,
+            ttl_policy,
+            miss_coalescer: Arc::new(SingleFlightMisses::default()),
+            backend: backend_handle,
+            responses,
+            clock,
+            events,
+            event_sequence: AtomicU64::new(0),
+            metrics,
+        }
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1345,26 +1468,16 @@ impl ResolveQuery {
         events: Arc<dyn QueryEventSink>,
         metrics: Arc<dyn MetricsSink>,
     ) -> Self {
-        let backend_cache_namespace = backend_cache_namespace(backend_generation);
-        Self {
-            protocol,
-            cache,
-            ttl_policy,
-            miss_coalescer: Arc::new(SingleFlightMisses::default()),
-            backend,
-            backend_generation,
-            backend_cache_namespace,
-            responses,
-            clock,
-            events,
-            event_sequence: AtomicU64::new(0),
-            metrics,
-        }
+        let snapshot = BackendSnapshot::forwarding(backend, backend_generation);
+        Self::with_cache_and_backend_snapshot(
+            protocol, cache, ttl_policy, snapshot, responses, clock, events, metrics,
+        )
     }
 
     pub async fn resolve(&self, mut request: ResolveRequest) -> ResolveOutcome {
         self.metrics.increment(ResolverMetric::QueryReceived);
         let started_at = self.clock.now();
+        let backend_snapshot = self.backend.current();
         let request_id = request_id_from_wire(&request.bytes);
         let request_bytes = std::mem::take(&mut request.bytes);
 
@@ -1387,7 +1500,9 @@ impl ResolveQuery {
         self.metrics.increment(ResolverMetric::QueryAllowed);
         let question = decoded.question.clone();
 
-        let mut cache_probe = self.probe_cache(&request, &decoded).await;
+        let mut cache_probe = self
+            .probe_cache(&backend_snapshot, &request, &decoded)
+            .await;
         if let Some(response_bytes) = cache_probe.hit {
             let decision = ResolveDecision {
                 client_ip: request.client_ip,
@@ -1409,6 +1524,7 @@ impl ResolveQuery {
         if let (Some(cache_key), true) = (cache_probe.key.take(), cache_probe.store_allowed) {
             return self
                 .resolve_coalesced_miss(
+                    &backend_snapshot,
                     started_at,
                     &request,
                     &decoded,
@@ -1420,6 +1536,7 @@ impl ResolveQuery {
         }
 
         self.resolve_backend_and_finish(
+            &backend_snapshot,
             started_at,
             &request,
             &decoded,
@@ -1434,6 +1551,7 @@ impl ResolveQuery {
     #[allow(clippy::too_many_arguments)]
     async fn resolve_coalesced_miss(
         &self,
+        backend_snapshot: &BackendSnapshot,
         started_at: SystemTime,
         request: &ResolveRequest,
         decoded: &DecodedQuery,
@@ -1444,7 +1562,7 @@ impl ResolveQuery {
         match self.miss_coalescer.begin(cache_key.clone()) {
             SingleFlightTicket::Leader { key, flight } => {
                 let guard = SingleFlightLeader::new(Arc::clone(&self.miss_coalescer), key, flight);
-                let backend_result = self.resolve_backend(decoded).await;
+                let backend_result = self.resolve_backend(backend_snapshot, decoded).await;
                 let (decision, response_bytes) = self
                     .prepare_backend_result(
                         request,
@@ -1507,6 +1625,7 @@ impl ResolveQuery {
     #[allow(clippy::too_many_arguments)]
     async fn resolve_backend_and_finish(
         &self,
+        backend_snapshot: &BackendSnapshot,
         started_at: SystemTime,
         request: &ResolveRequest,
         decoded: &DecodedQuery,
@@ -1515,7 +1634,7 @@ impl ResolveQuery {
         cache_store_allowed: bool,
         event_cache_result: Option<QueryEventCacheResult>,
     ) -> ResolveOutcome {
-        let backend_result = self.resolve_backend(decoded).await;
+        let backend_result = self.resolve_backend(backend_snapshot, decoded).await;
         self.finish_backend_result(
             started_at,
             request,
@@ -1531,17 +1650,24 @@ impl ResolveQuery {
 
     async fn resolve_backend(
         &self,
+        backend_snapshot: &BackendSnapshot,
         decoded: &DecodedQuery,
     ) -> Result<ResolutionResponse, ResolutionBackendError> {
-        self.backend
+        backend_snapshot
+            .backend
             .resolve(ResolutionRequest {
                 query: decoded.clone(),
-                backend_generation: self.backend_generation,
+                backend_generation: backend_snapshot.generation,
             })
             .await
     }
 
-    async fn probe_cache(&self, request: &ResolveRequest, decoded: &DecodedQuery) -> CacheProbe {
+    async fn probe_cache(
+        &self,
+        backend_snapshot: &BackendSnapshot,
+        request: &ResolveRequest,
+        decoded: &DecodedQuery,
+    ) -> CacheProbe {
         if !cache_supported(decoded) {
             self.metrics.increment(ResolverMetric::CacheBypass);
             self.metrics.increment(ResolverMetric::CacheMiss);
@@ -1555,7 +1681,7 @@ impl ResolveQuery {
 
         let key = CacheKey::from_query(
             decoded,
-            self.backend_cache_namespace.clone(),
+            backend_snapshot.cache_namespace.clone(),
             self.protocol.configured_max_udp_payload_size(),
         );
         let lookup = self
@@ -2125,11 +2251,19 @@ fn decoded_original_question_name(decoded: &DecodedQuery) -> Option<String> {
         .map(|question| question.qname.clone())
 }
 
-fn backend_cache_namespace(backend_generation: u64) -> Option<String> {
-    if backend_generation == 0 {
-        None
-    } else {
-        Some(format!("backend-generation:{backend_generation}"))
+fn backend_cache_namespace(mode: ResolutionMode, backend_generation: u64) -> Option<String> {
+    Some(format!(
+        "mode:{};backend-generation:{backend_generation}",
+        mode.cache_namespace_label()
+    ))
+}
+
+impl ResolutionMode {
+    fn cache_namespace_label(self) -> &'static str {
+        match self {
+            Self::Forward => "forward",
+            Self::Recursive => "recursive",
+        }
     }
 }
 
@@ -6210,7 +6344,11 @@ mod tests {
             .decode_query(&a_query(0xaaaa, "example.com"))
             .unwrap();
         cache.store_now(CacheStore {
-            key: CacheKey::from_query(&cached_query, None, 1232),
+            key: CacheKey::from_query(
+                &cached_query,
+                backend_cache_namespace(ResolutionMode::Forward, 0),
+                1232,
+            ),
             response_template: a_response_with_answer(0, "example.com", 60),
             response_code: ResponseCode::NoError,
             minimum_ttl: Duration::from_secs(60),
@@ -6267,7 +6405,11 @@ mod tests {
             .decode_query(&a_query_without_rd(0xaaaa, "example.com"))
             .unwrap();
         cache.store_now(CacheStore {
-            key: CacheKey::from_query(&cached_query, None, 1232),
+            key: CacheKey::from_query(
+                &cached_query,
+                backend_cache_namespace(ResolutionMode::Forward, 0),
+                1232,
+            ),
             response_template: a_response_with_answer(0, "example.com", 60),
             response_code: ResponseCode::NoError,
             minimum_ttl: Duration::from_secs(60),
@@ -6300,7 +6442,11 @@ mod tests {
             .decode_query(&a_query(0xaaaa, "example.com"))
             .unwrap();
         cache.store_now(CacheStore {
-            key: CacheKey::from_query(&cached_query, None, 1232),
+            key: CacheKey::from_query(
+                &cached_query,
+                backend_cache_namespace(ResolutionMode::Forward, 0),
+                1232,
+            ),
             response_template: a_response_with_answer(0, "example.com", 60),
             response_code: ResponseCode::NoError,
             minimum_ttl: Duration::from_secs(60),
@@ -6333,7 +6479,11 @@ mod tests {
             .decode_query(&a_query(0xaaaa, "example.com"))
             .unwrap();
         cache.store_now(CacheStore {
-            key: CacheKey::from_query(&cached_query, None, 1232),
+            key: CacheKey::from_query(
+                &cached_query,
+                backend_cache_namespace(ResolutionMode::Forward, 0),
+                1232,
+            ),
             response_template: a_response_with_answer(0, "example.com", 3600),
             response_code: ResponseCode::NoError,
             minimum_ttl: Duration::from_secs(60),
@@ -6644,6 +6794,48 @@ mod tests {
         let requests = upstream.requests.lock().unwrap();
         assert_eq!(requests.len(), 1);
         assert_eq!(requests[0].backend_generation, 99);
+    }
+
+    #[tokio::test]
+    async fn resolve_uses_latest_backend_handle_snapshot() {
+        let first_backend = Arc::new(StaticUpstream::new(Ok(upstream_response(
+            a_response_with_answer(0x1234, "example.com", 60),
+        ))));
+        let second_backend = Arc::new(StaticUpstream::new(Ok(upstream_response(
+            a_response_with_answer(0x1234, "example.com", 60),
+        ))));
+        let handle = BackendHandle::new(BackendSnapshot::forwarding(first_backend.clone(), 1));
+        let service = ResolveQuery::with_cache_and_backend_handle(
+            Arc::new(StandardProtocolCodec::new(1232)),
+            Arc::new(NoopDnsCache),
+            CacheTtlPolicy::default(),
+            handle.clone(),
+            Arc::new(BasicResponseFactory),
+            Arc::new(FixedClock(SystemTime::UNIX_EPOCH)),
+            Arc::new(RecordingEvents::default()),
+            Arc::new(RecordingMetrics::default()),
+        );
+
+        handle.publish(BackendSnapshot::new(
+            second_backend.clone(),
+            ResolutionMode::Forward,
+            2,
+            BackendHealth::Degraded,
+            Some("mode:forward;backend-generation:2".to_string()),
+        ));
+        let outcome = service
+            .resolve(ResolveRequest::new(
+                "192.0.2.10".parse().unwrap(),
+                SystemTime::UNIX_EPOCH,
+                a_query(0x1234, "example.com"),
+            ))
+            .await;
+
+        assert_eq!(outcome.decision.kind, ResolveDecisionKind::Allowed);
+        assert!(first_backend.requests.lock().unwrap().is_empty());
+        let requests = second_backend.requests.lock().unwrap();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].backend_generation, 2);
     }
 
     #[tokio::test]

@@ -19,14 +19,15 @@ use std::time::{Duration, SystemTime};
 use opentelemetry::metrics::{Counter, Histogram, MeterProvider};
 use opentelemetry_otlp::MetricExporter;
 use opentelemetry_sdk::metrics::{PeriodicReader, SdkMeterProvider};
-use rdns::config::RuntimeConfig;
+use rdns::config::{ResolutionMode as ConfigResolutionMode, RuntimeConfig};
 use rdns::delivery::dns::UdpDnsServer;
 use rdns::delivery::upstream::UdpUpstreamResolver;
 use rdns::resolver::{
-    BasicResponseFactory, CacheTtlPolicy, ChannelQueryEventSink, Clock, InMemoryDnsCache,
-    InMemoryQueryEventStore, InMemoryQueryEventStoreConfig, InMemorySuspiciousLookupClassifier,
-    InMemorySuspiciousLookupClassifierConfig, MetricsSink, QueryEventRecordResult, QueryEventSink,
-    QueryEventV1, ResolveQuery, ResolverMetric, StandardProtocolCodec,
+    BackendHealth, BackendSnapshot, BasicResponseFactory, CacheTtlPolicy, ChannelQueryEventSink,
+    Clock, InMemoryDnsCache, InMemoryQueryEventStore, InMemoryQueryEventStoreConfig,
+    InMemorySuspiciousLookupClassifier, InMemorySuspiciousLookupClassifierConfig, MetricsSink,
+    QueryEventRecordResult, QueryEventSink, QueryEventV1, ResolutionMode as ResolverResolutionMode,
+    ResolveQuery, ResolverMetric, StandardProtocolCodec,
 };
 use tokio::task::{JoinError, JoinSet};
 
@@ -64,14 +65,12 @@ async fn main() -> io::Result<()> {
         })
     };
 
-    let resolver = Arc::new(ResolveQuery::with_cache(
+    let backend_snapshot = build_backend_snapshot(&config)?;
+    let resolver = Arc::new(ResolveQuery::with_cache_and_backend_snapshot(
         Arc::new(StandardProtocolCodec::new(config.max_udp_payload_size)),
         Arc::new(InMemoryDnsCache::new(DEFAULT_CACHE_ENTRIES)),
         CacheTtlPolicy::default(),
-        Arc::new(
-            UdpUpstreamResolver::from_runtime_config(&config)
-                .map_err(|error| io::Error::other(format!("invalid upstream config: {error:?}")))?,
-        ),
+        backend_snapshot,
         Arc::new(BasicResponseFactory),
         Arc::new(SystemClock),
         Arc::new(StoreRecordingQueryEventSink::new(
@@ -142,6 +141,37 @@ async fn main() -> io::Result<()> {
     }
 
     Ok(())
+}
+
+fn build_backend_snapshot(config: &RuntimeConfig) -> io::Result<BackendSnapshot> {
+    match config.resolution.mode {
+        ConfigResolutionMode::Forward => {
+            let backend = Arc::new(UdpUpstreamResolver::from_runtime_config(config).map_err(
+                |error| io::Error::other(format!("invalid upstream config: {error:?}")),
+            )?);
+            Ok(BackendSnapshot::new(
+                backend,
+                ResolverResolutionMode::Forward,
+                config.resolution.generation,
+                BackendHealth::Healthy,
+                backend_cache_namespace(config),
+            ))
+        }
+        ConfigResolutionMode::Recursive => Err(io::Error::other(
+            "recursive resolution mode is configured but no recursive backend is available yet",
+        )),
+    }
+}
+
+fn backend_cache_namespace(config: &RuntimeConfig) -> Option<String> {
+    Some(format!(
+        "mode:{};backend-generation:{}",
+        match config.resolution.mode {
+            ConfigResolutionMode::Forward => "forward",
+            ConfigResolutionMode::Recursive => "recursive",
+        },
+        config.resolution.generation
+    ))
 }
 
 fn listener_task_result_to_io(result: Result<io::Result<()>, JoinError>) -> io::Result<()> {

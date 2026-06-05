@@ -19,6 +19,7 @@ use std::time::Duration;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RuntimeConfig {
     pub dns_listen: Vec<SocketAddr>,
+    pub resolution: ResolutionConfig,
     pub upstreams: Vec<UpstreamConfig>,
     pub per_query_deadline: Duration,
     pub max_udp_payload_size: usize,
@@ -31,8 +32,25 @@ impl RuntimeConfig {
         per_query_deadline: Duration,
         max_udp_payload_size: usize,
     ) -> Result<Self, ConfigError> {
+        Self::new_with_resolution(
+            dns_listen,
+            ResolutionConfig::forwarding_default(),
+            upstreams,
+            per_query_deadline,
+            max_udp_payload_size,
+        )
+    }
+
+    pub fn new_with_resolution(
+        dns_listen: Vec<SocketAddr>,
+        resolution: ResolutionConfig,
+        upstreams: Vec<UpstreamConfig>,
+        per_query_deadline: Duration,
+        max_udp_payload_size: usize,
+    ) -> Result<Self, ConfigError> {
         let config = Self {
             dns_listen,
+            resolution,
             upstreams,
             per_query_deadline,
             max_udp_payload_size,
@@ -47,6 +65,7 @@ impl RuntimeConfig {
                 IpAddr::V4(Ipv4Addr::LOCALHOST),
                 DEFAULT_DNS_LISTEN_PORT,
             )],
+            resolution: ResolutionConfig::forwarding_default(),
             upstreams: vec![UpstreamConfig {
                 name: "cloudflare".to_string(),
                 endpoint: SocketAddr::new(IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1)), 53),
@@ -72,7 +91,10 @@ impl RuntimeConfig {
             }
         }
 
-        if self.enabled_upstreams().next().is_none() {
+        self.resolution.validate()?;
+        if self.resolution.mode == ResolutionMode::Forward
+            && self.enabled_upstreams().next().is_none()
+        {
             return Err(ConfigError::NoEnabledUpstream);
         }
         for upstream in &self.upstreams {
@@ -109,6 +131,82 @@ impl RuntimeConfig {
         upstreams.sort_by_key(|upstream| upstream.priority);
         upstreams.into_iter()
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolutionConfig {
+    pub mode: ResolutionMode,
+    pub generation: u64,
+    pub recursive: Option<RecursiveResolutionConfig>,
+}
+
+impl ResolutionConfig {
+    pub fn forwarding_default() -> Self {
+        Self {
+            mode: ResolutionMode::Forward,
+            generation: 0,
+            recursive: None,
+        }
+    }
+
+    pub fn recursive(generation: u64, recursive: RecursiveResolutionConfig) -> Self {
+        Self {
+            mode: ResolutionMode::Recursive,
+            generation,
+            recursive: Some(recursive),
+        }
+    }
+
+    pub fn validate(&self) -> Result<(), ConfigError> {
+        if self.generation == u64::MAX {
+            return Err(ConfigError::InvalidResolutionGeneration {
+                generation: self.generation,
+            });
+        }
+        if self.mode == ResolutionMode::Recursive {
+            let Some(recursive) = &self.recursive else {
+                return Err(ConfigError::MissingRecursiveResolutionConfig);
+            };
+            recursive.validate()?;
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ResolutionMode {
+    Forward,
+    Recursive,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RecursiveResolutionConfig {
+    pub root_hints_version: String,
+    pub dnssec_validation: DnssecValidationMode,
+}
+
+impl RecursiveResolutionConfig {
+    pub fn new(
+        root_hints_version: impl Into<String>,
+        dnssec_validation: DnssecValidationMode,
+    ) -> Self {
+        Self {
+            root_hints_version: root_hints_version.into(),
+            dnssec_validation,
+        }
+    }
+
+    pub fn validate(&self) -> Result<(), ConfigError> {
+        if self.root_hints_version.trim().is_empty() {
+            return Err(ConfigError::InvalidRootHintsVersion);
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DnssecValidationMode {
+    Disabled,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -172,6 +270,11 @@ pub enum ConfigError {
         min: usize,
         max: usize,
     },
+    InvalidResolutionGeneration {
+        generation: u64,
+    },
+    MissingRecursiveResolutionConfig,
+    InvalidRootHintsVersion,
 }
 
 const DEFAULT_DNS_LISTEN_PORT: u16 = 5300;
@@ -225,6 +328,7 @@ mod tests {
     fn development_default_uses_high_local_dns_port_and_enabled_upstream() {
         let config = RuntimeConfig::development_default();
 
+        assert_eq!(config.resolution, ResolutionConfig::forwarding_default());
         assert_eq!(
             config.dns_listen,
             vec![SocketAddr::new(
@@ -301,6 +405,92 @@ mod tests {
         .unwrap_err();
 
         assert_eq!(error, ConfigError::NoEnabledUpstream);
+    }
+
+    #[test]
+    fn forward_mode_requires_enabled_upstream() {
+        let error = RuntimeConfig::new_with_resolution(
+            vec![SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 5300)],
+            ResolutionConfig::forwarding_default(),
+            vec![upstream("primary", 10, false)],
+            Duration::from_secs(2),
+            1232,
+        )
+        .unwrap_err();
+
+        assert_eq!(error, ConfigError::NoEnabledUpstream);
+    }
+
+    #[test]
+    fn recursive_mode_requires_settings_but_not_forwarding_upstreams() {
+        let config = RuntimeConfig::new_with_resolution(
+            vec![SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 5300)],
+            ResolutionConfig::recursive(
+                7,
+                RecursiveResolutionConfig::new("root-hints:v1", DnssecValidationMode::Disabled),
+            ),
+            Vec::new(),
+            Duration::from_secs(2),
+            1232,
+        )
+        .unwrap();
+
+        assert_eq!(config.resolution.mode, ResolutionMode::Recursive);
+        assert_eq!(config.resolution.generation, 7);
+        assert_eq!(config.enabled_upstreams().count(), 0);
+    }
+
+    #[test]
+    fn recursive_mode_rejects_missing_or_invalid_recursive_settings() {
+        let missing_error = RuntimeConfig::new_with_resolution(
+            vec![SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 5300)],
+            ResolutionConfig {
+                mode: ResolutionMode::Recursive,
+                generation: 1,
+                recursive: None,
+            },
+            Vec::new(),
+            Duration::from_secs(2),
+            1232,
+        )
+        .unwrap_err();
+        assert_eq!(missing_error, ConfigError::MissingRecursiveResolutionConfig);
+
+        let invalid_error = RuntimeConfig::new_with_resolution(
+            vec![SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 5300)],
+            ResolutionConfig::recursive(
+                1,
+                RecursiveResolutionConfig::new(" ", DnssecValidationMode::Disabled),
+            ),
+            Vec::new(),
+            Duration::from_secs(2),
+            1232,
+        )
+        .unwrap_err();
+        assert_eq!(invalid_error, ConfigError::InvalidRootHintsVersion);
+    }
+
+    #[test]
+    fn config_rejects_reserved_resolution_generation() {
+        let error = RuntimeConfig::new_with_resolution(
+            vec![SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 5300)],
+            ResolutionConfig {
+                mode: ResolutionMode::Forward,
+                generation: u64::MAX,
+                recursive: None,
+            },
+            vec![upstream("primary", 10, true)],
+            Duration::from_secs(2),
+            1232,
+        )
+        .unwrap_err();
+
+        assert_eq!(
+            error,
+            ConfigError::InvalidResolutionGeneration {
+                generation: u64::MAX
+            }
+        );
     }
 
     #[test]
