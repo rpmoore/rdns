@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::future::Future;
 use std::net::{IpAddr, SocketAddr};
 use std::pin::Pin;
@@ -439,6 +439,296 @@ fn has_requested_answer(message: &Message) -> bool {
     })
 }
 
+fn has_requested_answer_for(message: &Message, question: &QuestionKey) -> bool {
+    message.answers.iter().any(|record| {
+        QuestionKey::new(&record.name, record.rtype, record.rclass) == *question
+            && !matches!(record.record, RecordData::RRSIG { .. })
+    })
+}
+
+fn cname_record_for<'a>(message: &'a Message, question: &QuestionKey) -> Option<&'a Record> {
+    message.answers.iter().find(|record| {
+        if record.rclass == question.qclass
+            && record.rtype == CNAME_RECORD_TYPE
+            && QuestionKey::new(&record.name, question.qtype, question.qclass).qname
+                == question.qname
+        {
+            matches!(record.record, RecordData::CNAME(_))
+        } else {
+            false
+        }
+    })
+}
+
+fn authority_response_error(
+    message: &Message,
+    question: &QuestionKey,
+) -> Option<ResolutionBackendError> {
+    if !message.header.qr() || message.questions.len() != 1 {
+        return Some(ResolutionBackendError::MalformedResponse);
+    }
+    if QuestionKey::from_message(message).as_ref() != Some(question) {
+        return Some(ResolutionBackendError::QuestionMismatch);
+    }
+    None
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ReferralAuthorities {
+    owner: String,
+    endpoints: Vec<SocketAddr>,
+}
+
+fn referral_authorities(message: &Message, question: &QuestionKey) -> Option<ReferralAuthorities> {
+    let owner = message
+        .authorities
+        .iter()
+        .filter_map(|record| {
+            if !matches!(record.record, RecordData::NS(_)) {
+                return None;
+            }
+            let owner = normalize_question_name(&record.name);
+            if is_delegation_owner_for_question(&owner, &question.qname) {
+                Some(owner)
+            } else {
+                None
+            }
+        })
+        .max_by_key(|owner| owner.len())?;
+    let names: HashSet<_> = message
+        .authorities
+        .iter()
+        .filter_map(|record| match &record.record {
+            RecordData::NS(name)
+                if normalize_question_name(&record.name) == owner
+                    && is_delegation_owner_for_question(&owner, name) =>
+            {
+                Some(normalize_question_name(name))
+            }
+            _ => None,
+        })
+        .collect();
+    if names.is_empty() {
+        return None;
+    }
+
+    let endpoints = message
+        .additionals
+        .iter()
+        .filter_map(|record| {
+            if !names.contains(&normalize_question_name(&record.name)) {
+                return None;
+            }
+            match record.record {
+                RecordData::A(address) => Some(SocketAddr::new(IpAddr::V4(address), 53)),
+                RecordData::AAAA(address) => Some(SocketAddr::new(IpAddr::V6(address), 53)),
+                _ => None,
+            }
+        })
+        .collect::<Vec<_>>();
+    if endpoints.is_empty() {
+        return None;
+    }
+    Some(ReferralAuthorities { owner, endpoints })
+}
+
+fn is_delegation_owner_for_question(owner: &str, qname: &str) -> bool {
+    let owner = normalize_question_name(owner);
+    let qname = normalize_question_name(qname);
+    owner.is_empty() || qname == owner || qname.ends_with(&format!(".{owner}"))
+}
+
+fn is_negative_answer(message: &Message) -> bool {
+    (response_code(message) == Some(ResponseCode::NxDomain)
+        && message.header.aa()
+        && negative_ttl(message).is_some())
+        || (response_code(message) == Some(ResponseCode::NoError)
+            && message.header.aa()
+            && message.answers.is_empty()
+            && negative_ttl(message).is_some())
+}
+
+fn synthesize_recursive_cname_response(
+    original_query: &Message,
+    cname_chain: &[Record],
+    final_response: &Message,
+) -> Result<Message, ResolutionBackendError> {
+    let mut answers = cname_chain.to_vec();
+    answers.extend(
+        final_response
+            .answers
+            .iter()
+            .filter(|record| recursive_response_record_supported(record))
+            .cloned(),
+    );
+    let authorities = final_response
+        .authorities
+        .iter()
+        .filter(|record| recursive_response_record_supported(record))
+        .cloned()
+        .collect::<Vec<_>>();
+    let additionals = final_response
+        .additionals
+        .iter()
+        .filter(|record| recursive_response_record_supported(record))
+        .cloned()
+        .collect::<Vec<_>>();
+    let bytes = serialize_recursive_response(
+        original_query,
+        response_code(final_response).unwrap_or(ResponseCode::ServFail),
+        final_response.header.aa(),
+        &answers,
+        &authorities,
+        &additionals,
+    )?;
+    Message::parse_owned(bytes).map_err(|_| ResolutionBackendError::MalformedResponse)
+}
+
+fn recursive_response_record_supported(record: &Record) -> bool {
+    matches!(
+        record.record,
+        RecordData::A(_)
+            | RecordData::AAAA(_)
+            | RecordData::CNAME(_)
+            | RecordData::NS(_)
+            | RecordData::SOA { .. }
+            | RecordData::Unknown { .. }
+    )
+}
+
+fn serialize_recursive_response(
+    original_query: &Message,
+    rcode: ResponseCode,
+    authoritative: bool,
+    answers: &[Record],
+    authorities: &[Record],
+    additionals: &[Record],
+) -> Result<Vec<u8>, ResolutionBackendError> {
+    let Some(question) = original_query.questions.first() else {
+        return Err(ResolutionBackendError::MalformedResponse);
+    };
+
+    let mut bytes = Vec::new();
+    write_dns_u16(&mut bytes, original_query.header.id);
+    let mut flags = 0x8000u16 | 0x0080u16 | rcode as u16;
+    if original_query.header.rd() {
+        flags |= 0x0100;
+    }
+    if authoritative {
+        flags |= 0x0400;
+    }
+    write_dns_u16(&mut bytes, flags);
+    write_dns_u16(&mut bytes, 1);
+    write_dns_u16(&mut bytes, answers.len() as u16);
+    write_dns_u16(&mut bytes, authorities.len() as u16);
+    write_dns_u16(&mut bytes, additionals.len() as u16);
+    write_dns_question(&mut bytes, &question.qname, question.qtype, question.qclass);
+    for record in answers {
+        write_dns_record(&mut bytes, record)?;
+    }
+    for record in authorities {
+        write_dns_record(&mut bytes, record)?;
+    }
+    for record in additionals {
+        write_dns_record(&mut bytes, record)?;
+    }
+    Ok(bytes)
+}
+
+fn write_dns_question(bytes: &mut Vec<u8>, name: &str, qtype: u16, qclass: u16) {
+    write_dns_name(bytes, name);
+    write_dns_u16(bytes, qtype);
+    write_dns_u16(bytes, qclass);
+}
+
+fn write_dns_record(bytes: &mut Vec<u8>, record: &Record) -> Result<(), ResolutionBackendError> {
+    write_dns_name(bytes, &record.name);
+    write_dns_u16(bytes, record.rtype);
+    write_dns_u16(bytes, record.rclass);
+    write_dns_u32(bytes, record.ttl);
+    let rdlength_index = bytes.len();
+    write_dns_u16(bytes, 0);
+    let rdata_start = bytes.len();
+    match &record.record {
+        RecordData::A(address) => bytes.extend_from_slice(&address.octets()),
+        RecordData::AAAA(address) => bytes.extend_from_slice(&address.octets()),
+        RecordData::CNAME(name) | RecordData::NS(name) => write_dns_name(bytes, name),
+        RecordData::SOA {
+            ttl: _,
+            rname,
+            mname,
+            serial,
+            refresh,
+            retry,
+            expire,
+            minimum,
+        } => {
+            write_dns_name(bytes, mname);
+            write_dns_name(bytes, rname);
+            write_dns_u32(bytes, *serial);
+            write_dns_u32(bytes, *refresh);
+            write_dns_u32(bytes, *retry);
+            write_dns_u32(bytes, *expire);
+            write_dns_u32(bytes, *minimum);
+        }
+        RecordData::RRSIG {
+            type_covered,
+            algorithm,
+            labels,
+            original_ttl,
+            signature_expiration,
+            signature_inception,
+            key_tag,
+            signer_name,
+            signature,
+        } => {
+            write_dns_u16(bytes, *type_covered);
+            bytes.push(*algorithm);
+            bytes.push(*labels);
+            write_dns_u32(bytes, *original_ttl);
+            write_dns_u32(bytes, *signature_expiration);
+            write_dns_u32(bytes, *signature_inception);
+            write_dns_u16(bytes, *key_tag);
+            write_dns_name(bytes, signer_name);
+            bytes.extend_from_slice(signature);
+        }
+        RecordData::OPT(info) => {
+            bytes.extend_from_slice(&info.options);
+        }
+        RecordData::Unknown { rtype, bytes: data } if *rtype == record.rtype => {
+            bytes.extend_from_slice(data);
+        }
+        _ => return Err(ResolutionBackendError::MalformedResponse),
+    }
+    let rdlength = bytes.len() - rdata_start;
+    if rdlength > u16::MAX as usize {
+        return Err(ResolutionBackendError::MalformedResponse);
+    }
+    bytes[rdlength_index..rdlength_index + 2].copy_from_slice(&(rdlength as u16).to_be_bytes());
+    Ok(())
+}
+
+fn write_dns_name(bytes: &mut Vec<u8>, name: &str) {
+    let name = name.trim_end_matches('.');
+    if name.is_empty() {
+        bytes.push(0);
+        return;
+    }
+    for label in name.split('.') {
+        bytes.push(label.len() as u8);
+        bytes.extend_from_slice(label.as_bytes());
+    }
+    bytes.push(0);
+}
+
+fn write_dns_u16(bytes: &mut Vec<u8>, value: u16) {
+    bytes.extend_from_slice(&value.to_be_bytes());
+}
+
+fn write_dns_u32(bytes: &mut Vec<u8>, value: u32) {
+    bytes.extend_from_slice(&value.to_be_bytes());
+}
+
 fn question_type(message: &Message) -> Option<u16> {
     message.questions.first().map(|question| question.qtype)
 }
@@ -585,6 +875,14 @@ impl BackendProvenance {
             backend_name: Some(backend_name.into()),
         }
     }
+
+    pub fn recursive(generation: u64, backend_name: impl Into<String>) -> Self {
+        Self {
+            mode: ResolutionMode::Recursive,
+            generation,
+            backend_name: Some(backend_name.into()),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -693,6 +991,41 @@ impl ResolutionResponse {
                 ResolutionNoCacheReason::ValidationIncomplete,
             ),
         }
+    }
+
+    pub(crate) fn recursive_response(
+        original_query: &DecodedQuery,
+        authority_response: RecursiveAuthorityResponse,
+        cname_chain: &[Record],
+        received_at: SystemTime,
+        backend_generation: u64,
+        authority: SocketAddr,
+    ) -> Result<Self, ResolutionBackendError> {
+        let response_message = synthesize_recursive_cname_response(
+            &original_query.message,
+            cname_chain,
+            &authority_response.message,
+        )?;
+        let bytes = response_message.original_bytes.to_vec();
+        let response_code = response_code(&response_message);
+        let final_question = QuestionKey::from_message(&response_message);
+        let canonical_chain = canonical_chain_from_response(&response_message);
+        let negative_cache = negative_ttl(&response_message);
+        Ok(Self {
+            bytes,
+            received_at,
+            response_message: Some(response_message),
+            response_code,
+            final_question,
+            canonical_chain,
+            negative_cache,
+            source_credibility: SourceCredibility::Authoritative,
+            backend_provenance: BackendProvenance::recursive(
+                backend_generation,
+                format!("authority:{authority}"),
+            ),
+            cache_directive: ResolutionCacheDirective::Cacheable,
+        })
     }
 
     pub fn answers(&self) -> &[Record] {
@@ -3508,6 +3841,184 @@ pub trait ResolutionBackend: Send + Sync {
     ) -> BoxFuture<'a, Result<ResolutionResponse, ResolutionBackendError>>;
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RecursiveRootHint {
+    pub name: String,
+    pub endpoints: Vec<SocketAddr>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RecursiveResolverConfig {
+    pub root_hints: Vec<RecursiveRootHint>,
+    pub max_recursion_depth: u8,
+    pub max_cname_restarts: u8,
+}
+
+pub trait RecursiveAuthorityTransport: Send + Sync {
+    fn query<'a>(
+        &'a self,
+        authority: SocketAddr,
+        question: QuestionKey,
+    ) -> BoxFuture<'a, Result<RecursiveAuthorityResponse, ResolutionBackendError>>;
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RecursiveAuthorityResponse {
+    pub bytes: Vec<u8>,
+    pub message: Message,
+}
+
+impl RecursiveAuthorityResponse {
+    pub fn new(bytes: Vec<u8>, message: Message) -> Result<Self, ResolutionBackendError> {
+        if message.original_bytes.as_ref() != bytes.as_slice() {
+            return Err(ResolutionBackendError::MalformedResponse);
+        }
+        Ok(Self { bytes, message })
+    }
+}
+
+pub struct RecursiveResolutionBackend {
+    config: RecursiveResolverConfig,
+    transport: Arc<dyn RecursiveAuthorityTransport>,
+}
+
+impl RecursiveResolutionBackend {
+    pub fn new(
+        config: RecursiveResolverConfig,
+        transport: Arc<dyn RecursiveAuthorityTransport>,
+    ) -> Self {
+        Self { config, transport }
+    }
+
+    async fn resolve_iterative(
+        &self,
+        request: ResolutionRequest,
+    ) -> Result<ResolutionResponse, ResolutionBackendError> {
+        if self.config.root_hints.is_empty() {
+            return Err(ResolutionBackendError::NoBackendsAvailable);
+        }
+
+        let mut question = request.query.question.clone();
+        let mut authorities = self.root_authorities();
+        let mut seen_referrals = HashSet::new();
+        let mut seen_cnames = HashSet::from([question.qname.clone()]);
+        let mut cname_chain = Vec::new();
+        let mut cname_restarts = 0u8;
+
+        for _ in 0..self.config.max_recursion_depth {
+            if authorities.is_empty() {
+                return Err(ResolutionBackendError::NoBackendsAvailable);
+            }
+            let mut last_error = None;
+            let mut next_authorities = None;
+
+            for authority in authorities.iter().copied() {
+                let response = match self.transport.query(authority, question.clone()).await {
+                    Ok(response) => response,
+                    Err(error) => {
+                        last_error = Some(error);
+                        continue;
+                    }
+                };
+                let message = &response.message;
+                if let Some(error) = authority_response_error(message, &question) {
+                    last_error = Some(error);
+                    continue;
+                }
+
+                if (message.header.aa() && has_requested_answer_for(message, &question))
+                    || is_negative_answer(message)
+                {
+                    return Ok(ResolutionResponse::recursive_response(
+                        &request.query,
+                        response,
+                        &cname_chain,
+                        SystemTime::now(),
+                        request.backend_generation,
+                        authority,
+                    )?);
+                }
+
+                if message.header.aa() {
+                    if let Some(cname_record) = cname_record_for(message, &question) {
+                        let RecordData::CNAME(cname_target) = &cname_record.record else {
+                            unreachable!();
+                        };
+                        let target_question =
+                            QuestionKey::new(cname_target, question.qtype, question.qclass);
+                        if has_requested_answer_for(message, &target_question) {
+                            return Ok(ResolutionResponse::recursive_response(
+                                &request.query,
+                                response,
+                                &cname_chain,
+                                SystemTime::now(),
+                                request.backend_generation,
+                                authority,
+                            )?);
+                        }
+                        let next_name = normalize_question_name(cname_target);
+                        if cname_restarts >= self.config.max_cname_restarts
+                            || !seen_cnames.insert(next_name)
+                        {
+                            return Err(ResolutionBackendError::NoBackendsAvailable);
+                        }
+                        cname_chain.push(cname_record.clone());
+                        cname_restarts = cname_restarts.saturating_add(1);
+                        question = QuestionKey::new(cname_target, question.qtype, question.qclass);
+                        seen_referrals.clear();
+                        next_authorities = Some(self.root_authorities());
+                        break;
+                    }
+                }
+
+                let Some(referral) = referral_authorities(message, &question) else {
+                    last_error = Some(ResolutionBackendError::NoBackendsAvailable);
+                    continue;
+                };
+                let referral_key = referral
+                    .endpoints
+                    .iter()
+                    .map(SocketAddr::to_string)
+                    .collect::<Vec<_>>()
+                    .join(",");
+                let referral_key = format!("{}|{referral_key}", referral.owner);
+                if !seen_referrals.insert(referral_key) {
+                    return Err(ResolutionBackendError::NoBackendsAvailable);
+                }
+                next_authorities = Some(referral.endpoints);
+                break;
+            }
+
+            if let Some(next) = next_authorities {
+                authorities = next;
+            } else if let Some(error) = last_error {
+                return Err(error);
+            } else {
+                return Err(ResolutionBackendError::NoBackendsAvailable);
+            }
+        }
+
+        Err(ResolutionBackendError::Timeout)
+    }
+
+    fn root_authorities(&self) -> Vec<SocketAddr> {
+        self.config
+            .root_hints
+            .iter()
+            .flat_map(|hint| hint.endpoints.iter().copied())
+            .collect()
+    }
+}
+
+impl ResolutionBackend for RecursiveResolutionBackend {
+    fn resolve<'a>(
+        &'a self,
+        request: ResolutionRequest,
+    ) -> BoxFuture<'a, Result<ResolutionResponse, ResolutionBackendError>> {
+        Box::pin(async move { self.resolve_iterative(request).await })
+    }
+}
+
 pub trait ResponseFactory: Send + Sync {
     fn protocol_error(&self, request_id: Option<u16>, error: &QueryValidationError) -> Vec<u8>;
 
@@ -3572,7 +4083,9 @@ mod tests {
     use std::sync::Mutex;
     use std::thread;
 
-    use crate::protocol::{build_a_block_response, question_wire, Header, Question, Record};
+    use crate::protocol::{
+        build_a_block_response, question_wire, EdnsInfo, Header, Question, Record,
+    };
 
     fn a_query(id: u16, name: &str) -> Vec<u8> {
         let mut bytes = Vec::new();
@@ -5195,6 +5708,51 @@ mod tests {
         }
     }
 
+    struct ScriptedAuthorityTransport {
+        responses: Mutex<VecDeque<Result<RecursiveAuthorityResponse, ResolutionBackendError>>>,
+        requests: Mutex<Vec<(SocketAddr, QuestionKey)>>,
+    }
+
+    impl ScriptedAuthorityTransport {
+        fn new(
+            responses: impl IntoIterator<Item = Result<Message, ResolutionBackendError>>,
+        ) -> Self {
+            Self {
+                responses: Mutex::new(
+                    responses
+                        .into_iter()
+                        .map(|response| {
+                            response.and_then(|message| {
+                                RecursiveAuthorityResponse::new(
+                                    message.original_bytes.to_vec(),
+                                    message,
+                                )
+                            })
+                        })
+                        .collect(),
+                ),
+                requests: Mutex::new(Vec::new()),
+            }
+        }
+    }
+
+    impl RecursiveAuthorityTransport for ScriptedAuthorityTransport {
+        fn query<'a>(
+            &'a self,
+            authority: SocketAddr,
+            question: QuestionKey,
+        ) -> BoxFuture<'a, Result<RecursiveAuthorityResponse, ResolutionBackendError>> {
+            Box::pin(async move {
+                self.requests.lock().unwrap().push((authority, question));
+                self.responses
+                    .lock()
+                    .unwrap()
+                    .pop_front()
+                    .unwrap_or(Err(ResolutionBackendError::NoBackendsAvailable))
+            })
+        }
+    }
+
     struct BlockingUpstream {
         response: Result<UpstreamResponse, UpstreamError>,
         requests: Mutex<Vec<UpstreamRequest>>,
@@ -5306,6 +5864,699 @@ mod tests {
 
     fn upstream_response(bytes: Vec<u8>) -> UpstreamResponse {
         UpstreamResponse::forwarded_bytes(bytes, SystemTime::UNIX_EPOCH, 0, "test-forwarder")
+    }
+
+    fn recursive_backend(transport: Arc<ScriptedAuthorityTransport>) -> RecursiveResolutionBackend {
+        recursive_backend_with_root_endpoints(
+            transport,
+            vec!["198.51.100.53:53".parse().unwrap()],
+            8,
+        )
+    }
+
+    fn recursive_backend_with_root_endpoints(
+        transport: Arc<ScriptedAuthorityTransport>,
+        endpoints: Vec<SocketAddr>,
+        max_recursion_depth: u8,
+    ) -> RecursiveResolutionBackend {
+        RecursiveResolutionBackend::new(
+            RecursiveResolverConfig {
+                root_hints: vec![RecursiveRootHint {
+                    name: "a.root-servers.example".to_string(),
+                    endpoints,
+                }],
+                max_recursion_depth,
+                max_cname_restarts: 4,
+            },
+            transport,
+        )
+    }
+
+    fn recursive_request(name: &str) -> ResolutionRequest {
+        let query = StandardProtocolCodec::new(1232)
+            .decode_query(&a_query(0x1234, name))
+            .unwrap();
+        ResolutionRequest {
+            query,
+            backend_generation: 7,
+        }
+    }
+
+    #[tokio::test]
+    async fn recursive_backend_returns_authoritative_answer() {
+        let question = QuestionKey::new("example.com", 1, 1);
+        let transport = Arc::new(ScriptedAuthorityTransport::new([Ok(
+            response_message_for_question(
+                question.clone(),
+                ResponseCode::NoError,
+                vec![a_record("example.com", 60)],
+                Vec::new(),
+                Vec::new(),
+                true,
+            ),
+        )]));
+        let backend = recursive_backend(transport.clone());
+
+        let response = backend
+            .resolve(recursive_request("example.com"))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            response.source_credibility,
+            SourceCredibility::Authoritative
+        );
+        assert_eq!(response.backend_provenance.mode, ResolutionMode::Recursive);
+        assert_eq!(response.backend_provenance.generation, 7);
+        assert_eq!(response.final_question, Some(question.clone()));
+        assert_eq!(response.answers().len(), 1);
+        assert_eq!(
+            transport.requests.lock().unwrap().as_slice(),
+            &[("198.51.100.53:53".parse().unwrap(), question)]
+        );
+    }
+
+    #[tokio::test]
+    async fn recursive_backend_rewrites_authority_response_id() {
+        let question = QuestionKey::new("example.com", 1, 1);
+        let transport = Arc::new(ScriptedAuthorityTransport::new([Ok(
+            response_message_for_question_with_id(
+                0xbeef,
+                question.clone(),
+                ResponseCode::NoError,
+                vec![a_record("example.com", 60)],
+                Vec::new(),
+                Vec::new(),
+                true,
+            ),
+        )]));
+        let backend = recursive_backend(transport);
+
+        let response = backend
+            .resolve(recursive_request("example.com"))
+            .await
+            .unwrap();
+
+        assert_eq!(&response.bytes[0..2], &[0x12, 0x34]);
+        assert_eq!(
+            response
+                .response_message
+                .as_ref()
+                .map(|message| message.header.id),
+            Some(0x1234)
+        );
+    }
+
+    #[tokio::test]
+    async fn recursive_backend_filters_unsupported_records_from_synthesized_response() {
+        let question = QuestionKey::new("example.com", 1, 1);
+        let transport = Arc::new(ScriptedAuthorityTransport::new([Ok(
+            response_message_for_question(
+                question,
+                ResponseCode::NoError,
+                vec![
+                    a_record("example.com", 60),
+                    rrsig_record("example.com", 60, 1),
+                ],
+                Vec::new(),
+                vec![opt_record(1232)],
+                true,
+            ),
+        )]));
+        let backend = recursive_backend(transport);
+
+        let response = backend
+            .resolve(recursive_request("example.com"))
+            .await
+            .unwrap();
+
+        let message = response.response_message.as_ref().unwrap();
+        assert_eq!(message.answers.len(), 1);
+        assert!(message.additionals.is_empty());
+    }
+
+    #[tokio::test]
+    async fn recursive_backend_follows_referral_with_glue() {
+        let question = QuestionKey::new("www.example.com", 1, 1);
+        let referred = "203.0.113.10:53".parse().unwrap();
+        let transport = Arc::new(ScriptedAuthorityTransport::new([
+            Ok(response_message_for_question(
+                question.clone(),
+                ResponseCode::NoError,
+                Vec::new(),
+                vec![ns_record("example.com", 300, "ns1.example.com")],
+                vec![glue_a_record(
+                    "ns1.example.com",
+                    300,
+                    "203.0.113.10".parse().unwrap(),
+                )],
+                false,
+            )),
+            Ok(response_message_for_question(
+                question.clone(),
+                ResponseCode::NoError,
+                vec![a_record("www.example.com", 60)],
+                Vec::new(),
+                Vec::new(),
+                true,
+            )),
+        ]));
+        let backend = recursive_backend(transport.clone());
+
+        let response = backend
+            .resolve(recursive_request("www.example.com"))
+            .await
+            .unwrap();
+
+        assert_eq!(response.answers().len(), 1);
+        let requests = transport.requests.lock().unwrap();
+        assert_eq!(requests.len(), 2);
+        assert_eq!(requests[1], (referred, question));
+    }
+
+    #[tokio::test]
+    async fn recursive_backend_rejects_unrelated_referral() {
+        let question = QuestionKey::new("www.example.com", 1, 1);
+        let transport = Arc::new(ScriptedAuthorityTransport::new([Ok(
+            response_message_for_question(
+                question,
+                ResponseCode::NoError,
+                Vec::new(),
+                vec![ns_record("attacker.test", 300, "ns1.attacker.test")],
+                vec![glue_a_record(
+                    "ns1.attacker.test",
+                    300,
+                    "203.0.113.66".parse().unwrap(),
+                )],
+                false,
+            ),
+        )]));
+        let backend = recursive_backend(transport);
+
+        assert_eq!(
+            backend.resolve(recursive_request("www.example.com")).await,
+            Err(ResolutionBackendError::NoBackendsAvailable)
+        );
+    }
+
+    #[tokio::test]
+    async fn recursive_backend_defers_out_of_bailiwick_glue() {
+        let question = QuestionKey::new("www.example.com", 1, 1);
+        let transport = Arc::new(ScriptedAuthorityTransport::new([Ok(
+            response_message_for_question(
+                question,
+                ResponseCode::NoError,
+                Vec::new(),
+                vec![ns_record("example.com", 300, "ns1.attacker.test")],
+                vec![glue_a_record(
+                    "ns1.attacker.test",
+                    300,
+                    "203.0.113.66".parse().unwrap(),
+                )],
+                false,
+            ),
+        )]));
+        let backend = recursive_backend(transport);
+
+        assert_eq!(
+            backend.resolve(recursive_request("www.example.com")).await,
+            Err(ResolutionBackendError::NoBackendsAvailable)
+        );
+    }
+
+    #[tokio::test]
+    async fn recursive_backend_allows_same_authority_for_nested_delegations() {
+        let question = QuestionKey::new("www.child.example.com", 1, 1);
+        let shared_authority = "203.0.113.10:53".parse().unwrap();
+        let transport = Arc::new(ScriptedAuthorityTransport::new([
+            Ok(response_message_for_question(
+                question.clone(),
+                ResponseCode::NoError,
+                Vec::new(),
+                vec![ns_record("example.com", 300, "ns1.example.com")],
+                vec![glue_a_record(
+                    "ns1.example.com",
+                    300,
+                    "203.0.113.10".parse().unwrap(),
+                )],
+                false,
+            )),
+            Ok(response_message_for_question(
+                question.clone(),
+                ResponseCode::NoError,
+                Vec::new(),
+                vec![ns_record("child.example.com", 300, "ns1.child.example.com")],
+                vec![glue_a_record(
+                    "ns1.child.example.com",
+                    300,
+                    "203.0.113.10".parse().unwrap(),
+                )],
+                false,
+            )),
+            Ok(response_message_for_question(
+                question.clone(),
+                ResponseCode::NoError,
+                vec![a_record("www.child.example.com", 60)],
+                Vec::new(),
+                Vec::new(),
+                true,
+            )),
+        ]));
+        let backend = recursive_backend(transport.clone());
+
+        let response = backend
+            .resolve(recursive_request("www.child.example.com"))
+            .await
+            .unwrap();
+
+        assert_eq!(response.answers().len(), 1);
+        let requests = transport.requests.lock().unwrap();
+        assert_eq!(requests.len(), 3);
+        assert_eq!(requests[1], (shared_authority, question.clone()));
+        assert_eq!(requests[2], (shared_authority, question));
+    }
+
+    #[tokio::test]
+    async fn recursive_backend_restarts_for_cname() {
+        let first = QuestionKey::new("alias.example.com", 1, 1);
+        let second = QuestionKey::new("target.example.com", 1, 1);
+        let transport = Arc::new(ScriptedAuthorityTransport::new([
+            Ok(response_message_for_question(
+                first.clone(),
+                ResponseCode::NoError,
+                vec![cname_record("alias.example.com", 60, "target.example.com")],
+                Vec::new(),
+                Vec::new(),
+                true,
+            )),
+            Ok(response_message_for_question(
+                second.clone(),
+                ResponseCode::NoError,
+                vec![a_record("target.example.com", 60)],
+                Vec::new(),
+                Vec::new(),
+                true,
+            )),
+        ]));
+        let backend = recursive_backend(transport.clone());
+
+        let response = backend
+            .resolve(recursive_request("alias.example.com"))
+            .await
+            .unwrap();
+
+        assert_eq!(response.final_question, Some(first.clone()));
+        assert_eq!(response.answers().len(), 2);
+        let requests = transport.requests.lock().unwrap();
+        assert_eq!(requests[0].1, first);
+        assert_eq!(requests[1].1, second);
+    }
+
+    #[tokio::test]
+    async fn recursive_backend_accepts_complete_cname_answer() {
+        let first = QuestionKey::new("alias.example.com", 1, 1);
+        let transport = Arc::new(ScriptedAuthorityTransport::new([Ok(
+            response_message_for_question(
+                first.clone(),
+                ResponseCode::NoError,
+                vec![
+                    cname_record("alias.example.com", 60, "target.example.com"),
+                    a_record("target.example.com", 60),
+                ],
+                Vec::new(),
+                Vec::new(),
+                true,
+            ),
+        )]));
+        let backend = recursive_backend(transport.clone());
+
+        let response = backend
+            .resolve(recursive_request("alias.example.com"))
+            .await
+            .unwrap();
+
+        assert_eq!(response.final_question, Some(first.clone()));
+        assert_eq!(response.answers().len(), 2);
+        let requests = transport.requests.lock().unwrap();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].1, first);
+    }
+
+    #[tokio::test]
+    async fn recursive_backend_rejects_referral_loop_and_depth_exhaustion() {
+        let question = QuestionKey::new("www.example.com", 1, 1);
+        let referral = response_message_for_question(
+            question.clone(),
+            ResponseCode::NoError,
+            Vec::new(),
+            vec![ns_record("example.com", 300, "ns1.example.com")],
+            vec![glue_a_record(
+                "ns1.example.com",
+                300,
+                "203.0.113.10".parse().unwrap(),
+            )],
+            false,
+        );
+        let transport = Arc::new(ScriptedAuthorityTransport::new([
+            Ok(referral.clone()),
+            Ok(referral),
+        ]));
+        let backend = recursive_backend(transport);
+
+        assert_eq!(
+            backend.resolve(recursive_request("www.example.com")).await,
+            Err(ResolutionBackendError::NoBackendsAvailable)
+        );
+
+        let transport = Arc::new(ScriptedAuthorityTransport::new([Ok(
+            response_message_for_question(
+                question,
+                ResponseCode::NoError,
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+                false,
+            ),
+        )]));
+        let backend = RecursiveResolutionBackend::new(
+            RecursiveResolverConfig {
+                root_hints: vec![RecursiveRootHint {
+                    name: "a.root-servers.example".to_string(),
+                    endpoints: vec!["198.51.100.53:53".parse().unwrap()],
+                }],
+                max_recursion_depth: 1,
+                max_cname_restarts: 4,
+            },
+            transport,
+        );
+        assert_eq!(
+            backend.resolve(recursive_request("www.example.com")).await,
+            Err(ResolutionBackendError::NoBackendsAvailable)
+        );
+    }
+
+    #[tokio::test]
+    async fn recursive_backend_fails_over_to_alternate_authority() {
+        let question = QuestionKey::new("example.com", 1, 1);
+        let second_authority = "198.51.100.54:53".parse().unwrap();
+        let transport = Arc::new(ScriptedAuthorityTransport::new([
+            Err(ResolutionBackendError::Timeout),
+            Ok(response_message_for_question(
+                question.clone(),
+                ResponseCode::NoError,
+                vec![a_record("example.com", 60)],
+                Vec::new(),
+                Vec::new(),
+                true,
+            )),
+        ]));
+        let backend = recursive_backend_with_root_endpoints(
+            transport.clone(),
+            vec!["198.51.100.53:53".parse().unwrap(), second_authority],
+            8,
+        );
+
+        let response = backend
+            .resolve(recursive_request("example.com"))
+            .await
+            .unwrap();
+
+        assert_eq!(response.answers().len(), 1);
+        let requests = transport.requests.lock().unwrap();
+        assert_eq!(requests.len(), 2);
+        assert_eq!(requests[1], (second_authority, question));
+    }
+
+    #[tokio::test]
+    async fn recursive_backend_fails_over_after_mismatched_question() {
+        let question = QuestionKey::new("example.com", 1, 1);
+        let second_authority = "198.51.100.54:53".parse().unwrap();
+        let transport = Arc::new(ScriptedAuthorityTransport::new([
+            Ok(response_message_for_question(
+                QuestionKey::new("other.example.com", 1, 1),
+                ResponseCode::NoError,
+                vec![a_record("example.com", 60)],
+                Vec::new(),
+                Vec::new(),
+                true,
+            )),
+            Ok(response_message_for_question(
+                question.clone(),
+                ResponseCode::NoError,
+                vec![a_record("example.com", 60)],
+                Vec::new(),
+                Vec::new(),
+                true,
+            )),
+        ]));
+        let backend = recursive_backend_with_root_endpoints(
+            transport.clone(),
+            vec!["198.51.100.53:53".parse().unwrap(), second_authority],
+            8,
+        );
+
+        let response = backend
+            .resolve(recursive_request("example.com"))
+            .await
+            .unwrap();
+
+        assert_eq!(response.answers().len(), 1);
+        let requests = transport.requests.lock().unwrap();
+        assert_eq!(requests.len(), 2);
+        assert_eq!(requests[1], (second_authority, question));
+    }
+
+    #[tokio::test]
+    async fn recursive_backend_detects_cname_loop() {
+        let alias = QuestionKey::new("alias.example.com", 1, 1);
+        let target = QuestionKey::new("target.example.com", 1, 1);
+        let transport = Arc::new(ScriptedAuthorityTransport::new([
+            Ok(response_message_for_question(
+                alias.clone(),
+                ResponseCode::NoError,
+                vec![cname_record("alias.example.com", 60, "target.example.com")],
+                Vec::new(),
+                Vec::new(),
+                true,
+            )),
+            Ok(response_message_for_question(
+                target,
+                ResponseCode::NoError,
+                vec![cname_record("target.example.com", 60, "alias.example.com")],
+                Vec::new(),
+                Vec::new(),
+                true,
+            )),
+        ]));
+        let backend = recursive_backend(transport);
+
+        assert_eq!(
+            backend
+                .resolve(recursive_request("alias.example.com"))
+                .await,
+            Err(ResolutionBackendError::NoBackendsAvailable)
+        );
+    }
+
+    #[tokio::test]
+    async fn recursive_backend_allows_same_referral_after_cname_restart() {
+        let alias = QuestionKey::new("alias.example.com", 1, 1);
+        let target = QuestionKey::new("target.example.com", 1, 1);
+        let referral_authority = "203.0.113.10:53".parse().unwrap();
+        let referral_for_alias = response_message_for_question(
+            alias.clone(),
+            ResponseCode::NoError,
+            Vec::new(),
+            vec![ns_record("example.com", 300, "ns1.example.com")],
+            vec![glue_a_record(
+                "ns1.example.com",
+                300,
+                "203.0.113.10".parse().unwrap(),
+            )],
+            false,
+        );
+        let referral_for_target = response_message_for_question(
+            target.clone(),
+            ResponseCode::NoError,
+            Vec::new(),
+            vec![ns_record("example.com", 300, "ns1.example.com")],
+            vec![glue_a_record(
+                "ns1.example.com",
+                300,
+                "203.0.113.10".parse().unwrap(),
+            )],
+            false,
+        );
+        let transport = Arc::new(ScriptedAuthorityTransport::new([
+            Ok(referral_for_alias),
+            Ok(response_message_for_question(
+                alias.clone(),
+                ResponseCode::NoError,
+                vec![cname_record("alias.example.com", 60, "target.example.com")],
+                Vec::new(),
+                Vec::new(),
+                true,
+            )),
+            Ok(referral_for_target),
+            Ok(response_message_for_question(
+                target.clone(),
+                ResponseCode::NoError,
+                vec![a_record("target.example.com", 60)],
+                Vec::new(),
+                Vec::new(),
+                true,
+            )),
+        ]));
+        let backend = recursive_backend(transport.clone());
+
+        let response = backend
+            .resolve(recursive_request("alias.example.com"))
+            .await
+            .unwrap();
+
+        assert_eq!(response.answers().len(), 2);
+        let requests = transport.requests.lock().unwrap();
+        assert_eq!(requests.len(), 4);
+        assert_eq!(requests[1], (referral_authority, alias));
+        assert_eq!(requests[3], (referral_authority, target));
+    }
+
+    #[tokio::test]
+    async fn recursive_backend_requires_authoritative_negative_answer() {
+        let question = QuestionKey::new("missing.example.com", 1, 1);
+        let transport = Arc::new(ScriptedAuthorityTransport::new([Ok(
+            response_message_for_question(
+                question.clone(),
+                ResponseCode::NxDomain,
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+                false,
+            ),
+        )]));
+        let backend = recursive_backend(transport);
+
+        assert_eq!(
+            backend
+                .resolve(recursive_request("missing.example.com"))
+                .await,
+            Err(ResolutionBackendError::NoBackendsAvailable)
+        );
+
+        let transport = Arc::new(ScriptedAuthorityTransport::new([Ok(
+            response_message_for_question(
+                question,
+                ResponseCode::NxDomain,
+                Vec::new(),
+                vec![soa_record("example.com", 300, 60)],
+                Vec::new(),
+                true,
+            ),
+        )]));
+        let backend = recursive_backend(transport);
+
+        let response = backend
+            .resolve(recursive_request("missing.example.com"))
+            .await
+            .unwrap();
+
+        assert_eq!(response.response_code, Some(ResponseCode::NxDomain));
+        assert_eq!(
+            response
+                .negative_cache
+                .as_ref()
+                .map(|metadata| metadata.soa_minimum_ttl),
+            Some(Duration::from_secs(60))
+        );
+    }
+
+    #[tokio::test]
+    async fn recursive_backend_requires_authoritative_positive_answer() {
+        let question = QuestionKey::new("example.com", 1, 1);
+        let transport = Arc::new(ScriptedAuthorityTransport::new([Ok(
+            response_message_for_question(
+                question,
+                ResponseCode::NoError,
+                vec![a_record("example.com", 60)],
+                Vec::new(),
+                Vec::new(),
+                false,
+            ),
+        )]));
+        let backend = recursive_backend(transport);
+
+        assert_eq!(
+            backend.resolve(recursive_request("example.com")).await,
+            Err(ResolutionBackendError::NoBackendsAvailable)
+        );
+    }
+
+    #[tokio::test]
+    async fn recursive_backend_defers_dname_handling_as_failure() {
+        let question = QuestionKey::new("child.example.com", 1, 1);
+        let transport = Arc::new(ScriptedAuthorityTransport::new([Ok(
+            response_message_for_question(
+                question.clone(),
+                ResponseCode::NoError,
+                vec![dname_record("example.com", 60, "example.net")],
+                Vec::new(),
+                Vec::new(),
+                true,
+            ),
+        )]));
+        let backend = recursive_backend(transport);
+
+        assert_eq!(
+            backend
+                .resolve(recursive_request("child.example.com"))
+                .await,
+            Err(ResolutionBackendError::NoBackendsAvailable)
+        );
+    }
+
+    #[tokio::test]
+    async fn resolve_query_accepts_recursive_backend_response() {
+        let question = QuestionKey::new("example.com", 1, 1);
+        let transport = Arc::new(ScriptedAuthorityTransport::new([Ok(
+            response_message_for_question_with_id(
+                0xbeef,
+                question.clone(),
+                ResponseCode::NoError,
+                vec![a_record("example.com", 60)],
+                Vec::new(),
+                Vec::new(),
+                true,
+            ),
+        )]));
+        let backend = Arc::new(recursive_backend(transport.clone()));
+        let service = ResolveQuery::with_cache_and_backend_snapshot(
+            Arc::new(StandardProtocolCodec::new(1232)),
+            Arc::new(NoopDnsCache),
+            CacheTtlPolicy::default(),
+            BackendSnapshot::new(
+                backend,
+                ResolutionMode::Recursive,
+                7,
+                BackendHealth::Healthy,
+                Some("mode:recursive;backend-generation:7".to_string()),
+            ),
+            Arc::new(BasicResponseFactory),
+            Arc::new(FixedClock(SystemTime::UNIX_EPOCH)),
+            Arc::new(RecordingEvents::default()),
+            Arc::new(RecordingMetrics::default()),
+        );
+
+        let outcome = service
+            .resolve(ResolveRequest::new(
+                "192.0.2.10".parse().unwrap(),
+                SystemTime::UNIX_EPOCH,
+                a_query(0x1234, "example.com"),
+            ))
+            .await;
+
+        assert_eq!(outcome.decision.kind, ResolveDecisionKind::Allowed);
+        assert_eq!(&outcome.response_bytes[0..2], &[0x12, 0x34]);
+        assert_eq!(transport.requests.lock().unwrap().len(), 1);
     }
 
     #[tokio::test]
@@ -5632,6 +6883,47 @@ mod tests {
         }
     }
 
+    fn response_message_for_question(
+        question: QuestionKey,
+        response_code: ResponseCode,
+        answers: Vec<Record>,
+        authorities: Vec<Record>,
+        additionals: Vec<Record>,
+        authoritative: bool,
+    ) -> Message {
+        response_message_for_question_with_id(
+            0x1234,
+            question,
+            response_code,
+            answers,
+            authorities,
+            additionals,
+            authoritative,
+        )
+    }
+
+    fn response_message_for_question_with_id(
+        id: u16,
+        question: QuestionKey,
+        response_code: ResponseCode,
+        answers: Vec<Record>,
+        authorities: Vec<Record>,
+        additionals: Vec<Record>,
+        authoritative: bool,
+    ) -> Message {
+        let original_query = Message::parse_owned(a_query(id, &question.qname)).unwrap();
+        let bytes = serialize_recursive_response(
+            &original_query,
+            response_code,
+            authoritative,
+            &answers,
+            &authorities,
+            &additionals,
+        )
+        .unwrap();
+        Message::parse_owned(bytes).unwrap()
+    }
+
     fn a_record(name: &str, ttl: u32) -> Record {
         Record {
             name: name.to_string(),
@@ -5649,6 +6941,55 @@ mod tests {
             rclass: 1,
             ttl,
             record: RecordData::CNAME(target.to_string()),
+        }
+    }
+
+    fn ns_record(zone: &str, ttl: u32, ns: &str) -> Record {
+        Record {
+            name: zone.to_string(),
+            rtype: 2,
+            rclass: 1,
+            ttl,
+            record: RecordData::NS(ns.to_string()),
+        }
+    }
+
+    fn glue_a_record(name: &str, ttl: u32, address: std::net::Ipv4Addr) -> Record {
+        Record {
+            name: name.to_string(),
+            rtype: 1,
+            rclass: 1,
+            ttl,
+            record: RecordData::A(address),
+        }
+    }
+
+    fn dname_record(name: &str, ttl: u32, target: &str) -> Record {
+        let mut bytes = Vec::new();
+        write_dns_name(&mut bytes, target);
+        Record {
+            name: name.to_string(),
+            rtype: 39,
+            rclass: 1,
+            ttl,
+            record: RecordData::Unknown { rtype: 39, bytes },
+        }
+    }
+
+    fn opt_record(udp_payload_size: u16) -> Record {
+        Record {
+            name: String::new(),
+            rtype: 41,
+            rclass: udp_payload_size,
+            ttl: 0,
+            record: RecordData::OPT(EdnsInfo {
+                udp_payload_size,
+                extended_rcode: 0,
+                version: 0,
+                flags: 0,
+                dnssec_ok: false,
+                options: Vec::new(),
+            }),
         }
     }
 
