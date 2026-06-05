@@ -148,6 +148,8 @@ fn normalize_question_name(name: &str) -> String {
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct QueryFeatures {
     pub recursion_desired: bool,
+    pub authenticated_data: bool,
+    pub checking_disabled: bool,
     pub dnssec_ok: bool,
     pub edns_udp_payload_size: Option<u16>,
 }
@@ -156,6 +158,8 @@ impl QueryFeatures {
     pub fn from_message(message: &Message) -> Self {
         Self {
             recursion_desired: message.header.rd(),
+            authenticated_data: message.header.ad(),
+            checking_disabled: message.header.cd(),
             dnssec_ok: message
                 .edns
                 .as_ref()
@@ -524,6 +528,27 @@ fn cname_record_for<'a>(message: &'a Message, question: &QuestionKey) -> Option<
     })
 }
 
+fn cname_chain_records(message: &Message, cname_record: &Record, dnssec_ok: bool) -> Vec<Record> {
+    let mut records = vec![cname_record.clone()];
+    if dnssec_ok {
+        let cname_owner = normalize_question_name(&cname_record.name);
+        records.extend(message.answers.iter().filter_map(|record| {
+            let RecordData::RRSIG { type_covered, .. } = &record.record else {
+                return None;
+            };
+            if *type_covered == CNAME_RECORD_TYPE
+                && record.rclass == cname_record.rclass
+                && normalize_question_name(&record.name) == cname_owner
+            {
+                Some(record.clone())
+            } else {
+                None
+            }
+        }));
+    }
+    records
+}
+
 fn authority_response_error(
     message: &Message,
     question: &QuestionKey,
@@ -617,24 +642,29 @@ fn synthesize_recursive_cname_response(
     cname_chain: &[Record],
     final_response: &Message,
 ) -> Result<Message, ResolutionBackendError> {
+    let dnssec_ok = original_query
+        .edns
+        .as_ref()
+        .map(|edns| edns.dnssec_ok)
+        .unwrap_or(false);
     let mut answers = cname_chain.to_vec();
     answers.extend(
         final_response
             .answers
             .iter()
-            .filter(|record| recursive_response_record_supported(record))
+            .filter(|record| recursive_response_record_supported(record, dnssec_ok))
             .cloned(),
     );
     let authorities = final_response
         .authorities
         .iter()
-        .filter(|record| recursive_response_record_supported(record))
+        .filter(|record| recursive_response_record_supported(record, dnssec_ok))
         .cloned()
         .collect::<Vec<_>>();
     let additionals = final_response
         .additionals
         .iter()
-        .filter(|record| recursive_response_record_supported(record))
+        .filter(|record| recursive_response_record_supported(record, dnssec_ok))
         .cloned()
         .collect::<Vec<_>>();
     let bytes = serialize_recursive_response(
@@ -648,16 +678,26 @@ fn synthesize_recursive_cname_response(
     Message::parse_owned(bytes).map_err(|_| ResolutionBackendError::MalformedResponse)
 }
 
-fn recursive_response_record_supported(record: &Record) -> bool {
-    matches!(
-        record.record,
+fn recursive_response_record_supported(record: &Record, dnssec_ok: bool) -> bool {
+    match record.record {
         RecordData::A(_)
-            | RecordData::AAAA(_)
-            | RecordData::CNAME(_)
-            | RecordData::NS(_)
-            | RecordData::SOA { .. }
-            | RecordData::Unknown { .. }
-    )
+        | RecordData::AAAA(_)
+        | RecordData::CNAME(_)
+        | RecordData::NS(_)
+        | RecordData::SOA { .. } => true,
+        RecordData::DNSKEY { .. }
+        | RecordData::DS { .. }
+        | RecordData::NSEC { .. }
+        | RecordData::NSEC3 { .. }
+        | RecordData::NSEC3PARAM { .. }
+        | RecordData::RRSIG { .. } => dnssec_ok,
+        RecordData::Unknown { rtype, .. } => dnssec_ok || !is_dnssec_record_type(rtype),
+        _ => false,
+    }
+}
+
+fn is_dnssec_record_type(rtype: u16) -> bool {
+    matches!(rtype, 43 | 46 | 47 | 48 | 50 | 51 | 59 | 60 | 32769)
 }
 
 fn serialize_recursive_response(
@@ -717,6 +757,67 @@ fn write_dns_record(bytes: &mut Vec<u8>, record: &Record) -> Result<(), Resoluti
         RecordData::A(address) => bytes.extend_from_slice(&address.octets()),
         RecordData::AAAA(address) => bytes.extend_from_slice(&address.octets()),
         RecordData::CNAME(name) | RecordData::NS(name) => write_dns_name(bytes, name),
+        RecordData::DNSKEY {
+            flags,
+            protocol,
+            algorithm,
+            public_key,
+        } => {
+            write_dns_u16(bytes, *flags);
+            bytes.push(*protocol);
+            bytes.push(*algorithm);
+            bytes.extend_from_slice(public_key);
+        }
+        RecordData::DS {
+            key_tag,
+            algorithm,
+            digest_type,
+            digest,
+        } => {
+            write_dns_u16(bytes, *key_tag);
+            bytes.push(*algorithm);
+            bytes.push(*digest_type);
+            bytes.extend_from_slice(digest);
+        }
+        RecordData::NSEC {
+            next_domain,
+            type_bit_maps,
+        } => {
+            write_dns_name(bytes, next_domain);
+            bytes.extend_from_slice(type_bit_maps);
+        }
+        RecordData::NSEC3 {
+            hash_algorithm,
+            flags,
+            iterations,
+            salt_length,
+            salt,
+            hash_length,
+            next_domain,
+            type_bit_maps,
+        } => {
+            bytes.push(*hash_algorithm);
+            bytes.push(*flags);
+            write_dns_u16(bytes, *iterations);
+            bytes.push(*salt_length);
+            bytes.extend_from_slice(salt);
+            bytes.push(*hash_length);
+            write_hex_bytes(bytes, next_domain)?;
+            bytes.extend_from_slice(type_bit_maps);
+        }
+        RecordData::NSEC3PARAM {
+            hash_algorithm,
+            flags,
+            iterations,
+            salt_length,
+            salt,
+        } => {
+            bytes.push(*hash_algorithm);
+            bytes.push(*flags);
+            write_dns_u16(bytes, *iterations);
+            bytes.push(*salt_length);
+            bytes.extend_from_slice(salt);
+        }
         RecordData::SOA {
             ttl: _,
             rname,
@@ -793,6 +894,28 @@ fn write_dns_u32(bytes: &mut Vec<u8>, value: u32) {
     bytes.extend_from_slice(&value.to_be_bytes());
 }
 
+fn write_hex_bytes(bytes: &mut Vec<u8>, hex: &str) -> Result<(), ResolutionBackendError> {
+    if !hex.len().is_multiple_of(2) {
+        return Err(ResolutionBackendError::MalformedResponse);
+    }
+    let mut chars = hex.as_bytes().chunks_exact(2);
+    for chunk in &mut chars {
+        let high = hex_nibble(chunk[0])?;
+        let low = hex_nibble(chunk[1])?;
+        bytes.push((high << 4) | low);
+    }
+    Ok(())
+}
+
+fn hex_nibble(byte: u8) -> Result<u8, ResolutionBackendError> {
+    match byte {
+        b'0'..=b'9' => Ok(byte - b'0'),
+        b'a'..=b'f' => Ok(byte - b'a' + 10),
+        b'A'..=b'F' => Ok(byte - b'A' + 10),
+        _ => Err(ResolutionBackendError::MalformedResponse),
+    }
+}
+
 fn apply_ttl_bounds(ttl: Duration, min_ttl: Option<Duration>, max_ttl: Duration) -> Duration {
     let capped = ttl.min(max_ttl);
     match min_ttl {
@@ -846,12 +969,18 @@ pub enum BackendHealth {
     Unknown,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DnssecValidationStatus {
+    Disabled,
+}
+
 #[derive(Clone)]
 pub struct BackendSnapshot {
     pub backend: Arc<dyn ResolutionBackend>,
     pub mode: ResolutionMode,
     pub generation: u64,
     pub health: BackendHealth,
+    pub dnssec_validation: DnssecValidationStatus,
     pub cache_namespace: Option<String>,
 }
 
@@ -868,6 +997,7 @@ impl BackendSnapshot {
             mode,
             generation,
             health,
+            dnssec_validation: DnssecValidationStatus::Disabled,
             cache_namespace,
         }
     }
@@ -2695,9 +2825,6 @@ fn validate_backend_response_bytes(bytes: &[u8], query: &DecodedQuery) -> Option
 }
 
 fn cache_supported(query: &DecodedQuery) -> bool {
-    if query.message.header.ad() || query.message.header.cd() {
-        return false;
-    }
     query
         .message
         .edns
@@ -3921,6 +4048,7 @@ pub trait RecursiveAuthorityTransport: Send + Sync {
         &'a self,
         authority: SocketAddr,
         question: QuestionKey,
+        dnssec_ok: bool,
         timeout: Duration,
     ) -> BoxFuture<'a, Result<RecursiveAuthorityResponse, ResolutionBackendError>>;
 }
@@ -3986,8 +4114,12 @@ impl RecursiveResolutionBackend {
                 let attempt_timeout = remaining.min(self.config.per_authority_timeout);
                 let response = match time::timeout(
                     attempt_timeout,
-                    self.transport
-                        .query(authority, question.clone(), attempt_timeout),
+                    self.transport.query(
+                        authority,
+                        question.clone(),
+                        request.query.features.dnssec_ok,
+                        attempt_timeout,
+                    ),
                 )
                 .await
                 {
@@ -4043,7 +4175,11 @@ impl RecursiveResolutionBackend {
                         {
                             return Err(ResolutionBackendError::NoBackendsAvailable);
                         }
-                        cname_chain.push(cname_record.clone());
+                        cname_chain.extend(cname_chain_records(
+                            message,
+                            cname_record,
+                            request.query.features.dnssec_ok,
+                        ));
                         cname_restarts = cname_restarts.saturating_add(1);
                         question = QuestionKey::new(cname_target, question.qtype, question.qclass);
                         seen_referrals.clear();
@@ -4195,6 +4331,13 @@ mod tests {
     fn a_query_with_checking_disabled(id: u16, name: &str) -> Vec<u8> {
         let mut bytes = a_query(id, name);
         let flags = u16::from_be_bytes([bytes[2], bytes[3]]) | 0x0010;
+        bytes[2..4].copy_from_slice(&flags.to_be_bytes());
+        bytes
+    }
+
+    fn a_query_with_authenticated_data(id: u16, name: &str) -> Vec<u8> {
+        let mut bytes = a_query(id, name);
+        let flags = u16::from_be_bytes([bytes[2], bytes[3]]) | 0x0020;
         bytes[2..4].copy_from_slice(&flags.to_be_bytes());
         bytes
     }
@@ -5791,7 +5934,7 @@ mod tests {
 
     struct ScriptedAuthorityTransport {
         responses: Mutex<VecDeque<Result<RecursiveAuthorityResponse, ResolutionBackendError>>>,
-        requests: Mutex<Vec<(SocketAddr, QuestionKey)>>,
+        requests: Mutex<Vec<(SocketAddr, QuestionKey, bool)>>,
         timeouts: Mutex<Vec<Duration>>,
     }
 
@@ -5824,10 +5967,14 @@ mod tests {
             &'a self,
             authority: SocketAddr,
             question: QuestionKey,
+            dnssec_ok: bool,
             timeout: Duration,
         ) -> BoxFuture<'a, Result<RecursiveAuthorityResponse, ResolutionBackendError>> {
             Box::pin(async move {
-                self.requests.lock().unwrap().push((authority, question));
+                self.requests
+                    .lock()
+                    .unwrap()
+                    .push((authority, question, dnssec_ok));
                 self.timeouts.lock().unwrap().push(timeout);
                 self.responses
                     .lock()
@@ -5845,6 +5992,7 @@ mod tests {
             &'a self,
             _authority: SocketAddr,
             _question: QuestionKey,
+            _dnssec_ok: bool,
             _timeout: Duration,
         ) -> BoxFuture<'a, Result<RecursiveAuthorityResponse, ResolutionBackendError>> {
             Box::pin(async move {
@@ -6012,8 +6160,12 @@ mod tests {
     }
 
     fn recursive_request(name: &str) -> ResolutionRequest {
+        recursive_request_from_bytes(a_query(0x1234, name))
+    }
+
+    fn recursive_request_from_bytes(bytes: Vec<u8>) -> ResolutionRequest {
         let query = StandardProtocolCodec::new(1232)
-            .decode_query(&a_query(0x1234, name))
+            .decode_query(&bytes)
             .unwrap();
         ResolutionRequest {
             query,
@@ -6051,7 +6203,7 @@ mod tests {
         assert_eq!(response.answers().len(), 1);
         assert_eq!(
             transport.requests.lock().unwrap().as_slice(),
-            &[("198.51.100.53:53".parse().unwrap(), question)]
+            &[("198.51.100.53:53".parse().unwrap(), question, false)]
         );
     }
 
@@ -6115,6 +6267,201 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn recursive_backend_propagates_do_and_returns_dnssec_records_when_requested() {
+        let question = QuestionKey::new("example.com", 1, 1);
+        let transport = Arc::new(ScriptedAuthorityTransport::new([Ok(
+            response_message_for_question(
+                question.clone(),
+                ResponseCode::NoError,
+                vec![
+                    a_record("example.com", 60),
+                    rrsig_record("example.com", 60, 1),
+                ],
+                Vec::new(),
+                Vec::new(),
+                true,
+            ),
+        )]));
+        let backend = recursive_backend(transport.clone());
+
+        let response = backend
+            .resolve(recursive_request_from_bytes(a_query_with_edns(
+                0x1234,
+                "example.com",
+                1232,
+                true,
+            )))
+            .await
+            .unwrap();
+
+        let message = response.response_message.as_ref().unwrap();
+        assert_eq!(message.answers.len(), 2);
+        let requests = transport.requests.lock().unwrap();
+        assert_eq!(
+            requests.as_slice(),
+            &[("198.51.100.53:53".parse().unwrap(), question, true)]
+        );
+    }
+
+    #[tokio::test]
+    async fn recursive_backend_filters_raw_dnssec_records_without_do() {
+        let question = QuestionKey::new("example.com", 1, 1);
+        let raw_dnssec_record = unknown_record("example.com", 59, 60, &[1, 2, 3, 4]);
+        let transport = Arc::new(ScriptedAuthorityTransport::new([
+            Ok(response_message_for_question(
+                question.clone(),
+                ResponseCode::NoError,
+                vec![a_record("example.com", 60), raw_dnssec_record.clone()],
+                Vec::new(),
+                Vec::new(),
+                true,
+            )),
+            Ok(response_message_for_question(
+                question,
+                ResponseCode::NoError,
+                vec![a_record("example.com", 60), raw_dnssec_record],
+                Vec::new(),
+                Vec::new(),
+                true,
+            )),
+        ]));
+        let backend = recursive_backend(transport);
+
+        let without_do = backend
+            .resolve(recursive_request("example.com"))
+            .await
+            .unwrap();
+        assert_eq!(
+            without_do.response_message.as_ref().unwrap().answers.len(),
+            1
+        );
+
+        let with_do = backend
+            .resolve(recursive_request_from_bytes(a_query_with_edns(
+                0x1234,
+                "example.com",
+                1232,
+                true,
+            )))
+            .await
+            .unwrap();
+        let answers = &with_do.response_message.as_ref().unwrap().answers;
+        assert_eq!(answers.len(), 2);
+        assert_eq!(answers[1].rtype, 59);
+    }
+
+    #[tokio::test]
+    async fn recursive_backend_preserves_nsec3_records_when_do_requested() {
+        let question = QuestionKey::new("missing.example.com", 1, 1);
+        let transport = Arc::new(ScriptedAuthorityTransport::new([Ok(
+            response_message_for_question(
+                question,
+                ResponseCode::NoError,
+                Vec::new(),
+                vec![
+                    soa_record("example.com", 60, 60),
+                    nsec3_record("example.com", 60),
+                ],
+                Vec::new(),
+                true,
+            ),
+        )]));
+        let backend = recursive_backend(transport);
+
+        let response = backend
+            .resolve(recursive_request_from_bytes(a_query_with_edns(
+                0x1234,
+                "missing.example.com",
+                1232,
+                true,
+            )))
+            .await
+            .unwrap();
+
+        let authorities = response.authorities();
+        assert_eq!(authorities.len(), 2);
+        assert!(matches!(authorities[1].record, RecordData::NSEC3 { .. }));
+    }
+
+    #[tokio::test]
+    async fn recursive_backend_preserves_cname_dnssec_records_when_restarting() {
+        let first = QuestionKey::new("alias.example.com", 1, 1);
+        let second = QuestionKey::new("target.example.com", 1, 1);
+        let transport = Arc::new(ScriptedAuthorityTransport::new([
+            Ok(response_message_for_question(
+                first.clone(),
+                ResponseCode::NoError,
+                vec![
+                    cname_record("alias.example.com", 60, "target.example.com"),
+                    rrsig_record("alias.example.com", 60, CNAME_RECORD_TYPE),
+                ],
+                Vec::new(),
+                Vec::new(),
+                true,
+            )),
+            Ok(response_message_for_question(
+                second,
+                ResponseCode::NoError,
+                vec![a_record("target.example.com", 60)],
+                Vec::new(),
+                Vec::new(),
+                true,
+            )),
+        ]));
+        let backend = recursive_backend(transport);
+
+        let response = backend
+            .resolve(recursive_request_from_bytes(a_query_with_edns(
+                0x1234,
+                "alias.example.com",
+                1232,
+                true,
+            )))
+            .await
+            .unwrap();
+
+        let answers = response.answers();
+        assert_eq!(answers.len(), 3);
+        assert_eq!(answers[0].rtype, CNAME_RECORD_TYPE);
+        assert!(matches!(
+            answers[1].record,
+            RecordData::RRSIG {
+                type_covered: CNAME_RECORD_TYPE,
+                ..
+            }
+        ));
+        assert_eq!(answers[2].rtype, 1);
+    }
+
+    #[tokio::test]
+    async fn recursive_backend_clears_dnssec_validation_flags_while_disabled() {
+        let question = QuestionKey::new("example.com", 1, 1);
+        let transport = Arc::new(ScriptedAuthorityTransport::new([Ok(
+            response_message_for_question_with_extra_flags(
+                question,
+                ResponseCode::NoError,
+                vec![a_record("example.com", 60)],
+                Vec::new(),
+                Vec::new(),
+                true,
+                0x0030,
+            ),
+        )]));
+        let backend = recursive_backend(transport);
+
+        let response = backend
+            .resolve(recursive_request_from_bytes(
+                a_query_with_checking_disabled(0x1234, "example.com"),
+            ))
+            .await
+            .unwrap();
+
+        let message = response.response_message.as_ref().unwrap();
+        assert!(!message.header.ad());
+        assert!(!message.header.cd());
+    }
+
+    #[tokio::test]
     async fn recursive_backend_follows_referral_with_glue() {
         let question = QuestionKey::new("www.example.com", 1, 1);
         let referred = "203.0.113.10:53".parse().unwrap();
@@ -6150,7 +6497,7 @@ mod tests {
         assert_eq!(response.answers().len(), 1);
         let requests = transport.requests.lock().unwrap();
         assert_eq!(requests.len(), 2);
-        assert_eq!(requests[1], (referred, question));
+        assert_eq!(requests[1], (referred, question, false));
     }
 
     #[tokio::test]
@@ -6251,8 +6598,8 @@ mod tests {
         assert_eq!(response.answers().len(), 1);
         let requests = transport.requests.lock().unwrap();
         assert_eq!(requests.len(), 3);
-        assert_eq!(requests[1], (shared_authority, question.clone()));
-        assert_eq!(requests[2], (shared_authority, question));
+        assert_eq!(requests[1], (shared_authority, question.clone(), false));
+        assert_eq!(requests[2], (shared_authority, question, false));
     }
 
     #[tokio::test]
@@ -6288,7 +6635,9 @@ mod tests {
         assert_eq!(response.answers().len(), 2);
         let requests = transport.requests.lock().unwrap();
         assert_eq!(requests[0].1, first);
+        assert!(!requests[0].2);
         assert_eq!(requests[1].1, second);
+        assert!(!requests[1].2);
     }
 
     #[tokio::test]
@@ -6319,6 +6668,7 @@ mod tests {
         let requests = transport.requests.lock().unwrap();
         assert_eq!(requests.len(), 1);
         assert_eq!(requests[0].1, first);
+        assert!(!requests[0].2);
     }
 
     #[tokio::test]
@@ -6405,7 +6755,7 @@ mod tests {
         assert_eq!(response.answers().len(), 1);
         let requests = transport.requests.lock().unwrap();
         assert_eq!(requests.len(), 2);
-        assert_eq!(requests[1], (second_authority, question));
+        assert_eq!(requests[1], (second_authority, question, false));
     }
 
     #[tokio::test]
@@ -6501,7 +6851,7 @@ mod tests {
         assert_eq!(response.answers().len(), 1);
         let requests = transport.requests.lock().unwrap();
         assert_eq!(requests.len(), 2);
-        assert_eq!(requests[1], (second_authority, question));
+        assert_eq!(requests[1], (second_authority, question, false));
     }
 
     #[tokio::test]
@@ -6595,8 +6945,8 @@ mod tests {
         assert_eq!(response.answers().len(), 2);
         let requests = transport.requests.lock().unwrap();
         assert_eq!(requests.len(), 4);
-        assert_eq!(requests[1], (referral_authority, alias));
-        assert_eq!(requests[3], (referral_authority, target));
+        assert_eq!(requests[1], (referral_authority, alias, false));
+        assert_eq!(requests[3], (referral_authority, target, false));
     }
 
     #[tokio::test]
@@ -6734,6 +7084,10 @@ mod tests {
 
         assert_eq!(outcome.decision.kind, ResolveDecisionKind::Allowed);
         assert_eq!(&outcome.response_bytes[0..2], &[0x12, 0x34]);
+        assert_eq!(
+            service.backend.current().dnssec_validation,
+            DnssecValidationStatus::Disabled
+        );
         assert_eq!(transport.requests.lock().unwrap().len(), 1);
     }
 
@@ -6988,6 +7342,8 @@ mod tests {
                     .to_vec(),
                 QueryFeatures {
                     recursion_desired: true,
+                    authenticated_data: false,
+                    checking_disabled: false,
                     dnssec_ok: false,
                     edns_udp_payload_size: None,
                 },
@@ -7018,6 +7374,8 @@ mod tests {
             question_wire(&a_query(0x1000, name)).unwrap().to_vec(),
             QueryFeatures {
                 recursion_desired: true,
+                authenticated_data: false,
+                checking_disabled: false,
                 dnssec_ok: false,
                 edns_udp_payload_size: None,
             },
@@ -7106,6 +7464,29 @@ mod tests {
         Message::parse_owned(bytes).unwrap()
     }
 
+    fn response_message_for_question_with_extra_flags(
+        question: QuestionKey,
+        response_code: ResponseCode,
+        answers: Vec<Record>,
+        authorities: Vec<Record>,
+        additionals: Vec<Record>,
+        authoritative: bool,
+        extra_flags: u16,
+    ) -> Message {
+        let response = response_message_for_question(
+            question,
+            response_code,
+            answers,
+            authorities,
+            additionals,
+            authoritative,
+        );
+        let mut bytes = response.original_bytes.to_vec();
+        let flags = u16::from_be_bytes([bytes[2], bytes[3]]) | extra_flags;
+        bytes[2..4].copy_from_slice(&flags.to_be_bytes());
+        Message::parse_owned(bytes).unwrap()
+    }
+
     fn a_record(name: &str, ttl: u32) -> Record {
         Record {
             name: name.to_string(),
@@ -7191,6 +7572,38 @@ mod tests {
                 key_tag: 0,
                 signer_name: "example.com".to_string(),
                 signature: Vec::new(),
+            },
+        }
+    }
+
+    fn nsec3_record(name: &str, ttl: u32) -> Record {
+        Record {
+            name: name.to_string(),
+            rtype: 50,
+            rclass: 1,
+            ttl,
+            record: RecordData::NSEC3 {
+                hash_algorithm: 1,
+                flags: 0,
+                iterations: 1,
+                salt_length: 1,
+                salt: vec![0xaa],
+                hash_length: 2,
+                next_domain: "bbcc".to_string(),
+                type_bit_maps: vec![0, 1, 0x40],
+            },
+        }
+    }
+
+    fn unknown_record(name: &str, rtype: u16, ttl: u32, bytes: &[u8]) -> Record {
+        Record {
+            name: name.to_string(),
+            rtype,
+            rclass: 1,
+            ttl,
+            record: RecordData::Unknown {
+                rtype,
+                bytes: bytes.to_vec(),
             },
         }
     }
@@ -7910,6 +8323,8 @@ mod tests {
             key.features,
             QueryFeatures {
                 recursion_desired: true,
+                authenticated_data: false,
+                checking_disabled: false,
                 dnssec_ok: true,
                 edns_udp_payload_size: Some(4096),
             }
@@ -7978,6 +8393,41 @@ mod tests {
         assert_ne!(
             CacheKey::from_query(&recursive, None, 1232),
             CacheKey::from_query(&non_recursive, None, 1232)
+        );
+    }
+
+    #[test]
+    fn cache_key_separates_dnssec_request_flags() {
+        let codec = StandardProtocolCodec::new(1232);
+        let base = codec.decode_query(&a_query(0x1000, "example.com")).unwrap();
+        let ad = codec
+            .decode_query(&a_query_with_authenticated_data(0x1000, "example.com"))
+            .unwrap();
+        let cd = codec
+            .decode_query(&a_query_with_checking_disabled(0x1000, "example.com"))
+            .unwrap();
+        let do_query = codec
+            .decode_query(&a_query_with_edns(0x1000, "example.com", 1232, true))
+            .unwrap();
+
+        let base_key = CacheKey::from_query(&base, None, 1232);
+        assert_ne!(base_key, CacheKey::from_query(&ad, None, 1232));
+        assert_ne!(base_key, CacheKey::from_query(&cd, None, 1232));
+        assert_ne!(base_key, CacheKey::from_query(&do_query, None, 1232));
+        assert!(
+            CacheKey::from_query(&ad, None, 1232)
+                .features
+                .authenticated_data
+        );
+        assert!(
+            CacheKey::from_query(&cd, None, 1232)
+                .features
+                .checking_disabled
+        );
+        assert!(
+            CacheKey::from_query(&do_query, None, 1232)
+                .features
+                .dnssec_ok
         );
     }
 
@@ -8741,9 +9191,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn resolve_bypasses_cache_for_unsupported_flags_and_edns_version() {
+    async fn resolve_bypasses_cache_for_unsupported_edns_flags_and_version() {
         for request in [
-            a_query_with_checking_disabled(0x7777, "example.com"),
             a_query_with_edns_details(0x7777, "example.com", 1232, false, 0, 1, &[]),
             a_query_with_edns_flags(0x7777, "example.com", 1232, false, 0, 0, 0x4000, &[]),
         ] {

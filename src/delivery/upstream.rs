@@ -411,10 +411,16 @@ impl RecursiveAuthorityTransportClient {
         &self,
         authority: SocketAddr,
         question: QuestionKey,
+        dnssec_ok: bool,
         timeout: Duration,
     ) -> Result<RecursiveAuthorityResponse, UpstreamError> {
         let authority_id = self.id_generator.next_id();
-        let query = build_authority_query(authority_id, &question, self.max_udp_payload_size)?;
+        let query = build_authority_query(
+            authority_id,
+            &question,
+            self.max_udp_payload_size,
+            dnssec_ok,
+        )?;
         let deadline = Instant::now() + timeout;
 
         if self.transport_allowed(RecursiveTransport::Udp) {
@@ -483,9 +489,13 @@ impl RecursiveAuthorityTransport for RecursiveAuthorityTransportClient {
         &'a self,
         authority: SocketAddr,
         question: QuestionKey,
+        dnssec_ok: bool,
         timeout: Duration,
     ) -> crate::resolver::BoxFuture<'a, Result<RecursiveAuthorityResponse, UpstreamError>> {
-        Box::pin(async move { self.query_authority(authority, question, timeout).await })
+        Box::pin(async move {
+            self.query_authority(authority, question, dnssec_ok, timeout)
+                .await
+        })
     }
 }
 
@@ -792,6 +802,7 @@ fn build_authority_query(
     authority_id: u16,
     question: &QuestionKey,
     max_udp_payload_size: usize,
+    dnssec_ok: bool,
 ) -> Result<Vec<u8>, UpstreamError> {
     if max_udp_payload_size > u16::MAX as usize {
         return Err(UpstreamError::MalformedResponse);
@@ -809,7 +820,8 @@ fn build_authority_query(
     bytes.push(0);
     write_dns_u16(&mut bytes, 41);
     write_dns_u16(&mut bytes, max_udp_payload_size as u16);
-    write_dns_u32(&mut bytes, 0);
+    let edns_flags = if dnssec_ok { 0x8000u32 } else { 0 };
+    write_dns_u32(&mut bytes, edns_flags);
     write_dns_u16(&mut bytes, 0);
     Ok(bytes)
 }
@@ -1053,6 +1065,7 @@ mod tests {
             .query(
                 authority_addr,
                 authority_question("example.com"),
+                true,
                 Duration::from_secs(1),
             )
             .await
@@ -1066,6 +1079,7 @@ mod tests {
             query.edns.as_ref().map(|edns| edns.udp_payload_size),
             Some(1232)
         );
+        assert_eq!(query.edns.as_ref().map(|edns| edns.dnssec_ok), Some(true));
         assert_eq!(response.message.header.id, 0xbeef);
     }
 
@@ -1091,6 +1105,7 @@ mod tests {
             .query(
                 authority_addr,
                 authority_question("example.com"),
+                false,
                 Duration::from_secs(1),
             )
             .await
@@ -1121,6 +1136,7 @@ mod tests {
             .query(
                 authority_addr,
                 authority_question("example.com"),
+                false,
                 Duration::from_secs(1),
             )
             .await
@@ -1154,6 +1170,7 @@ mod tests {
             .query(
                 authority_addr,
                 authority_question("example.com"),
+                false,
                 Duration::from_secs(1),
             )
             .await
@@ -1187,6 +1204,7 @@ mod tests {
             .query(
                 authority_addr,
                 authority_question("example.com"),
+                false,
                 Duration::from_secs(1),
             )
             .await
@@ -1209,6 +1227,7 @@ mod tests {
             .query(
                 authority_addr,
                 authority_question("example.com"),
+                false,
                 Duration::from_millis(20),
             )
             .await
