@@ -4556,13 +4556,7 @@ impl RecursiveResolutionBackend {
                     last_error = Some(ResolutionBackendError::NoBackendsAvailable);
                     continue;
                 };
-                let referral_key = referral
-                    .endpoints
-                    .iter()
-                    .map(SocketAddr::to_string)
-                    .collect::<Vec<_>>()
-                    .join(",");
-                let referral_key = format!("{}|{referral_key}", referral.owner);
+                let referral_key = referral_loop_key(&referral);
                 if !seen_referrals.insert(referral_key) {
                     self.increment_metric(ResolverMetric::RecursiveReferralLoop);
                     return Err(ResolutionBackendError::NoBackendsAvailable);
@@ -4591,6 +4585,17 @@ impl RecursiveResolutionBackend {
             .flat_map(|hint| hint.endpoints.iter().copied())
             .collect()
     }
+}
+
+fn referral_loop_key(referral: &ReferralAuthorities) -> String {
+    let mut endpoints = referral.endpoints.clone();
+    endpoints.sort_unstable();
+    let endpoints = endpoints
+        .iter()
+        .map(SocketAddr::to_string)
+        .collect::<Vec<_>>()
+        .join(",");
+    format!("{}|{endpoints}", referral.owner)
 }
 
 impl ResolutionBackend for RecursiveResolutionBackend {
@@ -7577,6 +7582,66 @@ mod tests {
             .unwrap()
             .iter()
             .any(|(metric, _)| *metric == ResolverMetric::RecursiveQueryDuration));
+    }
+
+    #[tokio::test]
+    async fn recursive_backend_detects_reordered_referral_endpoint_loop() {
+        let question = QuestionKey::new("www.example.com", 1, 1);
+        let first_referral = response_message_for_question(
+            question.clone(),
+            ResponseCode::NoError,
+            Vec::new(),
+            vec![
+                ns_record("example.com", 300, "ns1.example.com"),
+                ns_record("example.com", 300, "ns2.example.com"),
+            ],
+            vec![
+                glue_a_record("ns1.example.com", 300, "203.0.113.10".parse().unwrap()),
+                glue_a_record("ns2.example.com", 300, "203.0.113.11".parse().unwrap()),
+            ],
+            false,
+        );
+        let reordered_referral = response_message_for_question(
+            question,
+            ResponseCode::NoError,
+            Vec::new(),
+            vec![
+                ns_record("example.com", 300, "ns2.example.com"),
+                ns_record("example.com", 300, "ns1.example.com"),
+            ],
+            vec![
+                glue_a_record("ns2.example.com", 300, "203.0.113.11".parse().unwrap()),
+                glue_a_record("ns1.example.com", 300, "203.0.113.10".parse().unwrap()),
+            ],
+            false,
+        );
+        let transport = Arc::new(ScriptedAuthorityTransport::new([
+            Ok(first_referral),
+            Ok(reordered_referral),
+        ]));
+        let metrics = Arc::new(RecordingMetrics::default());
+        let backend = RecursiveResolutionBackend::with_metrics(
+            RecursiveResolverConfig {
+                root_hints: vec![RecursiveRootHint {
+                    name: "a.root-servers.example".to_string(),
+                    endpoints: vec!["198.51.100.53:53".parse().unwrap()],
+                }],
+                per_authority_timeout: Duration::from_millis(500),
+                per_query_deadline: Duration::from_secs(2),
+                max_recursion_depth: 8,
+                max_cname_restarts: 4,
+            },
+            transport.clone(),
+            metrics.clone(),
+        );
+
+        assert_eq!(
+            backend.resolve(recursive_request("www.example.com")).await,
+            Err(ResolutionBackendError::NoBackendsAvailable)
+        );
+
+        assert_eq!(metrics.count(ResolverMetric::RecursiveReferralLoop), 1);
+        assert_eq!(transport.requests.lock().unwrap().len(), 2);
     }
 
     #[tokio::test]
