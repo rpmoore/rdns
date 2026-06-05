@@ -1286,6 +1286,7 @@ pub struct ResolveQuery {
     miss_coalescer: Arc<SingleFlightMisses>,
     backend: Arc<dyn ResolutionBackend>,
     backend_generation: u64,
+    backend_cache_namespace: Option<String>,
     responses: Arc<dyn ResponseFactory>,
     clock: Arc<dyn Clock>,
     events: Arc<dyn QueryEventSink>,
@@ -1342,6 +1343,7 @@ impl ResolveQuery {
         events: Arc<dyn QueryEventSink>,
         metrics: Arc<dyn MetricsSink>,
     ) -> Self {
+        let backend_cache_namespace = backend_cache_namespace(backend_generation);
         Self {
             protocol,
             cache,
@@ -1349,6 +1351,7 @@ impl ResolveQuery {
             miss_coalescer: Arc::new(SingleFlightMisses::default()),
             backend,
             backend_generation,
+            backend_cache_namespace,
             responses,
             clock,
             events,
@@ -1550,7 +1553,7 @@ impl ResolveQuery {
 
         let key = CacheKey::from_query(
             decoded,
-            self.backend_cache_namespace(),
+            self.backend_cache_namespace.clone(),
             self.protocol.configured_max_udp_payload_size(),
         );
         let lookup = self
@@ -1795,14 +1798,6 @@ impl ResolveQuery {
             stored_at,
             ttl,
         })
-    }
-
-    fn backend_cache_namespace(&self) -> Option<String> {
-        if self.backend_generation == 0 {
-            None
-        } else {
-            Some(format!("backend-generation:{}", self.backend_generation))
-        }
     }
 
     async fn finish(
@@ -2126,6 +2121,14 @@ fn decoded_original_question_name(decoded: &DecodedQuery) -> Option<String> {
         .questions
         .first()
         .map(|question| question.qname.clone())
+}
+
+fn backend_cache_namespace(backend_generation: u64) -> Option<String> {
+    if backend_generation == 0 {
+        None
+    } else {
+        Some(format!("backend-generation:{backend_generation}"))
+    }
 }
 
 fn validate_backend_response(

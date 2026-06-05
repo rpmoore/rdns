@@ -27,7 +27,9 @@ use tokio::time::{self, Instant};
 
 use crate::config::{RuntimeConfig, UpstreamConfig, UpstreamProtocol};
 use crate::protocol::{encode_tcp_frame, first_question, rewrite_response_id, Message};
-use crate::resolver::{ResolutionBackend, UpstreamError, UpstreamRequest, UpstreamResponse};
+use crate::resolver::{
+    QuestionKey, ResolutionBackend, UpstreamError, UpstreamRequest, UpstreamResponse,
+};
 
 const DEGRADED_FAILURE_THRESHOLD: u32 = 2;
 const DEGRADED_RETRY_AFTER: Duration = Duration::from_secs(30);
@@ -499,7 +501,8 @@ fn validate_response_question_prefix(
     response_bytes: &[u8],
 ) -> Result<(), UpstreamError> {
     let question = first_question(response_bytes).map_err(|_| UpstreamError::MalformedResponse)?;
-    if question != request.query.message.questions[0] {
+    let response_question = QuestionKey::new(&question.qname, question.qtype, question.qclass);
+    if response_question != request.query.question {
         return Err(UpstreamError::QuestionMismatch);
     }
     Ok(())
@@ -553,7 +556,9 @@ fn validate_upstream_response(
     if !response.header.qr() {
         return Err(UpstreamError::MalformedResponse);
     }
-    if response.questions.len() != 1 || response.questions[0] != request.query.message.questions[0]
+    if response.questions.len() != 1
+        || QuestionKey::from_message(&response).ok_or(UpstreamError::QuestionMismatch)?
+            != request.query.question
     {
         return Err(UpstreamError::QuestionMismatch);
     }
@@ -669,6 +674,27 @@ mod tests {
             query,
             backend_generation: 0,
         }
+    }
+
+    #[test]
+    fn validate_upstream_response_accepts_normalized_question_name() {
+        let request = upstream_request(0x1234, "Example.COM");
+        let response = a_response(0x5555, "example.com");
+
+        let parsed = validate_upstream_response(&request, &response, 0x5555).unwrap();
+
+        assert_eq!(
+            QuestionKey::from_message(&parsed),
+            Some(QuestionKey::new("example.com", 1, 1))
+        );
+    }
+
+    #[test]
+    fn truncated_response_prefix_accepts_normalized_question_name() {
+        let request = upstream_request(0x1234, "Example.COM");
+        let response = truncated_response(0x5555, "example.com");
+
+        assert!(truncated_response_matches_request(&request, &response, 0x5555).unwrap());
     }
 
     async fn read_tcp_query(stream: &mut TcpStream) -> Vec<u8> {
