@@ -24,6 +24,7 @@ use std::time::{Duration, SystemTime};
 
 use bytes::Bytes;
 use tokio::sync::{mpsc, Notify};
+use tokio::time::{self, Instant};
 
 use crate::protocol::{
     age_response_ttls, build_formerr_response, build_refused_response, build_servfail_response,
@@ -3850,6 +3851,8 @@ pub struct RecursiveRootHint {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RecursiveResolverConfig {
     pub root_hints: Vec<RecursiveRootHint>,
+    pub per_authority_timeout: Duration,
+    pub per_query_deadline: Duration,
     pub max_recursion_depth: u8,
     pub max_cname_restarts: u8,
 }
@@ -3859,6 +3862,7 @@ pub trait RecursiveAuthorityTransport: Send + Sync {
         &'a self,
         authority: SocketAddr,
         question: QuestionKey,
+        timeout: Duration,
     ) -> BoxFuture<'a, Result<RecursiveAuthorityResponse, ResolutionBackendError>>;
 }
 
@@ -3904,6 +3908,7 @@ impl RecursiveResolutionBackend {
         let mut seen_cnames = HashSet::from([question.qname.clone()]);
         let mut cname_chain = Vec::new();
         let mut cname_restarts = 0u8;
+        let query_deadline = Instant::now() + self.config.per_query_deadline;
 
         for _ in 0..self.config.max_recursion_depth {
             if authorities.is_empty() {
@@ -3913,10 +3918,27 @@ impl RecursiveResolutionBackend {
             let mut next_authorities = None;
 
             for authority in authorities.iter().copied() {
-                let response = match self.transport.query(authority, question.clone()).await {
-                    Ok(response) => response,
-                    Err(error) => {
+                let Some(remaining) = query_deadline.checked_duration_since(Instant::now()) else {
+                    return Err(ResolutionBackendError::Timeout);
+                };
+                if remaining.is_zero() {
+                    return Err(ResolutionBackendError::Timeout);
+                }
+                let attempt_timeout = remaining.min(self.config.per_authority_timeout);
+                let response = match time::timeout(
+                    attempt_timeout,
+                    self.transport
+                        .query(authority, question.clone(), attempt_timeout),
+                )
+                .await
+                {
+                    Ok(Ok(response)) => response,
+                    Ok(Err(error)) => {
                         last_error = Some(error);
+                        continue;
+                    }
+                    Err(_) => {
+                        last_error = Some(ResolutionBackendError::Timeout);
                         continue;
                     }
                 };
@@ -5711,6 +5733,7 @@ mod tests {
     struct ScriptedAuthorityTransport {
         responses: Mutex<VecDeque<Result<RecursiveAuthorityResponse, ResolutionBackendError>>>,
         requests: Mutex<Vec<(SocketAddr, QuestionKey)>>,
+        timeouts: Mutex<Vec<Duration>>,
     }
 
     impl ScriptedAuthorityTransport {
@@ -5732,6 +5755,7 @@ mod tests {
                         .collect(),
                 ),
                 requests: Mutex::new(Vec::new()),
+                timeouts: Mutex::new(Vec::new()),
             }
         }
     }
@@ -5741,14 +5765,32 @@ mod tests {
             &'a self,
             authority: SocketAddr,
             question: QuestionKey,
+            timeout: Duration,
         ) -> BoxFuture<'a, Result<RecursiveAuthorityResponse, ResolutionBackendError>> {
             Box::pin(async move {
                 self.requests.lock().unwrap().push((authority, question));
+                self.timeouts.lock().unwrap().push(timeout);
                 self.responses
                     .lock()
                     .unwrap()
                     .pop_front()
                     .unwrap_or(Err(ResolutionBackendError::NoBackendsAvailable))
+            })
+        }
+    }
+
+    struct HangingAuthorityTransport;
+
+    impl RecursiveAuthorityTransport for HangingAuthorityTransport {
+        fn query<'a>(
+            &'a self,
+            _authority: SocketAddr,
+            _question: QuestionKey,
+            _timeout: Duration,
+        ) -> BoxFuture<'a, Result<RecursiveAuthorityResponse, ResolutionBackendError>> {
+            Box::pin(async move {
+                std::future::pending::<Result<RecursiveAuthorityResponse, ResolutionBackendError>>()
+                    .await
             })
         }
     }
@@ -5879,12 +5921,30 @@ mod tests {
         endpoints: Vec<SocketAddr>,
         max_recursion_depth: u8,
     ) -> RecursiveResolutionBackend {
+        recursive_backend_with_timing(
+            transport,
+            endpoints,
+            Duration::from_millis(500),
+            Duration::from_secs(2),
+            max_recursion_depth,
+        )
+    }
+
+    fn recursive_backend_with_timing(
+        transport: Arc<ScriptedAuthorityTransport>,
+        endpoints: Vec<SocketAddr>,
+        per_authority_timeout: Duration,
+        per_query_deadline: Duration,
+        max_recursion_depth: u8,
+    ) -> RecursiveResolutionBackend {
         RecursiveResolutionBackend::new(
             RecursiveResolverConfig {
                 root_hints: vec![RecursiveRootHint {
                     name: "a.root-servers.example".to_string(),
                     endpoints,
                 }],
+                per_authority_timeout,
+                per_query_deadline,
                 max_recursion_depth,
                 max_cname_restarts: 4,
             },
@@ -6244,6 +6304,8 @@ mod tests {
                     name: "a.root-servers.example".to_string(),
                     endpoints: vec!["198.51.100.53:53".parse().unwrap()],
                 }],
+                per_authority_timeout: Duration::from_millis(500),
+                per_query_deadline: Duration::from_secs(2),
                 max_recursion_depth: 1,
                 max_cname_restarts: 4,
             },
@@ -6285,6 +6347,63 @@ mod tests {
         let requests = transport.requests.lock().unwrap();
         assert_eq!(requests.len(), 2);
         assert_eq!(requests[1], (second_authority, question));
+    }
+
+    #[tokio::test]
+    async fn recursive_backend_bounds_attempt_timeout_by_query_deadline() {
+        let question = QuestionKey::new("example.com", 1, 1);
+        let transport = Arc::new(ScriptedAuthorityTransport::new([Ok(
+            response_message_for_question(
+                question,
+                ResponseCode::NoError,
+                vec![a_record("example.com", 60)],
+                Vec::new(),
+                Vec::new(),
+                true,
+            ),
+        )]));
+        let backend = recursive_backend_with_timing(
+            transport.clone(),
+            vec!["198.51.100.53:53".parse().unwrap()],
+            Duration::from_secs(5),
+            Duration::from_millis(50),
+            8,
+        );
+
+        let response = backend
+            .resolve(recursive_request("example.com"))
+            .await
+            .unwrap();
+
+        assert_eq!(response.answers().len(), 1);
+        let timeouts = transport.timeouts.lock().unwrap();
+        assert_eq!(timeouts.len(), 1);
+        assert!(timeouts[0] <= Duration::from_millis(50));
+    }
+
+    #[tokio::test]
+    async fn recursive_backend_enforces_transport_attempt_timeout() {
+        let backend = RecursiveResolutionBackend::new(
+            RecursiveResolverConfig {
+                root_hints: vec![RecursiveRootHint {
+                    name: "a.root-servers.example".to_string(),
+                    endpoints: vec!["198.51.100.53:53".parse().unwrap()],
+                }],
+                per_authority_timeout: Duration::from_millis(20),
+                per_query_deadline: Duration::from_secs(1),
+                max_recursion_depth: 8,
+                max_cname_restarts: 4,
+            },
+            Arc::new(HangingAuthorityTransport),
+        );
+
+        let result = time::timeout(
+            Duration::from_millis(200),
+            backend.resolve(recursive_request("example.com")),
+        )
+        .await;
+
+        assert_eq!(result.unwrap(), Err(ResolutionBackendError::Timeout));
     }
 
     #[tokio::test]

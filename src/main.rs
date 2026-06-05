@@ -21,12 +21,13 @@ use opentelemetry_otlp::MetricExporter;
 use opentelemetry_sdk::metrics::{PeriodicReader, SdkMeterProvider};
 use rdns::config::{ResolutionMode as ConfigResolutionMode, RuntimeConfig};
 use rdns::delivery::dns::UdpDnsServer;
-use rdns::delivery::upstream::ForwardingResolutionBackend;
+use rdns::delivery::upstream::{ForwardingResolutionBackend, RecursiveAuthorityTransportClient};
 use rdns::resolver::{
     BackendHealth, BackendSnapshot, BasicResponseFactory, CacheTtlPolicy, ChannelQueryEventSink,
     Clock, InMemoryDnsCache, InMemoryQueryEventStore, InMemoryQueryEventStoreConfig,
     InMemorySuspiciousLookupClassifier, InMemorySuspiciousLookupClassifierConfig, MetricsSink,
-    QueryEventRecordResult, QueryEventSink, QueryEventV1, ResolutionMode as ResolverResolutionMode,
+    QueryEventRecordResult, QueryEventSink, QueryEventV1, RecursiveResolutionBackend,
+    RecursiveResolverConfig, RecursiveRootHint, ResolutionMode as ResolverResolutionMode,
     ResolveQuery, ResolverMetric, StandardProtocolCodec,
 };
 use tokio::task::{JoinError, JoinSet};
@@ -159,9 +160,44 @@ fn build_backend_snapshot(config: &RuntimeConfig) -> io::Result<BackendSnapshot>
                 Some(config.backend_cache_namespace()),
             ))
         }
-        ConfigResolutionMode::Recursive => Err(io::Error::other(
-            "recursive resolution mode is configured but no recursive backend is available yet",
-        )),
+        ConfigResolutionMode::Recursive => {
+            let recursive = config
+                .resolution
+                .recursive
+                .as_ref()
+                .ok_or_else(|| io::Error::other("recursive resolution config is missing"))?;
+            let root_hints = recursive
+                .load_root_hints()
+                .map_err(|error| io::Error::other(format!("invalid root hints: {error:?}")))?
+                .into_iter()
+                .map(|hint| RecursiveRootHint {
+                    name: hint.name,
+                    endpoints: hint.endpoints,
+                })
+                .collect();
+            let transport = Arc::new(
+                RecursiveAuthorityTransportClient::from_runtime_config(config).map_err(
+                    |error| io::Error::other(format!("invalid recursive transport: {error:?}")),
+                )?,
+            );
+            let backend = Arc::new(RecursiveResolutionBackend::new(
+                RecursiveResolverConfig {
+                    root_hints,
+                    per_authority_timeout: recursive.per_authority_timeout,
+                    per_query_deadline: config.per_query_deadline,
+                    max_recursion_depth: recursive.max_recursion_depth,
+                    max_cname_restarts: recursive.max_cname_restarts,
+                },
+                transport,
+            ));
+            Ok(BackendSnapshot::new(
+                backend,
+                ResolverResolutionMode::Recursive,
+                config.resolution.generation,
+                BackendHealth::Healthy,
+                Some(config.backend_cache_namespace()),
+            ))
+        }
     }
 }
 
