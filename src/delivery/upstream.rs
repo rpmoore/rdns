@@ -28,8 +28,9 @@ use tokio::time::{self, Instant};
 use crate::config::{RecursiveTransport, RuntimeConfig, UpstreamConfig, UpstreamProtocol};
 use crate::protocol::{encode_tcp_frame, first_question, rewrite_response_id, Message};
 use crate::resolver::{
-    QuestionKey, RecursiveAuthorityResponse, RecursiveAuthorityTransport, ResolutionBackend,
-    UpstreamError, UpstreamRequest, UpstreamResponse,
+    MetricsSink, NoopMetricsSink, QuestionKey, RecursiveAuthorityResponse,
+    RecursiveAuthorityTransport, ResolutionBackend, ResolverMetric, UpstreamError, UpstreamRequest,
+    UpstreamResponse,
 };
 
 const DEGRADED_FAILURE_THRESHOLD: u32 = 2;
@@ -116,6 +117,7 @@ pub struct RecursiveAuthorityTransportClient {
     id_generator: Arc<dyn TransactionIdGenerator>,
     allowed_transports: Vec<RecursiveTransport>,
     max_udp_payload_size: usize,
+    metrics: Arc<dyn MetricsSink>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -404,7 +406,13 @@ impl RecursiveAuthorityTransportClient {
             id_generator,
             allowed_transports,
             max_udp_payload_size,
+            metrics: Arc::new(NoopMetricsSink),
         }
+    }
+
+    pub fn with_metrics(mut self, metrics: Arc<dyn MetricsSink>) -> Self {
+        self.metrics = metrics;
+        self
     }
 
     async fn query_authority(
@@ -462,7 +470,14 @@ impl RecursiveAuthorityTransportClient {
         validate_upstream_response_source(source, authority)?;
         if truncated_authority_response_matches_question(question, &response_bytes, authority_id)? {
             if self.transport_allowed(RecursiveTransport::Tcp) {
-                return query_authority_tcp(authority, question, query, authority_id, deadline)
+                return self
+                    .query_authority_tcp_fallback(
+                        authority,
+                        question,
+                        query,
+                        authority_id,
+                        deadline,
+                    )
                     .await;
             }
             return Err(UpstreamError::MalformedResponse);
@@ -471,12 +486,44 @@ impl RecursiveAuthorityTransportClient {
         let response = validate_authority_response(question, &response_bytes, authority_id)?;
         if response.header.tc() {
             if self.transport_allowed(RecursiveTransport::Tcp) {
-                return query_authority_tcp(authority, question, query, authority_id, deadline)
+                return self
+                    .query_authority_tcp_fallback(
+                        authority,
+                        question,
+                        query,
+                        authority_id,
+                        deadline,
+                    )
                     .await;
             }
             return Err(UpstreamError::MalformedResponse);
         }
         RecursiveAuthorityResponse::new(response_bytes, response)
+    }
+
+    async fn query_authority_tcp_fallback(
+        &self,
+        authority: SocketAddr,
+        question: &QuestionKey,
+        query: &[u8],
+        authority_id: u16,
+        deadline: Instant,
+    ) -> Result<RecursiveAuthorityResponse, UpstreamError> {
+        self.metrics
+            .increment(ResolverMetric::RecursiveTcpFallbackAttempt);
+        let result = query_authority_tcp(authority, question, query, authority_id, deadline).await;
+        match &result {
+            Ok(_) => self
+                .metrics
+                .increment(ResolverMetric::RecursiveTcpFallbackSuccess),
+            Err(UpstreamError::Timeout) => self
+                .metrics
+                .increment(ResolverMetric::RecursiveTcpFallbackTimeout),
+            Err(_) => self
+                .metrics
+                .increment(ResolverMetric::RecursiveTcpFallbackFailure),
+        }
+        result
     }
 
     fn transport_allowed(&self, transport: RecursiveTransport) -> bool {
@@ -973,6 +1020,30 @@ mod tests {
         RecursiveAuthorityTransportClient::with_id_generator(transports, 1232, id_generator)
     }
 
+    #[derive(Default)]
+    struct RecordingMetrics {
+        increments: Mutex<Vec<ResolverMetric>>,
+    }
+
+    impl MetricsSink for RecordingMetrics {
+        fn increment(&self, metric: ResolverMetric) {
+            self.increments.lock().unwrap().push(metric);
+        }
+
+        fn observe_duration(&self, _metric: ResolverMetric, _duration: Duration) {}
+    }
+
+    impl RecordingMetrics {
+        fn count(&self, metric: ResolverMetric) -> usize {
+            self.increments
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|increment| **increment == metric)
+                .count()
+        }
+    }
+
     #[test]
     fn validate_upstream_response_accepts_normalized_question_name() {
         let request = upstream_request(0x1234, "Example.COM");
@@ -1165,6 +1236,8 @@ mod tests {
             vec![RecursiveTransport::Udp, RecursiveTransport::Tcp],
             Arc::new(FixedTransactionId(0xbeef)),
         );
+        let metrics = Arc::new(RecordingMetrics::default());
+        let transport = transport.with_metrics(metrics.clone());
 
         let response = transport
             .query(
@@ -1178,6 +1251,22 @@ mod tests {
 
         authority_task.await.unwrap();
         assert_eq!(response.message.header.id, 0xbeef);
+        assert_eq!(
+            metrics.count(ResolverMetric::RecursiveTcpFallbackAttempt),
+            1
+        );
+        assert_eq!(
+            metrics.count(ResolverMetric::RecursiveTcpFallbackSuccess),
+            1
+        );
+        assert_eq!(
+            metrics.count(ResolverMetric::RecursiveTcpFallbackFailure),
+            0
+        );
+        assert_eq!(
+            metrics.count(ResolverMetric::RecursiveTcpFallbackTimeout),
+            0
+        );
     }
 
     #[tokio::test]

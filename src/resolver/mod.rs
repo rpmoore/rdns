@@ -621,6 +621,13 @@ fn referral_authorities(message: &Message, question: &QuestionKey) -> Option<Ref
     Some(ReferralAuthorities { owner, endpoints })
 }
 
+fn has_delegation_for_question(message: &Message, question: &QuestionKey) -> bool {
+    message.authorities.iter().any(|record| {
+        matches!(record.record, RecordData::NS(_))
+            && is_delegation_owner_for_question(&record.name, &question.qname)
+    })
+}
+
 fn is_delegation_owner_for_question(owner: &str, qname: &str) -> bool {
     let owner = normalize_question_name(owner);
     let qname = normalize_question_name(qname);
@@ -974,6 +981,41 @@ pub enum DnssecValidationStatus {
     Disabled,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BackendStatus {
+    pub mode: ResolutionMode,
+    pub generation: u64,
+    pub health: BackendHealth,
+    pub dnssec_validation: DnssecValidationStatus,
+    pub cache_namespace: Option<String>,
+    pub root_hints: Option<BackendRootHintsStatus>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BackendRootHintsStatus {
+    pub source: String,
+    pub version: String,
+    pub loaded_at: SystemTime,
+}
+
+impl BackendRootHintsStatus {
+    pub fn loaded(
+        source: impl Into<String>,
+        version: impl Into<String>,
+        loaded_at: SystemTime,
+    ) -> Self {
+        Self {
+            source: source.into(),
+            version: version.into(),
+            loaded_at,
+        }
+    }
+
+    pub fn age_at(&self, now: SystemTime) -> Option<Duration> {
+        now.duration_since(self.loaded_at).ok()
+    }
+}
+
 #[derive(Clone)]
 pub struct BackendSnapshot {
     pub backend: Arc<dyn ResolutionBackend>,
@@ -982,6 +1024,7 @@ pub struct BackendSnapshot {
     pub health: BackendHealth,
     pub dnssec_validation: DnssecValidationStatus,
     pub cache_namespace: Option<String>,
+    pub root_hints: Option<BackendRootHintsStatus>,
 }
 
 impl BackendSnapshot {
@@ -999,6 +1042,23 @@ impl BackendSnapshot {
             health,
             dnssec_validation: DnssecValidationStatus::Disabled,
             cache_namespace,
+            root_hints: None,
+        }
+    }
+
+    pub fn with_root_hints_status(mut self, root_hints: BackendRootHintsStatus) -> Self {
+        self.root_hints = Some(root_hints);
+        self
+    }
+
+    pub fn status(&self) -> BackendStatus {
+        BackendStatus {
+            mode: self.mode,
+            generation: self.generation,
+            health: self.health,
+            dnssec_validation: self.dnssec_validation,
+            cache_namespace: self.cache_namespace.clone(),
+            root_hints: self.root_hints.clone(),
         }
     }
 
@@ -1033,7 +1093,11 @@ impl BackendHandle {
         Arc::clone(&snapshot)
     }
 
-    pub fn publish(&self, snapshot: BackendSnapshot) {
+    pub fn status(&self) -> BackendStatus {
+        self.current().status()
+    }
+
+    fn publish(&self, snapshot: BackendSnapshot) {
         let mut current = self
             .snapshot
             .write()
@@ -1292,12 +1356,13 @@ pub struct QueryEventV1 {
     pub terminal_outcome: QueryEventOutcome,
     pub response_code: Option<u16>,
     pub cache_result: Option<QueryEventCacheResult>,
+    pub backend: Option<QueryEventBackend>,
     pub latency: Option<Duration>,
     pub advisory_findings: Vec<QueryEventClassifierFinding>,
 }
 
 impl QueryEventV1 {
-    pub const SCHEMA_VERSION: u8 = 1;
+    pub const SCHEMA_VERSION: u8 = 2;
 
     pub fn from_decision(
         sequence: u64,
@@ -1343,8 +1408,30 @@ impl QueryEventV1 {
             terminal_outcome: QueryEventOutcome::from_decision_kind(&decision.kind),
             response_code,
             cache_result,
+            backend: None,
             latency,
             advisory_findings: Vec::new(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct QueryEventBackend {
+    pub mode: ResolutionMode,
+    pub generation: u64,
+    pub health: BackendHealth,
+    pub cache_namespace: Option<String>,
+    pub dnssec_validation: DnssecValidationStatus,
+}
+
+impl QueryEventBackend {
+    fn from_snapshot(snapshot: &BackendSnapshot) -> Self {
+        Self {
+            mode: snapshot.mode,
+            generation: snapshot.generation,
+            health: snapshot.health,
+            cache_namespace: snapshot.cache_namespace.clone(),
+            dnssec_validation: snapshot.dnssec_validation,
         }
     }
 }
@@ -1940,6 +2027,7 @@ impl ResolveQuery {
         events: Arc<dyn QueryEventSink>,
         metrics: Arc<dyn MetricsSink>,
     ) -> Self {
+        metrics.record_backend_status(&backend_snapshot.status());
         Self {
             protocol,
             cache,
@@ -1954,6 +2042,16 @@ impl ResolveQuery {
         }
     }
 
+    pub fn backend_status(&self) -> BackendStatus {
+        self.backend.status()
+    }
+
+    pub fn publish_backend_snapshot(&self, snapshot: BackendSnapshot) {
+        let status = snapshot.status();
+        self.backend.publish(snapshot);
+        self.metrics.record_backend_status(&status);
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub fn with_cache_and_backend_handle(
         protocol: Arc<dyn ProtocolCodec>,
@@ -1965,6 +2063,7 @@ impl ResolveQuery {
         events: Arc<dyn QueryEventSink>,
         metrics: Arc<dyn MetricsSink>,
     ) -> Self {
+        metrics.record_backend_status(&backend_handle.status());
         Self {
             protocol,
             cache,
@@ -2015,7 +2114,15 @@ impl ResolveQuery {
                 };
                 let response_bytes = self.responses.protocol_error(request_id, &error);
                 return self
-                    .finish(started_at, &request, None, decision, response_bytes, None)
+                    .finish(
+                        started_at,
+                        &request,
+                        None,
+                        decision,
+                        response_bytes,
+                        None,
+                        Some(QueryEventBackend::from_snapshot(&backend_snapshot)),
+                    )
                     .await;
             }
         };
@@ -2040,6 +2147,7 @@ impl ResolveQuery {
                     decision,
                     response_bytes,
                     cache_probe.event_cache_result,
+                    Some(QueryEventBackend::from_snapshot(&backend_snapshot)),
                 )
                 .await;
         }
@@ -2104,6 +2212,7 @@ impl ResolveQuery {
                     decision,
                     response_bytes,
                     event_cache_result,
+                    Some(QueryEventBackend::from_snapshot(backend_snapshot)),
                 )
                 .await
             }
@@ -2127,10 +2236,12 @@ impl ResolveQuery {
                             decision,
                             response_bytes,
                             Some(QueryEventCacheResult::Hit),
+                            Some(QueryEventBackend::from_snapshot(backend_snapshot)),
                         )
                         .await;
                 }
                 self.finish_backend_result(
+                    backend_snapshot,
                     started_at,
                     request,
                     decoded,
@@ -2159,6 +2270,7 @@ impl ResolveQuery {
     ) -> ResolveOutcome {
         let backend_result = self.resolve_backend(backend_snapshot, decoded).await;
         self.finish_backend_result(
+            backend_snapshot,
             started_at,
             request,
             decoded,
@@ -2289,6 +2401,9 @@ impl ResolveQuery {
             self.protocol
                 .serialize_cached_response(decoded, cached, request.received_at.0)?;
         self.metrics.increment(ResolverMetric::CacheHit);
+        if cached.negative_cache.is_some() {
+            self.metrics.increment(ResolverMetric::CacheNegativeHit);
+        }
         if response_is_truncated(&response_bytes) {
             self.metrics
                 .increment(ResolverMetric::CacheResponseTruncated);
@@ -2299,6 +2414,7 @@ impl ResolveQuery {
     #[allow(clippy::too_many_arguments)]
     async fn finish_backend_result(
         &self,
+        backend_snapshot: &BackendSnapshot,
         started_at: SystemTime,
         request: &ResolveRequest,
         decoded: &DecodedQuery,
@@ -2325,6 +2441,7 @@ impl ResolveQuery {
             decision,
             response_bytes,
             event_cache_result,
+            Some(QueryEventBackend::from_snapshot(backend_snapshot)),
         )
         .await
     }
@@ -2459,10 +2576,11 @@ impl ResolveQuery {
         decision: ResolveDecision,
         response_bytes: Vec<u8>,
         cache_result: Option<QueryEventCacheResult>,
+        backend: Option<QueryEventBackend>,
     ) -> ResolveOutcome {
         let finished_at = self.clock.now();
         let latency = finished_at.duration_since(started_at).ok();
-        let event = QueryEventV1::from_decision_context(
+        let mut event = QueryEventV1::from_decision_context(
             self.event_sequence.fetch_add(1, Ordering::Relaxed),
             finished_at,
             request.observed_source.clone(),
@@ -2472,7 +2590,9 @@ impl ResolveQuery {
             cache_result,
             latency,
         );
+        event.backend = backend;
         self.record_query_event(event);
+        self.metrics.record_backend_status(&self.backend.status());
         if let Some(duration) = latency {
             self.metrics
                 .observe_duration(ResolverMetric::QueryDuration, duration);
@@ -4071,6 +4191,7 @@ impl RecursiveAuthorityResponse {
 pub struct RecursiveResolutionBackend {
     config: RecursiveResolverConfig,
     transport: Arc<dyn RecursiveAuthorityTransport>,
+    metrics: Option<Arc<dyn MetricsSink>>,
 }
 
 impl RecursiveResolutionBackend {
@@ -4078,7 +4199,35 @@ impl RecursiveResolutionBackend {
         config: RecursiveResolverConfig,
         transport: Arc<dyn RecursiveAuthorityTransport>,
     ) -> Self {
-        Self { config, transport }
+        Self {
+            config,
+            transport,
+            metrics: None,
+        }
+    }
+
+    pub fn with_metrics(
+        config: RecursiveResolverConfig,
+        transport: Arc<dyn RecursiveAuthorityTransport>,
+        metrics: Arc<dyn MetricsSink>,
+    ) -> Self {
+        Self {
+            config,
+            transport,
+            metrics: Some(metrics),
+        }
+    }
+
+    fn increment_metric(&self, metric: ResolverMetric) {
+        if let Some(metrics) = &self.metrics {
+            metrics.increment(metric);
+        }
+    }
+
+    fn observe_metric(&self, metric: ResolverMetric, duration: Duration) {
+        if let Some(metrics) = &self.metrics {
+            metrics.observe_duration(metric, duration);
+        }
     }
 
     async fn resolve_iterative(
@@ -4086,6 +4235,7 @@ impl RecursiveResolutionBackend {
         request: ResolutionRequest,
     ) -> Result<ResolutionResponse, ResolutionBackendError> {
         if self.config.root_hints.is_empty() {
+            self.increment_metric(ResolverMetric::RecursiveLimitHit);
             return Err(ResolutionBackendError::NoBackendsAvailable);
         }
 
@@ -4099,6 +4249,7 @@ impl RecursiveResolutionBackend {
 
         for _ in 0..self.config.max_recursion_depth {
             if authorities.is_empty() {
+                self.increment_metric(ResolverMetric::RecursiveLimitHit);
                 return Err(ResolutionBackendError::NoBackendsAvailable);
             }
             let mut last_error = None;
@@ -4106,12 +4257,15 @@ impl RecursiveResolutionBackend {
 
             for authority in authorities.iter().copied() {
                 let Some(remaining) = query_deadline.checked_duration_since(Instant::now()) else {
+                    self.increment_metric(ResolverMetric::RecursiveAuthorityTimeout);
                     return Err(ResolutionBackendError::Timeout);
                 };
                 if remaining.is_zero() {
+                    self.increment_metric(ResolverMetric::RecursiveAuthorityTimeout);
                     return Err(ResolutionBackendError::Timeout);
                 }
                 let attempt_timeout = remaining.min(self.config.per_authority_timeout);
+                self.increment_metric(ResolverMetric::RecursiveAuthorityAttempt);
                 let response = match time::timeout(
                     attempt_timeout,
                     self.transport.query(
@@ -4125,16 +4279,23 @@ impl RecursiveResolutionBackend {
                 {
                     Ok(Ok(response)) => response,
                     Ok(Err(error)) => {
+                        if error == ResolutionBackendError::Timeout {
+                            self.increment_metric(ResolverMetric::RecursiveAuthorityTimeout);
+                        } else {
+                            self.increment_metric(ResolverMetric::RecursiveAuthorityError);
+                        }
                         last_error = Some(error);
                         continue;
                     }
                     Err(_) => {
+                        self.increment_metric(ResolverMetric::RecursiveAuthorityTimeout);
                         last_error = Some(ResolutionBackendError::Timeout);
                         continue;
                     }
                 };
                 let message = &response.message;
                 if let Some(error) = authority_response_error(message, &question) {
+                    self.increment_metric(ResolverMetric::RecursiveAuthorityError);
                     last_error = Some(error);
                     continue;
                 }
@@ -4173,6 +4334,7 @@ impl RecursiveResolutionBackend {
                         if cname_restarts >= self.config.max_cname_restarts
                             || !seen_cnames.insert(next_name)
                         {
+                            self.increment_metric(ResolverMetric::RecursiveLimitHit);
                             return Err(ResolutionBackendError::NoBackendsAvailable);
                         }
                         cname_chain.extend(cname_chain_records(
@@ -4189,6 +4351,11 @@ impl RecursiveResolutionBackend {
                 }
 
                 let Some(referral) = referral_authorities(message, &question) else {
+                    if has_delegation_for_question(message, &question) {
+                        self.increment_metric(ResolverMetric::RecursiveBailiwickReject);
+                    } else {
+                        self.increment_metric(ResolverMetric::RecursiveLameDelegation);
+                    }
                     last_error = Some(ResolutionBackendError::NoBackendsAvailable);
                     continue;
                 };
@@ -4200,6 +4367,7 @@ impl RecursiveResolutionBackend {
                     .join(",");
                 let referral_key = format!("{}|{referral_key}", referral.owner);
                 if !seen_referrals.insert(referral_key) {
+                    self.increment_metric(ResolverMetric::RecursiveReferralLoop);
                     return Err(ResolutionBackendError::NoBackendsAvailable);
                 }
                 next_authorities = Some(referral.endpoints);
@@ -4215,6 +4383,7 @@ impl RecursiveResolutionBackend {
             }
         }
 
+        self.increment_metric(ResolverMetric::RecursiveLimitHit);
         Err(ResolutionBackendError::Timeout)
     }
 
@@ -4232,7 +4401,13 @@ impl ResolutionBackend for RecursiveResolutionBackend {
         &'a self,
         request: ResolutionRequest,
     ) -> BoxFuture<'a, Result<ResolutionResponse, ResolutionBackendError>> {
-        Box::pin(async move { self.resolve_iterative(request).await })
+        Box::pin(async move {
+            self.increment_metric(ResolverMetric::RecursiveQuery);
+            let started = Instant::now();
+            let result = self.resolve_iterative(request).await;
+            self.observe_metric(ResolverMetric::RecursiveQueryDuration, started.elapsed());
+            result
+        })
     }
 }
 
@@ -4265,6 +4440,16 @@ pub trait MetricsSink: Send + Sync {
     fn increment(&self, metric: ResolverMetric);
 
     fn observe_duration(&self, metric: ResolverMetric, duration: Duration);
+
+    fn record_backend_status(&self, _status: &BackendStatus) {}
+}
+
+pub struct NoopMetricsSink;
+
+impl MetricsSink for NoopMetricsSink {
+    fn increment(&self, _metric: ResolverMetric) {}
+
+    fn observe_duration(&self, _metric: ResolverMetric, _duration: Duration) {}
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -4280,6 +4465,7 @@ pub enum ResolverMetric {
     CacheStore,
     CacheStoreSkipped,
     CacheNegativeStore,
+    CacheNegativeHit,
     CacheResponseTruncated,
     CacheCoalescedMiss,
     QueryEventAccepted,
@@ -4289,7 +4475,20 @@ pub enum ResolverMetric {
     QueryEventSampled,
     UpstreamSuccess,
     UpstreamFailure,
+    RecursiveQuery,
+    RecursiveAuthorityAttempt,
+    RecursiveAuthorityTimeout,
+    RecursiveAuthorityError,
+    RecursiveBailiwickReject,
+    RecursiveLameDelegation,
+    RecursiveReferralLoop,
+    RecursiveLimitHit,
+    RecursiveTcpFallbackAttempt,
+    RecursiveTcpFallbackSuccess,
+    RecursiveTcpFallbackFailure,
+    RecursiveTcpFallbackTimeout,
     QueryDuration,
+    RecursiveQueryDuration,
     ProtocolError,
 }
 
@@ -5829,6 +6028,7 @@ mod tests {
     struct RecordingMetrics {
         increments: Mutex<Vec<ResolverMetric>>,
         durations: Mutex<Vec<(ResolverMetric, Duration)>>,
+        backend_statuses: Mutex<Vec<BackendStatus>>,
     }
 
     impl MetricsSink for RecordingMetrics {
@@ -5838,6 +6038,10 @@ mod tests {
 
         fn observe_duration(&self, metric: ResolverMetric, duration: Duration) {
             self.durations.lock().unwrap().push((metric, duration));
+        }
+
+        fn record_backend_status(&self, status: &BackendStatus) {
+            self.backend_statuses.lock().unwrap().push(status.clone());
         }
     }
 
@@ -6727,6 +6931,57 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn recursive_backend_records_query_attempt_and_referral_loop_metrics() {
+        let question = QuestionKey::new("www.example.com", 1, 1);
+        let referral = response_message_for_question(
+            question,
+            ResponseCode::NoError,
+            Vec::new(),
+            vec![ns_record("example.com", 300, "ns1.example.com")],
+            vec![glue_a_record(
+                "ns1.example.com",
+                300,
+                "203.0.113.10".parse().unwrap(),
+            )],
+            false,
+        );
+        let transport = Arc::new(ScriptedAuthorityTransport::new([
+            Ok(referral.clone()),
+            Ok(referral),
+        ]));
+        let metrics = Arc::new(RecordingMetrics::default());
+        let backend = RecursiveResolutionBackend::with_metrics(
+            RecursiveResolverConfig {
+                root_hints: vec![RecursiveRootHint {
+                    name: "a.root-servers.example".to_string(),
+                    endpoints: vec!["198.51.100.53:53".parse().unwrap()],
+                }],
+                per_authority_timeout: Duration::from_millis(500),
+                per_query_deadline: Duration::from_secs(2),
+                max_recursion_depth: 8,
+                max_cname_restarts: 4,
+            },
+            transport,
+            metrics.clone(),
+        );
+
+        assert_eq!(
+            backend.resolve(recursive_request("www.example.com")).await,
+            Err(ResolutionBackendError::NoBackendsAvailable)
+        );
+
+        assert_eq!(metrics.count(ResolverMetric::RecursiveQuery), 1);
+        assert_eq!(metrics.count(ResolverMetric::RecursiveAuthorityAttempt), 2);
+        assert_eq!(metrics.count(ResolverMetric::RecursiveReferralLoop), 1);
+        assert!(metrics
+            .durations
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|(metric, _)| *metric == ResolverMetric::RecursiveQueryDuration));
+    }
+
+    #[tokio::test]
     async fn recursive_backend_fails_over_to_alternate_authority() {
         let question = QuestionKey::new("example.com", 1, 1);
         let second_authority = "198.51.100.54:53".parse().unwrap();
@@ -7057,6 +7312,7 @@ mod tests {
             ),
         )]));
         let backend = Arc::new(recursive_backend(transport.clone()));
+        let events = Arc::new(RecordingEvents::default());
         let service = ResolveQuery::with_cache_and_backend_snapshot(
             Arc::new(StandardProtocolCodec::new(1232)),
             Arc::new(NoopDnsCache),
@@ -7070,7 +7326,7 @@ mod tests {
             ),
             Arc::new(BasicResponseFactory),
             Arc::new(FixedClock(SystemTime::UNIX_EPOCH)),
-            Arc::new(RecordingEvents::default()),
+            events.clone(),
             Arc::new(RecordingMetrics::default()),
         );
 
@@ -7089,6 +7345,17 @@ mod tests {
             DnssecValidationStatus::Disabled
         );
         assert_eq!(transport.requests.lock().unwrap().len(), 1);
+        let recorded_events = events.events.lock().unwrap();
+        assert_eq!(
+            recorded_events[0].backend,
+            Some(QueryEventBackend {
+                mode: ResolutionMode::Recursive,
+                generation: 7,
+                health: BackendHealth::Healthy,
+                cache_namespace: Some("mode:recursive;backend-generation:7".to_string()),
+                dnssec_validation: DnssecValidationStatus::Disabled,
+            })
+        );
     }
 
     #[tokio::test]
@@ -8053,8 +8320,93 @@ mod tests {
         assert_eq!(event.terminal_outcome, QueryEventOutcome::AllowedFromCache);
         assert_eq!(event.response_code, Some(ResponseCode::NoError as u16));
         assert_eq!(event.cache_result, Some(QueryEventCacheResult::Hit));
+        assert_eq!(event.backend, None);
         assert_eq!(event.latency, Some(Duration::from_millis(12)));
         assert!(event.advisory_findings.is_empty());
+    }
+
+    #[test]
+    fn backend_snapshot_status_reports_backend_and_root_hints() {
+        let loaded_at = SystemTime::UNIX_EPOCH + Duration::from_secs(100);
+        let snapshot = BackendSnapshot::new(
+            Arc::new(StaticUpstream::new(Err(UpstreamError::Timeout))),
+            ResolutionMode::Recursive,
+            7,
+            BackendHealth::Healthy,
+            Some("mode:recursive;generation:7".to_string()),
+        )
+        .with_root_hints_status(BackendRootHintsStatus::loaded(
+            "bundled",
+            "root-hints:v1",
+            loaded_at,
+        ));
+
+        let status = snapshot.status();
+
+        assert_eq!(status.mode, ResolutionMode::Recursive);
+        assert_eq!(status.generation, 7);
+        assert_eq!(status.health, BackendHealth::Healthy);
+        assert_eq!(status.dnssec_validation, DnssecValidationStatus::Disabled);
+        assert_eq!(
+            status.cache_namespace.as_deref(),
+            Some("mode:recursive;generation:7")
+        );
+        let root_hints = status.root_hints.unwrap();
+        assert_eq!(root_hints.source, "bundled");
+        assert_eq!(root_hints.version, "root-hints:v1");
+        assert_eq!(
+            root_hints.age_at(loaded_at + Duration::from_secs(5)),
+            Some(Duration::from_secs(5))
+        );
+
+        let metrics = Arc::new(RecordingMetrics::default());
+        let service = ResolveQuery::with_cache_and_backend_snapshot(
+            Arc::new(StandardProtocolCodec::new(1232)),
+            Arc::new(NoopDnsCache),
+            CacheTtlPolicy::default(),
+            snapshot,
+            Arc::new(BasicResponseFactory),
+            Arc::new(FixedClock(SystemTime::UNIX_EPOCH)),
+            Arc::new(RecordingEvents::default()),
+            metrics.clone(),
+        );
+
+        assert_eq!(
+            metrics.backend_statuses.lock().unwrap().as_slice(),
+            &[service.backend_status()]
+        );
+
+        service.publish_backend_snapshot(BackendSnapshot::new(
+            Arc::new(StaticUpstream::new(Err(UpstreamError::NoBackendsAvailable))),
+            ResolutionMode::Forward,
+            8,
+            BackendHealth::Degraded,
+            Some("mode:forward;generation:8".to_string()),
+        ));
+
+        let status = service.backend_status();
+        assert_eq!(status.mode, ResolutionMode::Forward);
+        assert_eq!(status.generation, 8);
+        assert_eq!(status.health, BackendHealth::Degraded);
+        assert_eq!(status.root_hints, None);
+        assert_eq!(
+            metrics.backend_statuses.lock().unwrap().as_slice(),
+            &[
+                BackendStatus {
+                    mode: ResolutionMode::Recursive,
+                    generation: 7,
+                    health: BackendHealth::Healthy,
+                    dnssec_validation: DnssecValidationStatus::Disabled,
+                    cache_namespace: Some("mode:recursive;generation:7".to_string()),
+                    root_hints: Some(BackendRootHintsStatus::loaded(
+                        "bundled",
+                        "root-hints:v1",
+                        loaded_at,
+                    )),
+                },
+                status,
+            ]
+        );
     }
 
     #[test]
@@ -8501,7 +8853,14 @@ mod tests {
             response_template: a_response_with_answer(0, "example.com", 60),
             response_code: ResponseCode::NoError,
             minimum_ttl: Duration::from_secs(60),
-            negative_cache: None,
+            negative_cache: Some(negative_metadata(
+                "example.com",
+                "example.com",
+                1,
+                1,
+                NegativeCacheKind::NoData,
+                Duration::from_secs(60),
+            )),
             stored_at: SystemTime::UNIX_EPOCH,
             ttl: Duration::from_secs(60),
         });
@@ -8544,6 +8903,7 @@ mod tests {
             );
         }
         assert_eq!(metrics.count(ResolverMetric::CacheHit), 1);
+        assert_eq!(metrics.count(ResolverMetric::CacheNegativeHit), 1);
         assert_eq!(metrics.count(ResolverMetric::CacheMiss), 0);
     }
 
@@ -8958,6 +9318,7 @@ mod tests {
             a_response_with_answer(0x1234, "example.com", 60),
         ))));
         let handle = BackendHandle::new(BackendSnapshot::forwarding(first_backend.clone(), 1));
+        let metrics = Arc::new(RecordingMetrics::default());
         let service = ResolveQuery::with_cache_and_backend_handle(
             Arc::new(StandardProtocolCodec::new(1232)),
             Arc::new(NoopDnsCache),
@@ -8966,16 +9327,18 @@ mod tests {
             Arc::new(BasicResponseFactory),
             Arc::new(FixedClock(SystemTime::UNIX_EPOCH)),
             Arc::new(RecordingEvents::default()),
-            Arc::new(RecordingMetrics::default()),
+            metrics.clone(),
         );
+        assert_eq!(metrics.backend_statuses.lock().unwrap().len(), 1);
 
-        handle.publish(BackendSnapshot::new(
+        service.publish_backend_snapshot(BackendSnapshot::new(
             second_backend.clone(),
             ResolutionMode::Forward,
             2,
             BackendHealth::Degraded,
             Some("mode:forward;backend-generation:2".to_string()),
         ));
+        assert_eq!(metrics.backend_statuses.lock().unwrap().len(), 2);
         let outcome = service
             .resolve(ResolveRequest::new(
                 "192.0.2.10".parse().unwrap(),
@@ -8989,6 +9352,9 @@ mod tests {
         let requests = second_backend.requests.lock().unwrap();
         assert_eq!(requests.len(), 1);
         assert_eq!(requests[0].backend_generation, 2);
+        let statuses = metrics.backend_statuses.lock().unwrap();
+        assert_eq!(statuses.len(), 3);
+        assert_eq!(statuses[2].generation, 2);
     }
 
     #[tokio::test]
