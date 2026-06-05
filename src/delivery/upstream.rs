@@ -19,6 +19,7 @@ use std::sync::atomic::{AtomicU16, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use bytes::Bytes;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::net::UdpSocket;
@@ -26,7 +27,9 @@ use tokio::time::{self, Instant};
 
 use crate::config::{RuntimeConfig, UpstreamConfig, UpstreamProtocol};
 use crate::protocol::{encode_tcp_frame, first_question, rewrite_response_id, Message};
-use crate::resolver::{UpstreamError, UpstreamRequest, UpstreamResolver, UpstreamResponse};
+use crate::resolver::{
+    QuestionKey, ResolutionBackend, UpstreamError, UpstreamRequest, UpstreamResponse,
+};
 
 const DEGRADED_FAILURE_THRESHOLD: u32 = 2;
 const DEGRADED_RETRY_AFTER: Duration = Duration::from_secs(30);
@@ -157,7 +160,7 @@ impl UdpUpstreamResolver {
     ) -> Result<Self, UpstreamError> {
         let upstreams = ordered_enabled_udp_upstreams(upstreams);
         if upstreams.is_empty() {
-            return Err(UpstreamError::NoUpstreamsAvailable);
+            return Err(UpstreamError::NoBackendsAvailable);
         }
         let health = upstreams
             .iter()
@@ -261,7 +264,8 @@ impl UdpUpstreamResolver {
                 .resolve_tcp_fallback_attempt(upstream, request, upstream_query, attempt)
                 .await;
         }
-        let response = validate_upstream_response(request, &response_bytes, attempt.upstream_id)?;
+        let mut response =
+            validate_upstream_response(request, &response_bytes, attempt.upstream_id)?;
         if response.header.tc() {
             return self
                 .resolve_tcp_fallback_attempt(upstream, request, upstream_query, attempt)
@@ -269,11 +273,16 @@ impl UdpUpstreamResolver {
         }
         rewrite_response_id(&mut response_bytes, attempt.client_id)
             .map_err(|_| UpstreamError::MalformedResponse)?;
+        response.header.id = attempt.client_id;
+        response.original_bytes = Bytes::copy_from_slice(&response_bytes);
 
-        Ok(UpstreamResponse {
-            bytes: response_bytes,
-            received_at: SystemTime::now(),
-        })
+        Ok(UpstreamResponse::forwarded_message(
+            response_bytes,
+            response,
+            SystemTime::now(),
+            request.backend_generation,
+            upstream.name.clone(),
+        ))
     }
 
     async fn resolve_with_failover(
@@ -422,13 +431,18 @@ async fn resolve_tcp_fallback(
     .map_err(|_| UpstreamError::Timeout)?
     .map_err(transport_error)?;
 
-    validate_upstream_response(request, &response_bytes, upstream_id)?;
+    let mut response = validate_upstream_response(request, &response_bytes, upstream_id)?;
     rewrite_response_id(&mut response_bytes, client_id)
         .map_err(|_| UpstreamError::MalformedResponse)?;
-    Ok(UpstreamResponse {
-        bytes: response_bytes,
-        received_at: SystemTime::now(),
-    })
+    response.header.id = client_id;
+    response.original_bytes = Bytes::copy_from_slice(&response_bytes);
+    Ok(UpstreamResponse::forwarded_message(
+        response_bytes,
+        response,
+        SystemTime::now(),
+        request.backend_generation,
+        upstream.name.clone(),
+    ))
 }
 
 fn remaining_until(deadline: Instant) -> Result<Duration, UpstreamError> {
@@ -487,13 +501,14 @@ fn validate_response_question_prefix(
     response_bytes: &[u8],
 ) -> Result<(), UpstreamError> {
     let question = first_question(response_bytes).map_err(|_| UpstreamError::MalformedResponse)?;
-    if question != request.query.message.questions[0] {
+    let response_question = QuestionKey::new(&question.qname, question.qtype, question.qclass);
+    if response_question != request.query.question {
         return Err(UpstreamError::QuestionMismatch);
     }
     Ok(())
 }
 
-impl UpstreamResolver for UdpUpstreamResolver {
+impl ResolutionBackend for UdpUpstreamResolver {
     fn resolve<'a>(
         &'a self,
         request: UpstreamRequest,
@@ -541,7 +556,9 @@ fn validate_upstream_response(
     if !response.header.qr() {
         return Err(UpstreamError::MalformedResponse);
     }
-    if response.questions.len() != 1 || response.questions[0] != request.query.message.questions[0]
+    if response.questions.len() != 1
+        || QuestionKey::from_message(&response).ok_or(UpstreamError::QuestionMismatch)?
+            != request.query.question
     {
         return Err(UpstreamError::QuestionMismatch);
     }
@@ -653,7 +670,31 @@ mod tests {
     fn upstream_request(id: u16, name: &str) -> UpstreamRequest {
         let message = Message::parse_standard_query(&a_query(id, name)).unwrap();
         let query = DecodedQuery::new(message).unwrap();
-        UpstreamRequest { query }
+        UpstreamRequest {
+            query,
+            backend_generation: 0,
+        }
+    }
+
+    #[test]
+    fn validate_upstream_response_accepts_normalized_question_name() {
+        let request = upstream_request(0x1234, "Example.COM");
+        let response = a_response(0x5555, "example.com");
+
+        let parsed = validate_upstream_response(&request, &response, 0x5555).unwrap();
+
+        assert_eq!(
+            QuestionKey::from_message(&parsed),
+            Some(QuestionKey::new("example.com", 1, 1))
+        );
+    }
+
+    #[test]
+    fn truncated_response_prefix_accepts_normalized_question_name() {
+        let request = upstream_request(0x1234, "Example.COM");
+        let response = truncated_response(0x5555, "example.com");
+
+        assert!(truncated_response_matches_request(&request, &response, 0x5555).unwrap());
     }
 
     async fn read_tcp_query(stream: &mut TcpStream) -> Vec<u8> {
@@ -757,7 +798,7 @@ mod tests {
             Err(error) => error,
         };
 
-        assert_eq!(error, UpstreamError::NoUpstreamsAvailable);
+        assert_eq!(error, UpstreamError::NoBackendsAvailable);
     }
 
     #[tokio::test]
