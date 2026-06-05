@@ -461,7 +461,7 @@ pub struct ResolutionRequest {
 pub struct ResolutionResponse {
     pub bytes: Vec<u8>,
     pub received_at: SystemTime,
-    pub response_message: Option<Message>,
+    response_message: Option<Message>,
     pub response_code: Option<ResponseCode>,
     pub final_question: Option<QuestionKey>,
     pub canonical_chain: Vec<String>,
@@ -477,6 +477,7 @@ pub enum ResolutionBackendError {
     MalformedResponse,
     QuestionMismatch,
     NoBackendsAvailable,
+    #[deprecated(note = "use NoBackendsAvailable for backend-agnostic resolution failures")]
     NoUpstreamsAvailable,
     Transport(String),
 }
@@ -538,22 +539,80 @@ impl ResolutionResponse {
         backend_generation: u64,
         backend_name: impl Into<String>,
     ) -> Self {
-        let parsed = Message::parse(&bytes).ok();
-        let response_code = parsed.as_ref().and_then(response_code);
-        let final_question = parsed.as_ref().and_then(QuestionKey::from_message);
-        let canonical_chain = parsed
-            .as_ref()
-            .map(canonical_chain_from_response)
-            .unwrap_or_default();
-        let negative_cache = parsed.as_ref().and_then(negative_ttl);
+        let backend_name = backend_name.into();
+        match Message::parse(&bytes) {
+            Ok(message) => Self::forwarded_parsed_bytes(
+                bytes,
+                message,
+                received_at,
+                backend_generation,
+                backend_name,
+            ),
+            Err(_) => {
+                Self::unparsed_forwarded_bytes(bytes, received_at, backend_generation, backend_name)
+            }
+        }
+    }
+
+    pub(crate) fn forwarded_message(
+        bytes: Vec<u8>,
+        response_message: Message,
+        received_at: SystemTime,
+        backend_generation: u64,
+        backend_name: impl Into<String>,
+    ) -> Self {
+        let backend_name = backend_name.into();
+        if response_message.original_bytes.as_ref() != bytes.as_slice() {
+            return Self::forwarded_bytes(bytes, received_at, backend_generation, backend_name);
+        }
+        Self::forwarded_parsed_bytes(
+            bytes,
+            response_message,
+            received_at,
+            backend_generation,
+            backend_name,
+        )
+    }
+
+    fn forwarded_parsed_bytes(
+        bytes: Vec<u8>,
+        response_message: Message,
+        received_at: SystemTime,
+        backend_generation: u64,
+        backend_name: impl Into<String>,
+    ) -> Self {
+        let response_code = response_code(&response_message);
+        let final_question = QuestionKey::from_message(&response_message);
+        let canonical_chain = canonical_chain_from_response(&response_message);
+        let negative_cache = negative_ttl(&response_message);
         Self {
             bytes,
             received_at,
-            response_message: parsed,
+            response_message: Some(response_message),
             response_code,
             final_question,
             canonical_chain,
             negative_cache,
+            source_credibility: SourceCredibility::ForwarderValidated,
+            backend_provenance: BackendProvenance::forwarding(backend_generation, backend_name),
+            cache_directive: ResolutionCacheDirective::Cacheable,
+        }
+    }
+
+    fn unparsed_forwarded_bytes(
+        bytes: Vec<u8>,
+        received_at: SystemTime,
+        backend_generation: u64,
+        backend_name: impl Into<String>,
+    ) -> Self {
+        Self {
+            bytes,
+            received_at,
+            response_message: None,
+            response_code: None,
+            final_question: None,
+            canonical_chain: Vec::new(),
+            negative_cache: None,
             source_credibility: SourceCredibility::ForwarderValidated,
             backend_provenance: BackendProvenance::forwarding(backend_generation, backend_name),
             cache_directive: ResolutionCacheDirective::Cacheable,
@@ -565,6 +624,10 @@ impl ResolutionResponse {
             .as_ref()
             .map(|message| message.answers.as_slice())
             .unwrap_or_default()
+    }
+
+    pub fn response_message(&self) -> Option<&Message> {
+        self.response_message.as_ref()
     }
 
     pub fn authorities(&self) -> &[Record] {
@@ -1621,12 +1684,11 @@ impl ResolveQuery {
         cache_store_allowed: bool,
         backend_result: Result<ResolutionResponse, ResolutionBackendError>,
     ) -> (ResolveDecision, Vec<u8>) {
-        let Ok(response) = backend_result else {
+        let Ok(mut response) = backend_result else {
             return self.backend_failure_response(request, decoded, question);
         };
 
-        let Some(response_message) = validate_backend_response_bytes(&response.bytes, decoded)
-        else {
+        let Some(response_message) = validate_backend_response(&mut response, decoded) else {
             return self.backend_failure_response(request, decoded, question);
         };
 
@@ -1715,7 +1777,7 @@ impl ResolveQuery {
         if !response.header.qr()
             || response.questions.len() != 1
             || query.message.questions.len() != 1
-            || response.questions[0] != query.message.questions[0]
+            || QuestionKey::from_message(response)? != query.question
         {
             return None;
         }
@@ -2066,14 +2128,37 @@ fn decoded_original_question_name(decoded: &DecodedQuery) -> Option<String> {
         .map(|question| question.qname.clone())
 }
 
-fn validate_backend_response_bytes(bytes: &[u8], query: &DecodedQuery) -> Option<Message> {
-    let response = Message::parse(bytes).ok()?;
+fn validate_backend_response(
+    response: &mut ResolutionResponse,
+    query: &DecodedQuery,
+) -> Option<Message> {
+    if let Some(message) = response.response_message.take() {
+        validate_backend_response_message(&message, query)?;
+        if message.original_bytes.as_ref() != response.bytes.as_slice() {
+            return None;
+        }
+        return Some(message);
+    }
+
+    validate_backend_response_bytes(&response.bytes, query)
+}
+
+fn validate_backend_response_message<'a>(
+    response: &'a Message,
+    query: &DecodedQuery,
+) -> Option<&'a Message> {
     if !response.header.qr() || response.questions.len() != 1 {
         return None;
     }
-    if QuestionKey::from_message(&response)? != query.question {
+    if QuestionKey::from_message(response)? != query.question {
         return None;
     }
+    Some(response)
+}
+
+fn validate_backend_response_bytes(bytes: &[u8], query: &DecodedQuery) -> Option<Message> {
+    let response = Message::parse(bytes).ok()?;
+    validate_backend_response_message(&response, query)?;
     Some(response)
 }
 
@@ -6652,6 +6737,36 @@ mod tests {
         assert_eq!(metrics.count(ResolverMetric::CacheStoreSkipped), 0);
         assert_eq!(metrics.count(ResolverMetric::UpstreamSuccess), 0);
         assert_eq!(metrics.count(ResolverMetric::UpstreamFailure), 1);
+    }
+
+    #[tokio::test]
+    async fn resolve_caches_response_when_question_differs_only_by_case() {
+        let cache = Arc::new(RecordingCache::with_lookup(CacheLookup::Miss));
+        let upstream = Arc::new(StaticUpstream::new(Ok(upstream_response(
+            a_response_with_answer(0x5555, "example.com", 60),
+        ))));
+        let events = Arc::new(RecordingEvents::default());
+        let metrics = Arc::new(RecordingMetrics::default());
+        let service =
+            resolve_service_with_cache(upstream, cache.clone(), events, metrics.clone(), 1232);
+
+        let outcome = service
+            .resolve(ResolveRequest::new(
+                "192.0.2.10".parse().unwrap(),
+                SystemTime::UNIX_EPOCH,
+                a_query(0x5555, "Example.COM"),
+            ))
+            .await;
+
+        assert_eq!(outcome.decision.kind, ResolveDecisionKind::Allowed);
+        let stores = cache.stores.lock().unwrap();
+        assert_eq!(stores.len(), 1);
+        assert_eq!(
+            stores[0].key.question,
+            QuestionKey::new("example.com", 1, 1)
+        );
+        assert_eq!(metrics.count(ResolverMetric::CacheStore), 1);
+        assert_eq!(metrics.count(ResolverMetric::CacheStoreSkipped), 0);
     }
 
     #[tokio::test]

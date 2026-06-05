@@ -19,6 +19,7 @@ use std::sync::atomic::{AtomicU16, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use bytes::Bytes;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::net::UdpSocket;
@@ -261,7 +262,8 @@ impl UdpUpstreamResolver {
                 .resolve_tcp_fallback_attempt(upstream, request, upstream_query, attempt)
                 .await;
         }
-        let response = validate_upstream_response(request, &response_bytes, attempt.upstream_id)?;
+        let mut response =
+            validate_upstream_response(request, &response_bytes, attempt.upstream_id)?;
         if response.header.tc() {
             return self
                 .resolve_tcp_fallback_attempt(upstream, request, upstream_query, attempt)
@@ -269,9 +271,12 @@ impl UdpUpstreamResolver {
         }
         rewrite_response_id(&mut response_bytes, attempt.client_id)
             .map_err(|_| UpstreamError::MalformedResponse)?;
+        response.header.id = attempt.client_id;
+        response.original_bytes = Bytes::copy_from_slice(&response_bytes);
 
-        Ok(UpstreamResponse::forwarded_bytes(
+        Ok(UpstreamResponse::forwarded_message(
             response_bytes,
+            response,
             SystemTime::now(),
             request.backend_generation,
             upstream.name.clone(),
@@ -424,11 +429,14 @@ async fn resolve_tcp_fallback(
     .map_err(|_| UpstreamError::Timeout)?
     .map_err(transport_error)?;
 
-    validate_upstream_response(request, &response_bytes, upstream_id)?;
+    let mut response = validate_upstream_response(request, &response_bytes, upstream_id)?;
     rewrite_response_id(&mut response_bytes, client_id)
         .map_err(|_| UpstreamError::MalformedResponse)?;
-    Ok(UpstreamResponse::forwarded_bytes(
+    response.header.id = client_id;
+    response.original_bytes = Bytes::copy_from_slice(&response_bytes);
+    Ok(UpstreamResponse::forwarded_message(
         response_bytes,
+        response,
         SystemTime::now(),
         request.backend_generation,
         upstream.name.clone(),
