@@ -276,8 +276,19 @@ pub struct CachedResponse {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NegativeCacheMetadata {
-    pub authority_name: String,
+    pub authority_zone: String,
+    pub covered_name: String,
+    pub qtype: u16,
+    pub qclass: u16,
+    pub kind: NegativeCacheKind,
+    pub soa_owner: String,
     pub soa_minimum_ttl: Duration,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NegativeCacheKind {
+    NxDomain,
+    NoData,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -339,23 +350,28 @@ impl CacheTtlPolicy {
 
         if !response.answers.is_empty() {
             let answer_ttl = response.answers.iter().map(|record| record.ttl).min()?;
-            if let Some(metadata) = negative_ttl(response) {
-                let cname_chain_nodata = response_code == ResponseCode::NoError
-                    && question_type(response) != Some(CNAME_RECORD_TYPE)
-                    && !has_requested_answer(response);
-                if response_code == ResponseCode::NxDomain || cname_chain_nodata {
-                    let positive_ttl = apply_ttl_bounds(
-                        Duration::from_secs(u64::from(answer_ttl)),
-                        self.min_positive_ttl,
-                        self.max_positive_ttl,
-                    );
-                    let negative_ttl = apply_ttl_bounds(
-                        metadata.soa_minimum_ttl,
-                        self.min_negative_ttl,
-                        self.max_negative_ttl,
-                    );
-                    return Some((positive_ttl.min(negative_ttl), Some(metadata)));
-                }
+            let response_question = QuestionKey::from_message(response);
+            let cname_chain_nodata = response_code == ResponseCode::NoError
+                && response_question
+                    .as_ref()
+                    .map(|question| {
+                        question.qtype != CNAME_RECORD_TYPE
+                            && !has_requested_answer_after_cname_chain(response, question)
+                    })
+                    .unwrap_or(false);
+            if response_code == ResponseCode::NxDomain || cname_chain_nodata {
+                let metadata = negative_ttl(response)?;
+                let positive_ttl = apply_ttl_bounds(
+                    Duration::from_secs(u64::from(answer_ttl)),
+                    self.min_positive_ttl,
+                    self.max_positive_ttl,
+                );
+                let negative_ttl = apply_ttl_bounds(
+                    metadata.soa_minimum_ttl,
+                    self.min_negative_ttl,
+                    self.max_negative_ttl,
+                );
+                return Some((positive_ttl.min(negative_ttl), Some(metadata)));
             }
             return Some((
                 apply_ttl_bounds(
@@ -416,28 +432,64 @@ fn is_cacheable_response_code(response_code: ResponseCode) -> bool {
 }
 
 fn negative_ttl(response: &Message) -> Option<NegativeCacheMetadata> {
+    let response_code = response_code(response)?;
+    let question = response.questions.first()?;
+    let question_key = QuestionKey::new(&question.qname, question.qtype, question.qclass);
+    let kind = match response_code {
+        ResponseCode::NxDomain => NegativeCacheKind::NxDomain,
+        ResponseCode::NoError => NegativeCacheKind::NoData,
+        _ => return None,
+    };
+    let covered_name = negative_covered_name(response, &question_key)?;
     response.authorities.iter().find_map(|record| {
         let RecordData::SOA { minimum, .. } = &record.record else {
             return None;
         };
+        if record.rclass != question.qclass {
+            return None;
+        }
+        let soa_owner = normalize_question_name(&record.name);
+        if !name_is_at_or_below(&covered_name, &soa_owner) {
+            return None;
+        }
         let ttl = record.ttl.min(*minimum);
         Some(NegativeCacheMetadata {
-            authority_name: record.name.clone(),
+            authority_zone: soa_owner.clone(),
+            covered_name: covered_name.clone(),
+            qtype: question.qtype,
+            qclass: question.qclass,
+            kind,
+            soa_owner,
             soa_minimum_ttl: Duration::from_secs(u64::from(ttl)),
         })
     })
 }
 
-fn has_requested_answer(message: &Message) -> bool {
-    let Some(qtype) = question_type(message) else {
-        return false;
-    };
-    message.answers.iter().any(|record| {
-        if record.rtype != qtype {
-            return false;
-        }
-        !matches!(record.record, RecordData::RRSIG { .. })
-    })
+fn negative_covered_name(response: &Message, question: &QuestionKey) -> Option<String> {
+    let mut covered_name = question.qname.clone();
+    for _ in 0..=response.answers.len() {
+        let Some(record) = response.answers.iter().find(|record| {
+            record.rtype == CNAME_RECORD_TYPE
+                && record.rclass == question.qclass
+                && normalize_question_name(&record.name) == covered_name
+        }) else {
+            return Some(covered_name);
+        };
+        let RecordData::CNAME(target) = &record.record else {
+            return None;
+        };
+        covered_name = normalize_question_name(target);
+    }
+    None
+}
+
+fn name_is_at_or_below(name: &str, zone: &str) -> bool {
+    let name = normalize_question_name(name);
+    let zone = normalize_question_name(zone);
+    if zone.is_empty() {
+        return true;
+    }
+    name == zone || name.ends_with(&format!(".{zone}"))
 }
 
 fn has_requested_answer_for(message: &Message, question: &QuestionKey) -> bool {
@@ -445,6 +497,17 @@ fn has_requested_answer_for(message: &Message, question: &QuestionKey) -> bool {
         QuestionKey::new(&record.name, record.rtype, record.rclass) == *question
             && !matches!(record.record, RecordData::RRSIG { .. })
     })
+}
+
+fn has_requested_answer_after_cname_chain(message: &Message, question: &QuestionKey) -> bool {
+    if has_requested_answer_for(message, question) {
+        return true;
+    }
+    let Some(covered_name) = negative_covered_name(message, question) else {
+        return false;
+    };
+    let target_question = QuestionKey::new(covered_name, question.qtype, question.qclass);
+    has_requested_answer_for(message, &target_question)
 }
 
 fn cname_record_for<'a>(message: &'a Message, question: &QuestionKey) -> Option<&'a Record> {
@@ -728,10 +791,6 @@ fn write_dns_u16(bytes: &mut Vec<u8>, value: u16) {
 
 fn write_dns_u32(bytes: &mut Vec<u8>, value: u32) {
     bytes.extend_from_slice(&value.to_be_bytes());
-}
-
-fn question_type(message: &Message) -> Option<u16> {
-    message.questions.first().map(|question| question.qtype)
 }
 
 fn apply_ttl_bounds(ttl: Duration, min_ttl: Option<Duration>, max_ttl: Duration) -> Duration {
@@ -6861,10 +6920,14 @@ mod tests {
         assert!(response.additionals().is_empty());
         assert_eq!(
             response.negative_cache,
-            Some(NegativeCacheMetadata {
-                authority_name: "example.com".to_string(),
-                soa_minimum_ttl: Duration::from_secs(30),
-            })
+            Some(negative_metadata(
+                "example.com",
+                "example.com",
+                1,
+                1,
+                NegativeCacheKind::NxDomain,
+                Duration::from_secs(30)
+            ))
         );
         assert_eq!(
             response.source_credibility,
@@ -7151,6 +7214,25 @@ mod tests {
         }
     }
 
+    fn negative_metadata(
+        authority_zone: &str,
+        covered_name: &str,
+        qtype: u16,
+        qclass: u16,
+        kind: NegativeCacheKind,
+        ttl: Duration,
+    ) -> NegativeCacheMetadata {
+        NegativeCacheMetadata {
+            authority_zone: authority_zone.to_string(),
+            covered_name: covered_name.to_string(),
+            qtype,
+            qclass,
+            kind,
+            soa_owner: authority_zone.to_string(),
+            soa_minimum_ttl: ttl,
+        }
+    }
+
     #[test]
     fn ttl_policy_uses_minimum_answer_ttl_for_positive_response() {
         let policy = CacheTtlPolicy::default();
@@ -7211,20 +7293,39 @@ mod tests {
         assert_eq!(ttl, Duration::from_secs(90));
         assert_eq!(
             metadata,
-            Some(NegativeCacheMetadata {
-                authority_name: "example.com".to_string(),
-                soa_minimum_ttl: Duration::from_secs(90),
-            })
+            Some(negative_metadata(
+                "example.com",
+                "example.com",
+                1,
+                1,
+                NegativeCacheKind::NxDomain,
+                Duration::from_secs(90)
+            ))
         );
+    }
+
+    #[test]
+    fn ttl_policy_rejects_negative_cache_when_soa_does_not_cover_name() {
+        let policy = CacheTtlPolicy::default();
+        let response = response_message(
+            ResponseCode::NxDomain,
+            Vec::new(),
+            vec![soa_record("attacker.test", 90, 300)],
+        );
+
+        assert_eq!(policy.ttl_for_response(&response), None);
     }
 
     #[test]
     fn ttl_policy_preserves_negative_metadata_for_nxdomain_with_cname_answer() {
         let policy = CacheTtlPolicy::default();
-        let response = response_message(
+        let response = response_message_for_question(
+            QuestionKey::new("www.example.com", 1, 1),
             ResponseCode::NxDomain,
             vec![cname_record("www.example.com", 300, "missing.example.com")],
             vec![soa_record("example.com", 60, 120)],
+            Vec::new(),
+            true,
         );
 
         let (ttl, metadata) = policy.ttl_for_response(&response).unwrap();
@@ -7232,20 +7333,27 @@ mod tests {
         assert_eq!(ttl, Duration::from_secs(60));
         assert_eq!(
             metadata,
-            Some(NegativeCacheMetadata {
-                authority_name: "example.com".to_string(),
-                soa_minimum_ttl: Duration::from_secs(60),
-            })
+            Some(negative_metadata(
+                "example.com",
+                "missing.example.com",
+                1,
+                1,
+                NegativeCacheKind::NxDomain,
+                Duration::from_secs(60)
+            ))
         );
     }
 
     #[test]
     fn ttl_policy_preserves_negative_metadata_for_nodata_with_cname_answer() {
         let policy = CacheTtlPolicy::default();
-        let response = response_message(
+        let response = response_message_for_question(
+            QuestionKey::new("www.example.com", 1, 1),
             ResponseCode::NoError,
             vec![cname_record("www.example.com", 300, "target.example.com")],
             vec![soa_record("example.com", 30, 120)],
+            Vec::new(),
+            true,
         );
 
         let (ttl, metadata) = policy.ttl_for_response(&response).unwrap();
@@ -7253,23 +7361,129 @@ mod tests {
         assert_eq!(ttl, Duration::from_secs(30));
         assert_eq!(
             metadata,
-            Some(NegativeCacheMetadata {
-                authority_name: "example.com".to_string(),
-                soa_minimum_ttl: Duration::from_secs(30),
-            })
+            Some(negative_metadata(
+                "example.com",
+                "target.example.com",
+                1,
+                1,
+                NegativeCacheKind::NoData,
+                Duration::from_secs(30)
+            ))
+        );
+    }
+
+    #[test]
+    fn ttl_policy_rejects_cname_nodata_when_soa_does_not_cover_target() {
+        let policy = CacheTtlPolicy::default();
+        let response = response_message_for_question(
+            QuestionKey::new("www.example.com", 1, 1),
+            ResponseCode::NoError,
+            vec![cname_record("www.example.com", 300, "target.attacker.test")],
+            vec![soa_record("example.com", 30, 120)],
+            Vec::new(),
+            true,
+        );
+
+        assert_eq!(policy.ttl_for_response(&response), None);
+    }
+
+    #[test]
+    fn ttl_policy_ignores_unrelated_cname_when_validating_negative_coverage() {
+        let policy = CacheTtlPolicy::default();
+        let response = response_message_for_question(
+            QuestionKey::new("www.example.com", 1, 1),
+            ResponseCode::NoError,
+            vec![
+                cname_record("www.example.com", 300, "target.attacker.test"),
+                cname_record("unrelated.example.com", 300, "target.example.com"),
+            ],
+            vec![soa_record("example.com", 30, 120)],
+            Vec::new(),
+            true,
+        );
+
+        assert_eq!(policy.ttl_for_response(&response), None);
+    }
+
+    #[test]
+    fn ttl_policy_treats_unrelated_answer_as_cname_nodata() {
+        let policy = CacheTtlPolicy::default();
+        let response = response_message_for_question(
+            QuestionKey::new("www.example.com", 1, 1),
+            ResponseCode::NoError,
+            vec![
+                cname_record("www.example.com", 300, "target.example.com"),
+                a_record("unrelated.example.com", 300),
+            ],
+            vec![soa_record("example.com", 30, 120)],
+            Vec::new(),
+            true,
+        );
+
+        let (ttl, metadata) = policy.ttl_for_response(&response).unwrap();
+
+        assert_eq!(ttl, Duration::from_secs(30));
+        assert_eq!(
+            metadata,
+            Some(negative_metadata(
+                "example.com",
+                "target.example.com",
+                1,
+                1,
+                NegativeCacheKind::NoData,
+                Duration::from_secs(30)
+            ))
+        );
+    }
+
+    #[test]
+    fn ttl_policy_rejects_negative_cache_when_soa_class_differs() {
+        let policy = CacheTtlPolicy::default();
+        let mut soa = soa_record("example.com", 30, 120);
+        soa.rclass = 3;
+        let response = response_message(ResponseCode::NxDomain, Vec::new(), vec![soa]);
+
+        assert_eq!(policy.ttl_for_response(&response), None);
+    }
+
+    #[test]
+    fn ttl_policy_allows_root_soa_negative_cache() {
+        let policy = CacheTtlPolicy::default();
+        let response = response_message(
+            ResponseCode::NxDomain,
+            Vec::new(),
+            vec![soa_record("", 30, 120)],
+        );
+
+        let (ttl, metadata) = policy.ttl_for_response(&response).unwrap();
+
+        assert_eq!(ttl, Duration::from_secs(30));
+        assert_eq!(
+            metadata,
+            Some(negative_metadata(
+                "",
+                "example.com",
+                1,
+                1,
+                NegativeCacheKind::NxDomain,
+                Duration::from_secs(30)
+            ))
         );
     }
 
     #[test]
     fn ttl_policy_preserves_negative_metadata_for_dnssec_signed_cname_nodata() {
         let policy = CacheTtlPolicy::default();
-        let response = response_message(
+        let response = response_message_for_question(
+            QuestionKey::new("www.example.com", 1, 1),
             ResponseCode::NoError,
             vec![
                 cname_record("www.example.com", 300, "target.example.com"),
                 rrsig_record("www.example.com", 300, CNAME_RECORD_TYPE),
             ],
             vec![soa_record("example.com", 30, 120)],
+            Vec::new(),
+            true,
         );
 
         let (ttl, metadata) = policy.ttl_for_response(&response).unwrap();
@@ -7277,10 +7491,14 @@ mod tests {
         assert_eq!(ttl, Duration::from_secs(30));
         assert_eq!(
             metadata,
-            Some(NegativeCacheMetadata {
-                authority_name: "example.com".to_string(),
-                soa_minimum_ttl: Duration::from_secs(30),
-            })
+            Some(negative_metadata(
+                "example.com",
+                "target.example.com",
+                1,
+                1,
+                NegativeCacheKind::NoData,
+                Duration::from_secs(30)
+            ))
         );
     }
 
@@ -7297,6 +7515,27 @@ mod tests {
         let (ttl, metadata) = policy.ttl_for_response(&response).unwrap();
 
         assert_eq!(ttl, Duration::from_secs(300));
+        assert_eq!(metadata, None);
+    }
+
+    #[test]
+    fn ttl_policy_keeps_cname_chain_with_target_answer_positive() {
+        let policy = CacheTtlPolicy::default();
+        let response = response_message_for_question(
+            QuestionKey::new("www.example.com", 1, 1),
+            ResponseCode::NoError,
+            vec![
+                cname_record("www.example.com", 300, "target.example.com"),
+                a_record("target.example.com", 120),
+            ],
+            Vec::new(),
+            Vec::new(),
+            true,
+        );
+
+        let (ttl, metadata) = policy.ttl_for_response(&response).unwrap();
+
+        assert_eq!(ttl, Duration::from_secs(120));
         assert_eq!(metadata, None);
     }
 
@@ -8188,10 +8427,14 @@ mod tests {
         assert_eq!(stores[0].response_code, ResponseCode::NxDomain);
         assert_eq!(
             stores[0].negative_cache,
-            Some(NegativeCacheMetadata {
-                authority_name: "example.com".to_string(),
-                soa_minimum_ttl: Duration::from_secs(30),
-            })
+            Some(negative_metadata(
+                "example.com",
+                "example.com",
+                1,
+                1,
+                NegativeCacheKind::NxDomain,
+                Duration::from_secs(30)
+            ))
         );
         drop(stores);
         assert_eq!(metrics.count(ResolverMetric::CacheStore), 1);
