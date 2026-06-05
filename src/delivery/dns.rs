@@ -259,6 +259,13 @@ mod tests {
         bytes
     }
 
+    fn a_response(id: u16, name: &str) -> Vec<u8> {
+        let mut bytes = a_query(id, name);
+        bytes[2] = 0x81;
+        bytes[3] = 0x80;
+        bytes
+    }
+
     struct FixedClock(SystemTime);
 
     impl Clock for FixedClock {
@@ -338,10 +345,11 @@ mod tests {
     impl ResolutionBackend for DelayedFirstUpstream {
         fn resolve<'a>(
             &'a self,
-            _request: UpstreamRequest,
+            request: UpstreamRequest,
         ) -> Pin<Box<dyn Future<Output = Result<UpstreamResponse, UpstreamError>> + Send + 'a>>
         {
             Box::pin(async move {
+                let question = request.query.question.qname.clone();
                 let request_number = {
                     let mut requests = self.requests.lock().unwrap();
                     *requests += 1;
@@ -351,7 +359,7 @@ mod tests {
                     self.first_started.notify_waiters();
                     self.first_release.notified().await;
                 }
-                Ok(upstream_response(vec![0, 0, 0x81, 0x80]))
+                Ok(upstream_response(a_response(0, &question)))
             })
         }
     }
@@ -385,7 +393,7 @@ mod tests {
 
     #[tokio::test]
     async fn udp_server_passes_raw_query_and_client_ip_to_resolver() {
-        let backend_bytes = vec![0xab, 0xcd, 0x81, 0x80];
+        let backend_bytes = a_response(0xabcd, "example.com");
         let upstream = Arc::new(StaticUpstream::new(Ok(upstream_response(backend_bytes))));
         let events = Arc::new(RecordingEvents::default());
         let resolver = resolve_service(upstream.clone(), events.clone());
@@ -412,7 +420,10 @@ mod tests {
         let (response_len, source) = client.recv_from(&mut response).await.unwrap();
 
         assert_eq!(source, server_addr);
-        assert_eq!(&response[..response_len], &[0x12, 0x34, 0x81, 0x80]);
+        assert_eq!(
+            &response[..response_len],
+            &a_response(0x1234, "example.com")
+        );
         {
             let upstream_requests = upstream.requests.lock().unwrap();
             assert_eq!(upstream_requests.len(), 1);

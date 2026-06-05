@@ -157,7 +157,7 @@ impl UdpUpstreamResolver {
     ) -> Result<Self, UpstreamError> {
         let upstreams = ordered_enabled_udp_upstreams(upstreams);
         if upstreams.is_empty() {
-            return Err(UpstreamError::NoUpstreamsAvailable);
+            return Err(UpstreamError::NoBackendsAvailable);
         }
         let health = upstreams
             .iter()
@@ -764,7 +764,7 @@ mod tests {
             Err(error) => error,
         };
 
-        assert_eq!(error, UpstreamError::NoUpstreamsAvailable);
+        assert_eq!(error, UpstreamError::NoBackendsAvailable);
     }
 
     #[tokio::test]

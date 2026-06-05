@@ -464,9 +464,6 @@ pub struct ResolutionResponse {
     pub response_message: Option<Message>,
     pub response_code: Option<ResponseCode>,
     pub final_question: Option<QuestionKey>,
-    pub answers: Vec<Record>,
-    pub authorities: Vec<Record>,
-    pub additionals: Vec<Record>,
     pub canonical_chain: Vec<String>,
     pub negative_cache: Option<NegativeCacheMetadata>,
     pub source_credibility: SourceCredibility,
@@ -479,6 +476,7 @@ pub enum ResolutionBackendError {
     Timeout,
     MalformedResponse,
     QuestionMismatch,
+    NoBackendsAvailable,
     NoUpstreamsAvailable,
     Transport(String),
 }
@@ -543,18 +541,6 @@ impl ResolutionResponse {
         let parsed = Message::parse(&bytes).ok();
         let response_code = parsed.as_ref().and_then(response_code);
         let final_question = parsed.as_ref().and_then(QuestionKey::from_message);
-        let answers = parsed
-            .as_ref()
-            .map(|message| message.answers.clone())
-            .unwrap_or_default();
-        let authorities = parsed
-            .as_ref()
-            .map(|message| message.authorities.clone())
-            .unwrap_or_default();
-        let additionals = parsed
-            .as_ref()
-            .map(|message| message.additionals.clone())
-            .unwrap_or_default();
         let canonical_chain = parsed
             .as_ref()
             .map(canonical_chain_from_response)
@@ -566,15 +552,33 @@ impl ResolutionResponse {
             response_message: parsed,
             response_code,
             final_question,
-            answers,
-            authorities,
-            additionals,
             canonical_chain,
             negative_cache,
             source_credibility: SourceCredibility::ForwarderValidated,
             backend_provenance: BackendProvenance::forwarding(backend_generation, backend_name),
             cache_directive: ResolutionCacheDirective::Cacheable,
         }
+    }
+
+    pub fn answers(&self) -> &[Record] {
+        self.response_message
+            .as_ref()
+            .map(|message| message.answers.as_slice())
+            .unwrap_or_default()
+    }
+
+    pub fn authorities(&self) -> &[Record] {
+        self.response_message
+            .as_ref()
+            .map(|message| message.authorities.as_slice())
+            .unwrap_or_default()
+    }
+
+    pub fn additionals(&self) -> &[Record] {
+        self.response_message
+            .as_ref()
+            .map(|message| message.additionals.as_slice())
+            .unwrap_or_default()
     }
 }
 
@@ -1483,7 +1487,7 @@ impl ResolveQuery {
 
         let key = CacheKey::from_query(
             decoded,
-            None,
+            self.backend_cache_namespace(),
             self.protocol.configured_max_udp_payload_size(),
         );
         let lookup = self
@@ -1621,8 +1625,13 @@ impl ResolveQuery {
             return self.backend_failure_response(request, decoded, question);
         };
 
+        let Some(response_message) = validate_backend_response_bytes(&response.bytes, decoded)
+        else {
+            return self.backend_failure_response(request, decoded, question);
+        };
+
         self.metrics.increment(ResolverMetric::UpstreamSuccess);
-        let mut response_bytes = response.bytes.clone();
+        let mut response_bytes = response.bytes;
         if self
             .protocol
             .rewrite_response_id(&mut response_bytes, decoded.message.header.id)
@@ -1636,7 +1645,7 @@ impl ResolveQuery {
                 self.store_cache_response(
                     cache_key,
                     response_bytes.clone(),
-                    &response,
+                    &response_message,
                     decoded,
                     request,
                 )
@@ -1674,7 +1683,7 @@ impl ResolveQuery {
         &self,
         cache_key: CacheKey,
         response_bytes: Vec<u8>,
-        response: &ResolutionResponse,
+        response: &Message,
         decoded: &DecodedQuery,
         request: &ResolveRequest,
     ) {
@@ -1699,20 +1708,19 @@ impl ResolveQuery {
         &self,
         key: CacheKey,
         mut response_template: Vec<u8>,
-        response: &ResolutionResponse,
+        response: &Message,
         query: &DecodedQuery,
         stored_at: SystemTime,
     ) -> Option<CacheStore> {
-        let message = response.response_message.as_ref()?;
-        if !message.header.qr()
-            || message.questions.len() != 1
+        if !response.header.qr()
+            || response.questions.len() != 1
             || query.message.questions.len() != 1
-            || message.questions[0] != query.message.questions[0]
+            || response.questions[0] != query.message.questions[0]
         {
             return None;
         }
-        let response_code = response.response_code?;
-        let (ttl, negative_cache) = self.ttl_policy.ttl_for_response(message)?;
+        let response_code = response_code(response)?;
+        let (ttl, negative_cache) = self.ttl_policy.ttl_for_response(response)?;
         self.protocol
             .rewrite_response_id(&mut response_template, 0)
             .ok()?;
@@ -1725,6 +1733,14 @@ impl ResolveQuery {
             stored_at,
             ttl,
         })
+    }
+
+    fn backend_cache_namespace(&self) -> Option<String> {
+        if self.backend_generation == 0 {
+            None
+        } else {
+            Some(format!("backend-generation:{}", self.backend_generation))
+        }
     }
 
     async fn finish(
@@ -2048,6 +2064,17 @@ fn decoded_original_question_name(decoded: &DecodedQuery) -> Option<String> {
         .questions
         .first()
         .map(|question| question.qname.clone())
+}
+
+fn validate_backend_response_bytes(bytes: &[u8], query: &DecodedQuery) -> Option<Message> {
+    let response = Message::parse(bytes).ok()?;
+    if !response.header.qr() || response.questions.len() != 1 {
+        return None;
+    }
+    if QuestionKey::from_message(&response)? != query.question {
+        return None;
+    }
+    Some(response)
 }
 
 fn cache_supported(query: &DecodedQuery) -> bool {
@@ -5235,9 +5262,9 @@ mod tests {
             response.final_question,
             Some(QuestionKey::new("example.com", 1, 1))
         );
-        assert!(response.answers.is_empty());
-        assert_eq!(response.authorities.len(), 1);
-        assert!(response.additionals.is_empty());
+        assert!(response.answers().is_empty());
+        assert_eq!(response.authorities().len(), 1);
+        assert!(response.additionals().is_empty());
         assert_eq!(
             response.negative_cache,
             Some(NegativeCacheMetadata {
@@ -6020,7 +6047,7 @@ mod tests {
 
     #[tokio::test]
     async fn resolve_forwards_valid_query_to_upstream() {
-        let response = vec![0xab, 0xcd, 0x81, 0x80];
+        let response = a_response_with_answer(0xabcd, "Example.COM", 60);
         let upstream = Arc::new(StaticUpstream::new(Ok(upstream_response(response.clone()))));
         let events = Arc::new(RecordingEvents::default());
         let metrics = Arc::new(RecordingMetrics::default());
@@ -6517,15 +6544,66 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn resolve_does_not_store_malformed_or_question_mismatched_upstream_response() {
-        for (response, skipped_store_count) in [
-            (vec![0x12], 0),
-            (a_response_with_answer(0x5555, "other.example", 60), 1),
-            (a_response_with_answer(0x5555, "Example.COM", 60), 1),
-            (
-                multi_question_a_response_with_answer(0x5555, "example.com", 60),
-                1,
-            ),
+    async fn backend_generation_separates_cache_entries() {
+        let cache = Arc::new(InMemoryDnsCache::new(16));
+        let first_backend = Arc::new(StaticUpstream::new(Ok(upstream_response(
+            a_response_with_answer(0x1111, "example.com", 60),
+        ))));
+        let events = Arc::new(RecordingEvents::default());
+        let metrics = Arc::new(RecordingMetrics::default());
+        let first_service = ResolveQuery::with_cache_and_backend_generation(
+            Arc::new(StandardProtocolCodec::new(1232)),
+            cache.clone(),
+            CacheTtlPolicy::default(),
+            first_backend.clone(),
+            1,
+            Arc::new(BasicResponseFactory),
+            Arc::new(FixedClock(SystemTime::UNIX_EPOCH)),
+            events.clone(),
+            metrics.clone(),
+        );
+        let second_backend = Arc::new(StaticUpstream::new(Ok(upstream_response(
+            a_response_with_answer(0x2222, "example.com", 60),
+        ))));
+        let second_service = ResolveQuery::with_cache_and_backend_generation(
+            Arc::new(StandardProtocolCodec::new(1232)),
+            cache,
+            CacheTtlPolicy::default(),
+            second_backend.clone(),
+            2,
+            Arc::new(BasicResponseFactory),
+            Arc::new(FixedClock(SystemTime::UNIX_EPOCH)),
+            events,
+            metrics,
+        );
+
+        let first = first_service
+            .resolve(ResolveRequest::new(
+                "192.0.2.10".parse().unwrap(),
+                SystemTime::UNIX_EPOCH,
+                a_query(0x1111, "example.com"),
+            ))
+            .await;
+        let second = second_service
+            .resolve(ResolveRequest::new(
+                "192.0.2.10".parse().unwrap(),
+                SystemTime::UNIX_EPOCH,
+                a_query(0x2222, "example.com"),
+            ))
+            .await;
+
+        assert_eq!(first.decision.kind, ResolveDecisionKind::Allowed);
+        assert_eq!(second.decision.kind, ResolveDecisionKind::Allowed);
+        assert_eq!(first_backend.requests.lock().unwrap().len(), 1);
+        assert_eq!(second_backend.requests.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn resolve_rejects_invalid_backend_response_bytes() {
+        for response in [
+            vec![0x12],
+            a_response_with_answer(0x5555, "other.example", 60),
+            multi_question_a_response_with_answer(0x5555, "example.com", 60),
         ] {
             let cache = Arc::new(RecordingCache::with_lookup(CacheLookup::Miss));
             let upstream = Arc::new(StaticUpstream::new(Ok(upstream_response(response))));
@@ -6534,7 +6612,7 @@ mod tests {
             let service =
                 resolve_service_with_cache(upstream, cache.clone(), events, metrics.clone(), 1232);
 
-            let _ = service
+            let outcome = service
                 .resolve(ResolveRequest::new(
                     "192.0.2.10".parse().unwrap(),
                     SystemTime::UNIX_EPOCH,
@@ -6542,12 +6620,38 @@ mod tests {
                 ))
                 .await;
 
+            assert_eq!(outcome.decision.kind, ResolveDecisionKind::BackendFailure);
             assert!(cache.stores.lock().unwrap().is_empty());
-            assert_eq!(
-                metrics.count(ResolverMetric::CacheStoreSkipped),
-                skipped_store_count
-            );
+            assert_eq!(metrics.count(ResolverMetric::CacheStoreSkipped), 0);
+            assert_eq!(metrics.count(ResolverMetric::UpstreamSuccess), 0);
+            assert_eq!(metrics.count(ResolverMetric::UpstreamFailure), 1);
         }
+    }
+
+    #[tokio::test]
+    async fn resolve_rejects_backend_response_when_metadata_and_bytes_drift() {
+        let cache = Arc::new(RecordingCache::with_lookup(CacheLookup::Miss));
+        let mut response = upstream_response(a_response_with_answer(0x5555, "example.com", 60));
+        response.bytes = a_response_with_answer(0x5555, "other.example", 60);
+        let upstream = Arc::new(StaticUpstream::new(Ok(response)));
+        let events = Arc::new(RecordingEvents::default());
+        let metrics = Arc::new(RecordingMetrics::default());
+        let service =
+            resolve_service_with_cache(upstream, cache.clone(), events, metrics.clone(), 1232);
+
+        let outcome = service
+            .resolve(ResolveRequest::new(
+                "192.0.2.10".parse().unwrap(),
+                SystemTime::UNIX_EPOCH,
+                a_query(0x5555, "example.com"),
+            ))
+            .await;
+
+        assert_eq!(outcome.decision.kind, ResolveDecisionKind::BackendFailure);
+        assert!(cache.stores.lock().unwrap().is_empty());
+        assert_eq!(metrics.count(ResolverMetric::CacheStoreSkipped), 0);
+        assert_eq!(metrics.count(ResolverMetric::UpstreamSuccess), 0);
+        assert_eq!(metrics.count(ResolverMetric::UpstreamFailure), 1);
     }
 
     #[tokio::test]
@@ -6727,9 +6831,7 @@ mod tests {
 
     #[tokio::test]
     async fn resolve_maps_no_backends_to_servfail() {
-        let upstream = Arc::new(StaticUpstream::new(Err(
-            UpstreamError::NoUpstreamsAvailable,
-        )));
+        let upstream = Arc::new(StaticUpstream::new(Err(UpstreamError::NoBackendsAvailable)));
         let events = Arc::new(RecordingEvents::default());
         let metrics = Arc::new(RecordingMetrics::default());
         let service = resolve_service(upstream, events, metrics.clone());
