@@ -170,7 +170,7 @@ pub struct CacheKey {
     pub question: QuestionKey,
     pub question_wire: Vec<u8>,
     pub features: QueryFeatures,
-    pub upstream_policy_variant: Option<String>,
+    pub cache_namespace: Option<String>,
     pub effective_udp_payload_size: usize,
 }
 
@@ -179,28 +179,28 @@ impl CacheKey {
         question: QuestionKey,
         question_wire: Vec<u8>,
         features: QueryFeatures,
-        upstream_policy_variant: Option<String>,
+        cache_namespace: Option<String>,
         effective_udp_payload_size: usize,
     ) -> Self {
         Self {
             question,
             question_wire,
             features,
-            upstream_policy_variant,
+            cache_namespace,
             effective_udp_payload_size,
         }
     }
 
     pub fn from_query(
         query: &DecodedQuery,
-        upstream_policy_variant: Option<String>,
+        cache_namespace: Option<String>,
         configured_max_udp_payload_size: usize,
     ) -> Self {
         Self::new(
             query.question.clone(),
             query.question_wire.to_vec(),
             query.features.clone(),
-            upstream_policy_variant,
+            cache_namespace,
             query
                 .message
                 .effective_udp_payload_size(configured_max_udp_payload_size),
@@ -5436,10 +5436,7 @@ mod tests {
         };
 
         assert_eq!(entry.key.question.qname, "example.com");
-        assert_eq!(
-            entry.key.upstream_policy_variant.as_deref(),
-            Some("primary")
-        );
+        assert_eq!(entry.key.cache_namespace.as_deref(), Some("primary"));
         assert_eq!(entry.key.effective_udp_payload_size, 512);
         assert_eq!(entry.response_template, vec![1, 2, 3]);
         assert_eq!(entry.response_code, ResponseCode::NoError);
@@ -6084,7 +6081,7 @@ mod tests {
                 edns_udp_payload_size: Some(4096),
             }
         );
-        assert_eq!(key.upstream_policy_variant.as_deref(), Some("primary"));
+        assert_eq!(key.cache_namespace.as_deref(), Some("primary"));
         assert_eq!(key.effective_udp_payload_size, 1232);
     }
 
