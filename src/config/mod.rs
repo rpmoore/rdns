@@ -142,14 +142,17 @@ impl RuntimeConfig {
             ResolutionMode::Recursive => {
                 let recursive = self.resolution.recursive.as_ref();
                 format!(
-                    "mode:recursive;generation:{};root-hints:{};dnssec:{}",
+                    "mode:recursive;generation:{};root-hints:{};dnssec:{};authorities:{:016x}",
                     self.resolution.generation,
                     recursive
                         .map(|recursive| recursive.root_hints_version.as_str())
                         .unwrap_or("missing"),
                     recursive
                         .map(|recursive| recursive.dnssec_validation.cache_namespace_label())
-                        .unwrap_or("missing")
+                        .unwrap_or("missing"),
+                    recursive
+                        .map(RecursiveResolutionConfig::authority_config_hash)
+                        .unwrap_or(0)
                 )
             }
         }
@@ -232,17 +235,50 @@ pub enum ResolutionMode {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RecursiveResolutionConfig {
     pub root_hints_version: String,
+    pub root_hints_source: RootHintsSource,
+    pub per_authority_timeout: Duration,
+    pub max_recursion_depth: u8,
+    pub max_cname_restarts: u8,
+    pub allowed_transports: Vec<RecursiveTransport>,
     pub dnssec_validation: DnssecValidationMode,
+    pub dname_handling: DnameHandlingPolicy,
 }
 
 impl RecursiveResolutionConfig {
     pub fn new(
         root_hints_version: impl Into<String>,
+        root_hints: Vec<RootHintConfig>,
         dnssec_validation: DnssecValidationMode,
     ) -> Self {
         Self {
             root_hints_version: root_hints_version.into(),
+            root_hints_source: RootHintsSource::Static(root_hints),
+            per_authority_timeout: Duration::from_millis(750),
+            max_recursion_depth: 16,
+            max_cname_restarts: 8,
+            allowed_transports: vec![RecursiveTransport::Udp, RecursiveTransport::Tcp],
             dnssec_validation,
+            dname_handling: DnameHandlingPolicy::Defer,
+        }
+    }
+
+    pub fn bundled(root_hints_version: impl Into<String>) -> Self {
+        Self {
+            root_hints_version: root_hints_version.into(),
+            root_hints_source: RootHintsSource::Bundled,
+            per_authority_timeout: Duration::from_millis(750),
+            max_recursion_depth: 16,
+            max_cname_restarts: 8,
+            allowed_transports: vec![RecursiveTransport::Udp, RecursiveTransport::Tcp],
+            dnssec_validation: DnssecValidationMode::Disabled,
+            dname_handling: DnameHandlingPolicy::Defer,
+        }
+    }
+
+    pub fn load_root_hints(&self) -> Result<Vec<RootHintConfig>, ConfigError> {
+        match &self.root_hints_source {
+            RootHintsSource::Bundled => Ok(bundled_root_hints()),
+            RootHintsSource::Static(root_hints) => Ok(root_hints.clone()),
         }
     }
 
@@ -250,8 +286,205 @@ impl RecursiveResolutionConfig {
         if self.root_hints_version.trim().is_empty() {
             return Err(ConfigError::InvalidRootHintsVersion);
         }
+        let root_hints = self.load_root_hints()?;
+        if root_hints.is_empty() {
+            return Err(ConfigError::MissingRootHints);
+        }
+        for root_hint in &root_hints {
+            root_hint.validate()?;
+        }
+        validate_duration(
+            "recursive.per_authority_timeout",
+            self.per_authority_timeout,
+            MIN_RECURSIVE_AUTHORITY_TIMEOUT,
+            MAX_RECURSIVE_AUTHORITY_TIMEOUT,
+        )?;
+        if self.max_recursion_depth == 0 || self.max_recursion_depth > MAX_RECURSION_DEPTH {
+            return Err(ConfigError::InvalidRecursiveDepth {
+                value: self.max_recursion_depth,
+                max: MAX_RECURSION_DEPTH,
+            });
+        }
+        if self.max_cname_restarts > MAX_CNAME_RESTARTS {
+            return Err(ConfigError::InvalidCnameRestartLimit {
+                value: self.max_cname_restarts,
+                max: MAX_CNAME_RESTARTS,
+            });
+        }
+        if self.allowed_transports.is_empty() {
+            return Err(ConfigError::NoRecursiveTransports);
+        }
+        let mut transports = HashSet::with_capacity(self.allowed_transports.len());
+        for transport in &self.allowed_transports {
+            if !transports.insert(*transport) {
+                return Err(ConfigError::DuplicateRecursiveTransport {
+                    transport: *transport,
+                });
+            }
+        }
         Ok(())
     }
+
+    fn authority_config_hash(&self) -> u64 {
+        let mut hash = FNV1A64_OFFSET;
+        if let Ok(root_hints) = self.load_root_hints() {
+            for root_hint in &root_hints {
+                let root_name = canonical_authority_name(&root_hint.name)
+                    .unwrap_or_else(|_| root_hint.name.clone());
+                hash_namespace_field(&mut hash, "root-name", &root_name);
+                for endpoint in &root_hint.endpoints {
+                    hash_namespace_field(&mut hash, "root-endpoint", &endpoint.to_string());
+                }
+            }
+        }
+        hash_namespace_field(
+            &mut hash,
+            "root-hints-source",
+            self.root_hints_source.cache_namespace_label(),
+        );
+        hash_namespace_field(
+            &mut hash,
+            "authority-timeout-nanos",
+            &self.per_authority_timeout.as_nanos().to_string(),
+        );
+        hash_namespace_field(
+            &mut hash,
+            "max-recursion-depth",
+            &self.max_recursion_depth.to_string(),
+        );
+        hash_namespace_field(
+            &mut hash,
+            "max-cname-restarts",
+            &self.max_cname_restarts.to_string(),
+        );
+        let mut transports = self.allowed_transports.clone();
+        transports.sort_by_key(|transport| transport.cache_namespace_label());
+        for transport in &transports {
+            hash_namespace_field(&mut hash, "transport", transport.cache_namespace_label());
+        }
+        hash_namespace_field(
+            &mut hash,
+            "dname-policy",
+            self.dname_handling.cache_namespace_label(),
+        );
+        hash
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RootHintsSource {
+    Bundled,
+    Static(Vec<RootHintConfig>),
+}
+
+impl RootHintsSource {
+    fn cache_namespace_label(&self) -> &'static str {
+        match self {
+            Self::Bundled => "bundled",
+            Self::Static(_) => "static",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RootHintConfig {
+    pub name: String,
+    pub endpoints: Vec<SocketAddr>,
+}
+
+impl RootHintConfig {
+    pub fn new(name: impl Into<String>, endpoints: Vec<SocketAddr>) -> Self {
+        Self {
+            name: name.into(),
+            endpoints,
+        }
+    }
+
+    pub fn validate(&self) -> Result<(), ConfigError> {
+        canonical_authority_name(&self.name)?;
+        if self.endpoints.is_empty() {
+            return Err(ConfigError::MissingRootHintEndpoints);
+        }
+        for endpoint in &self.endpoints {
+            if endpoint.port() == 0 {
+                return Err(ConfigError::InvalidRootHintEndpoint {
+                    endpoint: *endpoint,
+                });
+            }
+            if !is_usable_authority_address(endpoint.ip()) {
+                return Err(ConfigError::InvalidRootHintEndpoint {
+                    endpoint: *endpoint,
+                });
+            }
+        }
+        Ok(())
+    }
+}
+
+fn is_usable_authority_address(address: IpAddr) -> bool {
+    match address {
+        IpAddr::V4(address) => {
+            !address.is_unspecified()
+                && !address.is_broadcast()
+                && !address.is_multicast()
+                && !address.is_loopback()
+        }
+        IpAddr::V6(address) => {
+            !address.is_unspecified() && !address.is_multicast() && !address.is_loopback()
+        }
+    }
+}
+
+fn bundled_root_hints() -> Vec<RootHintConfig> {
+    vec![
+        RootHintConfig::new(
+            "a.root-servers.net",
+            vec![SocketAddr::new(
+                IpAddr::V4(Ipv4Addr::new(198, 41, 0, 4)),
+                53,
+            )],
+        ),
+        RootHintConfig::new(
+            "b.root-servers.net",
+            vec![SocketAddr::new(
+                IpAddr::V4(Ipv4Addr::new(170, 247, 170, 2)),
+                53,
+            )],
+        ),
+    ]
+}
+
+fn canonical_authority_name(name: &str) -> Result<String, ConfigError> {
+    let trimmed = name.trim();
+    if trimmed.is_empty() || trimmed != name || trimmed.bytes().any(|byte| byte.is_ascii_control())
+    {
+        return Err(ConfigError::InvalidRootHintName);
+    }
+
+    let without_root = trimmed.strip_suffix('.').unwrap_or(trimmed);
+    if without_root.is_empty() || without_root.len() > 253 {
+        return Err(ConfigError::InvalidRootHintName);
+    }
+
+    let mut wire_len = 1usize;
+    for label in without_root.split('.') {
+        if label.is_empty()
+            || label.len() > 63
+            || label.starts_with('-')
+            || label.ends_with('-')
+            || !label
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+        {
+            return Err(ConfigError::InvalidRootHintName);
+        }
+        wire_len = wire_len.saturating_add(1 + label.len());
+    }
+    if wire_len > 255 {
+        return Err(ConfigError::InvalidRootHintName);
+    }
+
+    Ok(without_root.to_ascii_lowercase())
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -263,6 +496,34 @@ impl DnssecValidationMode {
     fn cache_namespace_label(self) -> &'static str {
         match self {
             Self::Disabled => "disabled",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum RecursiveTransport {
+    Udp,
+    Tcp,
+}
+
+impl RecursiveTransport {
+    fn cache_namespace_label(self) -> &'static str {
+        match self {
+            Self::Udp => "udp",
+            Self::Tcp => "tcp",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DnameHandlingPolicy {
+    Defer,
+}
+
+impl DnameHandlingPolicy {
+    fn cache_namespace_label(self) -> &'static str {
+        match self {
+            Self::Defer => "defer",
         }
     }
 }
@@ -342,6 +603,24 @@ pub enum ConfigError {
     },
     MissingRecursiveResolutionConfig,
     InvalidRootHintsVersion,
+    MissingRootHints,
+    InvalidRootHintName,
+    MissingRootHintEndpoints,
+    InvalidRootHintEndpoint {
+        endpoint: SocketAddr,
+    },
+    InvalidRecursiveDepth {
+        value: u8,
+        max: u8,
+    },
+    InvalidCnameRestartLimit {
+        value: u8,
+        max: u8,
+    },
+    NoRecursiveTransports,
+    DuplicateRecursiveTransport {
+        transport: RecursiveTransport,
+    },
 }
 
 const DEFAULT_DNS_LISTEN_PORT: u16 = 5300;
@@ -349,6 +628,10 @@ const MIN_UPSTREAM_TIMEOUT: Duration = Duration::from_millis(50);
 const MAX_UPSTREAM_TIMEOUT: Duration = Duration::from_secs(10);
 const MIN_PER_QUERY_DEADLINE: Duration = Duration::from_millis(100);
 const MAX_PER_QUERY_DEADLINE: Duration = Duration::from_secs(30);
+const MIN_RECURSIVE_AUTHORITY_TIMEOUT: Duration = Duration::from_millis(50);
+const MAX_RECURSIVE_AUTHORITY_TIMEOUT: Duration = Duration::from_secs(10);
+const MAX_RECURSION_DEPTH: u8 = 64;
+const MAX_CNAME_RESTARTS: u8 = 16;
 const MIN_UDP_PAYLOAD_SIZE: usize = 512;
 const MAX_UDP_PAYLOAD_SIZE: usize = 4096;
 const FNV1A64_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
@@ -405,6 +688,16 @@ mod tests {
             priority,
             timeout: Duration::from_millis(500),
         }
+    }
+
+    fn root_hint(name: &str) -> RootHintConfig {
+        RootHintConfig::new(
+            name,
+            vec![SocketAddr::new(
+                IpAddr::V4(Ipv4Addr::new(198, 51, 100, 53)),
+                53,
+            )],
+        )
     }
 
     #[test]
@@ -510,7 +803,11 @@ mod tests {
             vec![SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 5300)],
             ResolutionConfig::recursive(
                 7,
-                RecursiveResolutionConfig::new("root-hints:v1", DnssecValidationMode::Disabled),
+                RecursiveResolutionConfig::new(
+                    "root-hints:v1",
+                    vec![root_hint("a.root-servers.example")],
+                    DnssecValidationMode::Disabled,
+                ),
             ),
             Vec::new(),
             Duration::from_secs(2),
@@ -543,7 +840,11 @@ mod tests {
             vec![SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 5300)],
             ResolutionConfig::recursive(
                 1,
-                RecursiveResolutionConfig::new(" ", DnssecValidationMode::Disabled),
+                RecursiveResolutionConfig::new(
+                    " ",
+                    vec![root_hint("a.root-servers.example")],
+                    DnssecValidationMode::Disabled,
+                ),
             ),
             Vec::new(),
             Duration::from_secs(2),
@@ -667,7 +968,11 @@ mod tests {
             vec![SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 5300)],
             ResolutionConfig::recursive(
                 3,
-                RecursiveResolutionConfig::new("root-hints:v1", DnssecValidationMode::Disabled),
+                RecursiveResolutionConfig::new(
+                    "root-hints:v1",
+                    vec![root_hint("a.root-servers.example")],
+                    DnssecValidationMode::Disabled,
+                ),
             ),
             Vec::new(),
             Duration::from_secs(2),
@@ -675,9 +980,166 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(
+        assert!(config.backend_cache_namespace().starts_with(
+            "mode:recursive;generation:3;root-hints:root-hints:v1;dnssec:disabled;authorities:"
+        ));
+
+        let changed_roots = RuntimeConfig::new_with_resolution(
+            vec![SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 5300)],
+            ResolutionConfig::recursive(
+                3,
+                RecursiveResolutionConfig::new(
+                    "root-hints:v1",
+                    vec![root_hint("b.root-servers.example")],
+                    DnssecValidationMode::Disabled,
+                ),
+            ),
+            Vec::new(),
+            Duration::from_secs(2),
+            1232,
+        )
+        .unwrap();
+        assert_ne!(
             config.backend_cache_namespace(),
-            "mode:recursive;generation:3;root-hints:root-hints:v1;dnssec:disabled"
+            changed_roots.backend_cache_namespace()
+        );
+    }
+
+    #[test]
+    fn recursive_config_validates_root_hints_and_authority_limits() {
+        let bundled = RecursiveResolutionConfig::bundled("bundled:v1");
+        assert!(bundled.validate().is_ok());
+        assert!(!bundled.load_root_hints().unwrap().is_empty());
+        assert_eq!(bundled.dname_handling, DnameHandlingPolicy::Defer);
+
+        let missing_roots = RecursiveResolutionConfig::new(
+            "root-hints:v1",
+            Vec::new(),
+            DnssecValidationMode::Disabled,
+        )
+        .validate()
+        .unwrap_err();
+        assert_eq!(missing_roots, ConfigError::MissingRootHints);
+
+        let invalid_root = RecursiveResolutionConfig::new(
+            "root-hints:v1",
+            vec![RootHintConfig::new(
+                " ",
+                vec![SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 53)],
+            )],
+            DnssecValidationMode::Disabled,
+        )
+        .validate()
+        .unwrap_err();
+        assert_eq!(invalid_root, ConfigError::InvalidRootHintName);
+
+        for invalid_name in [
+            "a..root",
+            "-a.root",
+            "a-.root",
+            "root name",
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.root",
+        ] {
+            let invalid_root = RecursiveResolutionConfig::new(
+                "root-hints:v1",
+                vec![RootHintConfig::new(
+                    invalid_name,
+                    vec![SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 53)],
+                )],
+                DnssecValidationMode::Disabled,
+            )
+            .validate()
+            .unwrap_err();
+            assert_eq!(invalid_root, ConfigError::InvalidRootHintName);
+        }
+
+        let invalid_endpoint = RecursiveResolutionConfig::new(
+            "root-hints:v1",
+            vec![RootHintConfig::new(
+                "a.root-servers.example",
+                vec![SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0)],
+            )],
+            DnssecValidationMode::Disabled,
+        )
+        .validate()
+        .unwrap_err();
+        assert!(matches!(
+            invalid_endpoint,
+            ConfigError::InvalidRootHintEndpoint { .. }
+        ));
+
+        for invalid_address in [
+            IpAddr::V4(Ipv4Addr::UNSPECIFIED),
+            IpAddr::V4(Ipv4Addr::LOCALHOST),
+            IpAddr::V4(Ipv4Addr::BROADCAST),
+            IpAddr::V4(Ipv4Addr::new(224, 0, 0, 1)),
+            IpAddr::V6(std::net::Ipv6Addr::UNSPECIFIED),
+            IpAddr::V6(std::net::Ipv6Addr::LOCALHOST),
+            IpAddr::V6(std::net::Ipv6Addr::new(0xff02, 0, 0, 0, 0, 0, 0, 1)),
+        ] {
+            let invalid_endpoint = RecursiveResolutionConfig::new(
+                "root-hints:v1",
+                vec![RootHintConfig::new(
+                    "a.root-servers.example",
+                    vec![SocketAddr::new(invalid_address, 53)],
+                )],
+                DnssecValidationMode::Disabled,
+            )
+            .validate()
+            .unwrap_err();
+            assert!(matches!(
+                invalid_endpoint,
+                ConfigError::InvalidRootHintEndpoint { .. }
+            ));
+        }
+
+        let mut invalid_limits = RecursiveResolutionConfig::new(
+            "root-hints:v1",
+            vec![root_hint("a.root-servers.example")],
+            DnssecValidationMode::Disabled,
+        );
+        invalid_limits.per_authority_timeout = Duration::from_secs(30);
+        assert!(matches!(
+            invalid_limits.validate().unwrap_err(),
+            ConfigError::InvalidDuration {
+                field: "recursive.per_authority_timeout",
+                ..
+            }
+        ));
+
+        invalid_limits.per_authority_timeout = Duration::from_millis(750);
+        invalid_limits.max_recursion_depth = 0;
+        assert_eq!(
+            invalid_limits.validate().unwrap_err(),
+            ConfigError::InvalidRecursiveDepth {
+                value: 0,
+                max: MAX_RECURSION_DEPTH
+            }
+        );
+
+        invalid_limits.max_recursion_depth = 16;
+        invalid_limits.max_cname_restarts = MAX_CNAME_RESTARTS + 1;
+        assert_eq!(
+            invalid_limits.validate().unwrap_err(),
+            ConfigError::InvalidCnameRestartLimit {
+                value: MAX_CNAME_RESTARTS + 1,
+                max: MAX_CNAME_RESTARTS
+            }
+        );
+
+        invalid_limits.max_cname_restarts = 8;
+        invalid_limits.allowed_transports.clear();
+        assert_eq!(
+            invalid_limits.validate().unwrap_err(),
+            ConfigError::NoRecursiveTransports
+        );
+
+        invalid_limits.allowed_transports = vec![RecursiveTransport::Udp, RecursiveTransport::Udp];
+        assert_eq!(
+            invalid_limits.validate().unwrap_err(),
+            ConfigError::DuplicateRecursiveTransport {
+                transport: RecursiveTransport::Udp
+            }
         );
     }
 
