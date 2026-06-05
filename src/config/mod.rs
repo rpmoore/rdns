@@ -93,7 +93,7 @@ impl RuntimeConfig {
 
         self.resolution.validate()?;
         if self.resolution.mode == ResolutionMode::Forward
-            && self.enabled_upstreams().next().is_none()
+            && self.enabled_udp_upstreams().is_empty()
         {
             return Err(ConfigError::NoEnabledUpstream);
         }
@@ -132,6 +132,16 @@ impl RuntimeConfig {
         upstreams.into_iter()
     }
 
+    fn enabled_udp_upstreams(&self) -> Vec<&UpstreamConfig> {
+        let mut upstreams: Vec<_> = self
+            .upstreams
+            .iter()
+            .filter(|upstream| upstream.enabled && upstream.protocol == UpstreamProtocol::Udp)
+            .collect();
+        upstreams.sort_by_key(|upstream| upstream.priority);
+        upstreams
+    }
+
     pub fn backend_cache_namespace(&self) -> String {
         match self.resolution.mode {
             ResolutionMode::Forward => format!(
@@ -159,15 +169,8 @@ impl RuntimeConfig {
     }
 
     fn forwarding_upstream_set_hash(&self) -> u64 {
-        let mut upstreams: Vec<_> = self
-            .upstreams
-            .iter()
-            .filter(|upstream| upstream.enabled && upstream.protocol == UpstreamProtocol::Udp)
-            .collect();
-        upstreams.sort_by_key(|upstream| upstream.priority);
-
         let mut hash = FNV1A64_OFFSET;
-        for upstream in upstreams {
+        for upstream in self.enabled_udp_upstreams() {
             hash_namespace_field(&mut hash, "name", &upstream.name);
             hash_namespace_field(&mut hash, "endpoint", &upstream.endpoint.to_string());
             hash_namespace_field(
@@ -789,6 +792,19 @@ mod tests {
             vec![SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 5300)],
             ResolutionConfig::forwarding_default(),
             vec![upstream("primary", 10, false)],
+            Duration::from_secs(2),
+            1232,
+        )
+        .unwrap_err();
+
+        assert_eq!(error, ConfigError::NoEnabledUpstream);
+
+        let mut tcp_only = upstream("tcp-only", 10, true);
+        tcp_only.protocol = UpstreamProtocol::Tcp;
+        let error = RuntimeConfig::new_with_resolution(
+            vec![SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 5300)],
+            ResolutionConfig::forwarding_default(),
+            vec![tcp_only],
             Duration::from_secs(2),
             1232,
         )

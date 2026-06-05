@@ -1423,7 +1423,7 @@ mod tests {
 
     #[test]
     fn runtime_config_constructor_rejects_no_enabled_udp_upstreams() {
-        let config = RuntimeConfig::new(
+        let error = RuntimeConfig::new(
             vec!["127.0.0.1:5300".parse().unwrap()],
             vec![UpstreamConfig {
                 protocol: UpstreamProtocol::Tcp,
@@ -1437,14 +1437,9 @@ mod tests {
             Duration::from_secs(1),
             1232,
         )
-        .unwrap();
+        .unwrap_err();
 
-        let error = match ForwardingResolutionBackend::from_runtime_config(&config) {
-            Ok(_) => panic!("expected no enabled UDP upstreams"),
-            Err(error) => error,
-        };
-
-        assert_eq!(error, UpstreamError::NoBackendsAvailable);
+        assert_eq!(error, crate::config::ConfigError::NoEnabledUpstream);
     }
 
     #[tokio::test]
