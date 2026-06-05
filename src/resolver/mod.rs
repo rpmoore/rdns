@@ -615,7 +615,9 @@ impl ResolutionResponse {
             negative_cache: None,
             source_credibility: SourceCredibility::ForwarderValidated,
             backend_provenance: BackendProvenance::forwarding(backend_generation, backend_name),
-            cache_directive: ResolutionCacheDirective::Cacheable,
+            cache_directive: ResolutionCacheDirective::DoNotCache(
+                ResolutionNoCacheReason::ValidationIncomplete,
+            ),
         }
     }
 
@@ -5373,6 +5375,22 @@ mod tests {
         assert_eq!(
             response.cache_directive,
             ResolutionCacheDirective::Cacheable
+        );
+    }
+
+    #[test]
+    fn unparsed_forwarded_response_is_marked_not_cacheable() {
+        let response = ResolutionResponse::forwarded_bytes(
+            vec![0x12],
+            SystemTime::UNIX_EPOCH,
+            42,
+            "forward-primary",
+        );
+
+        assert_eq!(response.response_message(), None);
+        assert_eq!(
+            response.cache_directive,
+            ResolutionCacheDirective::DoNotCache(ResolutionNoCacheReason::ValidationIncomplete)
         );
     }
 
