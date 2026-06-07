@@ -34,7 +34,10 @@ use crate::protocol::{
 };
 
 pub mod policy;
-pub use policy::{DomainName, DomainNameError, DomainSelector};
+pub use policy::{
+    CidrPrefixError, ClientIdentity, ClientSelector, DomainName, DomainNameError, DomainSelector,
+    IpCidr,
+};
 
 const EDNS_DO_FLAG: u16 = 0x8000;
 const MAX_FAILURE_CACHE_TTL: Duration = Duration::from_secs(5 * 60);

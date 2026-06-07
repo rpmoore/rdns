@@ -13,6 +13,7 @@
 // limitations under the License.
 
 use std::fmt;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::str::FromStr;
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -111,6 +112,139 @@ impl DomainSelector {
             Self::Exact(domain) | Self::Subtree(domain) => domain,
         }
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum ClientIdentity {
+    Ip(IpAddr),
+}
+
+impl ClientIdentity {
+    pub fn ip(ip: IpAddr) -> Self {
+        Self::Ip(ip)
+    }
+
+    pub fn source_ip(&self) -> IpAddr {
+        match self {
+            Self::Ip(ip) => *ip,
+        }
+    }
+}
+
+impl From<IpAddr> for ClientIdentity {
+    fn from(ip: IpAddr) -> Self {
+        Self::ip(ip)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum ClientSelector {
+    ExactIp(IpAddr),
+    Cidr(IpCidr),
+}
+
+impl ClientSelector {
+    pub fn exact_ip(ip: IpAddr) -> Self {
+        Self::ExactIp(ip)
+    }
+
+    pub fn cidr(network: IpAddr, prefix_len: u8) -> Result<Self, CidrPrefixError> {
+        Ok(Self::Cidr(IpCidr::new(network, prefix_len)?))
+    }
+
+    pub fn matches(&self, client: &ClientIdentity) -> bool {
+        match self {
+            Self::ExactIp(ip) => client.source_ip() == *ip,
+            Self::Cidr(cidr) => cidr.contains(client.source_ip()),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct IpCidr {
+    network: IpAddr,
+    prefix_len: u8,
+}
+
+impl IpCidr {
+    pub fn new(network: IpAddr, prefix_len: u8) -> Result<Self, CidrPrefixError> {
+        let max_prefix_len = ip_bit_len(network);
+        if prefix_len > max_prefix_len {
+            return Err(CidrPrefixError {
+                prefix_len,
+                max_prefix_len,
+            });
+        }
+
+        Ok(Self {
+            network: mask_ip(network, prefix_len),
+            prefix_len,
+        })
+    }
+
+    pub fn network(&self) -> IpAddr {
+        self.network
+    }
+
+    pub fn prefix_len(&self) -> u8 {
+        self.prefix_len
+    }
+
+    pub fn contains(&self, ip: IpAddr) -> bool {
+        if !same_ip_family(self.network, ip) {
+            return false;
+        }
+        mask_ip(ip, self.prefix_len) == self.network
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CidrPrefixError {
+    pub prefix_len: u8,
+    pub max_prefix_len: u8,
+}
+
+fn same_ip_family(left: IpAddr, right: IpAddr) -> bool {
+    matches!(
+        (left, right),
+        (IpAddr::V4(_), IpAddr::V4(_)) | (IpAddr::V6(_), IpAddr::V6(_))
+    )
+}
+
+fn ip_bit_len(ip: IpAddr) -> u8 {
+    match ip {
+        IpAddr::V4(_) => 32,
+        IpAddr::V6(_) => 128,
+    }
+}
+
+fn mask_ip(ip: IpAddr, prefix_len: u8) -> IpAddr {
+    match ip {
+        IpAddr::V4(ip) => IpAddr::V4(mask_ipv4(ip, prefix_len)),
+        IpAddr::V6(ip) => IpAddr::V6(mask_ipv6(ip, prefix_len)),
+    }
+}
+
+fn mask_ipv4(ip: Ipv4Addr, prefix_len: u8) -> Ipv4Addr {
+    let raw = u32::from(ip);
+    let mask = if prefix_len == 0 {
+        0
+    } else {
+        u32::MAX << (32 - prefix_len)
+    };
+    Ipv4Addr::from(raw & mask)
+}
+
+fn mask_ipv6(ip: Ipv6Addr, prefix_len: u8) -> Ipv6Addr {
+    let raw = u128::from(ip);
+    let mask = if prefix_len == 0 {
+        0
+    } else {
+        u128::MAX << (128 - prefix_len)
+    };
+    Ipv6Addr::from(raw & mask)
 }
 
 fn validate_normalized_domain(domain: &str) -> Result<(), DomainNameError> {
@@ -268,5 +402,108 @@ mod tests {
         assert!(selector.matches(&DomainName::parse("deep.www.example.com").unwrap()));
         assert!(!selector.matches(&DomainName::parse("badexample.com").unwrap()));
         assert!(!selector.matches(&DomainName::parse("example.com.evil").unwrap()));
+    }
+
+    #[test]
+    fn client_identity_starts_with_source_ip() {
+        let ip = IpAddr::V4(Ipv4Addr::new(192, 0, 2, 10));
+        let identity = ClientIdentity::ip(ip);
+
+        assert_eq!(identity.source_ip(), ip);
+        assert_eq!(ClientIdentity::from(ip), identity);
+    }
+
+    #[test]
+    fn exact_ip_selector_matches_only_same_address() {
+        let selector = ClientSelector::exact_ip(IpAddr::V4(Ipv4Addr::new(192, 0, 2, 10)));
+
+        assert!(
+            selector.matches(&ClientIdentity::ip(IpAddr::V4(Ipv4Addr::new(
+                192, 0, 2, 10
+            ))))
+        );
+        assert!(
+            !selector.matches(&ClientIdentity::ip(IpAddr::V4(Ipv4Addr::new(
+                192, 0, 2, 11
+            ))))
+        );
+        assert!(!selector.matches(&ClientIdentity::ip(IpAddr::V6(Ipv6Addr::LOCALHOST))));
+    }
+
+    #[test]
+    fn cidr_selector_matches_ipv4_network_boundaries() {
+        let selector = ClientSelector::cidr(IpAddr::V4(Ipv4Addr::new(192, 0, 2, 99)), 24).unwrap();
+
+        assert_eq!(
+            match &selector {
+                ClientSelector::Cidr(cidr) => cidr.network(),
+                ClientSelector::ExactIp(_) => unreachable!(),
+            },
+            IpAddr::V4(Ipv4Addr::new(192, 0, 2, 0))
+        );
+        assert!(selector.matches(&ClientIdentity::ip(IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1)))));
+        assert!(
+            selector.matches(&ClientIdentity::ip(IpAddr::V4(Ipv4Addr::new(
+                192, 0, 2, 255
+            ))))
+        );
+        assert!(!selector.matches(&ClientIdentity::ip(IpAddr::V4(Ipv4Addr::new(192, 0, 3, 1)))));
+    }
+
+    #[test]
+    fn cidr_selector_matches_ipv6_network_boundaries() {
+        let selector = ClientSelector::cidr(
+            IpAddr::V6(Ipv6Addr::new(0x2001, 0xdb8, 1, 2, 3, 4, 5, 6)),
+            48,
+        )
+        .unwrap();
+
+        assert!(
+            selector.matches(&ClientIdentity::ip(IpAddr::V6(Ipv6Addr::new(
+                0x2001, 0xdb8, 1, 0xffff, 0, 0, 0, 1,
+            ))))
+        );
+        assert!(
+            !selector.matches(&ClientIdentity::ip(IpAddr::V6(Ipv6Addr::new(
+                0x2001, 0xdb8, 2, 0, 0, 0, 0, 1,
+            ))))
+        );
+        assert!(!selector.matches(&ClientIdentity::ip(IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1)))));
+    }
+
+    #[test]
+    fn cidr_prefix_validation_rejects_out_of_range_lengths() {
+        assert_eq!(
+            IpCidr::new(IpAddr::V4(Ipv4Addr::new(192, 0, 2, 0)), 33),
+            Err(CidrPrefixError {
+                prefix_len: 33,
+                max_prefix_len: 32,
+            })
+        );
+        assert_eq!(
+            IpCidr::new(IpAddr::V6(Ipv6Addr::LOCALHOST), 129),
+            Err(CidrPrefixError {
+                prefix_len: 129,
+                max_prefix_len: 128,
+            })
+        );
+    }
+
+    #[test]
+    fn zero_length_cidr_prefix_matches_family_only() {
+        let ipv4_selector = ClientSelector::cidr(IpAddr::V4(Ipv4Addr::LOCALHOST), 0).unwrap();
+        let ipv6_selector = ClientSelector::cidr(IpAddr::V6(Ipv6Addr::LOCALHOST), 0).unwrap();
+
+        assert!(
+            ipv4_selector.matches(&ClientIdentity::ip(IpAddr::V4(Ipv4Addr::new(
+                203, 0, 113, 1
+            ))))
+        );
+        assert!(!ipv4_selector.matches(&ClientIdentity::ip(IpAddr::V6(Ipv6Addr::LOCALHOST))));
+        assert!(
+            ipv6_selector.matches(&ClientIdentity::ip(IpAddr::V6(Ipv6Addr::new(
+                0x2001, 0xdb8, 0, 0, 0, 0, 0, 1,
+            ))))
+        );
     }
 }
