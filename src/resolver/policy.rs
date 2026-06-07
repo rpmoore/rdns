@@ -16,6 +16,8 @@ use std::fmt;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::str::FromStr;
 
+use super::{BlockReason, PolicyBlock, PolicyDecision, PolicyEvaluator, QuestionKey};
+
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct DomainName(String);
 
@@ -159,6 +161,87 @@ impl ClientSelector {
             Self::ExactIp(ip) => client.source_ip() == *ip,
             Self::Cidr(cidr) => cidr.contains(client.source_ip()),
         }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LocalDenyRule {
+    pub id: String,
+    pub client: ClientSelector,
+    pub domain: DomainSelector,
+    pub enabled: bool,
+}
+
+impl LocalDenyRule {
+    pub fn new(
+        id: impl Into<String>,
+        client: ClientSelector,
+        domain: DomainSelector,
+        enabled: bool,
+    ) -> Self {
+        Self {
+            id: id.into(),
+            client,
+            domain,
+            enabled,
+        }
+    }
+
+    pub fn matches(&self, client: &ClientIdentity, domain: &DomainName) -> bool {
+        self.enabled && self.client.matches(client) && self.domain.matches(domain)
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct LocalPolicyEvaluator {
+    deny_rules: Vec<LocalDenyRule>,
+}
+
+impl LocalPolicyEvaluator {
+    pub fn new(deny_rules: Vec<LocalDenyRule>) -> Self {
+        Self { deny_rules }
+    }
+
+    pub fn deny_rules(&self) -> &[LocalDenyRule] {
+        &self.deny_rules
+    }
+
+    pub fn evaluate_identity(
+        &self,
+        client: &ClientIdentity,
+        domain: &DomainName,
+    ) -> PolicyDecision {
+        self.deny_rules
+            .iter()
+            .find(|rule| rule.matches(client, domain))
+            .map(|rule| {
+                PolicyDecision::Block(PolicyBlock {
+                    reason: BlockReason::LocalRule,
+                    rule_id: Some(rule.id.clone()),
+                })
+            })
+            .unwrap_or(PolicyDecision::Allow)
+    }
+}
+
+impl PolicyEvaluator for LocalPolicyEvaluator {
+    fn evaluate(&self, client_ip: IpAddr, question: &QuestionKey) -> PolicyDecision {
+        let Ok(domain) = DomainName::parse(&question.qname) else {
+            return PolicyDecision::Block(PolicyBlock {
+                reason: BlockReason::InvalidDomain,
+                rule_id: None,
+            });
+        };
+        self.evaluate_identity(&ClientIdentity::ip(client_ip), &domain)
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+pub struct NoopPolicyEvaluator;
+
+impl PolicyEvaluator for NoopPolicyEvaluator {
+    fn evaluate(&self, _client_ip: IpAddr, _question: &QuestionKey) -> PolicyDecision {
+        PolicyDecision::Allow
     }
 }
 
@@ -504,6 +587,122 @@ mod tests {
             ipv6_selector.matches(&ClientIdentity::ip(IpAddr::V6(Ipv6Addr::new(
                 0x2001, 0xdb8, 0, 0, 0, 0, 0, 1,
             ))))
+        );
+    }
+
+    #[test]
+    fn local_deny_rule_requires_enabled_client_and_domain_match() {
+        let rule = LocalDenyRule::new(
+            "rule-1",
+            ClientSelector::cidr(IpAddr::V4(Ipv4Addr::new(192, 0, 2, 0)), 24).unwrap(),
+            DomainSelector::subtree("blocked.example").unwrap(),
+            true,
+        );
+        let client = ClientIdentity::ip(IpAddr::V4(Ipv4Addr::new(192, 0, 2, 55)));
+
+        assert!(rule.matches(&client, &DomainName::parse("host.blocked.example").unwrap()));
+        assert!(!rule.matches(
+            &ClientIdentity::ip(IpAddr::V4(Ipv4Addr::new(198, 51, 100, 1))),
+            &DomainName::parse("host.blocked.example").unwrap()
+        ));
+        assert!(!rule.matches(&client, &DomainName::parse("allowed.example").unwrap()));
+
+        let disabled = LocalDenyRule::new(
+            "rule-2",
+            ClientSelector::exact_ip(client.source_ip()),
+            DomainSelector::exact("blocked.example").unwrap(),
+            false,
+        );
+        assert!(!disabled.matches(&client, &DomainName::parse("blocked.example").unwrap()));
+    }
+
+    #[test]
+    fn local_policy_evaluator_returns_first_matching_rule_identifier() {
+        let evaluator = LocalPolicyEvaluator::new(vec![
+            LocalDenyRule::new(
+                "disabled-first",
+                ClientSelector::cidr(IpAddr::V4(Ipv4Addr::new(192, 0, 2, 0)), 24).unwrap(),
+                DomainSelector::subtree("blocked.example").unwrap(),
+                false,
+            ),
+            LocalDenyRule::new(
+                "match-first",
+                ClientSelector::cidr(IpAddr::V4(Ipv4Addr::new(192, 0, 2, 0)), 24).unwrap(),
+                DomainSelector::subtree("blocked.example").unwrap(),
+                true,
+            ),
+            LocalDenyRule::new(
+                "match-second",
+                ClientSelector::exact_ip(IpAddr::V4(Ipv4Addr::new(192, 0, 2, 55))),
+                DomainSelector::exact("host.blocked.example").unwrap(),
+                true,
+            ),
+        ]);
+
+        assert_eq!(
+            evaluator.evaluate_identity(
+                &ClientIdentity::ip(IpAddr::V4(Ipv4Addr::new(192, 0, 2, 55))),
+                &DomainName::parse("host.blocked.example").unwrap(),
+            ),
+            PolicyDecision::Block(PolicyBlock {
+                reason: BlockReason::LocalRule,
+                rule_id: Some("match-first".to_string()),
+            })
+        );
+    }
+
+    #[test]
+    fn local_policy_evaluator_allows_when_no_rule_matches() {
+        let evaluator = LocalPolicyEvaluator::new(vec![LocalDenyRule::new(
+            "rule-1",
+            ClientSelector::exact_ip(IpAddr::V4(Ipv4Addr::new(192, 0, 2, 55))),
+            DomainSelector::exact("blocked.example").unwrap(),
+            true,
+        )]);
+
+        assert_eq!(
+            evaluator.evaluate_identity(
+                &ClientIdentity::ip(IpAddr::V4(Ipv4Addr::new(192, 0, 2, 55))),
+                &DomainName::parse("allowed.example").unwrap(),
+            ),
+            PolicyDecision::Allow
+        );
+    }
+
+    #[test]
+    fn local_policy_evaluator_implements_existing_policy_port() {
+        let evaluator = LocalPolicyEvaluator::new(vec![LocalDenyRule::new(
+            "rule-1",
+            ClientSelector::exact_ip(IpAddr::V4(Ipv4Addr::new(192, 0, 2, 55))),
+            DomainSelector::exact("blocked.example").unwrap(),
+            true,
+        )]);
+
+        assert_eq!(
+            evaluator.evaluate(
+                IpAddr::V4(Ipv4Addr::new(192, 0, 2, 55)),
+                &QuestionKey::new("Blocked.Example.", 1, 1),
+            ),
+            PolicyDecision::Block(PolicyBlock {
+                reason: BlockReason::LocalRule,
+                rule_id: Some("rule-1".to_string()),
+            })
+        );
+    }
+
+    #[test]
+    fn local_policy_evaluator_reports_invalid_domain() {
+        let evaluator = LocalPolicyEvaluator::default();
+
+        assert_eq!(
+            evaluator.evaluate(
+                IpAddr::V4(Ipv4Addr::new(192, 0, 2, 55)),
+                &QuestionKey::new("bad_label.example", 1, 1),
+            ),
+            PolicyDecision::Block(PolicyBlock {
+                reason: BlockReason::InvalidDomain,
+                rule_id: None,
+            })
         );
     }
 }

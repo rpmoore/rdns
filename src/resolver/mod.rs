@@ -36,7 +36,7 @@ use crate::protocol::{
 pub mod policy;
 pub use policy::{
     CidrPrefixError, ClientIdentity, ClientSelector, DomainName, DomainNameError, DomainSelector,
-    IpCidr,
+    IpCidr, LocalDenyRule, LocalPolicyEvaluator, NoopPolicyEvaluator,
 };
 
 const EDNS_DO_FLAG: u16 = 0x8000;
@@ -270,6 +270,7 @@ pub struct PolicyBlock {
 pub enum BlockReason {
     LocalRule,
     MaliciousDomain,
+    InvalidDomain,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1486,7 +1487,7 @@ fn canonical_chain_from_response(response: &Message) -> Vec<String> {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ResolveDecisionKind {
     Allowed,
-    Blocked(BlockReason),
+    Blocked(PolicyBlock),
     CacheHit,
     CacheMiss,
     ProtocolError(ResponseCode),
@@ -1606,7 +1607,7 @@ impl QueryEventOutcome {
     fn from_decision_kind(kind: &ResolveDecisionKind) -> Self {
         match kind {
             ResolveDecisionKind::Allowed => Self::AllowedFromBackend,
-            ResolveDecisionKind::Blocked(reason) => Self::Blocked(reason.clone()),
+            ResolveDecisionKind::Blocked(block) => Self::Blocked(block.reason.clone()),
             ResolveDecisionKind::CacheHit => Self::AllowedFromCache,
             ResolveDecisionKind::CacheMiss => Self::AllowedFromBackend,
             ResolveDecisionKind::ProtocolError(code) => Self::ProtocolError(*code),
@@ -2124,6 +2125,7 @@ struct CacheProbe {
 
 pub struct ResolveQuery {
     protocol: Arc<dyn ProtocolCodec>,
+    policy: Arc<dyn PolicyEvaluator>,
     cache: Arc<dyn DnsCache>,
     ttl_policy: CacheTtlPolicy,
     miss_coalescer: Arc<SingleFlightMisses>,
@@ -2167,9 +2169,34 @@ impl ResolveQuery {
         events: Arc<dyn QueryEventSink>,
         metrics: Arc<dyn MetricsSink>,
     ) -> Self {
+        Self::with_cache_and_policy(
+            protocol,
+            cache,
+            Arc::new(NoopPolicyEvaluator),
+            ttl_policy,
+            backend,
+            responses,
+            clock,
+            events,
+            metrics,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn with_cache_and_policy(
+        protocol: Arc<dyn ProtocolCodec>,
+        cache: Arc<dyn DnsCache>,
+        policy: Arc<dyn PolicyEvaluator>,
+        ttl_policy: CacheTtlPolicy,
+        backend: Arc<dyn ResolutionBackend>,
+        responses: Arc<dyn ResponseFactory>,
+        clock: Arc<dyn Clock>,
+        events: Arc<dyn QueryEventSink>,
+        metrics: Arc<dyn MetricsSink>,
+    ) -> Self {
         let snapshot = BackendSnapshot::forwarding(backend, 0);
-        Self::with_cache_and_backend_snapshot(
-            protocol, cache, ttl_policy, snapshot, responses, clock, events, metrics,
+        Self::with_cache_policy_and_backend_snapshot(
+            protocol, cache, policy, ttl_policy, snapshot, responses, clock, events, metrics,
         )
     }
 
@@ -2184,9 +2211,35 @@ impl ResolveQuery {
         events: Arc<dyn QueryEventSink>,
         metrics: Arc<dyn MetricsSink>,
     ) -> Self {
+        Self::with_cache_policy_and_backend_snapshot(
+            protocol,
+            cache,
+            Arc::new(NoopPolicyEvaluator),
+            ttl_policy,
+            backend_snapshot,
+            responses,
+            clock,
+            events,
+            metrics,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn with_cache_policy_and_backend_snapshot(
+        protocol: Arc<dyn ProtocolCodec>,
+        cache: Arc<dyn DnsCache>,
+        policy: Arc<dyn PolicyEvaluator>,
+        ttl_policy: CacheTtlPolicy,
+        backend_snapshot: BackendSnapshot,
+        responses: Arc<dyn ResponseFactory>,
+        clock: Arc<dyn Clock>,
+        events: Arc<dyn QueryEventSink>,
+        metrics: Arc<dyn MetricsSink>,
+    ) -> Self {
         metrics.record_backend_status(&backend_snapshot.status());
         Self {
             protocol,
+            policy,
             cache,
             ttl_policy,
             miss_coalescer: Arc::new(SingleFlightMisses::default()),
@@ -2220,9 +2273,35 @@ impl ResolveQuery {
         events: Arc<dyn QueryEventSink>,
         metrics: Arc<dyn MetricsSink>,
     ) -> Self {
+        Self::with_cache_policy_and_backend_handle(
+            protocol,
+            cache,
+            Arc::new(NoopPolicyEvaluator),
+            ttl_policy,
+            backend_handle,
+            responses,
+            clock,
+            events,
+            metrics,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn with_cache_policy_and_backend_handle(
+        protocol: Arc<dyn ProtocolCodec>,
+        cache: Arc<dyn DnsCache>,
+        policy: Arc<dyn PolicyEvaluator>,
+        ttl_policy: CacheTtlPolicy,
+        backend_handle: BackendHandle,
+        responses: Arc<dyn ResponseFactory>,
+        clock: Arc<dyn Clock>,
+        events: Arc<dyn QueryEventSink>,
+        metrics: Arc<dyn MetricsSink>,
+    ) -> Self {
         metrics.record_backend_status(&backend_handle.status());
         Self {
             protocol,
+            policy,
             cache,
             ttl_policy,
             miss_coalescer: Arc::new(SingleFlightMisses::default()),
@@ -2248,8 +2327,16 @@ impl ResolveQuery {
         metrics: Arc<dyn MetricsSink>,
     ) -> Self {
         let snapshot = BackendSnapshot::forwarding(backend, backend_generation);
-        Self::with_cache_and_backend_snapshot(
-            protocol, cache, ttl_policy, snapshot, responses, clock, events, metrics,
+        Self::with_cache_policy_and_backend_snapshot(
+            protocol,
+            cache,
+            Arc::new(NoopPolicyEvaluator),
+            ttl_policy,
+            snapshot,
+            responses,
+            clock,
+            events,
+            metrics,
         )
     }
 
@@ -2284,8 +2371,29 @@ impl ResolveQuery {
             }
         };
 
-        self.metrics.increment(ResolverMetric::QueryAllowed);
         let question = decoded.question.clone();
+        if let PolicyDecision::Block(block) =
+            self.policy.evaluate(request.client_ip, &decoded.question)
+        {
+            let decision = ResolveDecision {
+                client_ip: request.client_ip,
+                question: Some(question),
+                kind: ResolveDecisionKind::Blocked(block.clone()),
+            };
+            let response_bytes = self.responses.blocked(&decoded, &block);
+            return self
+                .finish(
+                    started_at,
+                    &request,
+                    decoded_original_question_name(&decoded),
+                    decision,
+                    response_bytes,
+                    None,
+                    Some(QueryEventBackend::from_snapshot(&backend_snapshot)),
+                )
+                .await;
+        }
+        self.metrics.increment(ResolverMetric::QueryAllowed);
 
         let mut cache_probe = self
             .probe_cache(&backend_snapshot, &request, &decoded)
@@ -9732,6 +9840,75 @@ mod tests {
             .lock()
             .unwrap()
             .contains(&ResolverMetric::UpstreamSuccess));
+    }
+
+    #[tokio::test]
+    async fn resolve_applies_local_deny_policy_before_cache_or_backend() {
+        let upstream = Arc::new(StaticUpstream::new(Ok(upstream_response(
+            a_response_with_answer(0xabcd, "blocked.example", 60),
+        ))));
+        let cache = Arc::new(RecordingCache::with_lookup(CacheLookup::Miss));
+        let events = Arc::new(RecordingEvents::default());
+        let metrics = Arc::new(RecordingMetrics::default());
+        let policy = Arc::new(LocalPolicyEvaluator::new(vec![LocalDenyRule::new(
+            "rule-1",
+            ClientSelector::exact_ip("192.0.2.10".parse().unwrap()),
+            DomainSelector::exact("blocked.example").unwrap(),
+            true,
+        )]));
+        let service = ResolveQuery::with_cache_and_policy(
+            Arc::new(StandardProtocolCodec::new(1232)),
+            cache.clone(),
+            policy,
+            CacheTtlPolicy::default(),
+            upstream.clone(),
+            Arc::new(BasicResponseFactory),
+            Arc::new(FixedClock(SystemTime::UNIX_EPOCH)),
+            events.clone(),
+            metrics.clone(),
+        );
+
+        let outcome = service
+            .resolve(ResolveRequest::new(
+                "192.0.2.10".parse().unwrap(),
+                SystemTime::UNIX_EPOCH,
+                a_query(0x1234, "Blocked.Example"),
+            ))
+            .await;
+
+        assert_eq!(
+            outcome.decision.kind,
+            ResolveDecisionKind::Blocked(PolicyBlock {
+                reason: BlockReason::LocalRule,
+                rule_id: Some("rule-1".to_string()),
+            })
+        );
+        assert_eq!(outcome.decision.question.unwrap().qname, "blocked.example");
+        assert_eq!(upstream.requests.lock().unwrap().len(), 0);
+        assert_eq!(cache.lookups.lock().unwrap().len(), 0);
+        assert_eq!(cache.stores.lock().unwrap().len(), 0);
+        assert_eq!(
+            response_code_from_wire(&outcome.response_bytes),
+            Some(ResponseCode::Refused as u16)
+        );
+        {
+            let recorded_events = events.events.lock().unwrap();
+            assert_eq!(recorded_events.len(), 1);
+            assert_eq!(
+                recorded_events[0].terminal_outcome,
+                QueryEventOutcome::Blocked(BlockReason::LocalRule)
+            );
+            assert_eq!(recorded_events[0].cache_result, None);
+            assert_eq!(
+                recorded_events[0].original_question_name.as_deref(),
+                Some("Blocked.Example")
+            );
+        }
+        assert!(!metrics
+            .increments
+            .lock()
+            .unwrap()
+            .contains(&ResolverMetric::QueryAllowed));
     }
 
     #[tokio::test]
