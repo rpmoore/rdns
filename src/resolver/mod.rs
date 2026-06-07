@@ -33,6 +33,9 @@ use crate::protocol::{
     ResponseCode,
 };
 
+pub mod policy;
+pub use policy::{DomainName, DomainNameError, DomainSelector};
+
 const EDNS_DO_FLAG: u16 = 0x8000;
 const MAX_FAILURE_CACHE_TTL: Duration = Duration::from_secs(5 * 60);
 const CNAME_RECORD_TYPE: u16 = 5;
