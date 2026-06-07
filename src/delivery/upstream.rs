@@ -25,10 +25,12 @@ use tokio::net::TcpStream;
 use tokio::net::UdpSocket;
 use tokio::time::{self, Instant};
 
-use crate::config::{RuntimeConfig, UpstreamConfig, UpstreamProtocol};
+use crate::config::{RecursiveTransport, RuntimeConfig, UpstreamConfig, UpstreamProtocol};
 use crate::protocol::{encode_tcp_frame, first_question, rewrite_response_id, Message};
 use crate::resolver::{
-    QuestionKey, ResolutionBackend, UpstreamError, UpstreamRequest, UpstreamResponse,
+    MetricsSink, NoopMetricsSink, QuestionKey, RecursiveAuthorityResponse,
+    RecursiveAuthorityTransport, ResolutionBackend, ResolverMetric, UpstreamError, UpstreamRequest,
+    UpstreamResponse,
 };
 
 const DEGRADED_FAILURE_THRESHOLD: u32 = 2;
@@ -104,11 +106,18 @@ fn splitmix64(value: u64) -> u64 {
     mixed ^ (mixed >> 31)
 }
 
-pub struct UdpUpstreamResolver {
+pub struct ForwardingResolutionBackend {
     upstreams: Vec<UpstreamConfig>,
     id_generator: Arc<dyn TransactionIdGenerator>,
     per_query_deadline: Duration,
     health: Vec<Mutex<UpstreamHealth>>,
+}
+
+pub struct RecursiveAuthorityTransportClient {
+    id_generator: Arc<dyn TransactionIdGenerator>,
+    allowed_transports: Vec<RecursiveTransport>,
+    max_udp_payload_size: usize,
+    metrics: Arc<dyn MetricsSink>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -133,7 +142,7 @@ struct UpstreamAttempt {
     deadline: Instant,
 }
 
-impl UdpUpstreamResolver {
+impl ForwardingResolutionBackend {
     pub fn new(upstream: UpstreamConfig) -> Self {
         Self::with_id_generator(
             upstream,
@@ -376,6 +385,167 @@ impl UdpUpstreamResolver {
     }
 }
 
+impl RecursiveAuthorityTransportClient {
+    pub fn from_runtime_config(config: &RuntimeConfig) -> Result<Self, UpstreamError> {
+        let Some(recursive) = config.resolution.recursive.as_ref() else {
+            return Err(UpstreamError::NoBackendsAvailable);
+        };
+        Ok(Self::with_id_generator(
+            recursive.allowed_transports.clone(),
+            config.max_udp_payload_size,
+            Arc::new(MixedTransactionIdGenerator::seeded_from_environment()),
+        ))
+    }
+
+    pub fn with_id_generator(
+        allowed_transports: Vec<RecursiveTransport>,
+        max_udp_payload_size: usize,
+        id_generator: Arc<dyn TransactionIdGenerator>,
+    ) -> Self {
+        Self {
+            id_generator,
+            allowed_transports,
+            max_udp_payload_size,
+            metrics: Arc::new(NoopMetricsSink),
+        }
+    }
+
+    pub fn with_metrics(mut self, metrics: Arc<dyn MetricsSink>) -> Self {
+        self.metrics = metrics;
+        self
+    }
+
+    async fn query_authority(
+        &self,
+        authority: SocketAddr,
+        question: QuestionKey,
+        dnssec_ok: bool,
+        timeout: Duration,
+    ) -> Result<RecursiveAuthorityResponse, UpstreamError> {
+        let authority_id = self.id_generator.next_id();
+        let query = build_authority_query(
+            authority_id,
+            &question,
+            self.max_udp_payload_size,
+            dnssec_ok,
+        )?;
+        let deadline = Instant::now() + timeout;
+
+        if self.transport_allowed(RecursiveTransport::Udp) {
+            return self
+                .query_authority_udp(authority, &question, &query, authority_id, deadline)
+                .await;
+        }
+        if self.transport_allowed(RecursiveTransport::Tcp) {
+            return query_authority_tcp(authority, &question, &query, authority_id, deadline).await;
+        }
+
+        Err(UpstreamError::NoBackendsAvailable)
+    }
+
+    async fn query_authority_udp(
+        &self,
+        authority: SocketAddr,
+        question: &QuestionKey,
+        query: &[u8],
+        authority_id: u16,
+        deadline: Instant,
+    ) -> Result<RecursiveAuthorityResponse, UpstreamError> {
+        let socket = bind_ephemeral_for(authority).await?;
+        socket
+            .send_to(query, authority)
+            .await
+            .map_err(transport_error)?;
+
+        let mut response_bytes = vec![0; self.max_udp_payload_size];
+        let (response_len, source) = time::timeout(
+            remaining_until(deadline)?,
+            socket.recv_from(&mut response_bytes),
+        )
+        .await
+        .map_err(|_| UpstreamError::Timeout)?
+        .map_err(transport_error)?;
+        response_bytes.truncate(response_len);
+
+        validate_upstream_response_source(source, authority)?;
+        if truncated_authority_response_matches_question(question, &response_bytes, authority_id)? {
+            if self.transport_allowed(RecursiveTransport::Tcp) {
+                return self
+                    .query_authority_tcp_fallback(
+                        authority,
+                        question,
+                        query,
+                        authority_id,
+                        deadline,
+                    )
+                    .await;
+            }
+            return Err(UpstreamError::MalformedResponse);
+        }
+
+        let response = validate_authority_response(question, &response_bytes, authority_id)?;
+        if response.header.tc() {
+            if self.transport_allowed(RecursiveTransport::Tcp) {
+                return self
+                    .query_authority_tcp_fallback(
+                        authority,
+                        question,
+                        query,
+                        authority_id,
+                        deadline,
+                    )
+                    .await;
+            }
+            return Err(UpstreamError::MalformedResponse);
+        }
+        RecursiveAuthorityResponse::new(response_bytes, response)
+    }
+
+    async fn query_authority_tcp_fallback(
+        &self,
+        authority: SocketAddr,
+        question: &QuestionKey,
+        query: &[u8],
+        authority_id: u16,
+        deadline: Instant,
+    ) -> Result<RecursiveAuthorityResponse, UpstreamError> {
+        self.metrics
+            .increment(ResolverMetric::RecursiveTcpFallbackAttempt);
+        let result = query_authority_tcp(authority, question, query, authority_id, deadline).await;
+        match &result {
+            Ok(_) => self
+                .metrics
+                .increment(ResolverMetric::RecursiveTcpFallbackSuccess),
+            Err(UpstreamError::Timeout) => self
+                .metrics
+                .increment(ResolverMetric::RecursiveTcpFallbackTimeout),
+            Err(_) => self
+                .metrics
+                .increment(ResolverMetric::RecursiveTcpFallbackFailure),
+        }
+        result
+    }
+
+    fn transport_allowed(&self, transport: RecursiveTransport) -> bool {
+        self.allowed_transports.contains(&transport)
+    }
+}
+
+impl RecursiveAuthorityTransport for RecursiveAuthorityTransportClient {
+    fn query<'a>(
+        &'a self,
+        authority: SocketAddr,
+        question: QuestionKey,
+        dnssec_ok: bool,
+        timeout: Duration,
+    ) -> crate::resolver::BoxFuture<'a, Result<RecursiveAuthorityResponse, UpstreamError>> {
+        Box::pin(async move {
+            self.query_authority(authority, question, dnssec_ok, timeout)
+                .await
+        })
+    }
+}
+
 impl UpstreamHealth {
     fn is_degraded(&self, now: Instant) -> bool {
         self.degraded
@@ -445,6 +615,57 @@ async fn resolve_tcp_fallback(
     ))
 }
 
+async fn query_authority_tcp(
+    authority: SocketAddr,
+    question: &QuestionKey,
+    query: &[u8],
+    authority_id: u16,
+    attempt_deadline: Instant,
+) -> Result<RecursiveAuthorityResponse, UpstreamError> {
+    let frame = encode_tcp_frame(query, MAX_TCP_MESSAGE_SIZE)
+        .map_err(|_| UpstreamError::MalformedResponse)?;
+    let mut stream = time::timeout(
+        remaining_until(attempt_deadline)?,
+        TcpStream::connect(authority),
+    )
+    .await
+    .map_err(|_| UpstreamError::Timeout)?
+    .map_err(transport_error)?;
+
+    time::timeout(remaining_until(attempt_deadline)?, stream.write_all(&frame))
+        .await
+        .map_err(|_| UpstreamError::Timeout)?
+        .map_err(transport_error)?;
+
+    let mut length_prefix = [0u8; 2];
+    time::timeout(
+        remaining_until(attempt_deadline)?,
+        stream.read_exact(&mut length_prefix),
+    )
+    .await
+    .map_err(|_| UpstreamError::Timeout)?
+    .map_err(transport_error)?;
+    let message_len = u16::from_be_bytes(length_prefix) as usize;
+    if message_len > MAX_TCP_MESSAGE_SIZE {
+        return Err(UpstreamError::MalformedResponse);
+    }
+
+    let mut response_bytes = vec![0; message_len];
+    time::timeout(
+        remaining_until(attempt_deadline)?,
+        stream.read_exact(&mut response_bytes),
+    )
+    .await
+    .map_err(|_| UpstreamError::Timeout)?
+    .map_err(transport_error)?;
+
+    let response = validate_authority_response(question, &response_bytes, authority_id)?;
+    if response.header.tc() {
+        return Err(UpstreamError::MalformedResponse);
+    }
+    RecursiveAuthorityResponse::new(response_bytes, response)
+}
+
 fn remaining_until(deadline: Instant) -> Result<Duration, UpstreamError> {
     deadline
         .checked_duration_since(Instant::now())
@@ -471,6 +692,28 @@ fn truncated_response_matches_request(
         return Err(UpstreamError::QuestionMismatch);
     }
     validate_response_question_prefix(request, response_bytes)?;
+    Ok(true)
+}
+
+fn truncated_authority_response_matches_question(
+    question: &QuestionKey,
+    response_bytes: &[u8],
+    authority_id: u16,
+) -> Result<bool, UpstreamError> {
+    let header = response_header_prefix(response_bytes)?;
+    if header.id != authority_id {
+        return Err(UpstreamError::MalformedResponse);
+    }
+    if !header.qr {
+        return Err(UpstreamError::MalformedResponse);
+    }
+    if !header.tc {
+        return Ok(false);
+    }
+    if header.qd_count != 1 {
+        return Err(UpstreamError::QuestionMismatch);
+    }
+    validate_authority_response_question_prefix(question, response_bytes)?;
     Ok(true)
 }
 
@@ -508,7 +751,24 @@ fn validate_response_question_prefix(
     Ok(())
 }
 
-impl ResolutionBackend for UdpUpstreamResolver {
+fn validate_authority_response_question_prefix(
+    question: &QuestionKey,
+    response_bytes: &[u8],
+) -> Result<(), UpstreamError> {
+    let response_question =
+        first_question(response_bytes).map_err(|_| UpstreamError::MalformedResponse)?;
+    let response_question = QuestionKey::new(
+        &response_question.qname,
+        response_question.qtype,
+        response_question.qclass,
+    );
+    if response_question != *question {
+        return Err(UpstreamError::QuestionMismatch);
+    }
+    Ok(())
+}
+
+impl ResolutionBackend for ForwardingResolutionBackend {
     fn resolve<'a>(
         &'a self,
         request: UpstreamRequest,
@@ -563,6 +823,79 @@ fn validate_upstream_response(
         return Err(UpstreamError::QuestionMismatch);
     }
     Ok(response)
+}
+
+fn validate_authority_response(
+    question: &QuestionKey,
+    response_bytes: &[u8],
+    authority_id: u16,
+) -> Result<Message, UpstreamError> {
+    let response = Message::parse(response_bytes).map_err(|_| UpstreamError::MalformedResponse)?;
+    if response.header.id != authority_id {
+        return Err(UpstreamError::MalformedResponse);
+    }
+    if !response.header.qr() {
+        return Err(UpstreamError::MalformedResponse);
+    }
+    if response.questions.len() != 1
+        || QuestionKey::from_message(&response).ok_or(UpstreamError::QuestionMismatch)? != *question
+    {
+        return Err(UpstreamError::QuestionMismatch);
+    }
+    Ok(response)
+}
+
+fn build_authority_query(
+    authority_id: u16,
+    question: &QuestionKey,
+    max_udp_payload_size: usize,
+    dnssec_ok: bool,
+) -> Result<Vec<u8>, UpstreamError> {
+    if max_udp_payload_size > u16::MAX as usize {
+        return Err(UpstreamError::MalformedResponse);
+    }
+    let mut bytes = Vec::new();
+    write_dns_u16(&mut bytes, authority_id);
+    write_dns_u16(&mut bytes, 0);
+    write_dns_u16(&mut bytes, 1);
+    write_dns_u16(&mut bytes, 0);
+    write_dns_u16(&mut bytes, 0);
+    write_dns_u16(&mut bytes, 1);
+    write_dns_name(&mut bytes, &question.qname)?;
+    write_dns_u16(&mut bytes, question.qtype);
+    write_dns_u16(&mut bytes, question.qclass);
+    bytes.push(0);
+    write_dns_u16(&mut bytes, 41);
+    write_dns_u16(&mut bytes, max_udp_payload_size as u16);
+    let edns_flags = if dnssec_ok { 0x8000u32 } else { 0 };
+    write_dns_u32(&mut bytes, edns_flags);
+    write_dns_u16(&mut bytes, 0);
+    Ok(bytes)
+}
+
+fn write_dns_name(bytes: &mut Vec<u8>, name: &str) -> Result<(), UpstreamError> {
+    let name = name.trim_end_matches('.');
+    if name.is_empty() {
+        bytes.push(0);
+        return Ok(());
+    }
+    for label in name.split('.') {
+        if label.len() > 63 {
+            return Err(UpstreamError::MalformedResponse);
+        }
+        bytes.push(label.len() as u8);
+        bytes.extend_from_slice(label.as_bytes());
+    }
+    bytes.push(0);
+    Ok(())
+}
+
+fn write_dns_u16(bytes: &mut Vec<u8>, value: u16) {
+    bytes.extend_from_slice(&value.to_be_bytes());
+}
+
+fn write_dns_u32(bytes: &mut Vec<u8>, value: u32) {
+    bytes.extend_from_slice(&value.to_be_bytes());
 }
 
 fn transport_error(error: io::Error) -> UpstreamError {
@@ -676,6 +1009,41 @@ mod tests {
         }
     }
 
+    fn authority_question(name: &str) -> QuestionKey {
+        QuestionKey::new(name, 1, 1)
+    }
+
+    fn recursive_transport_with(
+        transports: Vec<RecursiveTransport>,
+        id_generator: Arc<dyn TransactionIdGenerator>,
+    ) -> RecursiveAuthorityTransportClient {
+        RecursiveAuthorityTransportClient::with_id_generator(transports, 1232, id_generator)
+    }
+
+    #[derive(Default)]
+    struct RecordingMetrics {
+        increments: Mutex<Vec<ResolverMetric>>,
+    }
+
+    impl MetricsSink for RecordingMetrics {
+        fn increment(&self, metric: ResolverMetric) {
+            self.increments.lock().unwrap().push(metric);
+        }
+
+        fn observe_duration(&self, _metric: ResolverMetric, _duration: Duration) {}
+    }
+
+    impl RecordingMetrics {
+        fn count(&self, metric: ResolverMetric) -> usize {
+            self.increments
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|increment| **increment == metric)
+                .count()
+        }
+    }
+
     #[test]
     fn validate_upstream_response_accepts_normalized_question_name() {
         let request = upstream_request(0x1234, "Example.COM");
@@ -704,6 +1072,11 @@ mod tests {
         let mut query = vec![0u8; query_len];
         stream.read_exact(&mut query).await.unwrap();
         query
+    }
+
+    async fn write_tcp_response(stream: &mut TcpStream, response: &[u8]) {
+        let frame = encode_tcp_frame(response, MAX_TCP_MESSAGE_SIZE).unwrap();
+        stream.write_all(&frame).await.unwrap();
     }
 
     fn bind_udp_tcp_pair() -> (UdpSocket, TcpListener, SocketAddr) {
@@ -736,6 +1109,279 @@ mod tests {
         assert_ne!(third, second.wrapping_add(1));
     }
 
+    #[tokio::test]
+    async fn recursive_authority_udp_uses_fresh_id_and_edns_bound() {
+        let authority_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let authority_addr = authority_socket.local_addr().unwrap();
+        let seen_query = Arc::new(Mutex::new(Vec::new()));
+        let seen_query_task = Arc::clone(&seen_query);
+        let authority_task = tokio::spawn(async move {
+            let mut request = [0u8; 1500];
+            let (request_len, source) = authority_socket.recv_from(&mut request).await.unwrap();
+            seen_query_task
+                .lock()
+                .unwrap()
+                .extend_from_slice(&request[..request_len]);
+            authority_socket
+                .send_to(&a_response(0xbeef, "example.com"), source)
+                .await
+                .unwrap();
+        });
+        let transport = recursive_transport_with(
+            vec![RecursiveTransport::Udp],
+            Arc::new(FixedTransactionId(0xbeef)),
+        );
+
+        let response = transport
+            .query(
+                authority_addr,
+                authority_question("example.com"),
+                true,
+                Duration::from_secs(1),
+            )
+            .await
+            .unwrap();
+
+        authority_task.await.unwrap();
+        let query = Message::parse(&seen_query.lock().unwrap()).unwrap();
+        assert_eq!(query.header.id, 0xbeef);
+        assert!(!query.header.rd());
+        assert_eq!(
+            query.edns.as_ref().map(|edns| edns.udp_payload_size),
+            Some(1232)
+        );
+        assert_eq!(query.edns.as_ref().map(|edns| edns.dnssec_ok), Some(true));
+        assert_eq!(response.message.header.id, 0xbeef);
+    }
+
+    #[tokio::test]
+    async fn recursive_authority_udp_rejects_response_from_wrong_source() {
+        let authority_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let authority_addr = authority_socket.local_addr().unwrap();
+        let rogue_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let authority_task = tokio::spawn(async move {
+            let mut request = [0u8; 512];
+            let (_, source) = authority_socket.recv_from(&mut request).await.unwrap();
+            rogue_socket
+                .send_to(&a_response(0xbeef, "example.com"), source)
+                .await
+                .unwrap();
+        });
+        let transport = recursive_transport_with(
+            vec![RecursiveTransport::Udp],
+            Arc::new(FixedTransactionId(0xbeef)),
+        );
+
+        let error = transport
+            .query(
+                authority_addr,
+                authority_question("example.com"),
+                false,
+                Duration::from_secs(1),
+            )
+            .await
+            .unwrap_err();
+
+        authority_task.await.unwrap();
+        assert!(matches!(error, UpstreamError::Transport(_)));
+    }
+
+    #[tokio::test]
+    async fn recursive_authority_udp_rejects_question_mismatch() {
+        let authority_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let authority_addr = authority_socket.local_addr().unwrap();
+        let authority_task = tokio::spawn(async move {
+            let mut request = [0u8; 512];
+            let (_, source) = authority_socket.recv_from(&mut request).await.unwrap();
+            authority_socket
+                .send_to(&a_response(0xbeef, "other.example"), source)
+                .await
+                .unwrap();
+        });
+        let transport = recursive_transport_with(
+            vec![RecursiveTransport::Udp],
+            Arc::new(FixedTransactionId(0xbeef)),
+        );
+
+        let error = transport
+            .query(
+                authority_addr,
+                authority_question("example.com"),
+                false,
+                Duration::from_secs(1),
+            )
+            .await
+            .unwrap_err();
+
+        authority_task.await.unwrap();
+        assert_eq!(error, UpstreamError::QuestionMismatch);
+    }
+
+    #[tokio::test]
+    async fn recursive_authority_udp_truncation_falls_back_to_tcp() {
+        let (udp_socket, tcp_listener, authority_addr) = bind_udp_tcp_pair();
+        let authority_task = tokio::spawn(async move {
+            let mut request = [0u8; 512];
+            let (_, source) = udp_socket.recv_from(&mut request).await.unwrap();
+            udp_socket
+                .send_to(&truncated_response(0xbeef, "example.com"), source)
+                .await
+                .unwrap();
+            let (mut stream, _) = tcp_listener.accept().await.unwrap();
+            let tcp_query = read_tcp_query(&mut stream).await;
+            assert_eq!(&tcp_query[0..2], &[0xbe, 0xef]);
+            write_tcp_response(&mut stream, &a_response(0xbeef, "example.com")).await;
+        });
+        let transport = recursive_transport_with(
+            vec![RecursiveTransport::Udp, RecursiveTransport::Tcp],
+            Arc::new(FixedTransactionId(0xbeef)),
+        );
+        let metrics = Arc::new(RecordingMetrics::default());
+        let transport = transport.with_metrics(metrics.clone());
+
+        let response = transport
+            .query(
+                authority_addr,
+                authority_question("example.com"),
+                false,
+                Duration::from_secs(1),
+            )
+            .await
+            .unwrap();
+
+        authority_task.await.unwrap();
+        assert_eq!(response.message.header.id, 0xbeef);
+        assert_eq!(
+            metrics.count(ResolverMetric::RecursiveTcpFallbackAttempt),
+            1
+        );
+        assert_eq!(
+            metrics.count(ResolverMetric::RecursiveTcpFallbackSuccess),
+            1
+        );
+        assert_eq!(
+            metrics.count(ResolverMetric::RecursiveTcpFallbackFailure),
+            0
+        );
+        assert_eq!(
+            metrics.count(ResolverMetric::RecursiveTcpFallbackTimeout),
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn recursive_authority_tcp_fallback_timeout_records_metric() {
+        let (udp_socket, tcp_listener, authority_addr) = bind_udp_tcp_pair();
+        let (tcp_query_seen_tx, tcp_query_seen_rx) = tokio::sync::oneshot::channel();
+        let authority_task = tokio::spawn(async move {
+            let mut request = [0u8; 512];
+            let (_, source) = udp_socket.recv_from(&mut request).await.unwrap();
+            udp_socket
+                .send_to(&truncated_response(0xbeef, "example.com"), source)
+                .await
+                .unwrap();
+            let (mut stream, _) = tcp_listener.accept().await.unwrap();
+            let tcp_query = read_tcp_query(&mut stream).await;
+            assert_eq!(&tcp_query[0..2], &[0xbe, 0xef]);
+            let _ = tcp_query_seen_tx.send(());
+            std::future::pending::<()>().await;
+        });
+        let transport = recursive_transport_with(
+            vec![RecursiveTransport::Udp, RecursiveTransport::Tcp],
+            Arc::new(FixedTransactionId(0xbeef)),
+        );
+        let metrics = Arc::new(RecordingMetrics::default());
+        let transport = transport.with_metrics(metrics.clone());
+
+        let query_task = tokio::spawn(async move {
+            transport
+                .query(
+                    authority_addr,
+                    authority_question("example.com"),
+                    false,
+                    Duration::from_millis(250),
+                )
+                .await
+        });
+        tcp_query_seen_rx.await.unwrap();
+        let error = query_task.await.unwrap().unwrap_err();
+
+        authority_task.abort();
+        assert_eq!(error, UpstreamError::Timeout);
+        assert_eq!(
+            metrics.count(ResolverMetric::RecursiveTcpFallbackAttempt),
+            1
+        );
+        assert_eq!(
+            metrics.count(ResolverMetric::RecursiveTcpFallbackTimeout),
+            1
+        );
+        assert_eq!(
+            metrics.count(ResolverMetric::RecursiveTcpFallbackSuccess),
+            0
+        );
+        assert_eq!(
+            metrics.count(ResolverMetric::RecursiveTcpFallbackFailure),
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn recursive_authority_tcp_only_skips_udp() {
+        let (udp_socket, tcp_listener, authority_addr) = bind_udp_tcp_pair();
+        let authority_task = tokio::spawn(async move {
+            let (mut stream, _) = tcp_listener.accept().await.unwrap();
+            let tcp_query = read_tcp_query(&mut stream).await;
+            assert_eq!(&tcp_query[0..2], &[0xbe, 0xef]);
+            write_tcp_response(&mut stream, &a_response(0xbeef, "example.com")).await;
+            assert!(time::timeout(Duration::from_millis(50), async {
+                let mut request = [0u8; 512];
+                udp_socket.recv_from(&mut request).await.unwrap();
+            })
+            .await
+            .is_err());
+        });
+        let transport = recursive_transport_with(
+            vec![RecursiveTransport::Tcp],
+            Arc::new(FixedTransactionId(0xbeef)),
+        );
+
+        let response = transport
+            .query(
+                authority_addr,
+                authority_question("example.com"),
+                false,
+                Duration::from_secs(1),
+            )
+            .await
+            .unwrap();
+
+        authority_task.await.unwrap();
+        assert_eq!(response.message.header.id, 0xbeef);
+    }
+
+    #[tokio::test]
+    async fn recursive_authority_udp_timeout_uses_attempt_deadline() {
+        let authority_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let authority_addr = authority_socket.local_addr().unwrap();
+        let transport = recursive_transport_with(
+            vec![RecursiveTransport::Udp],
+            Arc::new(FixedTransactionId(0xbeef)),
+        );
+
+        let error = transport
+            .query(
+                authority_addr,
+                authority_question("example.com"),
+                false,
+                Duration::from_millis(20),
+            )
+            .await
+            .unwrap_err();
+
+        assert_eq!(error, UpstreamError::Timeout);
+    }
+
     #[test]
     fn runtime_config_constructor_filters_and_orders_udp_upstreams() {
         let primary: SocketAddr = "192.0.2.10:53".parse().unwrap();
@@ -761,7 +1407,7 @@ mod tests {
         )
         .unwrap();
 
-        let resolver = UdpUpstreamResolver::from_runtime_config(&config).unwrap();
+        let resolver = ForwardingResolutionBackend::from_runtime_config(&config).unwrap();
         let health = resolver.health_snapshots();
 
         assert_eq!(
@@ -777,7 +1423,7 @@ mod tests {
 
     #[test]
     fn runtime_config_constructor_rejects_no_enabled_udp_upstreams() {
-        let config = RuntimeConfig::new(
+        let error = RuntimeConfig::new(
             vec!["127.0.0.1:5300".parse().unwrap()],
             vec![UpstreamConfig {
                 protocol: UpstreamProtocol::Tcp,
@@ -791,14 +1437,9 @@ mod tests {
             Duration::from_secs(1),
             1232,
         )
-        .unwrap();
+        .unwrap_err();
 
-        let error = match UdpUpstreamResolver::from_runtime_config(&config) {
-            Ok(_) => panic!("expected no enabled UDP upstreams"),
-            Err(error) => error,
-        };
-
-        assert_eq!(error, UpstreamError::NoBackendsAvailable);
+        assert_eq!(error, crate::config::ConfigError::NoEnabledUpstream);
     }
 
     #[tokio::test]
@@ -819,7 +1460,7 @@ mod tests {
                 .await
                 .unwrap();
         });
-        let resolver = UdpUpstreamResolver::with_id_generator(
+        let resolver = ForwardingResolutionBackend::with_id_generator(
             upstream_config(upstream_addr),
             Arc::new(FixedTransactionId(0xbeef)),
         );
@@ -846,7 +1487,7 @@ mod tests {
                 .await
                 .unwrap();
         });
-        let resolver = UdpUpstreamResolver::with_id_generator(
+        let resolver = ForwardingResolutionBackend::with_id_generator(
             upstream_config(upstream_addr),
             Arc::new(FixedTransactionId(0xbeef)),
         );
@@ -872,7 +1513,7 @@ mod tests {
                 .await
                 .unwrap();
         });
-        let resolver = UdpUpstreamResolver::with_id_generator(
+        let resolver = ForwardingResolutionBackend::with_id_generator(
             upstream_config(upstream_addr),
             Arc::new(FixedTransactionId(0xbeef)),
         );
@@ -898,7 +1539,7 @@ mod tests {
                 .await
                 .unwrap();
         });
-        let resolver = UdpUpstreamResolver::with_id_generator(
+        let resolver = ForwardingResolutionBackend::with_id_generator(
             upstream_config(upstream_addr),
             Arc::new(FixedTransactionId(0xbeef)),
         );
@@ -924,7 +1565,7 @@ mod tests {
                 .await
                 .unwrap();
         });
-        let resolver = UdpUpstreamResolver::with_id_generator(
+        let resolver = ForwardingResolutionBackend::with_id_generator(
             upstream_config(upstream_addr),
             Arc::new(FixedTransactionId(0xbeef)),
         );
@@ -966,7 +1607,7 @@ mod tests {
             stream.write_all(&response).await.unwrap();
         });
 
-        let resolver = UdpUpstreamResolver::with_id_generator(
+        let resolver = ForwardingResolutionBackend::with_id_generator(
             upstream_config(upstream_addr),
             Arc::new(FixedTransactionId(0xbeef)),
         );
@@ -1005,7 +1646,7 @@ mod tests {
             stream.write_all(&response).await.unwrap();
         });
 
-        let resolver = UdpUpstreamResolver::with_id_generator(
+        let resolver = ForwardingResolutionBackend::with_id_generator(
             upstream_config(upstream_addr),
             Arc::new(FixedTransactionId(0xbeef)),
         );
@@ -1039,7 +1680,7 @@ mod tests {
             let response = encode_tcp_frame(&a_response(0xabcd, "example.com"), 512).unwrap();
             stream.write_all(&response).await.unwrap();
         });
-        let resolver = UdpUpstreamResolver::with_id_generator(
+        let resolver = ForwardingResolutionBackend::with_id_generator(
             upstream_config(upstream_addr),
             Arc::new(FixedTransactionId(0xbeef)),
         );
@@ -1071,7 +1712,7 @@ mod tests {
             let _query = read_tcp_query(&mut stream).await;
             time::sleep(Duration::from_millis(80)).await;
         });
-        let resolver = UdpUpstreamResolver::with_upstreams_and_id_generator(
+        let resolver = ForwardingResolutionBackend::with_upstreams_and_id_generator(
             vec![upstream_config_with(
                 "primary",
                 upstream_addr,
@@ -1130,7 +1771,7 @@ mod tests {
                 .unwrap();
         });
 
-        let resolver = UdpUpstreamResolver::with_upstreams_and_id_generator(
+        let resolver = ForwardingResolutionBackend::with_upstreams_and_id_generator(
             vec![
                 upstream_config_with("secondary", second_addr, 20, Duration::from_secs(1)),
                 upstream_config_with("primary", first_addr, 10, Duration::from_secs(1)),
@@ -1202,7 +1843,7 @@ mod tests {
             stream.write_all(&response).await.unwrap();
         });
 
-        let resolver = UdpUpstreamResolver::with_upstreams_and_id_generator(
+        let resolver = ForwardingResolutionBackend::with_upstreams_and_id_generator(
             vec![
                 upstream_config_with("primary", first_addr, 10, Duration::from_secs(1)),
                 upstream_config_with("secondary", second_addr, 20, Duration::from_secs(1)),
@@ -1254,7 +1895,7 @@ mod tests {
                 .unwrap();
         });
 
-        let resolver = UdpUpstreamResolver::with_upstreams_and_id_generator(
+        let resolver = ForwardingResolutionBackend::with_upstreams_and_id_generator(
             vec![
                 upstream_config_with("primary", first_addr, 10, Duration::from_secs(1)),
                 upstream_config_with("secondary", second_addr, 20, Duration::from_secs(1)),
@@ -1289,7 +1930,7 @@ mod tests {
             let _ = first_socket.recv_from(&mut request).await.unwrap();
         });
 
-        let resolver = UdpUpstreamResolver::with_upstreams_and_id_generator(
+        let resolver = ForwardingResolutionBackend::with_upstreams_and_id_generator(
             vec![
                 upstream_config_with("primary", first_addr, 10, Duration::from_millis(40)),
                 upstream_config_with("secondary", second_addr, 20, Duration::from_millis(40)),
@@ -1329,7 +1970,7 @@ mod tests {
             let mut request = [0u8; 512];
             let _ = second_socket.recv_from(&mut request).await.unwrap();
         });
-        let resolver = UdpUpstreamResolver::with_upstreams_and_id_generator(
+        let resolver = ForwardingResolutionBackend::with_upstreams_and_id_generator(
             vec![
                 upstream_config_with("primary", first_addr, 10, Duration::from_millis(20)),
                 upstream_config_with("secondary", second_addr, 20, Duration::from_millis(20)),
@@ -1369,7 +2010,7 @@ mod tests {
                 upstream_socket.send_to(&response, source).await.unwrap();
             }
         });
-        let resolver = UdpUpstreamResolver::with_id_generator(
+        let resolver = ForwardingResolutionBackend::with_id_generator(
             upstream_config(upstream_addr),
             Arc::new(FixedTransactionId(0xbeef)),
         );
@@ -1419,7 +2060,7 @@ mod tests {
                 .await
                 .unwrap();
         });
-        let resolver = UdpUpstreamResolver::with_upstreams_and_id_generator(
+        let resolver = ForwardingResolutionBackend::with_upstreams_and_id_generator(
             vec![
                 upstream_config_with("primary", primary_addr, 10, Duration::from_millis(50)),
                 upstream_config_with("secondary", secondary_addr, 20, Duration::from_millis(50)),
@@ -1454,7 +2095,7 @@ mod tests {
     fn udp_upstream_attempt_order_preserves_original_indices() {
         let primary: SocketAddr = "192.0.2.10:53".parse().unwrap();
         let secondary: SocketAddr = "192.0.2.11:53".parse().unwrap();
-        let resolver = UdpUpstreamResolver::with_upstreams_and_id_generator(
+        let resolver = ForwardingResolutionBackend::with_upstreams_and_id_generator(
             vec![
                 upstream_config_with("secondary", secondary, 20, Duration::from_millis(50)),
                 upstream_config_with("primary", primary, 10, Duration::from_millis(50)),
