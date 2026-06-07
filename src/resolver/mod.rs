@@ -330,12 +330,6 @@ impl BlockResponseConfig {
     }
 
     pub fn validate(&self) -> Result<(), BlockResponseConfigError> {
-        if self.blocked_response_ttl > 0
-            && self.cacheable_by_clients
-            && self.uses_negative_cache_mode()
-        {
-            return Err(BlockResponseConfigError::NegativeTtlUnsupported);
-        }
         if self.uses_sinkhole() {
             if self.sinkhole_ipv4.is_none() {
                 return Err(BlockResponseConfigError::MissingIpv4SinkholeAddress);
@@ -343,6 +337,12 @@ impl BlockResponseConfig {
             if self.sinkhole_ipv6.is_none() {
                 return Err(BlockResponseConfigError::MissingIpv6SinkholeAddress);
             }
+        }
+        if self.blocked_response_ttl > 0
+            && self.cacheable_by_clients
+            && self.uses_non_sinkhole_mode()
+        {
+            return Err(BlockResponseConfigError::ClientCachingUnsupportedForNonSinkhole);
         }
         Ok(())
     }
@@ -356,19 +356,14 @@ impl BlockResponseConfig {
         .contains(&BlockResponseMode::Sinkhole)
     }
 
-    fn uses_negative_cache_mode(&self) -> bool {
+    fn uses_non_sinkhole_mode(&self) -> bool {
         [
             self.local_rule_mode,
             self.malicious_domain_mode,
             self.invalid_domain_mode,
         ]
         .iter()
-        .any(|mode| {
-            matches!(
-                mode,
-                BlockResponseMode::NxDomain | BlockResponseMode::NoData
-            )
-        })
+        .any(|mode| !matches!(mode, BlockResponseMode::Sinkhole))
     }
 }
 
@@ -388,7 +383,7 @@ impl Default for BlockResponseConfig {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BlockResponseConfigError {
-    NegativeTtlUnsupported,
+    ClientCachingUnsupportedForNonSinkhole,
     MissingIpv4SinkholeAddress,
     MissingIpv6SinkholeAddress,
 }
@@ -2712,6 +2707,7 @@ impl ResolveQuery {
         if let PolicyDecision::Block(block) =
             self.policy.evaluate(request.client_ip, &decoded.question)
         {
+            self.metrics.increment(ResolverMetric::QueryBlocked);
             let decision = ResolveDecision {
                 client_ip: request.client_ip,
                 question: Some(question),
@@ -2783,6 +2779,28 @@ impl ResolveQuery {
             .probe_cache(&backend_snapshot, &request, &decoded)
             .await;
         if let Some(response_bytes) = cache_probe.hit {
+            if let Some(block) =
+                self.response_bytes_policy_block(request.client_ip, &response_bytes)
+            {
+                self.metrics.increment(ResolverMetric::QueryBlocked);
+                let decision = ResolveDecision {
+                    client_ip: request.client_ip,
+                    question: Some(question),
+                    kind: ResolveDecisionKind::Blocked(block.clone()),
+                };
+                let response_bytes = self.responses.blocked(&decoded, &block);
+                return self
+                    .finish(
+                        started_at,
+                        &request,
+                        decoded_original_question_name(&decoded),
+                        decision,
+                        response_bytes,
+                        cache_probe.event_cache_result,
+                        Some(QueryEventBackend::from_snapshot(&backend_snapshot)),
+                    )
+                    .await;
+            }
             let decision = ResolveDecision {
                 client_ip: request.client_ip,
                 question: Some(question),
@@ -2873,6 +2891,28 @@ impl ResolveQuery {
                     .cache_hit_after_coalesced_miss(request, decoded, &cache_key)
                     .await
                 {
+                    if let Some(block) =
+                        self.response_bytes_policy_block(request.client_ip, &response_bytes)
+                    {
+                        self.metrics.increment(ResolverMetric::QueryBlocked);
+                        let decision = ResolveDecision {
+                            client_ip: request.client_ip,
+                            question: Some(question),
+                            kind: ResolveDecisionKind::Blocked(block.clone()),
+                        };
+                        let response_bytes = self.responses.blocked(decoded, &block);
+                        return self
+                            .finish(
+                                started_at,
+                                request,
+                                decoded_original_question_name(decoded),
+                                decision,
+                                response_bytes,
+                                Some(QueryEventCacheResult::Hit),
+                                Some(QueryEventBackend::from_snapshot(backend_snapshot)),
+                            )
+                            .await;
+                    }
                     let decision = ResolveDecision {
                         client_ip: request.client_ip,
                         question: Some(question),
@@ -3152,6 +3192,7 @@ impl ResolveQuery {
 
         self.metrics.increment(ResolverMetric::UpstreamSuccess);
         if let Some(block) = self.response_policy_block(request.client_ip, &response_message) {
+            self.metrics.increment(ResolverMetric::QueryBlocked);
             let decision = ResolveDecision {
                 client_ip: request.client_ip,
                 question: Some(question),
@@ -3211,6 +3252,15 @@ impl ResolveQuery {
             };
             Some(block)
         })
+    }
+
+    fn response_bytes_policy_block(
+        &self,
+        client_ip: IpAddr,
+        response_bytes: &[u8],
+    ) -> Option<PolicyBlock> {
+        let response = Message::parse(response_bytes).ok()?;
+        self.response_policy_block(client_ip, &response)
     }
 
     fn backend_failure_response(
@@ -6914,6 +6964,29 @@ mod tests {
         }
     }
 
+    struct ClientScopedResponsePolicy {
+        client_ip: IpAddr,
+        domain: DomainSelector,
+        rule_id: String,
+    }
+
+    impl PolicyEvaluator for ClientScopedResponsePolicy {
+        fn evaluate(&self, _client_ip: IpAddr, _question: &QuestionKey) -> PolicyDecision {
+            PolicyDecision::Allow
+        }
+
+        fn evaluate_response_name(&self, client_ip: IpAddr, domain: &DomainName) -> PolicyDecision {
+            if client_ip == self.client_ip && self.domain.matches(domain) {
+                PolicyDecision::Block(PolicyBlock {
+                    reason: BlockReason::MaliciousDomain,
+                    rule_id: Some(self.rule_id.clone()),
+                })
+            } else {
+                PolicyDecision::Allow
+            }
+        }
+    }
+
     #[derive(Default)]
     struct OwnedOnlyProtocolCodec {
         borrowed_calls: Mutex<usize>,
@@ -10344,8 +10417,8 @@ mod tests {
         assert_eq!(
             BlockResponseConfig::new(
                 BlockResponseMode::Sinkhole,
-                BlockResponseMode::Refused,
-                BlockResponseMode::Refused,
+                BlockResponseMode::Sinkhole,
+                BlockResponseMode::Sinkhole,
                 60,
                 true,
                 None,
@@ -10356,8 +10429,8 @@ mod tests {
         assert_eq!(
             BlockResponseConfig::new(
                 BlockResponseMode::Sinkhole,
-                BlockResponseMode::Refused,
-                BlockResponseMode::Refused,
+                BlockResponseMode::Sinkhole,
+                BlockResponseMode::Sinkhole,
                 60,
                 true,
                 Some(Ipv4Addr::new(192, 0, 2, 1)),
@@ -10368,7 +10441,7 @@ mod tests {
     }
 
     #[test]
-    fn block_response_config_rejects_negative_ttl_until_authority_ttl_is_supported() {
+    fn block_response_config_rejects_client_caching_for_non_sinkhole_modes() {
         assert_eq!(
             BlockResponseConfig::new(
                 BlockResponseMode::NxDomain,
@@ -10379,8 +10452,22 @@ mod tests {
                 None,
                 None,
             ),
-            Err(BlockResponseConfigError::NegativeTtlUnsupported)
+            Err(BlockResponseConfigError::ClientCachingUnsupportedForNonSinkhole)
         );
+        assert!(BlockResponseConfig::new(
+            BlockResponseMode::Sinkhole,
+            BlockResponseMode::Sinkhole,
+            BlockResponseMode::Sinkhole,
+            60,
+            true,
+            Some(Ipv4Addr::new(192, 0, 2, 1)),
+            Some(Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1)),
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn block_response_config_allows_internal_ttl_for_uncacheable_negative_modes() {
         assert!(BlockResponseConfig::new(
             BlockResponseMode::NxDomain,
             BlockResponseMode::Refused,
@@ -10439,8 +10526,8 @@ mod tests {
         let factory = ConfiguredResponseFactory::new(
             BlockResponseConfig::new(
                 BlockResponseMode::Sinkhole,
-                BlockResponseMode::Refused,
-                BlockResponseMode::Refused,
+                BlockResponseMode::Sinkhole,
+                BlockResponseMode::Sinkhole,
                 60,
                 true,
                 Some(Ipv4Addr::new(192, 0, 2, 1)),
@@ -10491,8 +10578,8 @@ mod tests {
         let factory = ConfiguredResponseFactory::new(
             BlockResponseConfig::new(
                 BlockResponseMode::Sinkhole,
-                BlockResponseMode::Refused,
-                BlockResponseMode::Refused,
+                BlockResponseMode::Sinkhole,
+                BlockResponseMode::Sinkhole,
                 60,
                 true,
                 Some(Ipv4Addr::new(192, 0, 2, 1)),
@@ -10640,6 +10727,7 @@ mod tests {
             .lock()
             .unwrap()
             .contains(&ResolverMetric::QueryAllowed));
+        assert_eq!(metrics.count(ResolverMetric::QueryBlocked), 1);
     }
 
     #[tokio::test]
@@ -10921,7 +11009,7 @@ mod tests {
                 BlockResponseConfig::new(
                     BlockResponseMode::Sinkhole,
                     BlockResponseMode::Sinkhole,
-                    BlockResponseMode::Refused,
+                    BlockResponseMode::Sinkhole,
                     60,
                     true,
                     Some(Ipv4Addr::new(192, 0, 2, 1)),
@@ -11091,6 +11179,7 @@ mod tests {
         )));
         let cache = Arc::new(RecordingCache::with_lookup(CacheLookup::Miss));
         let events = Arc::new(RecordingEvents::default());
+        let metrics = Arc::new(RecordingMetrics::default());
         let policy = Arc::new(MaliciousDomainPolicyEvaluator::new(vec![
             MaliciousDomainRule::new(
                 "malware-feed",
@@ -11108,7 +11197,7 @@ mod tests {
             Arc::new(ConfiguredResponseFactory::default()),
             Arc::new(FixedClock(SystemTime::UNIX_EPOCH)),
             events.clone(),
-            Arc::new(RecordingMetrics::default()),
+            metrics.clone(),
         );
 
         let outcome = service
@@ -11141,6 +11230,98 @@ mod tests {
             recorded_events[0].block_response_mode,
             Some(BlockResponseMode::Refused)
         );
+        assert_eq!(metrics.count(ResolverMetric::QueryBlocked), 1);
+    }
+
+    #[tokio::test]
+    async fn resolve_blocks_cached_response_with_malicious_cname_target() {
+        let cache = Arc::new(InMemoryDnsCache::new(16));
+        let question = QuestionKey::new("alias.example", A_RECORD_TYPE, 1);
+        let cached_query = StandardProtocolCodec::new(1232)
+            .decode_query(&a_query(0xaaaa, "alias.example"))
+            .unwrap();
+        let response_message = response_message_for_question_with_id(
+            0,
+            question,
+            ResponseCode::NoError,
+            vec![
+                cname_record("alias.example", 60, "target.malicious.example"),
+                a_record("target.malicious.example", 60),
+            ],
+            Vec::new(),
+            Vec::new(),
+            false,
+        );
+        cache.store_now(CacheStore {
+            key: CacheKey::from_query(
+                &cached_query,
+                backend_cache_namespace(ResolutionMode::Forward, 0),
+                1232,
+            ),
+            response_template: response_message.original_bytes.to_vec(),
+            response_code: ResponseCode::NoError,
+            minimum_ttl: Duration::from_secs(60),
+            negative_cache: None,
+            stored_at: SystemTime::UNIX_EPOCH,
+            ttl: Duration::from_secs(60),
+        });
+        let upstream = Arc::new(StaticUpstream::new(Err(UpstreamError::Timeout)));
+        let events = Arc::new(RecordingEvents::default());
+        let metrics = Arc::new(RecordingMetrics::default());
+        let policy = Arc::new(MaliciousDomainPolicyEvaluator::new(vec![
+            MaliciousDomainRule::new(
+                "malware-feed",
+                DomainSelector::subtree("malicious.example").unwrap(),
+                true,
+            ),
+        ]));
+        let service = ResolveQuery::with_cache_and_policy(
+            Arc::new(StandardProtocolCodec::new(1232)),
+            cache,
+            policy,
+            Arc::new(NoopLocalDnsEntries),
+            CacheTtlPolicy::default(),
+            upstream.clone(),
+            Arc::new(ConfiguredResponseFactory::default()),
+            Arc::new(FixedClock(SystemTime::UNIX_EPOCH)),
+            events.clone(),
+            metrics.clone(),
+        );
+
+        let outcome = service
+            .resolve(ResolveRequest::new(
+                "192.0.2.10".parse().unwrap(),
+                SystemTime::UNIX_EPOCH,
+                a_query(0x1234, "alias.example"),
+            ))
+            .await;
+
+        assert_eq!(
+            outcome.decision.kind,
+            ResolveDecisionKind::Blocked(PolicyBlock {
+                reason: BlockReason::MaliciousDomain,
+                rule_id: Some("malware-feed".to_string()),
+            })
+        );
+        assert_eq!(
+            response_code_from_wire(&outcome.response_bytes),
+            Some(ResponseCode::Refused as u16)
+        );
+        assert!(upstream.requests.lock().unwrap().is_empty());
+        {
+            let recorded_events = events.events.lock().unwrap();
+            assert_eq!(recorded_events.len(), 1);
+            assert_eq!(
+                recorded_events[0].terminal_outcome,
+                QueryEventOutcome::Blocked(BlockReason::MaliciousDomain)
+            );
+            assert_eq!(
+                recorded_events[0].cache_result,
+                Some(QueryEventCacheResult::Hit)
+            );
+        }
+        assert_eq!(metrics.count(ResolverMetric::CacheHit), 1);
+        assert_eq!(metrics.count(ResolverMetric::QueryBlocked), 1);
     }
 
     #[tokio::test]
@@ -11636,6 +11817,110 @@ mod tests {
         assert_eq!(metrics.count(ResolverMetric::CacheCoalescedMiss), 1);
         assert_eq!(metrics.count(ResolverMetric::CacheHit), 1);
         assert_eq!(metrics.count(ResolverMetric::CacheMiss), 2);
+    }
+
+    #[tokio::test]
+    async fn resolve_blocks_coalesced_cache_hit_with_malicious_cname_target() {
+        let cache = Arc::new(InMemoryDnsCache::new(16));
+        let question = QuestionKey::new("alias.example", A_RECORD_TYPE, 1);
+        let response_message = response_message_for_question(
+            question,
+            ResponseCode::NoError,
+            vec![
+                cname_record("alias.example", 60, "target.malicious.example"),
+                a_record("target.malicious.example", 60),
+            ],
+            Vec::new(),
+            Vec::new(),
+            false,
+        );
+        let upstream = Arc::new(BlockingUpstream::new(Ok(
+            ResolutionResponse::forwarded_message(
+                response_message.original_bytes.to_vec(),
+                response_message,
+                SystemTime::UNIX_EPOCH,
+                0,
+                "test-forwarder",
+            ),
+        )));
+        let events = Arc::new(RecordingEvents::default());
+        let metrics = Arc::new(RecordingMetrics::default());
+        let policy = Arc::new(ClientScopedResponsePolicy {
+            client_ip: "192.0.2.11".parse().unwrap(),
+            domain: DomainSelector::subtree("malicious.example").unwrap(),
+            rule_id: "malware-feed".to_string(),
+        });
+        let service = Arc::new(ResolveQuery::with_cache_and_policy(
+            Arc::new(StandardProtocolCodec::new(1232)),
+            cache,
+            policy,
+            Arc::new(NoopLocalDnsEntries),
+            CacheTtlPolicy::default(),
+            upstream.clone(),
+            Arc::new(ConfiguredResponseFactory::default()),
+            Arc::new(FixedClock(SystemTime::UNIX_EPOCH)),
+            events.clone(),
+            metrics.clone(),
+        ));
+        let first = {
+            let service = Arc::clone(&service);
+            tokio::spawn(async move {
+                service
+                    .resolve(ResolveRequest::new(
+                        "192.0.2.10".parse().unwrap(),
+                        SystemTime::UNIX_EPOCH,
+                        a_query(0x1111, "alias.example"),
+                    ))
+                    .await
+            })
+        };
+        upstream.wait_for_requests(1).await;
+        let second = {
+            let service = Arc::clone(&service);
+            tokio::spawn(async move {
+                service
+                    .resolve(ResolveRequest::new(
+                        "192.0.2.11".parse().unwrap(),
+                        SystemTime::UNIX_EPOCH,
+                        a_query(0x2222, "alias.example"),
+                    ))
+                    .await
+            })
+        };
+
+        tokio::task::yield_now().await;
+        assert_eq!(upstream.requests.lock().unwrap().len(), 1);
+        upstream.release.notify_waiters();
+        let first = first.await.unwrap();
+        let second = second.await.unwrap();
+
+        assert_eq!(first.decision.kind, ResolveDecisionKind::Allowed);
+        assert_eq!(
+            second.decision.kind,
+            ResolveDecisionKind::Blocked(PolicyBlock {
+                reason: BlockReason::MaliciousDomain,
+                rule_id: Some("malware-feed".to_string()),
+            })
+        );
+        assert_eq!(
+            response_code_from_wire(&second.response_bytes),
+            Some(ResponseCode::Refused as u16)
+        );
+        {
+            let recorded_events = events.events.lock().unwrap();
+            assert_eq!(recorded_events.len(), 2);
+            assert_eq!(
+                recorded_events[1].terminal_outcome,
+                QueryEventOutcome::Blocked(BlockReason::MaliciousDomain)
+            );
+            assert_eq!(
+                recorded_events[1].cache_result,
+                Some(QueryEventCacheResult::Hit)
+            );
+        }
+        assert_eq!(metrics.count(ResolverMetric::CacheCoalescedMiss), 1);
+        assert_eq!(metrics.count(ResolverMetric::CacheHit), 1);
+        assert_eq!(metrics.count(ResolverMetric::QueryBlocked), 1);
     }
 
     #[tokio::test]

@@ -451,7 +451,7 @@ fn validate_label(label: &str) -> Result<(), DomainNameError> {
     }
 
     for ch in label.chars() {
-        if !ch.is_ascii_alphanumeric() && ch != '-' {
+        if !ch.is_ascii_alphanumeric() && ch != '-' && ch != '_' {
             return Err(DomainNameError::InvalidLabelCharacter {
                 label: label.to_string(),
                 ch,
@@ -515,6 +515,13 @@ mod tests {
     }
 
     #[test]
+    fn domain_name_allows_underscore_service_labels() {
+        let domain = DomainName::parse("_acme-challenge.Example.COM").unwrap();
+
+        assert_eq!(domain.as_str(), "_acme-challenge.example.com");
+    }
+
+    #[test]
     fn domain_name_rejects_invalid_label_lengths_and_characters() {
         let long_label = format!("{}.com", "a".repeat(64));
         assert_eq!(
@@ -525,10 +532,10 @@ mod tests {
             })
         );
         assert_eq!(
-            DomainName::parse("bad_label.example"),
+            DomainName::parse("bad!label.example"),
             Err(DomainNameError::InvalidLabelCharacter {
-                label: "bad_label".to_string(),
-                ch: '_',
+                label: "bad!label".to_string(),
+                ch: '!',
             })
         );
         assert_eq!(
@@ -790,7 +797,7 @@ mod tests {
         assert_eq!(
             evaluator.evaluate(
                 IpAddr::V4(Ipv4Addr::new(192, 0, 2, 55)),
-                &QuestionKey::new("bad_label.example", 1, 1),
+                &QuestionKey::new("bad!label.example", 1, 1),
             ),
             PolicyDecision::Block(PolicyBlock {
                 reason: BlockReason::InvalidDomain,
