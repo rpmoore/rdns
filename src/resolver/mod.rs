@@ -3792,7 +3792,7 @@ impl ResponseFactory for BasicResponseFactory {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ConfiguredResponseFactory {
     block_config: BlockResponseConfig,
 }
@@ -3812,14 +3812,6 @@ impl ConfiguredResponseFactory {
             self.block_config.blocked_response_ttl
         } else {
             0
-        }
-    }
-}
-
-impl Default for ConfiguredResponseFactory {
-    fn default() -> Self {
-        Self {
-            block_config: BlockResponseConfig::default(),
         }
     }
 }
