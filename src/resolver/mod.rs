@@ -14,7 +14,7 @@
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::future::Future;
-use std::net::{IpAddr, SocketAddr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::pin::Pin;
 use std::sync::{
     atomic::{AtomicU64, Ordering},
@@ -27,10 +27,11 @@ use tokio::sync::{mpsc, Notify};
 use tokio::time::{self, Instant};
 
 use crate::protocol::{
-    age_response_ttls, build_formerr_response, build_refused_response, build_servfail_response,
-    build_truncated_response, cap_response_ttls, message_question_wire, rewrite_response_id,
-    rewrite_response_request_fields, EdnsInfo, Message, QueryValidationError, Record, RecordData,
-    ResponseCode,
+    age_response_ttls, build_a_block_response, build_aaaa_block_response, build_formerr_response,
+    build_nodata_response, build_nxdomain_response, build_refused_response,
+    build_servfail_response, build_truncated_response, cap_response_ttls, message_question_wire,
+    rewrite_response_id, rewrite_response_request_fields, EdnsInfo, Message, QueryValidationError,
+    Record, RecordData, ResponseCode,
 };
 
 pub mod policy;
@@ -40,6 +41,8 @@ pub use policy::{
 };
 
 const EDNS_DO_FLAG: u16 = 0x8000;
+const A_RECORD_TYPE: u16 = 1;
+const AAAA_RECORD_TYPE: u16 = 28;
 const MAX_FAILURE_CACHE_TTL: Duration = Duration::from_secs(5 * 60);
 const CNAME_RECORD_TYPE: u16 = 5;
 const DNSKEY_RECORD_TYPE: u16 = 48;
@@ -271,6 +274,120 @@ pub enum BlockReason {
     LocalRule,
     MaliciousDomain,
     InvalidDomain,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BlockResponseMode {
+    Refused,
+    NxDomain,
+    NoData,
+    Sinkhole,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BlockResponseConfig {
+    pub local_rule_mode: BlockResponseMode,
+    pub malicious_domain_mode: BlockResponseMode,
+    pub invalid_domain_mode: BlockResponseMode,
+    pub blocked_response_ttl: u32,
+    pub cacheable_by_clients: bool,
+    pub sinkhole_ipv4: Option<Ipv4Addr>,
+    pub sinkhole_ipv6: Option<Ipv6Addr>,
+}
+
+impl BlockResponseConfig {
+    pub fn new(
+        local_rule_mode: BlockResponseMode,
+        malicious_domain_mode: BlockResponseMode,
+        invalid_domain_mode: BlockResponseMode,
+        blocked_response_ttl: u32,
+        cacheable_by_clients: bool,
+        sinkhole_ipv4: Option<Ipv4Addr>,
+        sinkhole_ipv6: Option<Ipv6Addr>,
+    ) -> Result<Self, BlockResponseConfigError> {
+        let config = Self {
+            local_rule_mode,
+            malicious_domain_mode,
+            invalid_domain_mode,
+            blocked_response_ttl,
+            cacheable_by_clients,
+            sinkhole_ipv4,
+            sinkhole_ipv6,
+        };
+        config.validate()?;
+        Ok(config)
+    }
+
+    pub fn mode_for(&self, reason: &BlockReason) -> BlockResponseMode {
+        match reason {
+            BlockReason::LocalRule => self.local_rule_mode,
+            BlockReason::MaliciousDomain => self.malicious_domain_mode,
+            BlockReason::InvalidDomain => self.invalid_domain_mode,
+        }
+    }
+
+    pub fn validate(&self) -> Result<(), BlockResponseConfigError> {
+        if self.blocked_response_ttl > 0
+            && self.cacheable_by_clients
+            && self.uses_negative_cache_mode()
+        {
+            return Err(BlockResponseConfigError::NegativeTtlUnsupported);
+        }
+        if self.uses_sinkhole() {
+            if self.sinkhole_ipv4.is_none() {
+                return Err(BlockResponseConfigError::MissingIpv4SinkholeAddress);
+            }
+            if self.sinkhole_ipv6.is_none() {
+                return Err(BlockResponseConfigError::MissingIpv6SinkholeAddress);
+            }
+        }
+        Ok(())
+    }
+
+    fn uses_sinkhole(&self) -> bool {
+        [
+            self.local_rule_mode,
+            self.malicious_domain_mode,
+            self.invalid_domain_mode,
+        ]
+        .contains(&BlockResponseMode::Sinkhole)
+    }
+
+    fn uses_negative_cache_mode(&self) -> bool {
+        [
+            self.local_rule_mode,
+            self.malicious_domain_mode,
+            self.invalid_domain_mode,
+        ]
+        .iter()
+        .any(|mode| {
+            matches!(
+                mode,
+                BlockResponseMode::NxDomain | BlockResponseMode::NoData
+            )
+        })
+    }
+}
+
+impl Default for BlockResponseConfig {
+    fn default() -> Self {
+        Self {
+            local_rule_mode: BlockResponseMode::Refused,
+            malicious_domain_mode: BlockResponseMode::Refused,
+            invalid_domain_mode: BlockResponseMode::Refused,
+            blocked_response_ttl: 0,
+            cacheable_by_clients: false,
+            sinkhole_ipv4: None,
+            sinkhole_ipv6: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BlockResponseConfigError {
+    NegativeTtlUnsupported,
+    MissingIpv4SinkholeAddress,
+    MissingIpv6SinkholeAddress,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -3355,6 +3472,75 @@ impl ResponseFactory for BasicResponseFactory {
 
     fn servfail(&self, query: Option<&DecodedQuery>) -> Vec<u8> {
         build_servfail_response(query.map(|query| &query.message), None)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConfiguredResponseFactory {
+    block_config: BlockResponseConfig,
+}
+
+impl ConfiguredResponseFactory {
+    pub fn new(block_config: BlockResponseConfig) -> Result<Self, BlockResponseConfigError> {
+        block_config.validate()?;
+        Ok(Self { block_config })
+    }
+
+    pub fn block_config(&self) -> &BlockResponseConfig {
+        &self.block_config
+    }
+
+    fn block_ttl(&self) -> u32 {
+        if self.block_config.cacheable_by_clients {
+            self.block_config.blocked_response_ttl
+        } else {
+            0
+        }
+    }
+}
+
+impl Default for ConfiguredResponseFactory {
+    fn default() -> Self {
+        Self {
+            block_config: BlockResponseConfig::default(),
+        }
+    }
+}
+
+impl ResponseFactory for ConfiguredResponseFactory {
+    fn protocol_error(&self, request_id: Option<u16>, error: &QueryValidationError) -> Vec<u8> {
+        BasicResponseFactory.protocol_error(request_id, error)
+    }
+
+    fn blocked(&self, query: &DecodedQuery, block: &PolicyBlock) -> Vec<u8> {
+        match self.block_config.mode_for(&block.reason) {
+            BlockResponseMode::Refused => build_refused_response(&query.message),
+            BlockResponseMode::NxDomain => build_nxdomain_response(&query.message),
+            BlockResponseMode::NoData => build_nodata_response(&query.message),
+            BlockResponseMode::Sinkhole => self.sinkhole_response(query),
+        }
+    }
+
+    fn servfail(&self, query: Option<&DecodedQuery>) -> Vec<u8> {
+        BasicResponseFactory.servfail(query)
+    }
+}
+
+impl ConfiguredResponseFactory {
+    fn sinkhole_response(&self, query: &DecodedQuery) -> Vec<u8> {
+        match query.question.qtype {
+            A_RECORD_TYPE => self
+                .block_config
+                .sinkhole_ipv4
+                .map(|address| build_a_block_response(&query.message, address, self.block_ttl()))
+                .unwrap_or_else(|| build_nodata_response(&query.message)),
+            AAAA_RECORD_TYPE => self
+                .block_config
+                .sinkhole_ipv6
+                .map(|address| build_aaaa_block_response(&query.message, address, self.block_ttl()))
+                .unwrap_or_else(|| build_nodata_response(&query.message)),
+            _ => build_refused_response(&query.message),
+        }
     }
 }
 
@@ -9784,6 +9970,196 @@ mod tests {
             CacheKey::from_query(&do_query, None, 1232)
                 .features
                 .dnssec_ok
+        );
+    }
+
+    #[test]
+    fn block_response_config_defaults_to_uncacheable_refused() {
+        let config = BlockResponseConfig::default();
+
+        assert_eq!(config.local_rule_mode, BlockResponseMode::Refused);
+        assert_eq!(config.malicious_domain_mode, BlockResponseMode::Refused);
+        assert_eq!(config.invalid_domain_mode, BlockResponseMode::Refused);
+        assert_eq!(config.blocked_response_ttl, 0);
+        assert!(!config.cacheable_by_clients);
+        assert_eq!(config.validate(), Ok(()));
+    }
+
+    #[test]
+    fn block_response_config_rejects_sinkhole_without_addresses() {
+        assert_eq!(
+            BlockResponseConfig::new(
+                BlockResponseMode::Sinkhole,
+                BlockResponseMode::Refused,
+                BlockResponseMode::Refused,
+                60,
+                true,
+                None,
+                None,
+            ),
+            Err(BlockResponseConfigError::MissingIpv4SinkholeAddress)
+        );
+        assert_eq!(
+            BlockResponseConfig::new(
+                BlockResponseMode::Sinkhole,
+                BlockResponseMode::Refused,
+                BlockResponseMode::Refused,
+                60,
+                true,
+                Some(Ipv4Addr::new(192, 0, 2, 1)),
+                None,
+            ),
+            Err(BlockResponseConfigError::MissingIpv6SinkholeAddress)
+        );
+    }
+
+    #[test]
+    fn block_response_config_rejects_negative_ttl_until_authority_ttl_is_supported() {
+        assert_eq!(
+            BlockResponseConfig::new(
+                BlockResponseMode::NxDomain,
+                BlockResponseMode::Refused,
+                BlockResponseMode::Refused,
+                60,
+                true,
+                None,
+                None,
+            ),
+            Err(BlockResponseConfigError::NegativeTtlUnsupported)
+        );
+        assert!(BlockResponseConfig::new(
+            BlockResponseMode::NxDomain,
+            BlockResponseMode::Refused,
+            BlockResponseMode::Refused,
+            60,
+            false,
+            None,
+            None,
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn configured_response_factory_selects_block_mode_by_reason() {
+        let query = StandardProtocolCodec::new(1232)
+            .decode_query(&a_query(0x1234, "blocked.example"))
+            .unwrap();
+        let factory = ConfiguredResponseFactory::new(
+            BlockResponseConfig::new(
+                BlockResponseMode::NxDomain,
+                BlockResponseMode::NoData,
+                BlockResponseMode::Refused,
+                0,
+                false,
+                None,
+                None,
+            )
+            .unwrap(),
+        )
+        .unwrap();
+
+        assert_eq!(
+            response_code_from_wire(&factory.blocked(
+                &query,
+                &PolicyBlock {
+                    reason: BlockReason::LocalRule,
+                    rule_id: Some("rule-1".to_string()),
+                },
+            )),
+            Some(ResponseCode::NxDomain as u16)
+        );
+        let nodata = Message::parse(&factory.blocked(
+            &query,
+            &PolicyBlock {
+                reason: BlockReason::MaliciousDomain,
+                rule_id: Some("source-1".to_string()),
+            },
+        ))
+        .unwrap();
+        assert_eq!(nodata.header.r_code(), ResponseCode::NoError as u8);
+        assert!(nodata.answers.is_empty());
+    }
+
+    #[test]
+    fn configured_response_factory_builds_family_specific_sinkholes() {
+        let factory = ConfiguredResponseFactory::new(
+            BlockResponseConfig::new(
+                BlockResponseMode::Sinkhole,
+                BlockResponseMode::Refused,
+                BlockResponseMode::Refused,
+                60,
+                true,
+                Some(Ipv4Addr::new(192, 0, 2, 1)),
+                Some(Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1)),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let a_query = StandardProtocolCodec::new(1232)
+            .decode_query(&a_query(0x1234, "blocked.example"))
+            .unwrap();
+        let aaaa_query = StandardProtocolCodec::new(1232)
+            .decode_query(&aaaa_query(0x1234, "blocked.example"))
+            .unwrap();
+
+        let a_response = Message::parse(&factory.blocked(
+            &a_query,
+            &PolicyBlock {
+                reason: BlockReason::LocalRule,
+                rule_id: Some("rule-1".to_string()),
+            },
+        ))
+        .unwrap();
+        assert_eq!(a_response.answers.len(), 1);
+        assert_eq!(a_response.answers[0].ttl, 60);
+        assert_eq!(
+            a_response.answers[0].record,
+            RecordData::A(Ipv4Addr::new(192, 0, 2, 1))
+        );
+
+        let aaaa_response = Message::parse(&factory.blocked(
+            &aaaa_query,
+            &PolicyBlock {
+                reason: BlockReason::LocalRule,
+                rule_id: Some("rule-1".to_string()),
+            },
+        ))
+        .unwrap();
+        assert_eq!(aaaa_response.answers.len(), 1);
+        assert_eq!(
+            aaaa_response.answers[0].record,
+            RecordData::AAAA(Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1))
+        );
+    }
+
+    #[test]
+    fn configured_response_factory_refuses_non_address_sinkhole_queries() {
+        let factory = ConfiguredResponseFactory::new(
+            BlockResponseConfig::new(
+                BlockResponseMode::Sinkhole,
+                BlockResponseMode::Refused,
+                BlockResponseMode::Refused,
+                60,
+                true,
+                Some(Ipv4Addr::new(192, 0, 2, 1)),
+                Some(Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1)),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let mx_query = StandardProtocolCodec::new(1232)
+            .decode_query(&query(0x1234, "blocked.example", 15, 1))
+            .unwrap();
+
+        assert_eq!(
+            response_code_from_wire(&factory.blocked(
+                &mx_query,
+                &PolicyBlock {
+                    reason: BlockReason::LocalRule,
+                    rule_id: Some("rule-1".to_string()),
+                },
+            )),
+            Some(ResponseCode::Refused as u16)
         );
     }
 
