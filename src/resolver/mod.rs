@@ -38,7 +38,8 @@ use crate::protocol::{
 pub mod policy;
 pub use policy::{
     CidrPrefixError, ClientIdentity, ClientSelector, DomainName, DomainNameError, DomainSelector,
-    IpCidr, LocalDenyRule, LocalPolicyEvaluator, NoopPolicyEvaluator,
+    IpCidr, LocalDenyRule, LocalPolicyEvaluator, MaliciousDomainPolicyEvaluator,
+    MaliciousDomainRule, NoopPolicyEvaluator, PolicyChain,
 };
 
 const EDNS_DO_FLAG: u16 = 0x8000;
@@ -1652,6 +1653,21 @@ fn canonical_chain_from_response(response: &Message) -> Vec<String> {
         .collect()
 }
 
+fn response_policy_domains(response: &Message) -> impl Iterator<Item = DomainName> + '_ {
+    response.answers.iter().flat_map(|record| {
+        let mut domains = Vec::with_capacity(2);
+        if let Ok(owner) = DomainName::parse(&record.name) {
+            domains.push(owner);
+        }
+        if let RecordData::CNAME(target) = &record.record {
+            if let Ok(target) = DomainName::parse(target) {
+                domains.push(target);
+            }
+        }
+        domains
+    })
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ResolveDecisionKind {
     Allowed,
@@ -2993,6 +3009,16 @@ impl ResolveQuery {
         };
 
         self.metrics.increment(ResolverMetric::UpstreamSuccess);
+        if let Some(block) = self.response_policy_block(request.client_ip, &response_message) {
+            let decision = ResolveDecision {
+                client_ip: request.client_ip,
+                question: Some(question),
+                kind: ResolveDecisionKind::Blocked(block.clone()),
+            };
+            let response_bytes = self.responses.blocked(decoded, &block);
+            return (decision, response_bytes);
+        }
+
         let mut response_bytes = response.bytes;
         if self
             .protocol
@@ -3032,6 +3058,17 @@ impl ResolveQuery {
             kind: ResolveDecisionKind::Allowed,
         };
         (decision, response_bytes)
+    }
+
+    fn response_policy_block(&self, client_ip: IpAddr, response: &Message) -> Option<PolicyBlock> {
+        response_policy_domains(response).find_map(|domain| {
+            let PolicyDecision::Block(block) =
+                self.policy.evaluate_response_name(client_ip, &domain)
+            else {
+                return None;
+            };
+            Some(block)
+        })
     }
 
     fn backend_failure_response(
@@ -3717,6 +3754,10 @@ pub trait ProtocolCodec: Send + Sync {
 
 pub trait PolicyEvaluator: Send + Sync {
     fn evaluate(&self, client_ip: IpAddr, question: &QuestionKey) -> PolicyDecision;
+
+    fn evaluate_response_name(&self, _client_ip: IpAddr, _domain: &DomainName) -> PolicyDecision {
+        PolicyDecision::Allow
+    }
 }
 
 pub trait LocalDnsEntries: Send + Sync {
@@ -10683,6 +10724,190 @@ mod tests {
             Some(ResponseCode::Refused as u16)
         );
         assert_eq!(upstream.requests.lock().unwrap().len(), 0);
+    }
+
+    #[tokio::test]
+    async fn resolve_blocks_upstream_response_with_malicious_cname_target() {
+        let question = QuestionKey::new("alias.example", A_RECORD_TYPE, 1);
+        let response_message = response_message_for_question(
+            question.clone(),
+            ResponseCode::NoError,
+            vec![
+                cname_record("alias.example", 60, "target.malicious.example"),
+                a_record("target.malicious.example", 60),
+            ],
+            Vec::new(),
+            Vec::new(),
+            false,
+        );
+        let response_bytes = response_message.original_bytes.to_vec();
+        let upstream = Arc::new(StaticUpstream::new(Ok(
+            ResolutionResponse::forwarded_message(
+                response_bytes,
+                response_message,
+                SystemTime::UNIX_EPOCH,
+                0,
+                "test-forwarder",
+            ),
+        )));
+        let cache = Arc::new(RecordingCache::with_lookup(CacheLookup::Miss));
+        let events = Arc::new(RecordingEvents::default());
+        let policy = Arc::new(MaliciousDomainPolicyEvaluator::new(vec![
+            MaliciousDomainRule::new(
+                "malware-feed",
+                DomainSelector::subtree("malicious.example").unwrap(),
+                true,
+            ),
+        ]));
+        let service = ResolveQuery::with_cache_and_policy(
+            Arc::new(StandardProtocolCodec::new(1232)),
+            cache.clone(),
+            policy,
+            Arc::new(NoopLocalDnsEntries),
+            CacheTtlPolicy::default(),
+            upstream.clone(),
+            Arc::new(ConfiguredResponseFactory::default()),
+            Arc::new(FixedClock(SystemTime::UNIX_EPOCH)),
+            events.clone(),
+            Arc::new(RecordingMetrics::default()),
+        );
+
+        let outcome = service
+            .resolve(ResolveRequest::new(
+                "192.0.2.10".parse().unwrap(),
+                SystemTime::UNIX_EPOCH,
+                a_query(0x1234, "alias.example"),
+            ))
+            .await;
+
+        assert_eq!(
+            outcome.decision.kind,
+            ResolveDecisionKind::Blocked(PolicyBlock {
+                reason: BlockReason::MaliciousDomain,
+                rule_id: Some("malware-feed".to_string()),
+            })
+        );
+        assert_eq!(
+            response_code_from_wire(&outcome.response_bytes),
+            Some(ResponseCode::Refused as u16)
+        );
+        assert_eq!(cache.lookups.lock().unwrap().len(), 1);
+        assert_eq!(cache.stores.lock().unwrap().len(), 0);
+        let recorded_events = events.events.lock().unwrap();
+        assert_eq!(
+            recorded_events[0].terminal_outcome,
+            QueryEventOutcome::Blocked(BlockReason::MaliciousDomain)
+        );
+        assert_eq!(
+            recorded_events[0].block_response_mode,
+            Some(BlockResponseMode::Refused)
+        );
+    }
+
+    #[tokio::test]
+    async fn resolve_blocks_malicious_requested_domain_before_cache_or_backend() {
+        let upstream = Arc::new(StaticUpstream::new(Ok(upstream_response(
+            a_response_with_answer(0xabcd, "blocked.malicious.example", 60),
+        ))));
+        let cache = Arc::new(RecordingCache::with_lookup(CacheLookup::Miss));
+        let policy = Arc::new(MaliciousDomainPolicyEvaluator::new(vec![
+            MaliciousDomainRule::new(
+                "malware-feed",
+                DomainSelector::subtree("malicious.example").unwrap(),
+                true,
+            ),
+        ]));
+        let service = ResolveQuery::with_cache_and_policy(
+            Arc::new(StandardProtocolCodec::new(1232)),
+            cache.clone(),
+            policy,
+            Arc::new(NoopLocalDnsEntries),
+            CacheTtlPolicy::default(),
+            upstream.clone(),
+            Arc::new(ConfiguredResponseFactory::default()),
+            Arc::new(FixedClock(SystemTime::UNIX_EPOCH)),
+            Arc::new(RecordingEvents::default()),
+            Arc::new(RecordingMetrics::default()),
+        );
+
+        let outcome = service
+            .resolve(ResolveRequest::new(
+                "192.0.2.10".parse().unwrap(),
+                SystemTime::UNIX_EPOCH,
+                a_query(0x1234, "blocked.malicious.example"),
+            ))
+            .await;
+
+        assert_eq!(
+            outcome.decision.kind,
+            ResolveDecisionKind::Blocked(PolicyBlock {
+                reason: BlockReason::MaliciousDomain,
+                rule_id: Some("malware-feed".to_string()),
+            })
+        );
+        assert_eq!(upstream.requests.lock().unwrap().len(), 0);
+        assert_eq!(cache.lookups.lock().unwrap().len(), 0);
+        assert_eq!(cache.stores.lock().unwrap().len(), 0);
+    }
+
+    #[tokio::test]
+    async fn resolve_blocks_upstream_response_with_malicious_answer_owner() {
+        let question = QuestionKey::new("host.example", A_RECORD_TYPE, 1);
+        let response_message = response_message_for_question(
+            question.clone(),
+            ResponseCode::NoError,
+            vec![a_record("host.malicious.example", 60)],
+            Vec::new(),
+            Vec::new(),
+            false,
+        );
+        let response_bytes = response_message.original_bytes.to_vec();
+        let upstream = Arc::new(StaticUpstream::new(Ok(
+            ResolutionResponse::forwarded_message(
+                response_bytes,
+                response_message,
+                SystemTime::UNIX_EPOCH,
+                0,
+                "test-forwarder",
+            ),
+        )));
+        let cache = Arc::new(RecordingCache::with_lookup(CacheLookup::Miss));
+        let policy = Arc::new(MaliciousDomainPolicyEvaluator::new(vec![
+            MaliciousDomainRule::new(
+                "malware-feed",
+                DomainSelector::subtree("malicious.example").unwrap(),
+                true,
+            ),
+        ]));
+        let service = ResolveQuery::with_cache_and_policy(
+            Arc::new(StandardProtocolCodec::new(1232)),
+            cache.clone(),
+            policy,
+            Arc::new(NoopLocalDnsEntries),
+            CacheTtlPolicy::default(),
+            upstream.clone(),
+            Arc::new(ConfiguredResponseFactory::default()),
+            Arc::new(FixedClock(SystemTime::UNIX_EPOCH)),
+            Arc::new(RecordingEvents::default()),
+            Arc::new(RecordingMetrics::default()),
+        );
+
+        let outcome = service
+            .resolve(ResolveRequest::new(
+                "192.0.2.10".parse().unwrap(),
+                SystemTime::UNIX_EPOCH,
+                a_query(0x1234, "host.example"),
+            ))
+            .await;
+
+        assert_eq!(
+            outcome.decision.kind,
+            ResolveDecisionKind::Blocked(PolicyBlock {
+                reason: BlockReason::MaliciousDomain,
+                rule_id: Some("malware-feed".to_string()),
+            })
+        );
+        assert_eq!(cache.stores.lock().unwrap().len(), 0);
     }
 
     #[tokio::test]

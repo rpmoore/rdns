@@ -192,6 +192,27 @@ impl LocalDenyRule {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MaliciousDomainRule {
+    pub id: String,
+    pub domain: DomainSelector,
+    pub enabled: bool,
+}
+
+impl MaliciousDomainRule {
+    pub fn new(id: impl Into<String>, domain: DomainSelector, enabled: bool) -> Self {
+        Self {
+            id: id.into(),
+            domain,
+            enabled,
+        }
+    }
+
+    pub fn matches(&self, domain: &DomainName) -> bool {
+        self.enabled && self.domain.matches(domain)
+    }
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct LocalPolicyEvaluator {
     deny_rules: Vec<LocalDenyRule>,
@@ -233,6 +254,78 @@ impl PolicyEvaluator for LocalPolicyEvaluator {
             });
         };
         self.evaluate_identity(&ClientIdentity::ip(client_ip), &domain)
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct MaliciousDomainPolicyEvaluator {
+    rules: Vec<MaliciousDomainRule>,
+}
+
+impl MaliciousDomainPolicyEvaluator {
+    pub fn new(rules: Vec<MaliciousDomainRule>) -> Self {
+        Self { rules }
+    }
+
+    pub fn rules(&self) -> &[MaliciousDomainRule] {
+        &self.rules
+    }
+
+    pub fn evaluate_domain(&self, domain: &DomainName) -> PolicyDecision {
+        self.rules
+            .iter()
+            .find(|rule| rule.matches(domain))
+            .map(|rule| {
+                PolicyDecision::Block(PolicyBlock {
+                    reason: BlockReason::MaliciousDomain,
+                    rule_id: Some(rule.id.clone()),
+                })
+            })
+            .unwrap_or(PolicyDecision::Allow)
+    }
+}
+
+impl PolicyEvaluator for MaliciousDomainPolicyEvaluator {
+    fn evaluate(&self, _client_ip: IpAddr, question: &QuestionKey) -> PolicyDecision {
+        let Ok(domain) = DomainName::parse(&question.qname) else {
+            return PolicyDecision::Block(PolicyBlock {
+                reason: BlockReason::InvalidDomain,
+                rule_id: None,
+            });
+        };
+        self.evaluate_domain(&domain)
+    }
+
+    fn evaluate_response_name(&self, _client_ip: IpAddr, domain: &DomainName) -> PolicyDecision {
+        self.evaluate_domain(domain)
+    }
+}
+
+pub struct PolicyChain {
+    evaluators: Vec<Box<dyn PolicyEvaluator>>,
+}
+
+impl PolicyChain {
+    pub fn new(evaluators: Vec<Box<dyn PolicyEvaluator>>) -> Self {
+        Self { evaluators }
+    }
+}
+
+impl PolicyEvaluator for PolicyChain {
+    fn evaluate(&self, client_ip: IpAddr, question: &QuestionKey) -> PolicyDecision {
+        self.evaluators
+            .iter()
+            .map(|evaluator| evaluator.evaluate(client_ip, question))
+            .find(|decision| matches!(decision, PolicyDecision::Block(_)))
+            .unwrap_or(PolicyDecision::Allow)
+    }
+
+    fn evaluate_response_name(&self, client_ip: IpAddr, domain: &DomainName) -> PolicyDecision {
+        self.evaluators
+            .iter()
+            .map(|evaluator| evaluator.evaluate_response_name(client_ip, domain))
+            .find(|decision| matches!(decision, PolicyDecision::Block(_)))
+            .unwrap_or(PolicyDecision::Allow)
     }
 }
 
@@ -702,6 +795,90 @@ mod tests {
             PolicyDecision::Block(PolicyBlock {
                 reason: BlockReason::InvalidDomain,
                 rule_id: None,
+            })
+        );
+    }
+
+    #[test]
+    fn malicious_domain_policy_blocks_request_and_response_names() {
+        let evaluator = MaliciousDomainPolicyEvaluator::new(vec![
+            MaliciousDomainRule::new(
+                "disabled",
+                DomainSelector::subtree("disabled.example").unwrap(),
+                false,
+            ),
+            MaliciousDomainRule::new(
+                "malware-feed",
+                DomainSelector::subtree("malicious.example").unwrap(),
+                true,
+            ),
+        ]);
+
+        assert_eq!(
+            evaluator.evaluate(
+                IpAddr::V4(Ipv4Addr::new(192, 0, 2, 55)),
+                &QuestionKey::new("Host.Malicious.Example.", 1, 1),
+            ),
+            PolicyDecision::Block(PolicyBlock {
+                reason: BlockReason::MaliciousDomain,
+                rule_id: Some("malware-feed".to_string()),
+            })
+        );
+        assert_eq!(
+            evaluator.evaluate_response_name(
+                IpAddr::V4(Ipv4Addr::new(192, 0, 2, 55)),
+                &DomainName::parse("alias.malicious.example").unwrap(),
+            ),
+            PolicyDecision::Block(PolicyBlock {
+                reason: BlockReason::MaliciousDomain,
+                rule_id: Some("malware-feed".to_string()),
+            })
+        );
+        assert_eq!(
+            evaluator.evaluate(
+                IpAddr::V4(Ipv4Addr::new(192, 0, 2, 55)),
+                &QuestionKey::new("host.disabled.example", 1, 1),
+            ),
+            PolicyDecision::Allow
+        );
+    }
+
+    #[test]
+    fn policy_chain_keeps_local_rule_precedence_and_uses_response_aware_rules() {
+        let chain = PolicyChain::new(vec![
+            Box::new(LocalPolicyEvaluator::new(vec![LocalDenyRule::new(
+                "local-rule",
+                ClientSelector::exact_ip(IpAddr::V4(Ipv4Addr::new(192, 0, 2, 55))),
+                DomainSelector::exact("blocked.example").unwrap(),
+                true,
+            )])),
+            Box::new(MaliciousDomainPolicyEvaluator::new(vec![
+                MaliciousDomainRule::new(
+                    "malware-feed",
+                    DomainSelector::subtree("blocked.example").unwrap(),
+                    true,
+                ),
+            ])),
+        ]);
+
+        assert_eq!(
+            chain.evaluate(
+                IpAddr::V4(Ipv4Addr::new(192, 0, 2, 55)),
+                &QuestionKey::new("blocked.example", 1, 1),
+            ),
+            PolicyDecision::Block(PolicyBlock {
+                reason: BlockReason::LocalRule,
+                rule_id: Some("local-rule".to_string()),
+            })
+        );
+        assert_eq!(
+            chain.evaluate_response_name(
+                IpAddr::V4(Ipv4Addr::new(192, 0, 2, 55)),
+                &DomainName::parse("blocked.example").unwrap(),
+            ),
+            PolicyDecision::Block(PolicyBlock {
+                reason: BlockReason::MaliciousDomain,
+                rule_id: Some("malware-feed".to_string()),
             })
         );
     }
