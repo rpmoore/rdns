@@ -46,6 +46,7 @@ const EDNS_DO_FLAG: u16 = 0x8000;
 const A_RECORD_TYPE: u16 = 1;
 const AAAA_RECORD_TYPE: u16 = 28;
 const MAX_FAILURE_CACHE_TTL: Duration = Duration::from_secs(5 * 60);
+const MAX_LOCAL_DNS_TTL: u32 = 24 * 60 * 60;
 const CNAME_RECORD_TYPE: u16 = 5;
 const DNSKEY_RECORD_TYPE: u16 = 48;
 const DS_RECORD_TYPE: u16 = 43;
@@ -394,11 +395,13 @@ pub enum BlockResponseConfigError {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LocalDnsEntry {
+    pub id: Option<String>,
     pub name: DomainName,
     pub ipv4: Vec<Ipv4Addr>,
     pub ipv6: Vec<Ipv6Addr>,
     pub ttl: u32,
     pub enabled: bool,
+    pub generation: u64,
 }
 
 impl LocalDnsEntry {
@@ -410,12 +413,129 @@ impl LocalDnsEntry {
         enabled: bool,
     ) -> Self {
         Self {
+            id: None,
             name,
             ipv4,
             ipv6,
             ttl,
             enabled,
+            generation: 0,
         }
+    }
+
+    pub fn with_metadata(mut self, id: impl Into<String>, generation: u64) -> Self {
+        self.id = Some(id.into());
+        self.generation = generation;
+        self
+    }
+
+    pub fn validate(
+        &self,
+        public_address_acknowledged: bool,
+    ) -> Result<LocalDnsEntryValidation, LocalDnsEntryValidationError> {
+        if self.ipv4.is_empty() && self.ipv6.is_empty() {
+            return Err(LocalDnsEntryValidationError::NoAddresses);
+        }
+        if self.ttl == 0 {
+            return Err(LocalDnsEntryValidationError::TtlTooLow);
+        }
+        if self.ttl > MAX_LOCAL_DNS_TTL {
+            return Err(LocalDnsEntryValidationError::TtlTooHigh {
+                max: MAX_LOCAL_DNS_TTL,
+            });
+        }
+        let uses_public_address = self.ipv4.iter().any(|address| !ipv4_is_local_use(*address))
+            || self.ipv6.iter().any(|address| !ipv6_is_local_use(*address));
+        if uses_public_address && !public_address_acknowledged {
+            return Err(LocalDnsEntryValidationError::PublicAddressRequiresAcknowledgement);
+        }
+
+        let mut warnings = Vec::new();
+        if local_dns_name_uses_mdns_suffix(&self.name) {
+            warnings.push(LocalDnsEntryWarning::ReservedMdnsSuffix);
+        }
+        Ok(LocalDnsEntryValidation { warnings })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LocalDnsEntryValidation {
+    pub warnings: Vec<LocalDnsEntryWarning>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LocalDnsEntryWarning {
+    ReservedMdnsSuffix,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LocalDnsEntryValidationError {
+    NoAddresses,
+    TtlTooLow,
+    TtlTooHigh { max: u32 },
+    PublicAddressRequiresAcknowledgement,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LocalAnswerMetadata {
+    pub entry_id: Option<String>,
+    pub generation: u64,
+    pub family: LocalAnswerFamily,
+    pub ttl: u32,
+}
+
+impl LocalAnswerMetadata {
+    fn from_entry(entry: &LocalDnsEntry, family: LocalAnswerFamily) -> Self {
+        Self {
+            entry_id: entry.id.clone(),
+            generation: entry.generation,
+            family,
+            ttl: entry.ttl,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LocalAnswerFamily {
+    A,
+    Aaaa,
+    NoDataA,
+    NoDataAaaa,
+}
+
+fn local_dns_name_uses_mdns_suffix(name: &DomainName) -> bool {
+    let name = name.as_str();
+    name == "local" || name.ends_with(".local")
+}
+
+fn ipv4_is_local_use(address: Ipv4Addr) -> bool {
+    address.is_private()
+        || address.is_loopback()
+        || address.is_link_local()
+        || address.octets()[0] == 0
+        || address.octets()[0] == 127
+}
+
+fn ipv6_is_local_use(address: Ipv6Addr) -> bool {
+    address.is_loopback()
+        || address.is_unspecified()
+        || address.is_unique_local()
+        || address.is_unicast_link_local()
+}
+
+fn local_answer_family(qtype: u16) -> LocalAnswerFamily {
+    match qtype {
+        A_RECORD_TYPE => LocalAnswerFamily::A,
+        AAAA_RECORD_TYPE => LocalAnswerFamily::Aaaa,
+        _ => LocalAnswerFamily::NoDataA,
+    }
+}
+
+fn local_nodata_family(qtype: u16) -> LocalAnswerFamily {
+    match qtype {
+        A_RECORD_TYPE => LocalAnswerFamily::NoDataA,
+        AAAA_RECORD_TYPE => LocalAnswerFamily::NoDataAaaa,
+        _ => LocalAnswerFamily::NoDataA,
     }
 }
 
@@ -1672,7 +1792,7 @@ fn response_policy_domains(response: &Message) -> impl Iterator<Item = DomainNam
 pub enum ResolveDecisionKind {
     Allowed,
     Blocked(PolicyBlock),
-    LocalAnswer,
+    LocalAnswer(LocalAnswerMetadata),
     CacheHit,
     CacheMiss,
     ProtocolError(ResponseCode),
@@ -1698,6 +1818,7 @@ pub struct QueryEventV1 {
     pub qclass: Option<u16>,
     pub terminal_outcome: QueryEventOutcome,
     pub block_response_mode: Option<BlockResponseMode>,
+    pub local_answer: Option<LocalAnswerMetadata>,
     pub response_code: Option<u16>,
     pub cache_result: Option<QueryEventCacheResult>,
     pub backend: Option<QueryEventBackend>,
@@ -1706,7 +1827,7 @@ pub struct QueryEventV1 {
 }
 
 impl QueryEventV1 {
-    pub const SCHEMA_VERSION: u8 = 3;
+    pub const SCHEMA_VERSION: u8 = 4;
 
     pub fn from_decision(
         sequence: u64,
@@ -1751,12 +1872,20 @@ impl QueryEventV1 {
             normalized_question,
             terminal_outcome: QueryEventOutcome::from_decision_kind(&decision.kind),
             block_response_mode: None,
+            local_answer: local_answer_metadata(&decision.kind),
             response_code,
             cache_result,
             backend: None,
             latency,
             advisory_findings: Vec::new(),
         }
+    }
+}
+
+fn local_answer_metadata(kind: &ResolveDecisionKind) -> Option<LocalAnswerMetadata> {
+    match kind {
+        ResolveDecisionKind::LocalAnswer(metadata) => Some(metadata.clone()),
+        _ => None,
     }
 }
 
@@ -1796,7 +1925,7 @@ impl QueryEventOutcome {
         match kind {
             ResolveDecisionKind::Allowed => Self::AllowedFromBackend,
             ResolveDecisionKind::Blocked(block) => Self::Blocked(block.reason.clone()),
-            ResolveDecisionKind::LocalAnswer => Self::AllowedFromLocal,
+            ResolveDecisionKind::LocalAnswer(_) => Self::AllowedFromLocal,
             ResolveDecisionKind::CacheHit => Self::AllowedFromCache,
             ResolveDecisionKind::CacheMiss => Self::AllowedFromBackend,
             ResolveDecisionKind::ProtocolError(code) => Self::ProtocolError(*code),
@@ -2609,7 +2738,9 @@ impl ResolveQuery {
                 let decision = ResolveDecision {
                     client_ip: request.client_ip,
                     question: Some(question),
-                    kind: ResolveDecisionKind::LocalAnswer,
+                    kind: ResolveDecisionKind::LocalAnswer(
+                        self.local_entry_answer_metadata(&decoded, &entry),
+                    ),
                 };
                 return self
                     .finish(
@@ -2628,7 +2759,10 @@ impl ResolveQuery {
                 let decision = ResolveDecision {
                     client_ip: request.client_ip,
                     question: Some(question),
-                    kind: ResolveDecisionKind::LocalAnswer,
+                    kind: ResolveDecisionKind::LocalAnswer(LocalAnswerMetadata::from_entry(
+                        &_entry,
+                        local_nodata_family(decoded.question.qtype),
+                    )),
                 };
                 return self
                     .finish(
@@ -2837,6 +2971,14 @@ impl ResolveQuery {
         } else {
             response
         }
+    }
+
+    fn local_entry_answer_metadata(
+        &self,
+        decoded: &DecodedQuery,
+        entry: &LocalDnsEntry,
+    ) -> LocalAnswerMetadata {
+        LocalAnswerMetadata::from_entry(entry, local_answer_family(decoded.question.qtype))
     }
 
     async fn probe_cache(
@@ -9727,6 +9869,7 @@ mod tests {
         assert_eq!(event.qclass, Some(1));
         assert_eq!(event.terminal_outcome, QueryEventOutcome::AllowedFromCache);
         assert_eq!(event.block_response_mode, None);
+        assert_eq!(event.local_answer, None);
         assert_eq!(event.response_code, Some(ResponseCode::NoError as u16));
         assert_eq!(event.cache_result, Some(QueryEventCacheResult::Hit));
         assert_eq!(event.backend, None);
@@ -10573,6 +10716,125 @@ mod tests {
         );
     }
 
+    #[test]
+    fn local_dns_entry_validation_requires_addresses_and_public_acknowledgement() {
+        let empty = LocalDnsEntry::new(
+            DomainName::parse("host.example").unwrap(),
+            Vec::new(),
+            Vec::new(),
+            120,
+            true,
+        );
+        assert_eq!(
+            empty.validate(false),
+            Err(LocalDnsEntryValidationError::NoAddresses)
+        );
+
+        let public = LocalDnsEntry::new(
+            DomainName::parse("host.example").unwrap(),
+            vec![Ipv4Addr::new(8, 8, 8, 8)],
+            Vec::new(),
+            120,
+            true,
+        );
+        assert_eq!(
+            public.validate(false),
+            Err(LocalDnsEntryValidationError::PublicAddressRequiresAcknowledgement)
+        );
+        assert_eq!(
+            public.validate(true),
+            Ok(LocalDnsEntryValidation {
+                warnings: Vec::new(),
+            })
+        );
+        let zero_ttl = LocalDnsEntry::new(
+            DomainName::parse("host.example").unwrap(),
+            vec![Ipv4Addr::new(10, 0, 0, 7)],
+            Vec::new(),
+            0,
+            true,
+        );
+        assert_eq!(
+            zero_ttl.validate(false),
+            Err(LocalDnsEntryValidationError::TtlTooLow)
+        );
+        let excessive_ttl = LocalDnsEntry::new(
+            DomainName::parse("host.example").unwrap(),
+            vec![Ipv4Addr::new(10, 0, 0, 7)],
+            Vec::new(),
+            MAX_LOCAL_DNS_TTL + 1,
+            true,
+        );
+        assert_eq!(
+            excessive_ttl.validate(false),
+            Err(LocalDnsEntryValidationError::TtlTooHigh {
+                max: MAX_LOCAL_DNS_TTL,
+            })
+        );
+    }
+
+    #[test]
+    fn local_dns_entry_validation_accepts_local_addresses_and_warns_for_mdns_suffix() {
+        let entry = LocalDnsEntry::new(
+            DomainName::parse("dev1.local").unwrap(),
+            vec![Ipv4Addr::new(10, 0, 0, 7)],
+            vec![Ipv6Addr::new(0xfc00, 0, 0, 0, 0, 0, 0, 7)],
+            120,
+            true,
+        );
+
+        assert_eq!(
+            entry.validate(false),
+            Ok(LocalDnsEntryValidation {
+                warnings: vec![LocalDnsEntryWarning::ReservedMdnsSuffix],
+            })
+        );
+    }
+
+    #[test]
+    fn local_dns_entries_match_exact_enabled_address_queries_only() {
+        let enabled = LocalDnsEntry::new(
+            DomainName::parse("host.example").unwrap(),
+            vec![Ipv4Addr::new(10, 0, 0, 7)],
+            Vec::new(),
+            120,
+            true,
+        );
+        let disabled = LocalDnsEntry::new(
+            DomainName::parse("disabled.example").unwrap(),
+            vec![Ipv4Addr::new(10, 0, 0, 8)],
+            Vec::new(),
+            120,
+            false,
+        );
+        let entries = InMemoryLocalDnsEntries::new(vec![enabled.clone(), disabled]);
+
+        assert_eq!(
+            entries.lookup(&QuestionKey::new("Host.Example.", A_RECORD_TYPE, 1)),
+            LocalDnsLookup::Answer(enabled.clone())
+        );
+        assert_eq!(
+            entries.lookup(&QuestionKey::new("host.example", AAAA_RECORD_TYPE, 1)),
+            LocalDnsLookup::NoData(enabled)
+        );
+        assert_eq!(
+            entries.lookup(&QuestionKey::new("child.host.example", A_RECORD_TYPE, 1)),
+            LocalDnsLookup::NoMatch
+        );
+        assert_eq!(
+            entries.lookup(&QuestionKey::new("disabled.example", A_RECORD_TYPE, 1)),
+            LocalDnsLookup::NoMatch
+        );
+        assert_eq!(
+            entries.lookup(&QuestionKey::new("host.example", 15, 1)),
+            LocalDnsLookup::NoMatch
+        );
+        assert_eq!(
+            entries.lookup(&QuestionKey::new("host.example", A_RECORD_TYPE, 3)),
+            LocalDnsLookup::NoMatch
+        );
+    }
+
     #[tokio::test]
     async fn resolve_answers_exact_local_dns_entry_before_cache_or_backend() {
         let upstream = Arc::new(StaticUpstream::new(Ok(upstream_response(
@@ -10586,7 +10848,8 @@ mod tests {
             vec![Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 44)],
             120,
             true,
-        )]));
+        )
+        .with_metadata("entry-1", 7)]));
         let service = ResolveQuery::with_cache_and_policy(
             Arc::new(StandardProtocolCodec::new(1232)),
             cache.clone(),
@@ -10608,7 +10871,15 @@ mod tests {
             ))
             .await;
 
-        assert_eq!(outcome.decision.kind, ResolveDecisionKind::LocalAnswer);
+        assert_eq!(
+            outcome.decision.kind,
+            ResolveDecisionKind::LocalAnswer(LocalAnswerMetadata {
+                entry_id: Some("entry-1".to_string()),
+                generation: 7,
+                family: LocalAnswerFamily::A,
+                ttl: 120,
+            })
+        );
         assert_eq!(upstream.requests.lock().unwrap().len(), 0);
         assert_eq!(cache.lookups.lock().unwrap().len(), 0);
         let response = Message::parse(&outcome.response_bytes).unwrap();
@@ -10625,10 +10896,77 @@ mod tests {
                 RecordData::A(Ipv4Addr::new(192, 0, 2, 45)),
             ]
         );
+        let recorded_events = events.events.lock().unwrap();
         assert_eq!(
-            events.events.lock().unwrap()[0].terminal_outcome,
+            recorded_events[0].terminal_outcome,
             QueryEventOutcome::AllowedFromLocal
         );
+        assert_eq!(
+            recorded_events[0].local_answer,
+            Some(LocalAnswerMetadata {
+                entry_id: Some("entry-1".to_string()),
+                generation: 7,
+                family: LocalAnswerFamily::A,
+                ttl: 120,
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn resolve_local_dns_uses_entry_addresses_not_sinkhole_configuration() {
+        let upstream = Arc::new(StaticUpstream::new(Ok(upstream_response(
+            a_response_with_answer(0xabcd, "host.example", 60),
+        ))));
+        let local_entries = Arc::new(InMemoryLocalDnsEntries::new(vec![LocalDnsEntry::new(
+            DomainName::parse("host.example").unwrap(),
+            vec![Ipv4Addr::new(10, 0, 0, 7)],
+            Vec::new(),
+            120,
+            true,
+        )]));
+        let responses = Arc::new(
+            ConfiguredResponseFactory::new(
+                BlockResponseConfig::new(
+                    BlockResponseMode::Sinkhole,
+                    BlockResponseMode::Sinkhole,
+                    BlockResponseMode::Refused,
+                    60,
+                    true,
+                    Some(Ipv4Addr::new(192, 0, 2, 1)),
+                    Some(Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1)),
+                )
+                .unwrap(),
+            )
+            .unwrap(),
+        );
+        let service = ResolveQuery::with_cache_and_policy(
+            Arc::new(StandardProtocolCodec::new(1232)),
+            Arc::new(RecordingCache::with_lookup(CacheLookup::Miss)),
+            Arc::new(NoopPolicyEvaluator),
+            local_entries,
+            CacheTtlPolicy::default(),
+            upstream.clone(),
+            responses,
+            Arc::new(FixedClock(SystemTime::UNIX_EPOCH)),
+            Arc::new(RecordingEvents::default()),
+            Arc::new(RecordingMetrics::default()),
+        );
+
+        let outcome = service
+            .resolve(ResolveRequest::new(
+                "192.0.2.10".parse().unwrap(),
+                SystemTime::UNIX_EPOCH,
+                a_query(0x1234, "host.example"),
+            ))
+            .await;
+
+        let response = Message::parse(&outcome.response_bytes).unwrap();
+        assert_eq!(response.answers.len(), 1);
+        assert_eq!(
+            response.answers[0].record,
+            RecordData::A(Ipv4Addr::new(10, 0, 0, 7))
+        );
+        assert_eq!(upstream.requests.lock().unwrap().len(), 0);
     }
 
     #[tokio::test]
@@ -10643,7 +10981,8 @@ mod tests {
             Vec::new(),
             120,
             true,
-        )]));
+        )
+        .with_metadata("entry-2", 8)]));
         let service = ResolveQuery::with_cache_and_policy(
             Arc::new(StandardProtocolCodec::new(1232)),
             cache.clone(),
@@ -10665,7 +11004,15 @@ mod tests {
             ))
             .await;
 
-        assert_eq!(outcome.decision.kind, ResolveDecisionKind::LocalAnswer);
+        assert_eq!(
+            outcome.decision.kind,
+            ResolveDecisionKind::LocalAnswer(LocalAnswerMetadata {
+                entry_id: Some("entry-2".to_string()),
+                generation: 8,
+                family: LocalAnswerFamily::NoDataAaaa,
+                ttl: 120,
+            })
+        );
         assert_eq!(upstream.requests.lock().unwrap().len(), 0);
         assert_eq!(cache.lookups.lock().unwrap().len(), 0);
         let response = Message::parse(&outcome.response_bytes).unwrap();
