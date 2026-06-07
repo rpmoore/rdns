@@ -405,13 +405,29 @@ pub fn build_nodata_response(request: &Message) -> Vec<u8> {
 }
 
 pub fn build_a_block_response(request: &Message, ipv4: Ipv4Addr, ttl: u32) -> Vec<u8> {
-    let answer = SinkholeAnswer::A { address: ipv4, ttl };
-    build_question_response(request, ResponseCode::NoError, &[answer])
+    build_a_answers_response(request, &[ipv4], ttl)
 }
 
 pub fn build_aaaa_block_response(request: &Message, ipv6: Ipv6Addr, ttl: u32) -> Vec<u8> {
-    let answer = SinkholeAnswer::Aaaa { address: ipv6, ttl };
-    build_question_response(request, ResponseCode::NoError, &[answer])
+    build_aaaa_answers_response(request, &[ipv6], ttl)
+}
+
+pub fn build_a_answers_response(request: &Message, ipv4: &[Ipv4Addr], ttl: u32) -> Vec<u8> {
+    let answers: Vec<_> = ipv4
+        .iter()
+        .copied()
+        .map(|address| AddressAnswer::A { address, ttl })
+        .collect();
+    build_question_response(request, ResponseCode::NoError, &answers)
+}
+
+pub fn build_aaaa_answers_response(request: &Message, ipv6: &[Ipv6Addr], ttl: u32) -> Vec<u8> {
+    let answers: Vec<_> = ipv6
+        .iter()
+        .copied()
+        .map(|address| AddressAnswer::Aaaa { address, ttl })
+        .collect();
+    build_question_response(request, ResponseCode::NoError, &answers)
 }
 
 pub fn build_truncated_response(request: &Message) -> Vec<u8> {
@@ -569,7 +585,7 @@ fn validate_tcp_message_size(size: usize, max_size: usize) -> Result<()> {
     Ok(())
 }
 
-enum SinkholeAnswer {
+enum AddressAnswer {
     A { address: Ipv4Addr, ttl: u32 },
     Aaaa { address: Ipv6Addr, ttl: u32 },
 }
@@ -595,7 +611,7 @@ fn build_header_only_response(
 fn build_question_response(
     request: &Message,
     rcode: ResponseCode,
-    answers: &[SinkholeAnswer],
+    answers: &[AddressAnswer],
 ) -> Vec<u8> {
     let mut response = Vec::new();
     let question_count = u16::from(!request.questions.is_empty());
@@ -651,9 +667,9 @@ fn write_question(out: &mut Vec<u8>, question: &Question) {
     write_u16(out, question.qclass);
 }
 
-fn write_sinkhole_answer(out: &mut Vec<u8>, question: &Question, answer: &SinkholeAnswer) {
+fn write_sinkhole_answer(out: &mut Vec<u8>, question: &Question, answer: &AddressAnswer) {
     match answer {
-        SinkholeAnswer::A { address, ttl } => {
+        AddressAnswer::A { address, ttl } => {
             write_name(out, &question.qname);
             write_u16(out, 1);
             write_u16(out, question.qclass);
@@ -661,7 +677,7 @@ fn write_sinkhole_answer(out: &mut Vec<u8>, question: &Question, answer: &Sinkho
             write_u16(out, 4);
             out.extend_from_slice(&address.octets());
         }
-        SinkholeAnswer::Aaaa { address, ttl } => {
+        AddressAnswer::Aaaa { address, ttl } => {
             write_name(out, &question.qname);
             write_u16(out, 28);
             write_u16(out, question.qclass);
