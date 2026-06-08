@@ -14,7 +14,7 @@
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::future::Future;
-use std::net::{IpAddr, SocketAddr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::pin::Pin;
 use std::sync::{
     atomic::{AtomicU64, Ordering},
@@ -27,14 +27,26 @@ use tokio::sync::{mpsc, Notify};
 use tokio::time::{self, Instant};
 
 use crate::protocol::{
-    age_response_ttls, build_formerr_response, build_refused_response, build_servfail_response,
-    build_truncated_response, cap_response_ttls, message_question_wire, rewrite_response_id,
-    rewrite_response_request_fields, EdnsInfo, Message, QueryValidationError, Record, RecordData,
-    ResponseCode,
+    age_response_ttls, build_a_answers_response, build_a_block_response,
+    build_aaaa_answers_response, build_aaaa_block_response, build_formerr_response,
+    build_nodata_response, build_nxdomain_response, build_refused_response,
+    build_servfail_response, build_truncated_response, cap_response_ttls, message_question_wire,
+    rewrite_response_id, rewrite_response_request_fields, EdnsInfo, Message, QueryValidationError,
+    Record, RecordData, ResponseCode,
+};
+
+pub mod policy;
+pub use policy::{
+    CidrPrefixError, ClientIdentity, ClientSelector, DomainName, DomainNameError, DomainSelector,
+    IpCidr, LocalDenyRule, LocalPolicyEvaluator, MaliciousDomainPolicyEvaluator,
+    MaliciousDomainRule, NoopPolicyEvaluator, PolicyChain,
 };
 
 const EDNS_DO_FLAG: u16 = 0x8000;
+const A_RECORD_TYPE: u16 = 1;
+const AAAA_RECORD_TYPE: u16 = 28;
 const MAX_FAILURE_CACHE_TTL: Duration = Duration::from_secs(5 * 60);
+const MAX_LOCAL_DNS_TTL: u32 = 24 * 60 * 60;
 const CNAME_RECORD_TYPE: u16 = 5;
 const DNSKEY_RECORD_TYPE: u16 = 48;
 const DS_RECORD_TYPE: u16 = 43;
@@ -264,6 +276,279 @@ pub struct PolicyBlock {
 pub enum BlockReason {
     LocalRule,
     MaliciousDomain,
+    InvalidDomain,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BlockResponseMode {
+    Refused,
+    NxDomain,
+    NoData,
+    Sinkhole,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BlockResponseConfig {
+    pub local_rule_mode: BlockResponseMode,
+    pub malicious_domain_mode: BlockResponseMode,
+    pub invalid_domain_mode: BlockResponseMode,
+    pub blocked_response_ttl: u32,
+    pub cacheable_by_clients: bool,
+    pub sinkhole_ipv4: Option<Ipv4Addr>,
+    pub sinkhole_ipv6: Option<Ipv6Addr>,
+}
+
+impl BlockResponseConfig {
+    pub fn new(
+        local_rule_mode: BlockResponseMode,
+        malicious_domain_mode: BlockResponseMode,
+        invalid_domain_mode: BlockResponseMode,
+        blocked_response_ttl: u32,
+        cacheable_by_clients: bool,
+        sinkhole_ipv4: Option<Ipv4Addr>,
+        sinkhole_ipv6: Option<Ipv6Addr>,
+    ) -> Result<Self, BlockResponseConfigError> {
+        let config = Self {
+            local_rule_mode,
+            malicious_domain_mode,
+            invalid_domain_mode,
+            blocked_response_ttl,
+            cacheable_by_clients,
+            sinkhole_ipv4,
+            sinkhole_ipv6,
+        };
+        config.validate()?;
+        Ok(config)
+    }
+
+    pub fn mode_for(&self, reason: &BlockReason) -> BlockResponseMode {
+        match reason {
+            BlockReason::LocalRule => self.local_rule_mode,
+            BlockReason::MaliciousDomain => self.malicious_domain_mode,
+            BlockReason::InvalidDomain => self.invalid_domain_mode,
+        }
+    }
+
+    pub fn validate(&self) -> Result<(), BlockResponseConfigError> {
+        if self.uses_sinkhole() && self.sinkhole_ipv4.is_none() && self.sinkhole_ipv6.is_none() {
+            return Err(BlockResponseConfigError::MissingSinkholeAddress);
+        }
+        if self.blocked_response_ttl > 0
+            && self.cacheable_by_clients
+            && self.uses_non_sinkhole_mode()
+        {
+            return Err(BlockResponseConfigError::ClientCachingUnsupportedForNonSinkhole);
+        }
+        Ok(())
+    }
+
+    fn uses_sinkhole(&self) -> bool {
+        [
+            self.local_rule_mode,
+            self.malicious_domain_mode,
+            self.invalid_domain_mode,
+        ]
+        .contains(&BlockResponseMode::Sinkhole)
+    }
+
+    fn uses_non_sinkhole_mode(&self) -> bool {
+        [
+            self.local_rule_mode,
+            self.malicious_domain_mode,
+            self.invalid_domain_mode,
+        ]
+        .iter()
+        .any(|mode| !matches!(mode, BlockResponseMode::Sinkhole))
+    }
+}
+
+impl Default for BlockResponseConfig {
+    fn default() -> Self {
+        Self {
+            local_rule_mode: BlockResponseMode::Refused,
+            malicious_domain_mode: BlockResponseMode::Refused,
+            invalid_domain_mode: BlockResponseMode::Refused,
+            blocked_response_ttl: 0,
+            cacheable_by_clients: false,
+            sinkhole_ipv4: None,
+            sinkhole_ipv6: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BlockResponseConfigError {
+    ClientCachingUnsupportedForNonSinkhole,
+    MissingSinkholeAddress,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LocalDnsEntry {
+    pub id: Option<String>,
+    pub name: DomainName,
+    pub ipv4: Vec<Ipv4Addr>,
+    pub ipv6: Vec<Ipv6Addr>,
+    pub ttl: u32,
+    pub enabled: bool,
+    pub generation: u64,
+}
+
+impl LocalDnsEntry {
+    pub fn new(
+        name: DomainName,
+        ipv4: Vec<Ipv4Addr>,
+        ipv6: Vec<Ipv6Addr>,
+        ttl: u32,
+        enabled: bool,
+    ) -> Self {
+        Self {
+            id: None,
+            name,
+            ipv4,
+            ipv6,
+            ttl,
+            enabled,
+            generation: 0,
+        }
+    }
+
+    pub fn with_metadata(mut self, id: impl Into<String>, generation: u64) -> Self {
+        self.id = Some(id.into());
+        self.generation = generation;
+        self
+    }
+
+    pub fn validate(
+        &self,
+        public_address_acknowledged: bool,
+    ) -> Result<LocalDnsEntryValidation, LocalDnsEntryValidationError> {
+        if self.ipv4.is_empty() && self.ipv6.is_empty() {
+            return Err(LocalDnsEntryValidationError::NoAddresses);
+        }
+        if self.ttl == 0 {
+            return Err(LocalDnsEntryValidationError::TtlTooLow);
+        }
+        if self.ttl > MAX_LOCAL_DNS_TTL {
+            return Err(LocalDnsEntryValidationError::TtlTooHigh {
+                max: MAX_LOCAL_DNS_TTL,
+            });
+        }
+        let uses_public_address = self.ipv4.iter().any(|address| !ipv4_is_local_use(*address))
+            || self.ipv6.iter().any(|address| !ipv6_is_local_use(*address));
+        if uses_public_address && !public_address_acknowledged {
+            return Err(LocalDnsEntryValidationError::PublicAddressRequiresAcknowledgement);
+        }
+
+        let mut warnings = Vec::new();
+        if local_dns_name_uses_mdns_suffix(&self.name) {
+            warnings.push(LocalDnsEntryWarning::ReservedMdnsSuffix);
+        }
+        Ok(LocalDnsEntryValidation { warnings })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LocalDnsEntryValidation {
+    pub warnings: Vec<LocalDnsEntryWarning>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LocalDnsEntryWarning {
+    ReservedMdnsSuffix,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LocalDnsEntryValidationError {
+    NoAddresses,
+    TtlTooLow,
+    TtlTooHigh { max: u32 },
+    PublicAddressRequiresAcknowledgement,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LocalAnswerMetadata {
+    pub entry_id: Option<String>,
+    pub generation: u64,
+    pub family: LocalAnswerFamily,
+    pub ttl: u32,
+}
+
+impl LocalAnswerMetadata {
+    fn from_entry(entry: &LocalDnsEntry, family: LocalAnswerFamily) -> Self {
+        Self {
+            entry_id: entry.id.clone(),
+            generation: entry.generation,
+            family,
+            ttl: entry.ttl,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LocalAnswerFamily {
+    A,
+    Aaaa,
+    NoDataA,
+    NoDataAaaa,
+}
+
+fn local_dns_name_uses_mdns_suffix(name: &DomainName) -> bool {
+    let name = name.as_str();
+    name == "local" || name.ends_with(".local")
+}
+
+fn ipv4_is_local_use(address: Ipv4Addr) -> bool {
+    address.is_private()
+        || address.is_loopback()
+        || address.is_link_local()
+        || address.octets()[0] == 0
+        || address.octets()[0] == 127
+}
+
+fn ipv6_is_local_use(address: Ipv6Addr) -> bool {
+    address.is_loopback()
+        || address.is_unspecified()
+        || address.is_unique_local()
+        || address.is_unicast_link_local()
+}
+
+fn local_answer_family(qtype: u16) -> LocalAnswerFamily {
+    match qtype {
+        A_RECORD_TYPE => LocalAnswerFamily::A,
+        AAAA_RECORD_TYPE => LocalAnswerFamily::Aaaa,
+        _ => LocalAnswerFamily::NoDataA,
+    }
+}
+
+fn local_nodata_family(qtype: u16) -> LocalAnswerFamily {
+    match qtype {
+        A_RECORD_TYPE => LocalAnswerFamily::NoDataA,
+        AAAA_RECORD_TYPE => LocalAnswerFamily::NoDataAaaa,
+        _ => LocalAnswerFamily::NoDataA,
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LocalDnsLookup {
+    NoMatch,
+    Answer(LocalDnsEntry),
+    NoData(LocalDnsEntry),
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct InMemoryLocalDnsEntries {
+    entries: HashMap<DomainName, LocalDnsEntry>,
+}
+
+impl InMemoryLocalDnsEntries {
+    pub fn new(entries: Vec<LocalDnsEntry>) -> Self {
+        let entries = entries
+            .into_iter()
+            .filter(|entry| entry.enabled)
+            .map(|entry| (entry.name.clone(), entry))
+            .collect();
+        Self { entries }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1477,10 +1762,22 @@ fn canonical_chain_from_response(response: &Message) -> Vec<String> {
         .collect()
 }
 
+fn response_policy_domains(response: &Message) -> impl Iterator<Item = DomainName> + '_ {
+    response.answers.iter().flat_map(|record| {
+        let owner = DomainName::parse(&record.name).ok();
+        let target = match &record.record {
+            RecordData::CNAME(target) => DomainName::parse(target).ok(),
+            _ => None,
+        };
+        owner.into_iter().chain(target)
+    })
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ResolveDecisionKind {
     Allowed,
-    Blocked(BlockReason),
+    Blocked(PolicyBlock),
+    LocalAnswer(LocalAnswerMetadata),
     CacheHit,
     CacheMiss,
     ProtocolError(ResponseCode),
@@ -1505,6 +1802,8 @@ pub struct QueryEventV1 {
     pub qtype: Option<u16>,
     pub qclass: Option<u16>,
     pub terminal_outcome: QueryEventOutcome,
+    pub block_response_mode: Option<BlockResponseMode>,
+    pub local_answer: Option<LocalAnswerMetadata>,
     pub response_code: Option<u16>,
     pub cache_result: Option<QueryEventCacheResult>,
     pub backend: Option<QueryEventBackend>,
@@ -1513,7 +1812,7 @@ pub struct QueryEventV1 {
 }
 
 impl QueryEventV1 {
-    pub const SCHEMA_VERSION: u8 = 2;
+    pub const SCHEMA_VERSION: u8 = 4;
 
     pub fn from_decision(
         sequence: u64,
@@ -1557,12 +1856,21 @@ impl QueryEventV1 {
             qclass: normalized_question.as_ref().map(|question| question.qclass),
             normalized_question,
             terminal_outcome: QueryEventOutcome::from_decision_kind(&decision.kind),
+            block_response_mode: None,
+            local_answer: local_answer_metadata(&decision.kind),
             response_code,
             cache_result,
             backend: None,
             latency,
             advisory_findings: Vec::new(),
         }
+    }
+}
+
+fn local_answer_metadata(kind: &ResolveDecisionKind) -> Option<LocalAnswerMetadata> {
+    match kind {
+        ResolveDecisionKind::LocalAnswer(metadata) => Some(metadata.clone()),
+        _ => None,
     }
 }
 
@@ -1590,6 +1898,7 @@ impl QueryEventBackend {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum QueryEventOutcome {
     AllowedFromBackend,
+    AllowedFromLocal,
     AllowedFromCache,
     Blocked(BlockReason),
     ProtocolError(ResponseCode),
@@ -1600,7 +1909,8 @@ impl QueryEventOutcome {
     fn from_decision_kind(kind: &ResolveDecisionKind) -> Self {
         match kind {
             ResolveDecisionKind::Allowed => Self::AllowedFromBackend,
-            ResolveDecisionKind::Blocked(reason) => Self::Blocked(reason.clone()),
+            ResolveDecisionKind::Blocked(block) => Self::Blocked(block.reason.clone()),
+            ResolveDecisionKind::LocalAnswer(_) => Self::AllowedFromLocal,
             ResolveDecisionKind::CacheHit => Self::AllowedFromCache,
             ResolveDecisionKind::CacheMiss => Self::AllowedFromBackend,
             ResolveDecisionKind::ProtocolError(code) => Self::ProtocolError(*code),
@@ -2118,6 +2428,8 @@ struct CacheProbe {
 
 pub struct ResolveQuery {
     protocol: Arc<dyn ProtocolCodec>,
+    policy: Arc<dyn PolicyEvaluator>,
+    local_entries: Arc<dyn LocalDnsEntries>,
     cache: Arc<dyn DnsCache>,
     ttl_policy: CacheTtlPolicy,
     miss_coalescer: Arc<SingleFlightMisses>,
@@ -2161,9 +2473,45 @@ impl ResolveQuery {
         events: Arc<dyn QueryEventSink>,
         metrics: Arc<dyn MetricsSink>,
     ) -> Self {
+        Self::with_cache_and_policy(
+            protocol,
+            cache,
+            Arc::new(NoopPolicyEvaluator),
+            Arc::new(NoopLocalDnsEntries),
+            ttl_policy,
+            backend,
+            responses,
+            clock,
+            events,
+            metrics,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn with_cache_and_policy(
+        protocol: Arc<dyn ProtocolCodec>,
+        cache: Arc<dyn DnsCache>,
+        policy: Arc<dyn PolicyEvaluator>,
+        local_entries: Arc<dyn LocalDnsEntries>,
+        ttl_policy: CacheTtlPolicy,
+        backend: Arc<dyn ResolutionBackend>,
+        responses: Arc<dyn ResponseFactory>,
+        clock: Arc<dyn Clock>,
+        events: Arc<dyn QueryEventSink>,
+        metrics: Arc<dyn MetricsSink>,
+    ) -> Self {
         let snapshot = BackendSnapshot::forwarding(backend, 0);
-        Self::with_cache_and_backend_snapshot(
-            protocol, cache, ttl_policy, snapshot, responses, clock, events, metrics,
+        Self::with_cache_policy_and_backend_snapshot(
+            protocol,
+            cache,
+            policy,
+            local_entries,
+            ttl_policy,
+            snapshot,
+            responses,
+            clock,
+            events,
+            metrics,
         )
     }
 
@@ -2178,9 +2526,38 @@ impl ResolveQuery {
         events: Arc<dyn QueryEventSink>,
         metrics: Arc<dyn MetricsSink>,
     ) -> Self {
+        Self::with_cache_policy_and_backend_snapshot(
+            protocol,
+            cache,
+            Arc::new(NoopPolicyEvaluator),
+            Arc::new(NoopLocalDnsEntries),
+            ttl_policy,
+            backend_snapshot,
+            responses,
+            clock,
+            events,
+            metrics,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn with_cache_policy_and_backend_snapshot(
+        protocol: Arc<dyn ProtocolCodec>,
+        cache: Arc<dyn DnsCache>,
+        policy: Arc<dyn PolicyEvaluator>,
+        local_entries: Arc<dyn LocalDnsEntries>,
+        ttl_policy: CacheTtlPolicy,
+        backend_snapshot: BackendSnapshot,
+        responses: Arc<dyn ResponseFactory>,
+        clock: Arc<dyn Clock>,
+        events: Arc<dyn QueryEventSink>,
+        metrics: Arc<dyn MetricsSink>,
+    ) -> Self {
         metrics.record_backend_status(&backend_snapshot.status());
         Self {
             protocol,
+            policy,
+            local_entries,
             cache,
             ttl_policy,
             miss_coalescer: Arc::new(SingleFlightMisses::default()),
@@ -2214,9 +2591,38 @@ impl ResolveQuery {
         events: Arc<dyn QueryEventSink>,
         metrics: Arc<dyn MetricsSink>,
     ) -> Self {
+        Self::with_cache_policy_and_backend_handle(
+            protocol,
+            cache,
+            Arc::new(NoopPolicyEvaluator),
+            Arc::new(NoopLocalDnsEntries),
+            ttl_policy,
+            backend_handle,
+            responses,
+            clock,
+            events,
+            metrics,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn with_cache_policy_and_backend_handle(
+        protocol: Arc<dyn ProtocolCodec>,
+        cache: Arc<dyn DnsCache>,
+        policy: Arc<dyn PolicyEvaluator>,
+        local_entries: Arc<dyn LocalDnsEntries>,
+        ttl_policy: CacheTtlPolicy,
+        backend_handle: BackendHandle,
+        responses: Arc<dyn ResponseFactory>,
+        clock: Arc<dyn Clock>,
+        events: Arc<dyn QueryEventSink>,
+        metrics: Arc<dyn MetricsSink>,
+    ) -> Self {
         metrics.record_backend_status(&backend_handle.status());
         Self {
             protocol,
+            policy,
+            local_entries,
             cache,
             ttl_policy,
             miss_coalescer: Arc::new(SingleFlightMisses::default()),
@@ -2242,8 +2648,17 @@ impl ResolveQuery {
         metrics: Arc<dyn MetricsSink>,
     ) -> Self {
         let snapshot = BackendSnapshot::forwarding(backend, backend_generation);
-        Self::with_cache_and_backend_snapshot(
-            protocol, cache, ttl_policy, snapshot, responses, clock, events, metrics,
+        Self::with_cache_policy_and_backend_snapshot(
+            protocol,
+            cache,
+            Arc::new(NoopPolicyEvaluator),
+            Arc::new(NoopLocalDnsEntries),
+            ttl_policy,
+            snapshot,
+            responses,
+            clock,
+            events,
+            metrics,
         )
     }
 
@@ -2278,18 +2693,110 @@ impl ResolveQuery {
             }
         };
 
-        self.metrics.increment(ResolverMetric::QueryAllowed);
         let question = decoded.question.clone();
+        if let PolicyDecision::Block(block) =
+            self.policy.evaluate(request.client_ip, &decoded.question)
+        {
+            self.metrics.increment(ResolverMetric::QueryBlocked);
+            let decision = ResolveDecision {
+                client_ip: request.client_ip,
+                question: Some(question),
+                kind: ResolveDecisionKind::Blocked(block.clone()),
+            };
+            let response_bytes = self.responses.blocked(&decoded, &block);
+            return self
+                .finish(
+                    started_at,
+                    &request,
+                    decoded_original_question_name(&decoded),
+                    decision,
+                    response_bytes,
+                    None,
+                    Some(QueryEventBackend::from_snapshot(&backend_snapshot)),
+                )
+                .await;
+        }
+        match self.local_entries.lookup(&decoded.question) {
+            LocalDnsLookup::Answer(entry) => {
+                self.metrics.increment(ResolverMetric::QueryAllowed);
+                let response_bytes = self.local_entry_response(&decoded, &entry);
+                let decision = ResolveDecision {
+                    client_ip: request.client_ip,
+                    question: Some(question),
+                    kind: ResolveDecisionKind::LocalAnswer(
+                        self.local_entry_answer_metadata(&decoded, &entry),
+                    ),
+                };
+                return self
+                    .finish(
+                        started_at,
+                        &request,
+                        decoded_original_question_name(&decoded),
+                        decision,
+                        response_bytes,
+                        None,
+                        Some(QueryEventBackend::from_snapshot(&backend_snapshot)),
+                    )
+                    .await;
+            }
+            LocalDnsLookup::NoData(_entry) => {
+                self.metrics.increment(ResolverMetric::QueryAllowed);
+                let response_bytes = build_nodata_response(&decoded.message);
+                let decision = ResolveDecision {
+                    client_ip: request.client_ip,
+                    question: Some(question),
+                    kind: ResolveDecisionKind::LocalAnswer(LocalAnswerMetadata::from_entry(
+                        &_entry,
+                        local_nodata_family(decoded.question.qtype),
+                    )),
+                };
+                return self
+                    .finish(
+                        started_at,
+                        &request,
+                        decoded_original_question_name(&decoded),
+                        decision,
+                        response_bytes,
+                        None,
+                        Some(QueryEventBackend::from_snapshot(&backend_snapshot)),
+                    )
+                    .await;
+            }
+            LocalDnsLookup::NoMatch => {}
+        }
 
         let mut cache_probe = self
             .probe_cache(&backend_snapshot, &request, &decoded)
             .await;
         if let Some(response_bytes) = cache_probe.hit {
+            if let Some(block) =
+                self.response_bytes_policy_block(request.client_ip, &response_bytes)
+            {
+                self.metrics.increment(ResolverMetric::QueryBlocked);
+                let decision = ResolveDecision {
+                    client_ip: request.client_ip,
+                    question: Some(question),
+                    kind: ResolveDecisionKind::Blocked(block.clone()),
+                };
+                let response_bytes = self.responses.blocked(&decoded, &block);
+                return self
+                    .finish(
+                        started_at,
+                        &request,
+                        decoded_original_question_name(&decoded),
+                        decision,
+                        response_bytes,
+                        cache_probe.event_cache_result,
+                        Some(QueryEventBackend::from_snapshot(&backend_snapshot)),
+                    )
+                    .await;
+            }
             let decision = ResolveDecision {
                 client_ip: request.client_ip,
                 question: Some(question),
                 kind: ResolveDecisionKind::CacheHit,
             };
+            self.metrics.increment(ResolverMetric::QueryAllowed);
             return self
                 .finish(
                     started_at,
@@ -2375,11 +2882,34 @@ impl ResolveQuery {
                     .cache_hit_after_coalesced_miss(request, decoded, &cache_key)
                     .await
                 {
+                    if let Some(block) =
+                        self.response_bytes_policy_block(request.client_ip, &response_bytes)
+                    {
+                        self.metrics.increment(ResolverMetric::QueryBlocked);
+                        let decision = ResolveDecision {
+                            client_ip: request.client_ip,
+                            question: Some(question),
+                            kind: ResolveDecisionKind::Blocked(block.clone()),
+                        };
+                        let response_bytes = self.responses.blocked(decoded, &block);
+                        return self
+                            .finish(
+                                started_at,
+                                request,
+                                decoded_original_question_name(decoded),
+                                decision,
+                                response_bytes,
+                                Some(QueryEventCacheResult::Hit),
+                                Some(QueryEventBackend::from_snapshot(backend_snapshot)),
+                            )
+                            .await;
+                    }
                     let decision = ResolveDecision {
                         client_ip: request.client_ip,
                         question: Some(question),
                         kind: ResolveDecisionKind::CacheHit,
                     };
+                    self.metrics.increment(ResolverMetric::QueryAllowed);
                     return self
                         .finish(
                             started_at,
@@ -2455,6 +2985,32 @@ impl ResolveQuery {
                 backend_generation: backend_snapshot.generation,
             })
             .await
+    }
+
+    fn local_entry_response(&self, decoded: &DecodedQuery, entry: &LocalDnsEntry) -> Vec<u8> {
+        let response = match decoded.question.qtype {
+            A_RECORD_TYPE => build_a_answers_response(&decoded.message, &entry.ipv4, entry.ttl),
+            AAAA_RECORD_TYPE => {
+                build_aaaa_answers_response(&decoded.message, &entry.ipv6, entry.ttl)
+            }
+            _ => build_nodata_response(&decoded.message),
+        };
+        if decoded.message.response_exceeds_udp_payload(
+            response.len(),
+            self.protocol.configured_max_udp_payload_size(),
+        ) {
+            build_truncated_response(&decoded.message)
+        } else {
+            response
+        }
+    }
+
+    fn local_entry_answer_metadata(
+        &self,
+        decoded: &DecodedQuery,
+        entry: &LocalDnsEntry,
+    ) -> LocalAnswerMetadata {
+        LocalAnswerMetadata::from_entry(entry, local_answer_family(decoded.question.qtype))
     }
 
     async fn probe_cache(
@@ -2627,6 +3183,17 @@ impl ResolveQuery {
         };
 
         self.metrics.increment(ResolverMetric::UpstreamSuccess);
+        if let Some(block) = self.response_policy_block(request.client_ip, &response_message) {
+            self.metrics.increment(ResolverMetric::QueryBlocked);
+            let decision = ResolveDecision {
+                client_ip: request.client_ip,
+                question: Some(question),
+                kind: ResolveDecisionKind::Blocked(block.clone()),
+            };
+            let response_bytes = self.responses.blocked(decoded, &block);
+            return (decision, response_bytes);
+        }
+
         let mut response_bytes = response.bytes;
         if self
             .protocol
@@ -2665,7 +3232,28 @@ impl ResolveQuery {
             question: Some(question),
             kind: ResolveDecisionKind::Allowed,
         };
+        self.metrics.increment(ResolverMetric::QueryAllowed);
         (decision, response_bytes)
+    }
+
+    fn response_policy_block(&self, client_ip: IpAddr, response: &Message) -> Option<PolicyBlock> {
+        response_policy_domains(response).find_map(|domain| {
+            let PolicyDecision::Block(block) =
+                self.policy.evaluate_response_name(client_ip, &domain)
+            else {
+                return None;
+            };
+            Some(block)
+        })
+    }
+
+    fn response_bytes_policy_block(
+        &self,
+        client_ip: IpAddr,
+        response_bytes: &[u8],
+    ) -> Option<PolicyBlock> {
+        let response = Message::parse(response_bytes).ok()?;
+        self.response_policy_block(client_ip, &response)
     }
 
     fn backend_failure_response(
@@ -2763,6 +3351,9 @@ impl ResolveQuery {
             cache_result,
             latency,
         );
+        if let ResolveDecisionKind::Blocked(block) = &decision.kind {
+            event.block_response_mode = Some(self.responses.block_response_mode(block));
+        }
         event.backend = backend;
         self.record_query_event(event);
         self.metrics.record_backend_status(&self.backend.status());
@@ -3244,6 +3835,71 @@ impl ResponseFactory for BasicResponseFactory {
     }
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ConfiguredResponseFactory {
+    block_config: BlockResponseConfig,
+}
+
+impl ConfiguredResponseFactory {
+    pub fn new(block_config: BlockResponseConfig) -> Result<Self, BlockResponseConfigError> {
+        block_config.validate()?;
+        Ok(Self { block_config })
+    }
+
+    pub fn block_config(&self) -> &BlockResponseConfig {
+        &self.block_config
+    }
+
+    fn block_ttl(&self) -> u32 {
+        if self.block_config.cacheable_by_clients {
+            self.block_config.blocked_response_ttl
+        } else {
+            0
+        }
+    }
+}
+
+impl ResponseFactory for ConfiguredResponseFactory {
+    fn protocol_error(&self, request_id: Option<u16>, error: &QueryValidationError) -> Vec<u8> {
+        BasicResponseFactory.protocol_error(request_id, error)
+    }
+
+    fn block_response_mode(&self, block: &PolicyBlock) -> BlockResponseMode {
+        self.block_config.mode_for(&block.reason)
+    }
+
+    fn blocked(&self, query: &DecodedQuery, block: &PolicyBlock) -> Vec<u8> {
+        match self.block_config.mode_for(&block.reason) {
+            BlockResponseMode::Refused => build_refused_response(&query.message),
+            BlockResponseMode::NxDomain => build_nxdomain_response(&query.message),
+            BlockResponseMode::NoData => build_nodata_response(&query.message),
+            BlockResponseMode::Sinkhole => self.sinkhole_response(query),
+        }
+    }
+
+    fn servfail(&self, query: Option<&DecodedQuery>) -> Vec<u8> {
+        BasicResponseFactory.servfail(query)
+    }
+}
+
+impl ConfiguredResponseFactory {
+    fn sinkhole_response(&self, query: &DecodedQuery) -> Vec<u8> {
+        match query.question.qtype {
+            A_RECORD_TYPE => self
+                .block_config
+                .sinkhole_ipv4
+                .map(|address| build_a_block_response(&query.message, address, self.block_ttl()))
+                .unwrap_or_else(|| build_nodata_response(&query.message)),
+            AAAA_RECORD_TYPE => self
+                .block_config
+                .sinkhole_ipv6
+                .map(|address| build_aaaa_block_response(&query.message, address, self.block_ttl()))
+                .unwrap_or_else(|| build_nodata_response(&query.message)),
+            _ => build_refused_response(&query.message),
+        }
+    }
+}
+
 fn build_header_only_protocol_error(request_id: u16, rcode: ResponseCode) -> Vec<u8> {
     let mut response = build_formerr_response(request_id);
     response[3] = (response[3] & 0xf0) | rcode as u8;
@@ -3275,6 +3931,41 @@ pub trait ProtocolCodec: Send + Sync {
 
 pub trait PolicyEvaluator: Send + Sync {
     fn evaluate(&self, client_ip: IpAddr, question: &QuestionKey) -> PolicyDecision;
+
+    fn evaluate_response_name(&self, _client_ip: IpAddr, _domain: &DomainName) -> PolicyDecision {
+        PolicyDecision::Allow
+    }
+}
+
+pub trait LocalDnsEntries: Send + Sync {
+    fn lookup(&self, question: &QuestionKey) -> LocalDnsLookup;
+}
+
+impl LocalDnsEntries for InMemoryLocalDnsEntries {
+    fn lookup(&self, question: &QuestionKey) -> LocalDnsLookup {
+        if question.qclass != 1 || !matches!(question.qtype, A_RECORD_TYPE | AAAA_RECORD_TYPE) {
+            return LocalDnsLookup::NoMatch;
+        }
+        let Ok(name) = DomainName::parse(&question.qname) else {
+            return LocalDnsLookup::NoMatch;
+        };
+        let Some(entry) = self.entries.get(&name) else {
+            return LocalDnsLookup::NoMatch;
+        };
+        match question.qtype {
+            A_RECORD_TYPE if !entry.ipv4.is_empty() => LocalDnsLookup::Answer(entry.clone()),
+            AAAA_RECORD_TYPE if !entry.ipv6.is_empty() => LocalDnsLookup::Answer(entry.clone()),
+            _ => LocalDnsLookup::NoData(entry.clone()),
+        }
+    }
+}
+
+pub struct NoopLocalDnsEntries;
+
+impl LocalDnsEntries for NoopLocalDnsEntries {
+    fn lookup(&self, _question: &QuestionKey) -> LocalDnsLookup {
+        LocalDnsLookup::NoMatch
+    }
 }
 
 pub trait DnsCache: Send + Sync {
@@ -4615,6 +5306,10 @@ impl ResolutionBackend for RecursiveResolutionBackend {
 
 pub trait ResponseFactory: Send + Sync {
     fn protocol_error(&self, request_id: Option<u16>, error: &QueryValidationError) -> Vec<u8>;
+
+    fn block_response_mode(&self, _block: &PolicyBlock) -> BlockResponseMode {
+        BlockResponseMode::Refused
+    }
 
     fn blocked(&self, query: &DecodedQuery, block: &PolicyBlock) -> Vec<u8>;
 
@@ -6259,6 +6954,29 @@ mod tests {
                 .iter()
                 .filter(|increment| **increment == metric)
                 .count()
+        }
+    }
+
+    struct ClientScopedResponsePolicy {
+        client_ip: IpAddr,
+        domain: DomainSelector,
+        rule_id: String,
+    }
+
+    impl PolicyEvaluator for ClientScopedResponsePolicy {
+        fn evaluate(&self, _client_ip: IpAddr, _question: &QuestionKey) -> PolicyDecision {
+            PolicyDecision::Allow
+        }
+
+        fn evaluate_response_name(&self, client_ip: IpAddr, domain: &DomainName) -> PolicyDecision {
+            if client_ip == self.client_ip && self.domain.matches(domain) {
+                PolicyDecision::Block(PolicyBlock {
+                    reason: BlockReason::MaliciousDomain,
+                    rule_id: Some(self.rule_id.clone()),
+                })
+            } else {
+                PolicyDecision::Allow
+            }
         }
     }
 
@@ -9208,6 +9926,8 @@ mod tests {
         assert_eq!(event.qtype, Some(1));
         assert_eq!(event.qclass, Some(1));
         assert_eq!(event.terminal_outcome, QueryEventOutcome::AllowedFromCache);
+        assert_eq!(event.block_response_mode, None);
+        assert_eq!(event.local_answer, None);
         assert_eq!(event.response_code, Some(ResponseCode::NoError as u16));
         assert_eq!(event.cache_result, Some(QueryEventCacheResult::Hit));
         assert_eq!(event.backend, None);
@@ -9673,6 +10393,218 @@ mod tests {
         );
     }
 
+    #[test]
+    fn block_response_config_defaults_to_uncacheable_refused() {
+        let config = BlockResponseConfig::default();
+
+        assert_eq!(config.local_rule_mode, BlockResponseMode::Refused);
+        assert_eq!(config.malicious_domain_mode, BlockResponseMode::Refused);
+        assert_eq!(config.invalid_domain_mode, BlockResponseMode::Refused);
+        assert_eq!(config.blocked_response_ttl, 0);
+        assert!(!config.cacheable_by_clients);
+        assert_eq!(config.validate(), Ok(()));
+    }
+
+    #[test]
+    fn block_response_config_requires_at_least_one_sinkhole_address() {
+        assert_eq!(
+            BlockResponseConfig::new(
+                BlockResponseMode::Sinkhole,
+                BlockResponseMode::Sinkhole,
+                BlockResponseMode::Sinkhole,
+                60,
+                true,
+                None,
+                None,
+            ),
+            Err(BlockResponseConfigError::MissingSinkholeAddress)
+        );
+        assert!(BlockResponseConfig::new(
+            BlockResponseMode::Sinkhole,
+            BlockResponseMode::Sinkhole,
+            BlockResponseMode::Sinkhole,
+            60,
+            true,
+            Some(Ipv4Addr::new(192, 0, 2, 1)),
+            None,
+        )
+        .is_ok());
+        assert!(BlockResponseConfig::new(
+            BlockResponseMode::Sinkhole,
+            BlockResponseMode::Sinkhole,
+            BlockResponseMode::Sinkhole,
+            60,
+            true,
+            None,
+            Some(Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1)),
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn block_response_config_rejects_client_caching_for_non_sinkhole_modes() {
+        assert_eq!(
+            BlockResponseConfig::new(
+                BlockResponseMode::NxDomain,
+                BlockResponseMode::Refused,
+                BlockResponseMode::Refused,
+                60,
+                true,
+                None,
+                None,
+            ),
+            Err(BlockResponseConfigError::ClientCachingUnsupportedForNonSinkhole)
+        );
+        assert!(BlockResponseConfig::new(
+            BlockResponseMode::Sinkhole,
+            BlockResponseMode::Sinkhole,
+            BlockResponseMode::Sinkhole,
+            60,
+            true,
+            Some(Ipv4Addr::new(192, 0, 2, 1)),
+            Some(Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1)),
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn block_response_config_allows_internal_ttl_for_uncacheable_negative_modes() {
+        assert!(BlockResponseConfig::new(
+            BlockResponseMode::NxDomain,
+            BlockResponseMode::Refused,
+            BlockResponseMode::Refused,
+            60,
+            false,
+            None,
+            None,
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn configured_response_factory_selects_block_mode_by_reason() {
+        let query = StandardProtocolCodec::new(1232)
+            .decode_query(&a_query(0x1234, "blocked.example"))
+            .unwrap();
+        let factory = ConfiguredResponseFactory::new(
+            BlockResponseConfig::new(
+                BlockResponseMode::NxDomain,
+                BlockResponseMode::NoData,
+                BlockResponseMode::Refused,
+                0,
+                false,
+                None,
+                None,
+            )
+            .unwrap(),
+        )
+        .unwrap();
+
+        assert_eq!(
+            response_code_from_wire(&factory.blocked(
+                &query,
+                &PolicyBlock {
+                    reason: BlockReason::LocalRule,
+                    rule_id: Some("rule-1".to_string()),
+                },
+            )),
+            Some(ResponseCode::NxDomain as u16)
+        );
+        let nodata = Message::parse(&factory.blocked(
+            &query,
+            &PolicyBlock {
+                reason: BlockReason::MaliciousDomain,
+                rule_id: Some("source-1".to_string()),
+            },
+        ))
+        .unwrap();
+        assert_eq!(nodata.header.r_code(), ResponseCode::NoError as u8);
+        assert!(nodata.answers.is_empty());
+    }
+
+    #[test]
+    fn configured_response_factory_builds_family_specific_sinkholes() {
+        let factory = ConfiguredResponseFactory::new(
+            BlockResponseConfig::new(
+                BlockResponseMode::Sinkhole,
+                BlockResponseMode::Sinkhole,
+                BlockResponseMode::Sinkhole,
+                60,
+                true,
+                Some(Ipv4Addr::new(192, 0, 2, 1)),
+                Some(Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1)),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let a_query = StandardProtocolCodec::new(1232)
+            .decode_query(&a_query(0x1234, "blocked.example"))
+            .unwrap();
+        let aaaa_query = StandardProtocolCodec::new(1232)
+            .decode_query(&aaaa_query(0x1234, "blocked.example"))
+            .unwrap();
+
+        let a_response = Message::parse(&factory.blocked(
+            &a_query,
+            &PolicyBlock {
+                reason: BlockReason::LocalRule,
+                rule_id: Some("rule-1".to_string()),
+            },
+        ))
+        .unwrap();
+        assert_eq!(a_response.answers.len(), 1);
+        assert_eq!(a_response.answers[0].ttl, 60);
+        assert_eq!(
+            a_response.answers[0].record,
+            RecordData::A(Ipv4Addr::new(192, 0, 2, 1))
+        );
+
+        let aaaa_response = Message::parse(&factory.blocked(
+            &aaaa_query,
+            &PolicyBlock {
+                reason: BlockReason::LocalRule,
+                rule_id: Some("rule-1".to_string()),
+            },
+        ))
+        .unwrap();
+        assert_eq!(aaaa_response.answers.len(), 1);
+        assert_eq!(
+            aaaa_response.answers[0].record,
+            RecordData::AAAA(Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1))
+        );
+    }
+
+    #[test]
+    fn configured_response_factory_refuses_non_address_sinkhole_queries() {
+        let factory = ConfiguredResponseFactory::new(
+            BlockResponseConfig::new(
+                BlockResponseMode::Sinkhole,
+                BlockResponseMode::Sinkhole,
+                BlockResponseMode::Sinkhole,
+                60,
+                true,
+                Some(Ipv4Addr::new(192, 0, 2, 1)),
+                Some(Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1)),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let mx_query = StandardProtocolCodec::new(1232)
+            .decode_query(&query(0x1234, "blocked.example", 15, 1))
+            .unwrap();
+
+        assert_eq!(
+            response_code_from_wire(&factory.blocked(
+                &mx_query,
+                &PolicyBlock {
+                    reason: BlockReason::LocalRule,
+                    rule_id: Some("rule-1".to_string()),
+                },
+            )),
+            Some(ResponseCode::Refused as u16)
+        );
+    }
+
     #[tokio::test]
     async fn resolve_forwards_valid_query_to_upstream() {
         let response = a_response_with_answer(0xabcd, "Example.COM", 60);
@@ -9726,6 +10658,779 @@ mod tests {
             .lock()
             .unwrap()
             .contains(&ResolverMetric::UpstreamSuccess));
+    }
+
+    #[tokio::test]
+    async fn resolve_applies_local_deny_policy_before_cache_or_backend() {
+        let upstream = Arc::new(StaticUpstream::new(Ok(upstream_response(
+            a_response_with_answer(0xabcd, "blocked.example", 60),
+        ))));
+        let cache = Arc::new(RecordingCache::with_lookup(CacheLookup::Miss));
+        let events = Arc::new(RecordingEvents::default());
+        let metrics = Arc::new(RecordingMetrics::default());
+        let policy = Arc::new(LocalPolicyEvaluator::new(vec![LocalDenyRule::new(
+            "rule-1",
+            ClientSelector::exact_ip("192.0.2.10".parse().unwrap()),
+            DomainSelector::exact("blocked.example").unwrap(),
+            true,
+        )]));
+        let service = ResolveQuery::with_cache_and_policy(
+            Arc::new(StandardProtocolCodec::new(1232)),
+            cache.clone(),
+            policy,
+            Arc::new(NoopLocalDnsEntries),
+            CacheTtlPolicy::default(),
+            upstream.clone(),
+            Arc::new(BasicResponseFactory),
+            Arc::new(FixedClock(SystemTime::UNIX_EPOCH)),
+            events.clone(),
+            metrics.clone(),
+        );
+
+        let outcome = service
+            .resolve(ResolveRequest::new(
+                "192.0.2.10".parse().unwrap(),
+                SystemTime::UNIX_EPOCH,
+                a_query(0x1234, "Blocked.Example"),
+            ))
+            .await;
+
+        assert_eq!(
+            outcome.decision.kind,
+            ResolveDecisionKind::Blocked(PolicyBlock {
+                reason: BlockReason::LocalRule,
+                rule_id: Some("rule-1".to_string()),
+            })
+        );
+        assert_eq!(outcome.decision.question.unwrap().qname, "blocked.example");
+        assert_eq!(upstream.requests.lock().unwrap().len(), 0);
+        assert_eq!(cache.lookups.lock().unwrap().len(), 0);
+        assert_eq!(cache.stores.lock().unwrap().len(), 0);
+        assert_eq!(
+            response_code_from_wire(&outcome.response_bytes),
+            Some(ResponseCode::Refused as u16)
+        );
+        {
+            let recorded_events = events.events.lock().unwrap();
+            assert_eq!(recorded_events.len(), 1);
+            assert_eq!(
+                recorded_events[0].terminal_outcome,
+                QueryEventOutcome::Blocked(BlockReason::LocalRule)
+            );
+            assert_eq!(recorded_events[0].cache_result, None);
+            assert_eq!(
+                recorded_events[0].original_question_name.as_deref(),
+                Some("Blocked.Example")
+            );
+        }
+        assert!(!metrics
+            .increments
+            .lock()
+            .unwrap()
+            .contains(&ResolverMetric::QueryAllowed));
+        assert_eq!(metrics.count(ResolverMetric::QueryBlocked), 1);
+    }
+
+    #[tokio::test]
+    async fn resolve_logs_block_response_mode_separately_from_policy_reason() {
+        let upstream = Arc::new(StaticUpstream::new(Ok(upstream_response(
+            a_response_with_answer(0xabcd, "blocked.example", 60),
+        ))));
+        let cache = Arc::new(RecordingCache::with_lookup(CacheLookup::Miss));
+        let events = Arc::new(RecordingEvents::default());
+        let policy = Arc::new(LocalPolicyEvaluator::new(vec![LocalDenyRule::new(
+            "rule-1",
+            ClientSelector::exact_ip("192.0.2.10".parse().unwrap()),
+            DomainSelector::exact("blocked.example").unwrap(),
+            true,
+        )]));
+        let responses = Arc::new(
+            ConfiguredResponseFactory::new(
+                BlockResponseConfig::new(
+                    BlockResponseMode::NoData,
+                    BlockResponseMode::Refused,
+                    BlockResponseMode::Refused,
+                    0,
+                    false,
+                    None,
+                    None,
+                )
+                .unwrap(),
+            )
+            .unwrap(),
+        );
+        let service = ResolveQuery::with_cache_and_policy(
+            Arc::new(StandardProtocolCodec::new(1232)),
+            cache.clone(),
+            policy,
+            Arc::new(NoopLocalDnsEntries),
+            CacheTtlPolicy::default(),
+            upstream.clone(),
+            responses,
+            Arc::new(FixedClock(SystemTime::UNIX_EPOCH)),
+            events.clone(),
+            Arc::new(RecordingMetrics::default()),
+        );
+
+        let outcome = service
+            .resolve(ResolveRequest::new(
+                "192.0.2.10".parse().unwrap(),
+                SystemTime::UNIX_EPOCH,
+                a_query(0x1234, "blocked.example"),
+            ))
+            .await;
+
+        let response = Message::parse(&outcome.response_bytes).unwrap();
+        assert_eq!(response.header.r_code(), ResponseCode::NoError as u8);
+        assert!(response.answers.is_empty());
+        assert_eq!(upstream.requests.lock().unwrap().len(), 0);
+        assert_eq!(cache.lookups.lock().unwrap().len(), 0);
+        let recorded_events = events.events.lock().unwrap();
+        assert_eq!(recorded_events.len(), 1);
+        assert_eq!(
+            recorded_events[0].terminal_outcome,
+            QueryEventOutcome::Blocked(BlockReason::LocalRule)
+        );
+        assert_eq!(
+            recorded_events[0].block_response_mode,
+            Some(BlockResponseMode::NoData)
+        );
+    }
+
+    #[test]
+    fn local_dns_entry_validation_requires_addresses_and_public_acknowledgement() {
+        let empty = LocalDnsEntry::new(
+            DomainName::parse("host.example").unwrap(),
+            Vec::new(),
+            Vec::new(),
+            120,
+            true,
+        );
+        assert_eq!(
+            empty.validate(false),
+            Err(LocalDnsEntryValidationError::NoAddresses)
+        );
+
+        let public = LocalDnsEntry::new(
+            DomainName::parse("host.example").unwrap(),
+            vec![Ipv4Addr::new(8, 8, 8, 8)],
+            Vec::new(),
+            120,
+            true,
+        );
+        assert_eq!(
+            public.validate(false),
+            Err(LocalDnsEntryValidationError::PublicAddressRequiresAcknowledgement)
+        );
+        assert_eq!(
+            public.validate(true),
+            Ok(LocalDnsEntryValidation {
+                warnings: Vec::new(),
+            })
+        );
+        let zero_ttl = LocalDnsEntry::new(
+            DomainName::parse("host.example").unwrap(),
+            vec![Ipv4Addr::new(10, 0, 0, 7)],
+            Vec::new(),
+            0,
+            true,
+        );
+        assert_eq!(
+            zero_ttl.validate(false),
+            Err(LocalDnsEntryValidationError::TtlTooLow)
+        );
+        let excessive_ttl = LocalDnsEntry::new(
+            DomainName::parse("host.example").unwrap(),
+            vec![Ipv4Addr::new(10, 0, 0, 7)],
+            Vec::new(),
+            MAX_LOCAL_DNS_TTL + 1,
+            true,
+        );
+        assert_eq!(
+            excessive_ttl.validate(false),
+            Err(LocalDnsEntryValidationError::TtlTooHigh {
+                max: MAX_LOCAL_DNS_TTL,
+            })
+        );
+    }
+
+    #[test]
+    fn local_dns_entry_validation_accepts_local_addresses_and_warns_for_mdns_suffix() {
+        let entry = LocalDnsEntry::new(
+            DomainName::parse("dev1.local").unwrap(),
+            vec![Ipv4Addr::new(10, 0, 0, 7)],
+            vec![Ipv6Addr::new(0xfc00, 0, 0, 0, 0, 0, 0, 7)],
+            120,
+            true,
+        );
+
+        assert_eq!(
+            entry.validate(false),
+            Ok(LocalDnsEntryValidation {
+                warnings: vec![LocalDnsEntryWarning::ReservedMdnsSuffix],
+            })
+        );
+    }
+
+    #[test]
+    fn local_dns_entries_match_exact_enabled_address_queries_only() {
+        let enabled = LocalDnsEntry::new(
+            DomainName::parse("host.example").unwrap(),
+            vec![Ipv4Addr::new(10, 0, 0, 7)],
+            Vec::new(),
+            120,
+            true,
+        );
+        let disabled = LocalDnsEntry::new(
+            DomainName::parse("disabled.example").unwrap(),
+            vec![Ipv4Addr::new(10, 0, 0, 8)],
+            Vec::new(),
+            120,
+            false,
+        );
+        let entries = InMemoryLocalDnsEntries::new(vec![enabled.clone(), disabled]);
+
+        assert_eq!(
+            entries.lookup(&QuestionKey::new("Host.Example.", A_RECORD_TYPE, 1)),
+            LocalDnsLookup::Answer(enabled.clone())
+        );
+        assert_eq!(
+            entries.lookup(&QuestionKey::new("host.example", AAAA_RECORD_TYPE, 1)),
+            LocalDnsLookup::NoData(enabled)
+        );
+        assert_eq!(
+            entries.lookup(&QuestionKey::new("child.host.example", A_RECORD_TYPE, 1)),
+            LocalDnsLookup::NoMatch
+        );
+        assert_eq!(
+            entries.lookup(&QuestionKey::new("disabled.example", A_RECORD_TYPE, 1)),
+            LocalDnsLookup::NoMatch
+        );
+        assert_eq!(
+            entries.lookup(&QuestionKey::new("host.example", 15, 1)),
+            LocalDnsLookup::NoMatch
+        );
+        assert_eq!(
+            entries.lookup(&QuestionKey::new("host.example", A_RECORD_TYPE, 3)),
+            LocalDnsLookup::NoMatch
+        );
+    }
+
+    #[tokio::test]
+    async fn resolve_answers_exact_local_dns_entry_before_cache_or_backend() {
+        let upstream = Arc::new(StaticUpstream::new(Ok(upstream_response(
+            a_response_with_answer(0xabcd, "host.example", 60),
+        ))));
+        let cache = Arc::new(RecordingCache::with_lookup(CacheLookup::Miss));
+        let events = Arc::new(RecordingEvents::default());
+        let local_entries = Arc::new(InMemoryLocalDnsEntries::new(vec![LocalDnsEntry::new(
+            DomainName::parse("host.example").unwrap(),
+            vec![Ipv4Addr::new(192, 0, 2, 44), Ipv4Addr::new(192, 0, 2, 45)],
+            vec![Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 44)],
+            120,
+            true,
+        )
+        .with_metadata("entry-1", 7)]));
+        let service = ResolveQuery::with_cache_and_policy(
+            Arc::new(StandardProtocolCodec::new(1232)),
+            cache.clone(),
+            Arc::new(NoopPolicyEvaluator),
+            local_entries,
+            CacheTtlPolicy::default(),
+            upstream.clone(),
+            Arc::new(BasicResponseFactory),
+            Arc::new(FixedClock(SystemTime::UNIX_EPOCH)),
+            events.clone(),
+            Arc::new(RecordingMetrics::default()),
+        );
+
+        let outcome = service
+            .resolve(ResolveRequest::new(
+                "192.0.2.10".parse().unwrap(),
+                SystemTime::UNIX_EPOCH,
+                a_query(0x1234, "Host.Example"),
+            ))
+            .await;
+
+        assert_eq!(
+            outcome.decision.kind,
+            ResolveDecisionKind::LocalAnswer(LocalAnswerMetadata {
+                entry_id: Some("entry-1".to_string()),
+                generation: 7,
+                family: LocalAnswerFamily::A,
+                ttl: 120,
+            })
+        );
+        assert_eq!(upstream.requests.lock().unwrap().len(), 0);
+        assert_eq!(cache.lookups.lock().unwrap().len(), 0);
+        let response = Message::parse(&outcome.response_bytes).unwrap();
+        assert_eq!(response.answers.len(), 2);
+        assert_eq!(response.answers[0].ttl, 120);
+        assert_eq!(
+            response
+                .answers
+                .iter()
+                .map(|record| record.record.clone())
+                .collect::<Vec<_>>(),
+            vec![
+                RecordData::A(Ipv4Addr::new(192, 0, 2, 44)),
+                RecordData::A(Ipv4Addr::new(192, 0, 2, 45)),
+            ]
+        );
+        let recorded_events = events.events.lock().unwrap();
+        assert_eq!(
+            recorded_events[0].terminal_outcome,
+            QueryEventOutcome::AllowedFromLocal
+        );
+        assert_eq!(
+            recorded_events[0].local_answer,
+            Some(LocalAnswerMetadata {
+                entry_id: Some("entry-1".to_string()),
+                generation: 7,
+                family: LocalAnswerFamily::A,
+                ttl: 120,
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn resolve_local_dns_uses_entry_addresses_not_sinkhole_configuration() {
+        let upstream = Arc::new(StaticUpstream::new(Ok(upstream_response(
+            a_response_with_answer(0xabcd, "host.example", 60),
+        ))));
+        let local_entries = Arc::new(InMemoryLocalDnsEntries::new(vec![LocalDnsEntry::new(
+            DomainName::parse("host.example").unwrap(),
+            vec![Ipv4Addr::new(10, 0, 0, 7)],
+            Vec::new(),
+            120,
+            true,
+        )]));
+        let responses = Arc::new(
+            ConfiguredResponseFactory::new(
+                BlockResponseConfig::new(
+                    BlockResponseMode::Sinkhole,
+                    BlockResponseMode::Sinkhole,
+                    BlockResponseMode::Sinkhole,
+                    60,
+                    true,
+                    Some(Ipv4Addr::new(192, 0, 2, 1)),
+                    Some(Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1)),
+                )
+                .unwrap(),
+            )
+            .unwrap(),
+        );
+        let service = ResolveQuery::with_cache_and_policy(
+            Arc::new(StandardProtocolCodec::new(1232)),
+            Arc::new(RecordingCache::with_lookup(CacheLookup::Miss)),
+            Arc::new(NoopPolicyEvaluator),
+            local_entries,
+            CacheTtlPolicy::default(),
+            upstream.clone(),
+            responses,
+            Arc::new(FixedClock(SystemTime::UNIX_EPOCH)),
+            Arc::new(RecordingEvents::default()),
+            Arc::new(RecordingMetrics::default()),
+        );
+
+        let outcome = service
+            .resolve(ResolveRequest::new(
+                "192.0.2.10".parse().unwrap(),
+                SystemTime::UNIX_EPOCH,
+                a_query(0x1234, "host.example"),
+            ))
+            .await;
+
+        let response = Message::parse(&outcome.response_bytes).unwrap();
+        assert_eq!(response.answers.len(), 1);
+        assert_eq!(
+            response.answers[0].record,
+            RecordData::A(Ipv4Addr::new(10, 0, 0, 7))
+        );
+        assert_eq!(upstream.requests.lock().unwrap().len(), 0);
+    }
+
+    #[tokio::test]
+    async fn resolve_returns_nodata_for_local_entry_missing_requested_family() {
+        let upstream = Arc::new(StaticUpstream::new(Ok(upstream_response(
+            a_response_with_answer(0xabcd, "host.example", 60),
+        ))));
+        let cache = Arc::new(RecordingCache::with_lookup(CacheLookup::Miss));
+        let local_entries = Arc::new(InMemoryLocalDnsEntries::new(vec![LocalDnsEntry::new(
+            DomainName::parse("host.example").unwrap(),
+            vec![Ipv4Addr::new(192, 0, 2, 44)],
+            Vec::new(),
+            120,
+            true,
+        )
+        .with_metadata("entry-2", 8)]));
+        let service = ResolveQuery::with_cache_and_policy(
+            Arc::new(StandardProtocolCodec::new(1232)),
+            cache.clone(),
+            Arc::new(NoopPolicyEvaluator),
+            local_entries,
+            CacheTtlPolicy::default(),
+            upstream.clone(),
+            Arc::new(BasicResponseFactory),
+            Arc::new(FixedClock(SystemTime::UNIX_EPOCH)),
+            Arc::new(RecordingEvents::default()),
+            Arc::new(RecordingMetrics::default()),
+        );
+
+        let outcome = service
+            .resolve(ResolveRequest::new(
+                "192.0.2.10".parse().unwrap(),
+                SystemTime::UNIX_EPOCH,
+                aaaa_query(0x1234, "host.example"),
+            ))
+            .await;
+
+        assert_eq!(
+            outcome.decision.kind,
+            ResolveDecisionKind::LocalAnswer(LocalAnswerMetadata {
+                entry_id: Some("entry-2".to_string()),
+                generation: 8,
+                family: LocalAnswerFamily::NoDataAaaa,
+                ttl: 120,
+            })
+        );
+        assert_eq!(upstream.requests.lock().unwrap().len(), 0);
+        assert_eq!(cache.lookups.lock().unwrap().len(), 0);
+        let response = Message::parse(&outcome.response_bytes).unwrap();
+        assert_eq!(response.header.r_code(), ResponseCode::NoError as u8);
+        assert!(response.answers.is_empty());
+    }
+
+    #[tokio::test]
+    async fn resolve_applies_policy_before_local_dns_entries() {
+        let upstream = Arc::new(StaticUpstream::new(Ok(upstream_response(
+            a_response_with_answer(0xabcd, "host.example", 60),
+        ))));
+        let policy = Arc::new(LocalPolicyEvaluator::new(vec![LocalDenyRule::new(
+            "rule-1",
+            ClientSelector::exact_ip("192.0.2.10".parse().unwrap()),
+            DomainSelector::exact("host.example").unwrap(),
+            true,
+        )]));
+        let local_entries = Arc::new(InMemoryLocalDnsEntries::new(vec![LocalDnsEntry::new(
+            DomainName::parse("host.example").unwrap(),
+            vec![Ipv4Addr::new(192, 0, 2, 44)],
+            Vec::new(),
+            120,
+            true,
+        )]));
+        let service = ResolveQuery::with_cache_and_policy(
+            Arc::new(StandardProtocolCodec::new(1232)),
+            Arc::new(RecordingCache::with_lookup(CacheLookup::Miss)),
+            policy,
+            local_entries,
+            CacheTtlPolicy::default(),
+            upstream.clone(),
+            Arc::new(BasicResponseFactory),
+            Arc::new(FixedClock(SystemTime::UNIX_EPOCH)),
+            Arc::new(RecordingEvents::default()),
+            Arc::new(RecordingMetrics::default()),
+        );
+
+        let outcome = service
+            .resolve(ResolveRequest::new(
+                "192.0.2.10".parse().unwrap(),
+                SystemTime::UNIX_EPOCH,
+                a_query(0x1234, "host.example"),
+            ))
+            .await;
+
+        assert!(matches!(
+            outcome.decision.kind,
+            ResolveDecisionKind::Blocked(PolicyBlock {
+                reason: BlockReason::LocalRule,
+                ..
+            })
+        ));
+        assert_eq!(
+            response_code_from_wire(&outcome.response_bytes),
+            Some(ResponseCode::Refused as u16)
+        );
+        assert_eq!(upstream.requests.lock().unwrap().len(), 0);
+    }
+
+    #[tokio::test]
+    async fn resolve_blocks_upstream_response_with_malicious_cname_target() {
+        let question = QuestionKey::new("alias.example", A_RECORD_TYPE, 1);
+        let response_message = response_message_for_question(
+            question.clone(),
+            ResponseCode::NoError,
+            vec![
+                cname_record("alias.example", 60, "target.malicious.example"),
+                a_record("target.malicious.example", 60),
+            ],
+            Vec::new(),
+            Vec::new(),
+            false,
+        );
+        let response_bytes = response_message.original_bytes.to_vec();
+        let upstream = Arc::new(StaticUpstream::new(Ok(
+            ResolutionResponse::forwarded_message(
+                response_bytes,
+                response_message,
+                SystemTime::UNIX_EPOCH,
+                0,
+                "test-forwarder",
+            ),
+        )));
+        let cache = Arc::new(RecordingCache::with_lookup(CacheLookup::Miss));
+        let events = Arc::new(RecordingEvents::default());
+        let metrics = Arc::new(RecordingMetrics::default());
+        let policy = Arc::new(MaliciousDomainPolicyEvaluator::new(vec![
+            MaliciousDomainRule::new(
+                "malware-feed",
+                DomainSelector::subtree("malicious.example").unwrap(),
+                true,
+            ),
+        ]));
+        let service = ResolveQuery::with_cache_and_policy(
+            Arc::new(StandardProtocolCodec::new(1232)),
+            cache.clone(),
+            policy,
+            Arc::new(NoopLocalDnsEntries),
+            CacheTtlPolicy::default(),
+            upstream.clone(),
+            Arc::new(ConfiguredResponseFactory::default()),
+            Arc::new(FixedClock(SystemTime::UNIX_EPOCH)),
+            events.clone(),
+            metrics.clone(),
+        );
+
+        let outcome = service
+            .resolve(ResolveRequest::new(
+                "192.0.2.10".parse().unwrap(),
+                SystemTime::UNIX_EPOCH,
+                a_query(0x1234, "alias.example"),
+            ))
+            .await;
+
+        assert_eq!(
+            outcome.decision.kind,
+            ResolveDecisionKind::Blocked(PolicyBlock {
+                reason: BlockReason::MaliciousDomain,
+                rule_id: Some("malware-feed".to_string()),
+            })
+        );
+        assert_eq!(
+            response_code_from_wire(&outcome.response_bytes),
+            Some(ResponseCode::Refused as u16)
+        );
+        assert_eq!(cache.lookups.lock().unwrap().len(), 1);
+        assert_eq!(cache.stores.lock().unwrap().len(), 0);
+        let recorded_events = events.events.lock().unwrap();
+        assert_eq!(
+            recorded_events[0].terminal_outcome,
+            QueryEventOutcome::Blocked(BlockReason::MaliciousDomain)
+        );
+        assert_eq!(
+            recorded_events[0].block_response_mode,
+            Some(BlockResponseMode::Refused)
+        );
+        assert_eq!(metrics.count(ResolverMetric::QueryBlocked), 1);
+        assert_eq!(metrics.count(ResolverMetric::QueryAllowed), 0);
+    }
+
+    #[tokio::test]
+    async fn resolve_blocks_cached_response_with_malicious_cname_target() {
+        let cache = Arc::new(InMemoryDnsCache::new(16));
+        let question = QuestionKey::new("alias.example", A_RECORD_TYPE, 1);
+        let cached_query = StandardProtocolCodec::new(1232)
+            .decode_query(&a_query(0xaaaa, "alias.example"))
+            .unwrap();
+        let response_message = response_message_for_question_with_id(
+            0,
+            question,
+            ResponseCode::NoError,
+            vec![
+                cname_record("alias.example", 60, "target.malicious.example"),
+                a_record("target.malicious.example", 60),
+            ],
+            Vec::new(),
+            Vec::new(),
+            false,
+        );
+        cache.store_now(CacheStore {
+            key: CacheKey::from_query(
+                &cached_query,
+                backend_cache_namespace(ResolutionMode::Forward, 0),
+                1232,
+            ),
+            response_template: response_message.original_bytes.to_vec(),
+            response_code: ResponseCode::NoError,
+            minimum_ttl: Duration::from_secs(60),
+            negative_cache: None,
+            stored_at: SystemTime::UNIX_EPOCH,
+            ttl: Duration::from_secs(60),
+        });
+        let upstream = Arc::new(StaticUpstream::new(Err(UpstreamError::Timeout)));
+        let events = Arc::new(RecordingEvents::default());
+        let metrics = Arc::new(RecordingMetrics::default());
+        let policy = Arc::new(MaliciousDomainPolicyEvaluator::new(vec![
+            MaliciousDomainRule::new(
+                "malware-feed",
+                DomainSelector::subtree("malicious.example").unwrap(),
+                true,
+            ),
+        ]));
+        let service = ResolveQuery::with_cache_and_policy(
+            Arc::new(StandardProtocolCodec::new(1232)),
+            cache,
+            policy,
+            Arc::new(NoopLocalDnsEntries),
+            CacheTtlPolicy::default(),
+            upstream.clone(),
+            Arc::new(ConfiguredResponseFactory::default()),
+            Arc::new(FixedClock(SystemTime::UNIX_EPOCH)),
+            events.clone(),
+            metrics.clone(),
+        );
+
+        let outcome = service
+            .resolve(ResolveRequest::new(
+                "192.0.2.10".parse().unwrap(),
+                SystemTime::UNIX_EPOCH,
+                a_query(0x1234, "alias.example"),
+            ))
+            .await;
+
+        assert_eq!(
+            outcome.decision.kind,
+            ResolveDecisionKind::Blocked(PolicyBlock {
+                reason: BlockReason::MaliciousDomain,
+                rule_id: Some("malware-feed".to_string()),
+            })
+        );
+        assert_eq!(
+            response_code_from_wire(&outcome.response_bytes),
+            Some(ResponseCode::Refused as u16)
+        );
+        assert!(upstream.requests.lock().unwrap().is_empty());
+        {
+            let recorded_events = events.events.lock().unwrap();
+            assert_eq!(recorded_events.len(), 1);
+            assert_eq!(
+                recorded_events[0].terminal_outcome,
+                QueryEventOutcome::Blocked(BlockReason::MaliciousDomain)
+            );
+            assert_eq!(
+                recorded_events[0].cache_result,
+                Some(QueryEventCacheResult::Hit)
+            );
+        }
+        assert_eq!(metrics.count(ResolverMetric::CacheHit), 1);
+        assert_eq!(metrics.count(ResolverMetric::QueryBlocked), 1);
+        assert_eq!(metrics.count(ResolverMetric::QueryAllowed), 0);
+    }
+
+    #[tokio::test]
+    async fn resolve_blocks_malicious_requested_domain_before_cache_or_backend() {
+        let upstream = Arc::new(StaticUpstream::new(Ok(upstream_response(
+            a_response_with_answer(0xabcd, "blocked.malicious.example", 60),
+        ))));
+        let cache = Arc::new(RecordingCache::with_lookup(CacheLookup::Miss));
+        let policy = Arc::new(MaliciousDomainPolicyEvaluator::new(vec![
+            MaliciousDomainRule::new(
+                "malware-feed",
+                DomainSelector::subtree("malicious.example").unwrap(),
+                true,
+            ),
+        ]));
+        let service = ResolveQuery::with_cache_and_policy(
+            Arc::new(StandardProtocolCodec::new(1232)),
+            cache.clone(),
+            policy,
+            Arc::new(NoopLocalDnsEntries),
+            CacheTtlPolicy::default(),
+            upstream.clone(),
+            Arc::new(ConfiguredResponseFactory::default()),
+            Arc::new(FixedClock(SystemTime::UNIX_EPOCH)),
+            Arc::new(RecordingEvents::default()),
+            Arc::new(RecordingMetrics::default()),
+        );
+
+        let outcome = service
+            .resolve(ResolveRequest::new(
+                "192.0.2.10".parse().unwrap(),
+                SystemTime::UNIX_EPOCH,
+                a_query(0x1234, "blocked.malicious.example"),
+            ))
+            .await;
+
+        assert_eq!(
+            outcome.decision.kind,
+            ResolveDecisionKind::Blocked(PolicyBlock {
+                reason: BlockReason::MaliciousDomain,
+                rule_id: Some("malware-feed".to_string()),
+            })
+        );
+        assert_eq!(upstream.requests.lock().unwrap().len(), 0);
+        assert_eq!(cache.lookups.lock().unwrap().len(), 0);
+        assert_eq!(cache.stores.lock().unwrap().len(), 0);
+    }
+
+    #[tokio::test]
+    async fn resolve_blocks_upstream_response_with_malicious_answer_owner() {
+        let question = QuestionKey::new("host.example", A_RECORD_TYPE, 1);
+        let response_message = response_message_for_question(
+            question.clone(),
+            ResponseCode::NoError,
+            vec![a_record("host.malicious.example", 60)],
+            Vec::new(),
+            Vec::new(),
+            false,
+        );
+        let response_bytes = response_message.original_bytes.to_vec();
+        let upstream = Arc::new(StaticUpstream::new(Ok(
+            ResolutionResponse::forwarded_message(
+                response_bytes,
+                response_message,
+                SystemTime::UNIX_EPOCH,
+                0,
+                "test-forwarder",
+            ),
+        )));
+        let cache = Arc::new(RecordingCache::with_lookup(CacheLookup::Miss));
+        let policy = Arc::new(MaliciousDomainPolicyEvaluator::new(vec![
+            MaliciousDomainRule::new(
+                "malware-feed",
+                DomainSelector::subtree("malicious.example").unwrap(),
+                true,
+            ),
+        ]));
+        let service = ResolveQuery::with_cache_and_policy(
+            Arc::new(StandardProtocolCodec::new(1232)),
+            cache.clone(),
+            policy,
+            Arc::new(NoopLocalDnsEntries),
+            CacheTtlPolicy::default(),
+            upstream.clone(),
+            Arc::new(ConfiguredResponseFactory::default()),
+            Arc::new(FixedClock(SystemTime::UNIX_EPOCH)),
+            Arc::new(RecordingEvents::default()),
+            Arc::new(RecordingMetrics::default()),
+        );
+
+        let outcome = service
+            .resolve(ResolveRequest::new(
+                "192.0.2.10".parse().unwrap(),
+                SystemTime::UNIX_EPOCH,
+                a_query(0x1234, "host.example"),
+            ))
+            .await;
+
+        assert_eq!(
+            outcome.decision.kind,
+            ResolveDecisionKind::Blocked(PolicyBlock {
+                reason: BlockReason::MaliciousDomain,
+                rule_id: Some("malware-feed".to_string()),
+            })
+        );
+        assert_eq!(cache.stores.lock().unwrap().len(), 0);
     }
 
     #[tokio::test]
@@ -10115,6 +11820,111 @@ mod tests {
         assert_eq!(metrics.count(ResolverMetric::CacheCoalescedMiss), 1);
         assert_eq!(metrics.count(ResolverMetric::CacheHit), 1);
         assert_eq!(metrics.count(ResolverMetric::CacheMiss), 2);
+    }
+
+    #[tokio::test]
+    async fn resolve_blocks_coalesced_cache_hit_with_malicious_cname_target() {
+        let cache = Arc::new(InMemoryDnsCache::new(16));
+        let question = QuestionKey::new("alias.example", A_RECORD_TYPE, 1);
+        let response_message = response_message_for_question(
+            question,
+            ResponseCode::NoError,
+            vec![
+                cname_record("alias.example", 60, "target.malicious.example"),
+                a_record("target.malicious.example", 60),
+            ],
+            Vec::new(),
+            Vec::new(),
+            false,
+        );
+        let upstream = Arc::new(BlockingUpstream::new(Ok(
+            ResolutionResponse::forwarded_message(
+                response_message.original_bytes.to_vec(),
+                response_message,
+                SystemTime::UNIX_EPOCH,
+                0,
+                "test-forwarder",
+            ),
+        )));
+        let events = Arc::new(RecordingEvents::default());
+        let metrics = Arc::new(RecordingMetrics::default());
+        let policy = Arc::new(ClientScopedResponsePolicy {
+            client_ip: "192.0.2.11".parse().unwrap(),
+            domain: DomainSelector::subtree("malicious.example").unwrap(),
+            rule_id: "malware-feed".to_string(),
+        });
+        let service = Arc::new(ResolveQuery::with_cache_and_policy(
+            Arc::new(StandardProtocolCodec::new(1232)),
+            cache,
+            policy,
+            Arc::new(NoopLocalDnsEntries),
+            CacheTtlPolicy::default(),
+            upstream.clone(),
+            Arc::new(ConfiguredResponseFactory::default()),
+            Arc::new(FixedClock(SystemTime::UNIX_EPOCH)),
+            events.clone(),
+            metrics.clone(),
+        ));
+        let first = {
+            let service = Arc::clone(&service);
+            tokio::spawn(async move {
+                service
+                    .resolve(ResolveRequest::new(
+                        "192.0.2.10".parse().unwrap(),
+                        SystemTime::UNIX_EPOCH,
+                        a_query(0x1111, "alias.example"),
+                    ))
+                    .await
+            })
+        };
+        upstream.wait_for_requests(1).await;
+        let second = {
+            let service = Arc::clone(&service);
+            tokio::spawn(async move {
+                service
+                    .resolve(ResolveRequest::new(
+                        "192.0.2.11".parse().unwrap(),
+                        SystemTime::UNIX_EPOCH,
+                        a_query(0x2222, "alias.example"),
+                    ))
+                    .await
+            })
+        };
+
+        tokio::task::yield_now().await;
+        assert_eq!(upstream.requests.lock().unwrap().len(), 1);
+        upstream.release.notify_waiters();
+        let first = first.await.unwrap();
+        let second = second.await.unwrap();
+
+        assert_eq!(first.decision.kind, ResolveDecisionKind::Allowed);
+        assert_eq!(
+            second.decision.kind,
+            ResolveDecisionKind::Blocked(PolicyBlock {
+                reason: BlockReason::MaliciousDomain,
+                rule_id: Some("malware-feed".to_string()),
+            })
+        );
+        assert_eq!(
+            response_code_from_wire(&second.response_bytes),
+            Some(ResponseCode::Refused as u16)
+        );
+        {
+            let recorded_events = events.events.lock().unwrap();
+            assert_eq!(recorded_events.len(), 2);
+            assert_eq!(
+                recorded_events[1].terminal_outcome,
+                QueryEventOutcome::Blocked(BlockReason::MaliciousDomain)
+            );
+            assert_eq!(
+                recorded_events[1].cache_result,
+                Some(QueryEventCacheResult::Hit)
+            );
+        }
+        assert_eq!(metrics.count(ResolverMetric::CacheCoalescedMiss), 1);
+        assert_eq!(metrics.count(ResolverMetric::CacheHit), 1);
+        assert_eq!(metrics.count(ResolverMetric::QueryBlocked), 1);
+        assert_eq!(metrics.count(ResolverMetric::QueryAllowed), 1);
     }
 
     #[tokio::test]
