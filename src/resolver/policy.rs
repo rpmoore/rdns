@@ -55,7 +55,11 @@ impl DomainName {
         if base.is_root() {
             return true;
         }
-        self == base || self.0.ends_with(&format!(".{}", base.0))
+        self == base
+            || self
+                .0
+                .strip_suffix(base.as_str())
+                .is_some_and(|prefix| prefix.ends_with('.'))
     }
 }
 

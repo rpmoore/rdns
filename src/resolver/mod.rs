@@ -330,13 +330,8 @@ impl BlockResponseConfig {
     }
 
     pub fn validate(&self) -> Result<(), BlockResponseConfigError> {
-        if self.uses_sinkhole() {
-            if self.sinkhole_ipv4.is_none() {
-                return Err(BlockResponseConfigError::MissingIpv4SinkholeAddress);
-            }
-            if self.sinkhole_ipv6.is_none() {
-                return Err(BlockResponseConfigError::MissingIpv6SinkholeAddress);
-            }
+        if self.uses_sinkhole() && self.sinkhole_ipv4.is_none() && self.sinkhole_ipv6.is_none() {
+            return Err(BlockResponseConfigError::MissingSinkholeAddress);
         }
         if self.blocked_response_ttl > 0
             && self.cacheable_by_clients
@@ -384,8 +379,7 @@ impl Default for BlockResponseConfig {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BlockResponseConfigError {
     ClientCachingUnsupportedForNonSinkhole,
-    MissingIpv4SinkholeAddress,
-    MissingIpv6SinkholeAddress,
+    MissingSinkholeAddress,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1770,16 +1764,12 @@ fn canonical_chain_from_response(response: &Message) -> Vec<String> {
 
 fn response_policy_domains(response: &Message) -> impl Iterator<Item = DomainName> + '_ {
     response.answers.iter().flat_map(|record| {
-        let mut domains = Vec::with_capacity(2);
-        if let Ok(owner) = DomainName::parse(&record.name) {
-            domains.push(owner);
-        }
-        if let RecordData::CNAME(target) = &record.record {
-            if let Ok(target) = DomainName::parse(target) {
-                domains.push(target);
-            }
-        }
-        domains
+        let owner = DomainName::parse(&record.name).ok();
+        let target = match &record.record {
+            RecordData::CNAME(target) => DomainName::parse(target).ok(),
+            _ => None,
+        };
+        owner.into_iter().chain(target)
     })
 }
 
@@ -2726,10 +2716,9 @@ impl ResolveQuery {
                 )
                 .await;
         }
-        self.metrics.increment(ResolverMetric::QueryAllowed);
-
         match self.local_entries.lookup(&decoded.question) {
             LocalDnsLookup::Answer(entry) => {
+                self.metrics.increment(ResolverMetric::QueryAllowed);
                 let response_bytes = self.local_entry_response(&decoded, &entry);
                 let decision = ResolveDecision {
                     client_ip: request.client_ip,
@@ -2751,6 +2740,7 @@ impl ResolveQuery {
                     .await;
             }
             LocalDnsLookup::NoData(_entry) => {
+                self.metrics.increment(ResolverMetric::QueryAllowed);
                 let response_bytes = build_nodata_response(&decoded.message);
                 let decision = ResolveDecision {
                     client_ip: request.client_ip,
@@ -2806,6 +2796,7 @@ impl ResolveQuery {
                 question: Some(question),
                 kind: ResolveDecisionKind::CacheHit,
             };
+            self.metrics.increment(ResolverMetric::QueryAllowed);
             return self
                 .finish(
                     started_at,
@@ -2918,6 +2909,7 @@ impl ResolveQuery {
                         question: Some(question),
                         kind: ResolveDecisionKind::CacheHit,
                     };
+                    self.metrics.increment(ResolverMetric::QueryAllowed);
                     return self
                         .finish(
                             started_at,
@@ -3240,6 +3232,7 @@ impl ResolveQuery {
             question: Some(question),
             kind: ResolveDecisionKind::Allowed,
         };
+        self.metrics.increment(ResolverMetric::QueryAllowed);
         (decision, response_bytes)
     }
 
@@ -10413,7 +10406,7 @@ mod tests {
     }
 
     #[test]
-    fn block_response_config_rejects_sinkhole_without_addresses() {
+    fn block_response_config_requires_at_least_one_sinkhole_address() {
         assert_eq!(
             BlockResponseConfig::new(
                 BlockResponseMode::Sinkhole,
@@ -10424,20 +10417,28 @@ mod tests {
                 None,
                 None,
             ),
-            Err(BlockResponseConfigError::MissingIpv4SinkholeAddress)
+            Err(BlockResponseConfigError::MissingSinkholeAddress)
         );
-        assert_eq!(
-            BlockResponseConfig::new(
-                BlockResponseMode::Sinkhole,
-                BlockResponseMode::Sinkhole,
-                BlockResponseMode::Sinkhole,
-                60,
-                true,
-                Some(Ipv4Addr::new(192, 0, 2, 1)),
-                None,
-            ),
-            Err(BlockResponseConfigError::MissingIpv6SinkholeAddress)
-        );
+        assert!(BlockResponseConfig::new(
+            BlockResponseMode::Sinkhole,
+            BlockResponseMode::Sinkhole,
+            BlockResponseMode::Sinkhole,
+            60,
+            true,
+            Some(Ipv4Addr::new(192, 0, 2, 1)),
+            None,
+        )
+        .is_ok());
+        assert!(BlockResponseConfig::new(
+            BlockResponseMode::Sinkhole,
+            BlockResponseMode::Sinkhole,
+            BlockResponseMode::Sinkhole,
+            60,
+            true,
+            None,
+            Some(Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1)),
+        )
+        .is_ok());
     }
 
     #[test]
@@ -11231,6 +11232,7 @@ mod tests {
             Some(BlockResponseMode::Refused)
         );
         assert_eq!(metrics.count(ResolverMetric::QueryBlocked), 1);
+        assert_eq!(metrics.count(ResolverMetric::QueryAllowed), 0);
     }
 
     #[tokio::test]
@@ -11322,6 +11324,7 @@ mod tests {
         }
         assert_eq!(metrics.count(ResolverMetric::CacheHit), 1);
         assert_eq!(metrics.count(ResolverMetric::QueryBlocked), 1);
+        assert_eq!(metrics.count(ResolverMetric::QueryAllowed), 0);
     }
 
     #[tokio::test]
@@ -11921,6 +11924,7 @@ mod tests {
         assert_eq!(metrics.count(ResolverMetric::CacheCoalescedMiss), 1);
         assert_eq!(metrics.count(ResolverMetric::CacheHit), 1);
         assert_eq!(metrics.count(ResolverMetric::QueryBlocked), 1);
+        assert_eq!(metrics.count(ResolverMetric::QueryAllowed), 1);
     }
 
     #[tokio::test]
