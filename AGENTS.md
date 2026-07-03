@@ -46,6 +46,10 @@ Guidance for Codex and other coding agents working in this repository.
 - When working on a step in `docs/steps.md` that links to a GitHub issue, update that issue's status as work progresses. Leave a concise progress comment when starting or materially changing scope, and close the issue only after the step's acceptance criteria and verification are complete.
 - After changes, summarize what changed and which verification commands were run.
 
+## Change Logging
+
+Record every completed step (edit, command, decision) to Obsidian's daily note, under a heading/section for `rdns_change_log`. Use `mcp__obsidian__vault_patch` (or `vault_append` if no daily note structure exists yet) to append entries as work happens — not just at session end. Each entry must include why the tool/step was run, not just what was run.
+
 ## Directory Summary Instructions
 
 Do not use this root `AGENTS.md` to store a full summary of the current codebase. Instead, future agents should summarize code close to the directory being described.
