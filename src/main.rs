@@ -16,17 +16,22 @@ use std::io;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
-use opentelemetry::metrics::{Counter, Histogram, MeterProvider};
+use opentelemetry::metrics::{Counter, Gauge, Histogram, MeterProvider};
+use opentelemetry::KeyValue;
 use opentelemetry_otlp::MetricExporter;
 use opentelemetry_sdk::metrics::{PeriodicReader, SdkMeterProvider};
-use rdns::config::RuntimeConfig;
+use rdns::config::{
+    ResolutionMode as ConfigResolutionMode, RootHintsSource as ConfigRootHintsSource, RuntimeConfig,
+};
 use rdns::delivery::dns::UdpDnsServer;
-use rdns::delivery::upstream::UdpUpstreamResolver;
+use rdns::delivery::upstream::{ForwardingResolutionBackend, RecursiveAuthorityTransportClient};
 use rdns::resolver::{
-    BasicResponseFactory, CacheTtlPolicy, ChannelQueryEventSink, Clock, InMemoryDnsCache,
+    BackendHealth, BackendRootHintsStatus, BackendSnapshot, BackendStatus, BasicResponseFactory,
+    CacheTtlPolicy, ChannelQueryEventSink, Clock, DnssecValidationStatus, InMemoryDnsCache,
     InMemoryQueryEventStore, InMemoryQueryEventStoreConfig, InMemorySuspiciousLookupClassifier,
     InMemorySuspiciousLookupClassifierConfig, MetricsSink, QueryEventRecordResult, QueryEventSink,
-    QueryEventV1, ResolveQuery, ResolverMetric, StandardProtocolCodec,
+    QueryEventV1, RecursiveResolutionBackend, RecursiveResolverConfig, RecursiveRootHint,
+    ResolutionMode as ResolverResolutionMode, ResolveQuery, ResolverMetric, StandardProtocolCodec,
 };
 use tokio::task::{JoinError, JoinSet};
 
@@ -64,26 +69,25 @@ async fn main() -> io::Result<()> {
         })
     };
 
-    let resolver = Arc::new(ResolveQuery::with_cache(
+    let metrics = OpenTelemetryMetrics::new()
+        .map(|metrics| Arc::new(metrics) as Arc<dyn MetricsSink>)
+        .unwrap_or_else(|error| {
+            eprintln!("failed to initialize OpenTelemetry metrics exporter: {error}");
+            Arc::new(NoopMetrics)
+        });
+    let backend_snapshot = build_backend_snapshot(&config, Arc::clone(&metrics))?;
+    let resolver = Arc::new(ResolveQuery::with_cache_and_backend_snapshot(
         Arc::new(StandardProtocolCodec::new(config.max_udp_payload_size)),
         Arc::new(InMemoryDnsCache::new(DEFAULT_CACHE_ENTRIES)),
         CacheTtlPolicy::default(),
-        Arc::new(
-            UdpUpstreamResolver::from_runtime_config(&config)
-                .map_err(|error| io::Error::other(format!("invalid upstream config: {error:?}")))?,
-        ),
+        backend_snapshot,
         Arc::new(BasicResponseFactory),
         Arc::new(SystemClock),
         Arc::new(StoreRecordingQueryEventSink::new(
             ChannelQueryEventSink::new(event_tx),
             Arc::clone(&query_event_store),
         )),
-        OpenTelemetryMetrics::new()
-            .map(|metrics| Arc::new(metrics) as Arc<dyn MetricsSink>)
-            .unwrap_or_else(|error| {
-                eprintln!("failed to initialize OpenTelemetry metrics exporter: {error}");
-                Arc::new(NoopMetrics)
-            }),
+        metrics,
     ));
 
     let servers = UdpDnsServer::bind_configured(&config, Arc::clone(&resolver)).await?;
@@ -142,6 +146,81 @@ async fn main() -> io::Result<()> {
     }
 
     Ok(())
+}
+
+fn build_backend_snapshot(
+    config: &RuntimeConfig,
+    metrics: Arc<dyn MetricsSink>,
+) -> io::Result<BackendSnapshot> {
+    match config.resolution.mode {
+        ConfigResolutionMode::Forward => {
+            let backend = Arc::new(
+                ForwardingResolutionBackend::from_runtime_config(config).map_err(|error| {
+                    io::Error::other(format!("invalid upstream config: {error:?}"))
+                })?,
+            );
+            Ok(BackendSnapshot::new(
+                backend,
+                ResolverResolutionMode::Forward,
+                config.resolution.generation,
+                BackendHealth::Healthy,
+                Some(config.backend_cache_namespace()),
+            ))
+        }
+        ConfigResolutionMode::Recursive => {
+            let recursive = config
+                .resolution
+                .recursive
+                .as_ref()
+                .ok_or_else(|| io::Error::other("recursive resolution config is missing"))?;
+            let root_hints = recursive
+                .load_root_hints()
+                .map_err(|error| io::Error::other(format!("invalid root hints: {error:?}")))?
+                .into_iter()
+                .map(|hint| RecursiveRootHint {
+                    name: hint.name,
+                    endpoints: hint.endpoints,
+                })
+                .collect();
+            let transport = Arc::new(
+                RecursiveAuthorityTransportClient::from_runtime_config(config)
+                    .map_err(|error| {
+                        io::Error::other(format!("invalid recursive transport: {error:?}"))
+                    })?
+                    .with_metrics(Arc::clone(&metrics)),
+            );
+            let backend = Arc::new(RecursiveResolutionBackend::with_metrics(
+                RecursiveResolverConfig {
+                    root_hints,
+                    per_authority_timeout: recursive.per_authority_timeout,
+                    per_query_deadline: config.per_query_deadline,
+                    max_recursion_depth: recursive.max_recursion_depth,
+                    max_cname_restarts: recursive.max_cname_restarts,
+                },
+                transport,
+                metrics,
+            ));
+            Ok(BackendSnapshot::new(
+                backend,
+                ResolverResolutionMode::Recursive,
+                config.resolution.generation,
+                BackendHealth::Healthy,
+                Some(config.backend_cache_namespace()),
+            )
+            .with_root_hints_status(BackendRootHintsStatus::loaded(
+                root_hints_source_label(&recursive.root_hints_source),
+                recursive.root_hints_version.clone(),
+                SystemTime::now(),
+            )))
+        }
+    }
+}
+
+fn root_hints_source_label(source: &ConfigRootHintsSource) -> &'static str {
+    match source {
+        ConfigRootHintsSource::Bundled => "bundled",
+        ConfigRootHintsSource::Static(_) => "static",
+    }
 }
 
 fn listener_task_result_to_io(result: Result<io::Result<()>, JoinError>) -> io::Result<()> {
@@ -213,6 +292,7 @@ struct OpenTelemetryMetrics {
     cache_store_total: Counter<u64>,
     cache_store_skipped_total: Counter<u64>,
     cache_negative_store_total: Counter<u64>,
+    cache_negative_hit_total: Counter<u64>,
     cache_response_truncated_total: Counter<u64>,
     cache_coalesced_miss_total: Counter<u64>,
     query_event_accepted_total: Counter<u64>,
@@ -222,8 +302,24 @@ struct OpenTelemetryMetrics {
     query_event_sampled_total: Counter<u64>,
     upstream_success_total: Counter<u64>,
     upstream_failure_total: Counter<u64>,
+    recursive_query_total: Counter<u64>,
+    recursive_authority_attempt_total: Counter<u64>,
+    recursive_authority_timeout_total: Counter<u64>,
+    recursive_authority_error_total: Counter<u64>,
+    recursive_bailiwick_reject_total: Counter<u64>,
+    recursive_lame_delegation_total: Counter<u64>,
+    recursive_referral_loop_total: Counter<u64>,
+    recursive_limit_hit_total: Counter<u64>,
+    recursive_tcp_fallback_attempt_total: Counter<u64>,
+    recursive_tcp_fallback_success_total: Counter<u64>,
+    recursive_tcp_fallback_failure_total: Counter<u64>,
+    recursive_tcp_fallback_timeout_total: Counter<u64>,
+    backend_generation: Gauge<u64>,
+    root_hints_age_seconds: Gauge<f64>,
+    dnssec_validation_disabled: Gauge<u64>,
     protocol_error_total: Counter<u64>,
     query_duration_seconds: Histogram<f64>,
+    recursive_query_duration_seconds: Histogram<f64>,
 }
 
 impl OpenTelemetryMetrics {
@@ -249,6 +345,7 @@ impl OpenTelemetryMetrics {
             cache_store_total: meter.u64_counter("cache_store_total").build(),
             cache_store_skipped_total: meter.u64_counter("cache_store_skipped_total").build(),
             cache_negative_store_total: meter.u64_counter("cache_negative_store_total").build(),
+            cache_negative_hit_total: meter.u64_counter("cache_negative_hit_total").build(),
             cache_response_truncated_total: meter
                 .u64_counter("cache_response_truncated_total")
                 .build(),
@@ -264,8 +361,46 @@ impl OpenTelemetryMetrics {
             query_event_sampled_total: meter.u64_counter("query_event_sampled_total").build(),
             upstream_success_total: meter.u64_counter("upstream_success_total").build(),
             upstream_failure_total: meter.u64_counter("upstream_failure_total").build(),
+            recursive_query_total: meter.u64_counter("recursive_query_total").build(),
+            recursive_authority_attempt_total: meter
+                .u64_counter("recursive_authority_attempt_total")
+                .build(),
+            recursive_authority_timeout_total: meter
+                .u64_counter("recursive_authority_timeout_total")
+                .build(),
+            recursive_authority_error_total: meter
+                .u64_counter("recursive_authority_error_total")
+                .build(),
+            recursive_bailiwick_reject_total: meter
+                .u64_counter("recursive_bailiwick_reject_total")
+                .build(),
+            recursive_lame_delegation_total: meter
+                .u64_counter("recursive_lame_delegation_total")
+                .build(),
+            recursive_referral_loop_total: meter
+                .u64_counter("recursive_referral_loop_total")
+                .build(),
+            recursive_limit_hit_total: meter.u64_counter("recursive_limit_hit_total").build(),
+            recursive_tcp_fallback_attempt_total: meter
+                .u64_counter("recursive_tcp_fallback_attempt_total")
+                .build(),
+            recursive_tcp_fallback_success_total: meter
+                .u64_counter("recursive_tcp_fallback_success_total")
+                .build(),
+            recursive_tcp_fallback_failure_total: meter
+                .u64_counter("recursive_tcp_fallback_failure_total")
+                .build(),
+            recursive_tcp_fallback_timeout_total: meter
+                .u64_counter("recursive_tcp_fallback_timeout_total")
+                .build(),
+            backend_generation: meter.u64_gauge("backend_generation").build(),
+            root_hints_age_seconds: meter.f64_gauge("root_hints_age_seconds").build(),
+            dnssec_validation_disabled: meter.u64_gauge("dnssec_validation_disabled").build(),
             protocol_error_total: meter.u64_counter("protocol_error_total").build(),
             query_duration_seconds: meter.f64_histogram("query_duration_seconds").build(),
+            recursive_query_duration_seconds: meter
+                .f64_histogram("recursive_query_duration_seconds")
+                .build(),
         })
     }
 }
@@ -284,6 +419,7 @@ impl MetricsSink for OpenTelemetryMetrics {
             ResolverMetric::CacheStore => self.cache_store_total.add(1, &[]),
             ResolverMetric::CacheStoreSkipped => self.cache_store_skipped_total.add(1, &[]),
             ResolverMetric::CacheNegativeStore => self.cache_negative_store_total.add(1, &[]),
+            ResolverMetric::CacheNegativeHit => self.cache_negative_hit_total.add(1, &[]),
             ResolverMetric::CacheResponseTruncated => {
                 self.cache_response_truncated_total.add(1, &[])
             }
@@ -299,16 +435,113 @@ impl MetricsSink for OpenTelemetryMetrics {
             ResolverMetric::QueryEventSampled => self.query_event_sampled_total.add(1, &[]),
             ResolverMetric::UpstreamSuccess => self.upstream_success_total.add(1, &[]),
             ResolverMetric::UpstreamFailure => self.upstream_failure_total.add(1, &[]),
+            ResolverMetric::RecursiveQuery => self.recursive_query_total.add(1, &[]),
+            ResolverMetric::RecursiveAuthorityAttempt => {
+                self.recursive_authority_attempt_total.add(1, &[])
+            }
+            ResolverMetric::RecursiveAuthorityTimeout => {
+                self.recursive_authority_timeout_total.add(1, &[])
+            }
+            ResolverMetric::RecursiveAuthorityError => {
+                self.recursive_authority_error_total.add(1, &[])
+            }
+            ResolverMetric::RecursiveBailiwickReject => {
+                self.recursive_bailiwick_reject_total.add(1, &[])
+            }
+            ResolverMetric::RecursiveLameDelegation => {
+                self.recursive_lame_delegation_total.add(1, &[])
+            }
+            ResolverMetric::RecursiveReferralLoop => self.recursive_referral_loop_total.add(1, &[]),
+            ResolverMetric::RecursiveLimitHit => self.recursive_limit_hit_total.add(1, &[]),
+            ResolverMetric::RecursiveTcpFallbackAttempt => {
+                self.recursive_tcp_fallback_attempt_total.add(1, &[])
+            }
+            ResolverMetric::RecursiveTcpFallbackSuccess => {
+                self.recursive_tcp_fallback_success_total.add(1, &[])
+            }
+            ResolverMetric::RecursiveTcpFallbackFailure => {
+                self.recursive_tcp_fallback_failure_total.add(1, &[])
+            }
+            ResolverMetric::RecursiveTcpFallbackTimeout => {
+                self.recursive_tcp_fallback_timeout_total.add(1, &[])
+            }
             ResolverMetric::ProtocolError => self.protocol_error_total.add(1, &[]),
-            ResolverMetric::QueryDuration => {}
+            ResolverMetric::QueryDuration | ResolverMetric::RecursiveQueryDuration => {}
         }
     }
 
     fn observe_duration(&self, metric: ResolverMetric, duration: Duration) {
-        if metric == ResolverMetric::QueryDuration {
-            self.query_duration_seconds
-                .record(duration.as_secs_f64(), &[]);
+        match metric {
+            ResolverMetric::QueryDuration => {
+                self.query_duration_seconds
+                    .record(duration.as_secs_f64(), &[]);
+            }
+            ResolverMetric::RecursiveQueryDuration => {
+                self.recursive_query_duration_seconds
+                    .record(duration.as_secs_f64(), &[]);
+            }
+            _ => {}
         }
+    }
+
+    fn record_backend_status(&self, status: &BackendStatus) {
+        let attributes = backend_status_attributes(status);
+        self.backend_generation
+            .record(status.generation, &attributes);
+        self.dnssec_validation_disabled.record(
+            u64::from(status.dnssec_validation == DnssecValidationStatus::Disabled),
+            &attributes,
+        );
+        if let Some(root_hints) = &status.root_hints {
+            if let Some(age) = root_hints.age_at(SystemTime::now()) {
+                self.root_hints_age_seconds
+                    .record(age.as_secs_f64(), &attributes);
+            }
+        }
+    }
+}
+
+fn backend_status_attributes(status: &BackendStatus) -> Vec<KeyValue> {
+    let mut attributes = vec![
+        KeyValue::new("mode", resolver_mode_label(status.mode)),
+        KeyValue::new("health", backend_health_label(status.health)),
+        KeyValue::new(
+            "dnssec_validation",
+            dnssec_validation_label(status.dnssec_validation),
+        ),
+    ];
+    if let Some(root_hints) = &status.root_hints {
+        attributes.push(KeyValue::new(
+            "root_hints_source",
+            root_hints.source.clone(),
+        ));
+        attributes.push(KeyValue::new(
+            "root_hints_version",
+            root_hints.version.clone(),
+        ));
+    }
+    attributes
+}
+
+fn resolver_mode_label(mode: ResolverResolutionMode) -> &'static str {
+    match mode {
+        ResolverResolutionMode::Forward => "forward",
+        ResolverResolutionMode::Recursive => "recursive",
+    }
+}
+
+fn backend_health_label(health: BackendHealth) -> &'static str {
+    match health {
+        BackendHealth::Healthy => "healthy",
+        BackendHealth::Degraded => "degraded",
+        BackendHealth::Unavailable => "unavailable",
+        BackendHealth::Unknown => "unknown",
+    }
+}
+
+fn dnssec_validation_label(status: DnssecValidationStatus) -> &'static str {
+    match status {
+        DnssecValidationStatus::Disabled => "disabled",
     }
 }
 

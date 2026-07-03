@@ -12,28 +12,36 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::future::Future;
 use std::net::{IpAddr, SocketAddr};
 use std::pin::Pin;
 use std::sync::{
     atomic::{AtomicU64, Ordering},
-    Arc, Mutex,
+    Arc, Mutex, RwLock,
 };
 use std::time::{Duration, SystemTime};
 
 use bytes::Bytes;
 use tokio::sync::{mpsc, Notify};
+use tokio::time::{self, Instant};
 
 use crate::protocol::{
     age_response_ttls, build_formerr_response, build_refused_response, build_servfail_response,
-    cap_response_ttls, message_question_wire, rewrite_response_id, rewrite_response_request_fields,
-    Message, QueryValidationError, RecordData, ResponseCode,
+    build_truncated_response, cap_response_ttls, message_question_wire, rewrite_response_id,
+    rewrite_response_request_fields, EdnsInfo, Message, QueryValidationError, Record, RecordData,
+    ResponseCode,
 };
 
 const EDNS_DO_FLAG: u16 = 0x8000;
 const MAX_FAILURE_CACHE_TTL: Duration = Duration::from_secs(5 * 60);
 const CNAME_RECORD_TYPE: u16 = 5;
+const DNSKEY_RECORD_TYPE: u16 = 48;
+const DS_RECORD_TYPE: u16 = 43;
+const NSEC_RECORD_TYPE: u16 = 47;
+const NSEC3_RECORD_TYPE: u16 = 50;
+const NSEC3PARAM_RECORD_TYPE: u16 = 51;
+const RRSIG_RECORD_TYPE: u16 = 46;
 const LRU_COMPACTION_MULTIPLIER: usize = 4;
 
 pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
@@ -147,6 +155,8 @@ fn normalize_question_name(name: &str) -> String {
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct QueryFeatures {
     pub recursion_desired: bool,
+    pub authenticated_data: bool,
+    pub checking_disabled: bool,
     pub dnssec_ok: bool,
     pub edns_udp_payload_size: Option<u16>,
 }
@@ -155,6 +165,8 @@ impl QueryFeatures {
     pub fn from_message(message: &Message) -> Self {
         Self {
             recursion_desired: message.header.rd(),
+            authenticated_data: message.header.ad(),
+            checking_disabled: message.header.cd(),
             dnssec_ok: message
                 .edns
                 .as_ref()
@@ -170,7 +182,7 @@ pub struct CacheKey {
     pub question: QuestionKey,
     pub question_wire: Vec<u8>,
     pub features: QueryFeatures,
-    pub upstream_policy_variant: Option<String>,
+    pub cache_namespace: Option<String>,
     pub effective_udp_payload_size: usize,
 }
 
@@ -179,28 +191,28 @@ impl CacheKey {
         question: QuestionKey,
         question_wire: Vec<u8>,
         features: QueryFeatures,
-        upstream_policy_variant: Option<String>,
+        cache_namespace: Option<String>,
         effective_udp_payload_size: usize,
     ) -> Self {
         Self {
             question,
             question_wire,
             features,
-            upstream_policy_variant,
+            cache_namespace,
             effective_udp_payload_size,
         }
     }
 
     pub fn from_query(
         query: &DecodedQuery,
-        upstream_policy_variant: Option<String>,
+        cache_namespace: Option<String>,
         configured_max_udp_payload_size: usize,
     ) -> Self {
         Self::new(
             query.question.clone(),
             query.question_wire.to_vec(),
             query.features.clone(),
-            upstream_policy_variant,
+            cache_namespace,
             query
                 .message
                 .effective_udp_payload_size(configured_max_udp_payload_size),
@@ -275,8 +287,19 @@ pub struct CachedResponse {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NegativeCacheMetadata {
-    pub authority_name: String,
+    pub authority_zone: String,
+    pub covered_name: String,
+    pub qtype: u16,
+    pub qclass: u16,
+    pub kind: NegativeCacheKind,
+    pub soa_owner: String,
     pub soa_minimum_ttl: Duration,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NegativeCacheKind {
+    NxDomain,
+    NoData,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -338,23 +361,28 @@ impl CacheTtlPolicy {
 
         if !response.answers.is_empty() {
             let answer_ttl = response.answers.iter().map(|record| record.ttl).min()?;
-            if let Some(metadata) = negative_ttl(response) {
-                let cname_chain_nodata = response_code == ResponseCode::NoError
-                    && question_type(response) != Some(CNAME_RECORD_TYPE)
-                    && !has_requested_answer(response);
-                if response_code == ResponseCode::NxDomain || cname_chain_nodata {
-                    let positive_ttl = apply_ttl_bounds(
-                        Duration::from_secs(u64::from(answer_ttl)),
-                        self.min_positive_ttl,
-                        self.max_positive_ttl,
-                    );
-                    let negative_ttl = apply_ttl_bounds(
-                        metadata.soa_minimum_ttl,
-                        self.min_negative_ttl,
-                        self.max_negative_ttl,
-                    );
-                    return Some((positive_ttl.min(negative_ttl), Some(metadata)));
-                }
+            let response_question = QuestionKey::from_message(response);
+            let cname_chain_nodata = response_code == ResponseCode::NoError
+                && response_question
+                    .as_ref()
+                    .map(|question| {
+                        question.qtype != CNAME_RECORD_TYPE
+                            && !has_requested_answer_after_cname_chain(response, question)
+                    })
+                    .unwrap_or(false);
+            if response_code == ResponseCode::NxDomain || cname_chain_nodata {
+                let metadata = negative_ttl(response)?;
+                let positive_ttl = apply_ttl_bounds(
+                    Duration::from_secs(u64::from(answer_ttl)),
+                    self.min_positive_ttl,
+                    self.max_positive_ttl,
+                );
+                let negative_ttl = apply_ttl_bounds(
+                    metadata.soa_minimum_ttl,
+                    self.min_negative_ttl,
+                    self.max_negative_ttl,
+                );
+                return Some((positive_ttl.min(negative_ttl), Some(metadata)));
             }
             return Some((
                 apply_ttl_bounds(
@@ -415,32 +443,635 @@ fn is_cacheable_response_code(response_code: ResponseCode) -> bool {
 }
 
 fn negative_ttl(response: &Message) -> Option<NegativeCacheMetadata> {
+    let response_code = response_code(response)?;
+    let question = response.questions.first()?;
+    let question_key = QuestionKey::new(&question.qname, question.qtype, question.qclass);
+    let kind = match response_code {
+        ResponseCode::NxDomain => NegativeCacheKind::NxDomain,
+        ResponseCode::NoError => NegativeCacheKind::NoData,
+        _ => return None,
+    };
+    let covered_name = negative_covered_name(response, &question_key)?;
     response.authorities.iter().find_map(|record| {
         let RecordData::SOA { minimum, .. } = &record.record else {
             return None;
         };
+        if record.rclass != question.qclass {
+            return None;
+        }
+        let soa_owner = normalize_question_name(&record.name);
+        if !name_is_at_or_below(&covered_name, &soa_owner) {
+            return None;
+        }
         let ttl = record.ttl.min(*minimum);
         Some(NegativeCacheMetadata {
-            authority_name: record.name.clone(),
+            authority_zone: soa_owner.clone(),
+            covered_name: covered_name.clone(),
+            qtype: question.qtype,
+            qclass: question.qclass,
+            kind,
+            soa_owner,
             soa_minimum_ttl: Duration::from_secs(u64::from(ttl)),
         })
     })
 }
 
-fn has_requested_answer(message: &Message) -> bool {
-    let Some(qtype) = question_type(message) else {
-        return false;
-    };
+fn negative_covered_name(response: &Message, question: &QuestionKey) -> Option<String> {
+    let mut covered_name = question.qname.clone();
+    for _ in 0..=response.answers.len() {
+        let Some(record) = response.answers.iter().find(|record| {
+            record.rtype == CNAME_RECORD_TYPE
+                && record.rclass == question.qclass
+                && normalize_question_name(&record.name) == covered_name
+        }) else {
+            return Some(covered_name);
+        };
+        let RecordData::CNAME(target) = &record.record else {
+            return None;
+        };
+        covered_name = normalize_question_name(target);
+    }
+    None
+}
+
+fn name_is_at_or_below(name: &str, zone: &str) -> bool {
+    let name = normalize_question_name(name);
+    let zone = normalize_question_name(zone);
+    if zone.is_empty() {
+        return true;
+    }
+    name == zone || name.ends_with(&format!(".{zone}"))
+}
+
+fn has_requested_answer_for(message: &Message, question: &QuestionKey) -> bool {
     message.answers.iter().any(|record| {
-        if record.rtype != qtype {
-            return false;
-        }
-        !matches!(record.record, RecordData::RRSIG { .. })
+        QuestionKey::new(&record.name, record.rtype, record.rclass) == *question
+            && recursive_response_record_supported(record, false, &[question])
     })
 }
 
-fn question_type(message: &Message) -> Option<u16> {
-    message.questions.first().map(|question| question.qtype)
+fn has_requested_answer_after_cname_chain(message: &Message, question: &QuestionKey) -> bool {
+    if has_requested_answer_for(message, question) {
+        return true;
+    }
+    let Some(covered_name) = negative_covered_name(message, question) else {
+        return false;
+    };
+    let target_question = QuestionKey::new(covered_name, question.qtype, question.qclass);
+    has_requested_answer_for(message, &target_question)
+}
+
+fn cname_record_for<'a>(message: &'a Message, question: &QuestionKey) -> Option<&'a Record> {
+    message.answers.iter().find(|record| {
+        if record.rclass == question.qclass
+            && record.rtype == CNAME_RECORD_TYPE
+            && QuestionKey::new(&record.name, question.qtype, question.qclass).qname
+                == question.qname
+        {
+            matches!(record.record, RecordData::CNAME(_))
+        } else {
+            false
+        }
+    })
+}
+
+fn cname_chain_records(message: &Message, cname_record: &Record, dnssec_ok: bool) -> Vec<Record> {
+    let mut records = vec![cname_record.clone()];
+    if dnssec_ok {
+        let cname_owner = normalize_question_name(&cname_record.name);
+        records.extend(message.answers.iter().filter_map(|record| {
+            let RecordData::RRSIG { type_covered, .. } = &record.record else {
+                return None;
+            };
+            if *type_covered == CNAME_RECORD_TYPE
+                && record.rclass == cname_record.rclass
+                && normalize_question_name(&record.name) == cname_owner
+            {
+                Some(record.clone())
+            } else {
+                None
+            }
+        }));
+    }
+    records
+}
+
+fn authority_response_error(
+    message: &Message,
+    question: &QuestionKey,
+) -> Option<ResolutionBackendError> {
+    if !message.header.qr() || message.questions.len() != 1 {
+        return Some(ResolutionBackendError::MalformedResponse);
+    }
+    if QuestionKey::from_message(message).as_ref() != Some(question) {
+        return Some(ResolutionBackendError::QuestionMismatch);
+    }
+    None
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ReferralAuthorities {
+    owner: String,
+    endpoints: Vec<SocketAddr>,
+}
+
+fn referral_authorities(message: &Message, question: &QuestionKey) -> Option<ReferralAuthorities> {
+    let owner = message
+        .authorities
+        .iter()
+        .filter_map(|record| {
+            if !matches!(record.record, RecordData::NS(_)) {
+                return None;
+            }
+            if record.rclass != question.qclass {
+                return None;
+            }
+            let owner = normalize_question_name(&record.name);
+            if is_delegation_owner_for_question(&owner, &question.qname) {
+                Some(owner)
+            } else {
+                None
+            }
+        })
+        .max_by_key(|owner| owner.len())?;
+    let names: HashSet<_> = message
+        .authorities
+        .iter()
+        .filter_map(|record| match &record.record {
+            RecordData::NS(name)
+                if normalize_question_name(&record.name) == owner
+                    && record.rclass == question.qclass
+                    && ns_name_allowed_for_delegation(&owner, name) =>
+            {
+                Some(normalize_question_name(name))
+            }
+            _ => None,
+        })
+        .collect();
+    if names.is_empty() {
+        return None;
+    }
+
+    let endpoints = message
+        .additionals
+        .iter()
+        .filter_map(|record| {
+            if record.rclass != question.qclass {
+                return None;
+            }
+            if !names.contains(&normalize_question_name(&record.name)) {
+                return None;
+            }
+            match record.record {
+                RecordData::A(address) => Some(SocketAddr::new(IpAddr::V4(address), 53)),
+                RecordData::AAAA(address) => Some(SocketAddr::new(IpAddr::V6(address), 53)),
+                _ => None,
+            }
+        })
+        .collect::<Vec<_>>();
+    if endpoints.is_empty() {
+        return None;
+    }
+    Some(ReferralAuthorities { owner, endpoints })
+}
+
+fn has_delegation_for_question(message: &Message, question: &QuestionKey) -> bool {
+    message.authorities.iter().any(|record| {
+        matches!(record.record, RecordData::NS(_))
+            && record.rclass == question.qclass
+            && is_delegation_owner_for_question(&record.name, &question.qname)
+    })
+}
+
+fn is_delegation_owner_for_question(owner: &str, qname: &str) -> bool {
+    let owner = normalize_question_name(owner);
+    let qname = normalize_question_name(qname);
+    owner.is_empty() || qname == owner || qname.ends_with(&format!(".{owner}"))
+}
+
+fn ns_name_allowed_for_delegation(owner: &str, name: &str) -> bool {
+    is_delegation_owner_for_question(owner, name) || name_is_at_or_below(name, &parent_zone(owner))
+}
+
+fn parent_zone(name: &str) -> String {
+    let name = normalize_question_name(name);
+    let Some((_, parent)) = name.split_once('.') else {
+        return String::new();
+    };
+    parent.to_string()
+}
+
+fn is_negative_answer(message: &Message) -> bool {
+    (response_code(message) == Some(ResponseCode::NxDomain)
+        && message.header.aa()
+        && negative_ttl(message).is_some())
+        || (response_code(message) == Some(ResponseCode::NoError)
+            && message.header.aa()
+            && message.answers.is_empty()
+            && negative_ttl(message).is_some())
+}
+
+fn synthesize_recursive_cname_response(
+    original_query: &Message,
+    cname_chain: &[Record],
+    final_response: &Message,
+) -> Result<Message, ResolutionBackendError> {
+    let dnssec_ok = original_query
+        .edns
+        .as_ref()
+        .map(|edns| edns.dnssec_ok)
+        .unwrap_or(false);
+    let original_question = QuestionKey::from_message(original_query)
+        .ok_or(ResolutionBackendError::MalformedResponse)?;
+    let final_question = QuestionKey::from_message(final_response)
+        .ok_or(ResolutionBackendError::MalformedResponse)?;
+    let mut answers = cname_chain.to_vec();
+    answers.extend(
+        final_response
+            .answers
+            .iter()
+            .filter(|record| {
+                recursive_response_record_supported(
+                    record,
+                    dnssec_ok,
+                    &[&original_question, &final_question],
+                )
+            })
+            .cloned(),
+    );
+    let authorities = final_response
+        .authorities
+        .iter()
+        .filter(|record| {
+            recursive_response_record_supported(
+                record,
+                dnssec_ok,
+                &[&original_question, &final_question],
+            )
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    let mut additionals = final_response
+        .additionals
+        .iter()
+        .filter(|record| {
+            recursive_response_record_supported(
+                record,
+                dnssec_ok,
+                &[&original_question, &final_question],
+            )
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    if let Some(opt) = mirrored_client_opt_record(original_query) {
+        additionals.push(opt);
+    }
+    let bytes = serialize_recursive_response(
+        original_query,
+        response_code(final_response).unwrap_or(ResponseCode::ServFail),
+        false,
+        &answers,
+        &authorities,
+        &additionals,
+    )?;
+    Message::parse_owned(bytes).map_err(|_| ResolutionBackendError::MalformedResponse)
+}
+
+fn recursive_response_record_supported(
+    record: &Record,
+    dnssec_ok: bool,
+    questions: &[&QuestionKey],
+) -> bool {
+    match record.record {
+        RecordData::A(_)
+        | RecordData::AAAA(_)
+        | RecordData::CAA { .. }
+        | RecordData::CERT { .. }
+        | RecordData::CNAME(_)
+        | RecordData::MX { .. }
+        | RecordData::NS(_)
+        | RecordData::PTR(_)
+        | RecordData::RP { .. }
+        | RecordData::SOA { .. }
+        | RecordData::SRV { .. }
+        | RecordData::TXT(_) => true,
+        RecordData::DNSKEY { .. }
+        | RecordData::DS { .. }
+        | RecordData::NSEC { .. }
+        | RecordData::NSEC3 { .. }
+        | RecordData::NSEC3PARAM { .. }
+        | RecordData::RRSIG { .. } => dnssec_ok || record_matches_any_question(record, questions),
+        RecordData::Unknown { rtype, .. } => dnssec_ok || !is_dnssec_record_type(rtype),
+        _ => false,
+    }
+}
+
+fn is_dnssec_record_type(rtype: u16) -> bool {
+    matches!(
+        rtype,
+        DS_RECORD_TYPE
+            | RRSIG_RECORD_TYPE
+            | NSEC_RECORD_TYPE
+            | DNSKEY_RECORD_TYPE
+            | NSEC3_RECORD_TYPE
+            | NSEC3PARAM_RECORD_TYPE
+            | 59
+            | 60
+            | 32769
+    )
+}
+
+fn record_matches_any_question(record: &Record, questions: &[&QuestionKey]) -> bool {
+    questions
+        .iter()
+        .any(|question| QuestionKey::new(&record.name, record.rtype, record.rclass) == **question)
+}
+
+fn mirrored_client_opt_record(original_query: &Message) -> Option<Record> {
+    let edns = original_query.edns.as_ref()?;
+    let flags = if edns.dnssec_ok { EDNS_DO_FLAG } else { 0 };
+    Some(Record {
+        name: String::new(),
+        rtype: 41,
+        rclass: edns.udp_payload_size,
+        ttl: u32::from(flags),
+        record: RecordData::OPT(EdnsInfo {
+            udp_payload_size: edns.udp_payload_size,
+            extended_rcode: 0,
+            version: 0,
+            flags,
+            dnssec_ok: edns.dnssec_ok,
+            options: Vec::new(),
+        }),
+    })
+}
+
+fn serialize_recursive_response(
+    original_query: &Message,
+    rcode: ResponseCode,
+    authoritative: bool,
+    answers: &[Record],
+    authorities: &[Record],
+    additionals: &[Record],
+) -> Result<Vec<u8>, ResolutionBackendError> {
+    let Some(question) = original_query.questions.first() else {
+        return Err(ResolutionBackendError::MalformedResponse);
+    };
+
+    let mut bytes = Vec::new();
+    write_dns_u16(&mut bytes, original_query.header.id);
+    let mut flags = 0x8000u16 | 0x0080u16 | rcode as u16;
+    if original_query.header.rd() {
+        flags |= 0x0100;
+    }
+    if authoritative {
+        flags |= 0x0400;
+    }
+    write_dns_u16(&mut bytes, flags);
+    write_dns_u16(&mut bytes, 1);
+    write_dns_u16(&mut bytes, answers.len() as u16);
+    write_dns_u16(&mut bytes, authorities.len() as u16);
+    write_dns_u16(&mut bytes, additionals.len() as u16);
+    write_dns_question(&mut bytes, &question.qname, question.qtype, question.qclass);
+    for record in answers {
+        write_dns_record(&mut bytes, record)?;
+    }
+    for record in authorities {
+        write_dns_record(&mut bytes, record)?;
+    }
+    for record in additionals {
+        write_dns_record(&mut bytes, record)?;
+    }
+    Ok(bytes)
+}
+
+fn write_dns_question(bytes: &mut Vec<u8>, name: &str, qtype: u16, qclass: u16) {
+    write_dns_name(bytes, name);
+    write_dns_u16(bytes, qtype);
+    write_dns_u16(bytes, qclass);
+}
+
+fn write_dns_record(bytes: &mut Vec<u8>, record: &Record) -> Result<(), ResolutionBackendError> {
+    write_dns_name(bytes, &record.name);
+    write_dns_u16(bytes, record.rtype);
+    write_dns_u16(bytes, record.rclass);
+    write_dns_u32(bytes, record.ttl);
+    let rdlength_index = bytes.len();
+    write_dns_u16(bytes, 0);
+    let rdata_start = bytes.len();
+    match &record.record {
+        RecordData::A(address) => bytes.extend_from_slice(&address.octets()),
+        RecordData::AAAA(address) => bytes.extend_from_slice(&address.octets()),
+        RecordData::CAA { flags, tag, value } => {
+            if tag.len() > u8::MAX as usize {
+                return Err(ResolutionBackendError::MalformedResponse);
+            }
+            bytes.push(*flags);
+            bytes.push(tag.len() as u8);
+            bytes.extend_from_slice(tag.as_bytes());
+            bytes.extend_from_slice(value.as_bytes());
+        }
+        RecordData::CERT {
+            cert_type,
+            key_tag,
+            algorithm,
+            cert,
+        } => {
+            write_dns_u16(bytes, *cert_type);
+            write_dns_u16(bytes, *key_tag);
+            bytes.push(*algorithm);
+            bytes.extend_from_slice(cert);
+        }
+        RecordData::CNAME(name) | RecordData::NS(name) => write_dns_name(bytes, name),
+        RecordData::MX {
+            preference,
+            exchange,
+        } => {
+            write_dns_u16(bytes, *preference);
+            write_dns_name(bytes, exchange);
+        }
+        RecordData::DNSKEY {
+            flags,
+            protocol,
+            algorithm,
+            public_key,
+        } => {
+            write_dns_u16(bytes, *flags);
+            bytes.push(*protocol);
+            bytes.push(*algorithm);
+            bytes.extend_from_slice(public_key);
+        }
+        RecordData::DS {
+            key_tag,
+            algorithm,
+            digest_type,
+            digest,
+        } => {
+            write_dns_u16(bytes, *key_tag);
+            bytes.push(*algorithm);
+            bytes.push(*digest_type);
+            bytes.extend_from_slice(digest);
+        }
+        RecordData::NSEC {
+            next_domain,
+            type_bit_maps,
+        } => {
+            write_dns_name(bytes, next_domain);
+            bytes.extend_from_slice(type_bit_maps);
+        }
+        RecordData::NSEC3 {
+            hash_algorithm,
+            flags,
+            iterations,
+            salt_length,
+            salt,
+            hash_length,
+            next_domain,
+            type_bit_maps,
+        } => {
+            bytes.push(*hash_algorithm);
+            bytes.push(*flags);
+            write_dns_u16(bytes, *iterations);
+            bytes.push(*salt_length);
+            bytes.extend_from_slice(salt);
+            bytes.push(*hash_length);
+            write_hex_bytes(bytes, next_domain)?;
+            bytes.extend_from_slice(type_bit_maps);
+        }
+        RecordData::NSEC3PARAM {
+            hash_algorithm,
+            flags,
+            iterations,
+            salt_length,
+            salt,
+        } => {
+            bytes.push(*hash_algorithm);
+            bytes.push(*flags);
+            write_dns_u16(bytes, *iterations);
+            bytes.push(*salt_length);
+            bytes.extend_from_slice(salt);
+        }
+        RecordData::PTR(name) => write_dns_name(bytes, name),
+        RecordData::RP {
+            mboxdname,
+            txtdname,
+        } => {
+            write_dns_name(bytes, mboxdname);
+            write_dns_name(bytes, txtdname);
+        }
+        RecordData::SOA {
+            ttl: _,
+            rname,
+            mname,
+            serial,
+            refresh,
+            retry,
+            expire,
+            minimum,
+        } => {
+            write_dns_name(bytes, mname);
+            write_dns_name(bytes, rname);
+            write_dns_u32(bytes, *serial);
+            write_dns_u32(bytes, *refresh);
+            write_dns_u32(bytes, *retry);
+            write_dns_u32(bytes, *expire);
+            write_dns_u32(bytes, *minimum);
+        }
+        RecordData::SRV {
+            priority,
+            weight,
+            port,
+            target,
+        } => {
+            write_dns_u16(bytes, *priority);
+            write_dns_u16(bytes, *weight);
+            write_dns_u16(bytes, *port);
+            write_dns_name(bytes, target);
+        }
+        RecordData::TXT(text) => {
+            for chunk in text.as_bytes().chunks(255) {
+                bytes.push(chunk.len() as u8);
+                bytes.extend_from_slice(chunk);
+            }
+        }
+        RecordData::RRSIG {
+            type_covered,
+            algorithm,
+            labels,
+            original_ttl,
+            signature_expiration,
+            signature_inception,
+            key_tag,
+            signer_name,
+            signature,
+        } => {
+            write_dns_u16(bytes, *type_covered);
+            bytes.push(*algorithm);
+            bytes.push(*labels);
+            write_dns_u32(bytes, *original_ttl);
+            write_dns_u32(bytes, *signature_expiration);
+            write_dns_u32(bytes, *signature_inception);
+            write_dns_u16(bytes, *key_tag);
+            write_dns_name(bytes, signer_name);
+            bytes.extend_from_slice(signature);
+        }
+        RecordData::OPT(info) => {
+            bytes.extend_from_slice(&info.options);
+        }
+        RecordData::Unknown { rtype, bytes: data } if *rtype == record.rtype => {
+            bytes.extend_from_slice(data);
+        }
+        _ => return Err(ResolutionBackendError::MalformedResponse),
+    }
+    let rdlength = bytes.len() - rdata_start;
+    if rdlength > u16::MAX as usize {
+        return Err(ResolutionBackendError::MalformedResponse);
+    }
+    bytes[rdlength_index..rdlength_index + 2].copy_from_slice(&(rdlength as u16).to_be_bytes());
+    Ok(())
+}
+
+fn write_dns_name(bytes: &mut Vec<u8>, name: &str) {
+    let name = name.trim_end_matches('.');
+    if name.is_empty() {
+        bytes.push(0);
+        return;
+    }
+    for label in name.split('.') {
+        bytes.push(label.len() as u8);
+        bytes.extend_from_slice(label.as_bytes());
+    }
+    bytes.push(0);
+}
+
+fn write_dns_u16(bytes: &mut Vec<u8>, value: u16) {
+    bytes.extend_from_slice(&value.to_be_bytes());
+}
+
+fn write_dns_u32(bytes: &mut Vec<u8>, value: u32) {
+    bytes.extend_from_slice(&value.to_be_bytes());
+}
+
+fn write_hex_bytes(bytes: &mut Vec<u8>, hex: &str) -> Result<(), ResolutionBackendError> {
+    if !hex.len().is_multiple_of(2) {
+        return Err(ResolutionBackendError::MalformedResponse);
+    }
+    let mut chars = hex.as_bytes().chunks_exact(2);
+    for chunk in &mut chars {
+        let high = hex_nibble(chunk[0])?;
+        let low = hex_nibble(chunk[1])?;
+        bytes.push((high << 4) | low);
+    }
+    Ok(())
+}
+
+fn hex_nibble(byte: u8) -> Result<u8, ResolutionBackendError> {
+    match byte {
+        b'0'..=b'9' => Ok(byte - b'0'),
+        b'a'..=b'f' => Ok(byte - b'a' + 10),
+        b'A'..=b'F' => Ok(byte - b'A' + 10),
+        _ => Err(ResolutionBackendError::MalformedResponse),
+    }
 }
 
 fn apply_ttl_bounds(ttl: Duration, min_ttl: Option<Duration>, max_ttl: Duration) -> Duration {
@@ -452,23 +1083,398 @@ fn apply_ttl_bounds(ttl: Duration, min_ttl: Option<Duration>, max_ttl: Duration)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct UpstreamRequest {
+pub struct ResolutionRequest {
     pub query: DecodedQuery,
+    pub backend_generation: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct UpstreamResponse {
+pub struct ResolutionResponse {
     pub bytes: Vec<u8>,
     pub received_at: SystemTime,
+    response_message: Option<Message>,
+    pub response_code: Option<ResponseCode>,
+    pub final_question: Option<QuestionKey>,
+    pub canonical_chain: Vec<String>,
+    pub negative_cache: Option<NegativeCacheMetadata>,
+    pub source_credibility: SourceCredibility,
+    pub backend_provenance: BackendProvenance,
+    pub cache_directive: ResolutionCacheDirective,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum UpstreamError {
+pub enum ResolutionBackendError {
     Timeout,
     MalformedResponse,
     QuestionMismatch,
+    NoBackendsAvailable,
+    #[deprecated(note = "use NoBackendsAvailable for backend-agnostic resolution failures")]
     NoUpstreamsAvailable,
     Transport(String),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ResolutionMode {
+    Forward,
+    Recursive,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BackendHealth {
+    Healthy,
+    Degraded,
+    Unavailable,
+    Unknown,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DnssecValidationStatus {
+    Disabled,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BackendStatus {
+    pub mode: ResolutionMode,
+    pub generation: u64,
+    pub health: BackendHealth,
+    pub dnssec_validation: DnssecValidationStatus,
+    pub cache_namespace: Option<String>,
+    pub root_hints: Option<BackendRootHintsStatus>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BackendRootHintsStatus {
+    pub source: String,
+    pub version: String,
+    pub loaded_at: SystemTime,
+}
+
+impl BackendRootHintsStatus {
+    pub fn loaded(
+        source: impl Into<String>,
+        version: impl Into<String>,
+        loaded_at: SystemTime,
+    ) -> Self {
+        Self {
+            source: source.into(),
+            version: version.into(),
+            loaded_at,
+        }
+    }
+
+    pub fn age_at(&self, now: SystemTime) -> Option<Duration> {
+        now.duration_since(self.loaded_at).ok()
+    }
+}
+
+#[derive(Clone)]
+pub struct BackendSnapshot {
+    pub backend: Arc<dyn ResolutionBackend>,
+    pub mode: ResolutionMode,
+    pub generation: u64,
+    pub health: BackendHealth,
+    pub dnssec_validation: DnssecValidationStatus,
+    pub cache_namespace: Option<String>,
+    pub root_hints: Option<BackendRootHintsStatus>,
+}
+
+impl BackendSnapshot {
+    pub fn new(
+        backend: Arc<dyn ResolutionBackend>,
+        mode: ResolutionMode,
+        generation: u64,
+        health: BackendHealth,
+        cache_namespace: Option<String>,
+    ) -> Self {
+        Self {
+            backend,
+            mode,
+            generation,
+            health,
+            dnssec_validation: DnssecValidationStatus::Disabled,
+            cache_namespace,
+            root_hints: None,
+        }
+    }
+
+    pub fn with_root_hints_status(mut self, root_hints: BackendRootHintsStatus) -> Self {
+        self.root_hints = Some(root_hints);
+        self
+    }
+
+    pub fn status(&self) -> BackendStatus {
+        BackendStatus {
+            mode: self.mode,
+            generation: self.generation,
+            health: self.health,
+            dnssec_validation: self.dnssec_validation,
+            cache_namespace: self.cache_namespace.clone(),
+            root_hints: self.root_hints.clone(),
+        }
+    }
+
+    fn forwarding(backend: Arc<dyn ResolutionBackend>, generation: u64) -> Self {
+        Self::new(
+            backend,
+            ResolutionMode::Forward,
+            generation,
+            BackendHealth::Healthy,
+            backend_cache_namespace(ResolutionMode::Forward, generation),
+        )
+    }
+}
+
+#[derive(Clone)]
+pub struct BackendHandle {
+    snapshot: Arc<RwLock<Arc<BackendSnapshot>>>,
+}
+
+impl BackendHandle {
+    pub fn new(snapshot: BackendSnapshot) -> Self {
+        Self {
+            snapshot: Arc::new(RwLock::new(Arc::new(snapshot))),
+        }
+    }
+
+    pub fn current(&self) -> Arc<BackendSnapshot> {
+        let snapshot = self
+            .snapshot
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        Arc::clone(&snapshot)
+    }
+
+    pub fn status(&self) -> BackendStatus {
+        self.current().status()
+    }
+
+    fn publish(&self, snapshot: BackendSnapshot) {
+        let mut current = self
+            .snapshot
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        *current = Arc::new(snapshot);
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SourceCredibility {
+    ForwarderValidated,
+    Authoritative,
+    InsecureReferral,
+    Unknown,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BackendProvenance {
+    pub mode: ResolutionMode,
+    pub generation: u64,
+    pub backend_name: Option<String>,
+}
+
+impl BackendProvenance {
+    pub fn forwarding(generation: u64, backend_name: impl Into<String>) -> Self {
+        Self {
+            mode: ResolutionMode::Forward,
+            generation,
+            backend_name: Some(backend_name.into()),
+        }
+    }
+
+    pub fn recursive(generation: u64, backend_name: impl Into<String>) -> Self {
+        Self {
+            mode: ResolutionMode::Recursive,
+            generation,
+            backend_name: Some(backend_name.into()),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ResolutionCacheDirective {
+    Cacheable,
+    DoNotCache(ResolutionNoCacheReason),
+}
+
+impl ResolutionCacheDirective {
+    fn is_cacheable(&self) -> bool {
+        matches!(self, Self::Cacheable)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ResolutionNoCacheReason {
+    BackendPolicy,
+    UnsupportedResponseSemantics,
+    ValidationIncomplete,
+}
+
+impl ResolutionResponse {
+    pub fn forwarded_bytes(
+        bytes: Vec<u8>,
+        received_at: SystemTime,
+        backend_generation: u64,
+        backend_name: impl Into<String>,
+    ) -> Self {
+        let backend_name = backend_name.into();
+        match Message::parse(&bytes) {
+            Ok(message) => Self::forwarded_parsed_bytes(
+                bytes,
+                message,
+                received_at,
+                backend_generation,
+                backend_name,
+            ),
+            Err(_) => {
+                Self::unparsed_forwarded_bytes(bytes, received_at, backend_generation, backend_name)
+            }
+        }
+    }
+
+    pub(crate) fn forwarded_message(
+        bytes: Vec<u8>,
+        response_message: Message,
+        received_at: SystemTime,
+        backend_generation: u64,
+        backend_name: impl Into<String>,
+    ) -> Self {
+        let backend_name = backend_name.into();
+        if response_message.original_bytes.as_ref() != bytes.as_slice() {
+            return Self::forwarded_bytes(bytes, received_at, backend_generation, backend_name);
+        }
+        Self::forwarded_parsed_bytes(
+            bytes,
+            response_message,
+            received_at,
+            backend_generation,
+            backend_name,
+        )
+    }
+
+    fn forwarded_parsed_bytes(
+        bytes: Vec<u8>,
+        response_message: Message,
+        received_at: SystemTime,
+        backend_generation: u64,
+        backend_name: impl Into<String>,
+    ) -> Self {
+        let response_code = response_code(&response_message);
+        let final_question = QuestionKey::from_message(&response_message);
+        let canonical_chain = canonical_chain_from_response(&response_message);
+        let negative_cache = negative_ttl(&response_message);
+        Self {
+            bytes,
+            received_at,
+            response_message: Some(response_message),
+            response_code,
+            final_question,
+            canonical_chain,
+            negative_cache,
+            source_credibility: SourceCredibility::ForwarderValidated,
+            backend_provenance: BackendProvenance::forwarding(backend_generation, backend_name),
+            cache_directive: ResolutionCacheDirective::Cacheable,
+        }
+    }
+
+    fn unparsed_forwarded_bytes(
+        bytes: Vec<u8>,
+        received_at: SystemTime,
+        backend_generation: u64,
+        backend_name: impl Into<String>,
+    ) -> Self {
+        Self {
+            bytes,
+            received_at,
+            response_message: None,
+            response_code: None,
+            final_question: None,
+            canonical_chain: Vec::new(),
+            negative_cache: None,
+            source_credibility: SourceCredibility::ForwarderValidated,
+            backend_provenance: BackendProvenance::forwarding(backend_generation, backend_name),
+            cache_directive: ResolutionCacheDirective::DoNotCache(
+                ResolutionNoCacheReason::ValidationIncomplete,
+            ),
+        }
+    }
+
+    pub(crate) fn recursive_response(
+        original_query: &DecodedQuery,
+        authority_response: RecursiveAuthorityResponse,
+        cname_chain: &[Record],
+        received_at: SystemTime,
+        backend_generation: u64,
+        authority: SocketAddr,
+    ) -> Result<Self, ResolutionBackendError> {
+        let response_message = synthesize_recursive_cname_response(
+            &original_query.message,
+            cname_chain,
+            &authority_response.message,
+        )?;
+        let bytes = response_message.original_bytes.to_vec();
+        let response_code = response_code(&response_message);
+        let final_question = QuestionKey::from_message(&response_message);
+        let canonical_chain = canonical_chain_from_response(&response_message);
+        let negative_cache = negative_ttl(&response_message);
+        Ok(Self {
+            bytes,
+            received_at,
+            response_message: Some(response_message),
+            response_code,
+            final_question,
+            canonical_chain,
+            negative_cache,
+            source_credibility: SourceCredibility::Authoritative,
+            backend_provenance: BackendProvenance::recursive(
+                backend_generation,
+                format!("authority:{authority}"),
+            ),
+            cache_directive: ResolutionCacheDirective::Cacheable,
+        })
+    }
+
+    pub fn answers(&self) -> &[Record] {
+        self.response_message
+            .as_ref()
+            .map(|message| message.answers.as_slice())
+            .unwrap_or_default()
+    }
+
+    pub fn response_message(&self) -> Option<&Message> {
+        self.response_message.as_ref()
+    }
+
+    pub fn authorities(&self) -> &[Record] {
+        self.response_message
+            .as_ref()
+            .map(|message| message.authorities.as_slice())
+            .unwrap_or_default()
+    }
+
+    pub fn additionals(&self) -> &[Record] {
+        self.response_message
+            .as_ref()
+            .map(|message| message.additionals.as_slice())
+            .unwrap_or_default()
+    }
+}
+
+pub type UpstreamRequest = ResolutionRequest;
+pub type UpstreamResponse = ResolutionResponse;
+pub type UpstreamError = ResolutionBackendError;
+
+fn canonical_chain_from_response(response: &Message) -> Vec<String> {
+    response
+        .answers
+        .iter()
+        .filter_map(|record| {
+            if let RecordData::CNAME(cname) = &record.record {
+                Some(normalize_question_name(cname))
+            } else {
+                None
+            }
+        })
+        .collect()
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -478,7 +1484,7 @@ pub enum ResolveDecisionKind {
     CacheHit,
     CacheMiss,
     ProtocolError(ResponseCode),
-    UpstreamFailure,
+    BackendFailure,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -501,12 +1507,13 @@ pub struct QueryEventV1 {
     pub terminal_outcome: QueryEventOutcome,
     pub response_code: Option<u16>,
     pub cache_result: Option<QueryEventCacheResult>,
+    pub backend: Option<QueryEventBackend>,
     pub latency: Option<Duration>,
     pub advisory_findings: Vec<QueryEventClassifierFinding>,
 }
 
 impl QueryEventV1 {
-    pub const SCHEMA_VERSION: u8 = 1;
+    pub const SCHEMA_VERSION: u8 = 2;
 
     pub fn from_decision(
         sequence: u64,
@@ -552,8 +1559,30 @@ impl QueryEventV1 {
             terminal_outcome: QueryEventOutcome::from_decision_kind(&decision.kind),
             response_code,
             cache_result,
+            backend: None,
             latency,
             advisory_findings: Vec::new(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct QueryEventBackend {
+    pub mode: ResolutionMode,
+    pub generation: u64,
+    pub health: BackendHealth,
+    pub cache_namespace: Option<String>,
+    pub dnssec_validation: DnssecValidationStatus,
+}
+
+impl QueryEventBackend {
+    fn from_snapshot(snapshot: &BackendSnapshot) -> Self {
+        Self {
+            mode: snapshot.mode,
+            generation: snapshot.generation,
+            health: snapshot.health,
+            cache_namespace: snapshot.cache_namespace.clone(),
+            dnssec_validation: snapshot.dnssec_validation,
         }
     }
 }
@@ -575,7 +1604,7 @@ impl QueryEventOutcome {
             ResolveDecisionKind::CacheHit => Self::AllowedFromCache,
             ResolveDecisionKind::CacheMiss => Self::AllowedFromBackend,
             ResolveDecisionKind::ProtocolError(code) => Self::ProtocolError(*code),
-            ResolveDecisionKind::UpstreamFailure => Self::BackendFailure,
+            ResolveDecisionKind::BackendFailure => Self::BackendFailure,
         }
     }
 }
@@ -1092,7 +2121,7 @@ pub struct ResolveQuery {
     cache: Arc<dyn DnsCache>,
     ttl_policy: CacheTtlPolicy,
     miss_coalescer: Arc<SingleFlightMisses>,
-    upstream: Arc<dyn UpstreamResolver>,
+    backend: BackendHandle,
     responses: Arc<dyn ResponseFactory>,
     clock: Arc<dyn Clock>,
     events: Arc<dyn QueryEventSink>,
@@ -1103,7 +2132,7 @@ pub struct ResolveQuery {
 impl ResolveQuery {
     pub fn new(
         protocol: Arc<dyn ProtocolCodec>,
-        upstream: Arc<dyn UpstreamResolver>,
+        backend: Arc<dyn ResolutionBackend>,
         responses: Arc<dyn ResponseFactory>,
         clock: Arc<dyn Clock>,
         events: Arc<dyn QueryEventSink>,
@@ -1113,7 +2142,7 @@ impl ResolveQuery {
             protocol,
             Arc::new(NoopDnsCache),
             CacheTtlPolicy::default(),
-            upstream,
+            backend,
             responses,
             clock,
             events,
@@ -1126,18 +2155,36 @@ impl ResolveQuery {
         protocol: Arc<dyn ProtocolCodec>,
         cache: Arc<dyn DnsCache>,
         ttl_policy: CacheTtlPolicy,
-        upstream: Arc<dyn UpstreamResolver>,
+        backend: Arc<dyn ResolutionBackend>,
         responses: Arc<dyn ResponseFactory>,
         clock: Arc<dyn Clock>,
         events: Arc<dyn QueryEventSink>,
         metrics: Arc<dyn MetricsSink>,
     ) -> Self {
+        let snapshot = BackendSnapshot::forwarding(backend, 0);
+        Self::with_cache_and_backend_snapshot(
+            protocol, cache, ttl_policy, snapshot, responses, clock, events, metrics,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn with_cache_and_backend_snapshot(
+        protocol: Arc<dyn ProtocolCodec>,
+        cache: Arc<dyn DnsCache>,
+        ttl_policy: CacheTtlPolicy,
+        backend_snapshot: BackendSnapshot,
+        responses: Arc<dyn ResponseFactory>,
+        clock: Arc<dyn Clock>,
+        events: Arc<dyn QueryEventSink>,
+        metrics: Arc<dyn MetricsSink>,
+    ) -> Self {
+        metrics.record_backend_status(&backend_snapshot.status());
         Self {
             protocol,
             cache,
             ttl_policy,
             miss_coalescer: Arc::new(SingleFlightMisses::default()),
-            upstream,
+            backend: BackendHandle::new(backend_snapshot),
             responses,
             clock,
             events,
@@ -1146,9 +2193,64 @@ impl ResolveQuery {
         }
     }
 
+    pub fn backend_status(&self) -> BackendStatus {
+        self.backend.status()
+    }
+
+    pub fn publish_backend_snapshot(&self, snapshot: BackendSnapshot) {
+        let status = snapshot.status();
+        self.backend.publish(snapshot);
+        self.metrics.record_backend_status(&status);
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn with_cache_and_backend_handle(
+        protocol: Arc<dyn ProtocolCodec>,
+        cache: Arc<dyn DnsCache>,
+        ttl_policy: CacheTtlPolicy,
+        backend_handle: BackendHandle,
+        responses: Arc<dyn ResponseFactory>,
+        clock: Arc<dyn Clock>,
+        events: Arc<dyn QueryEventSink>,
+        metrics: Arc<dyn MetricsSink>,
+    ) -> Self {
+        metrics.record_backend_status(&backend_handle.status());
+        Self {
+            protocol,
+            cache,
+            ttl_policy,
+            miss_coalescer: Arc::new(SingleFlightMisses::default()),
+            backend: backend_handle,
+            responses,
+            clock,
+            events,
+            event_sequence: AtomicU64::new(0),
+            metrics,
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn with_cache_and_backend_generation(
+        protocol: Arc<dyn ProtocolCodec>,
+        cache: Arc<dyn DnsCache>,
+        ttl_policy: CacheTtlPolicy,
+        backend: Arc<dyn ResolutionBackend>,
+        backend_generation: u64,
+        responses: Arc<dyn ResponseFactory>,
+        clock: Arc<dyn Clock>,
+        events: Arc<dyn QueryEventSink>,
+        metrics: Arc<dyn MetricsSink>,
+    ) -> Self {
+        let snapshot = BackendSnapshot::forwarding(backend, backend_generation);
+        Self::with_cache_and_backend_snapshot(
+            protocol, cache, ttl_policy, snapshot, responses, clock, events, metrics,
+        )
+    }
+
     pub async fn resolve(&self, mut request: ResolveRequest) -> ResolveOutcome {
         self.metrics.increment(ResolverMetric::QueryReceived);
         let started_at = self.clock.now();
+        let backend_snapshot = self.backend.current();
         let request_id = request_id_from_wire(&request.bytes);
         let request_bytes = std::mem::take(&mut request.bytes);
 
@@ -1163,7 +2265,15 @@ impl ResolveQuery {
                 };
                 let response_bytes = self.responses.protocol_error(request_id, &error);
                 return self
-                    .finish(started_at, &request, None, decision, response_bytes, None)
+                    .finish(
+                        started_at,
+                        &request,
+                        None,
+                        decision,
+                        response_bytes,
+                        None,
+                        Some(QueryEventBackend::from_snapshot(&backend_snapshot)),
+                    )
                     .await;
             }
         };
@@ -1171,7 +2281,9 @@ impl ResolveQuery {
         self.metrics.increment(ResolverMetric::QueryAllowed);
         let question = decoded.question.clone();
 
-        let mut cache_probe = self.probe_cache(&request, &decoded).await;
+        let mut cache_probe = self
+            .probe_cache(&backend_snapshot, &request, &decoded)
+            .await;
         if let Some(response_bytes) = cache_probe.hit {
             let decision = ResolveDecision {
                 client_ip: request.client_ip,
@@ -1186,6 +2298,7 @@ impl ResolveQuery {
                     decision,
                     response_bytes,
                     cache_probe.event_cache_result,
+                    Some(QueryEventBackend::from_snapshot(&backend_snapshot)),
                 )
                 .await;
         }
@@ -1193,6 +2306,7 @@ impl ResolveQuery {
         if let (Some(cache_key), true) = (cache_probe.key.take(), cache_probe.store_allowed) {
             return self
                 .resolve_coalesced_miss(
+                    &backend_snapshot,
                     started_at,
                     &request,
                     &decoded,
@@ -1203,7 +2317,8 @@ impl ResolveQuery {
                 .await;
         }
 
-        self.resolve_upstream_and_finish(
+        self.resolve_backend_and_finish(
+            &backend_snapshot,
             started_at,
             &request,
             &decoded,
@@ -1218,6 +2333,7 @@ impl ResolveQuery {
     #[allow(clippy::too_many_arguments)]
     async fn resolve_coalesced_miss(
         &self,
+        backend_snapshot: &BackendSnapshot,
         started_at: SystemTime,
         request: &ResolveRequest,
         decoded: &DecodedQuery,
@@ -1228,18 +2344,19 @@ impl ResolveQuery {
         match self.miss_coalescer.begin(cache_key.clone()) {
             SingleFlightTicket::Leader { key, flight } => {
                 let guard = SingleFlightLeader::new(Arc::clone(&self.miss_coalescer), key, flight);
-                let upstream_result = self.resolve_upstream(decoded).await;
+                let backend_result = self.resolve_backend(backend_snapshot, decoded).await;
                 let (decision, response_bytes) = self
-                    .prepare_upstream_result(
+                    .prepare_backend_result(
                         request,
                         decoded,
                         question,
                         Some(cache_key),
                         true,
-                        upstream_result.clone(),
+                        backend_snapshot.mode,
+                        backend_result.clone(),
                     )
                     .await;
-                guard.complete(upstream_result);
+                guard.complete(backend_result);
                 self.finish(
                     started_at,
                     request,
@@ -1247,12 +2364,13 @@ impl ResolveQuery {
                     decision,
                     response_bytes,
                     event_cache_result,
+                    Some(QueryEventBackend::from_snapshot(backend_snapshot)),
                 )
                 .await
             }
             SingleFlightTicket::Follower { flight } => {
                 self.metrics.increment(ResolverMetric::CacheCoalescedMiss);
-                let upstream_result = flight.wait().await;
+                let backend_result = flight.wait().await;
                 if let Some(response_bytes) = self
                     .cache_hit_after_coalesced_miss(request, decoded, &cache_key)
                     .await
@@ -1270,10 +2388,12 @@ impl ResolveQuery {
                             decision,
                             response_bytes,
                             Some(QueryEventCacheResult::Hit),
+                            Some(QueryEventBackend::from_snapshot(backend_snapshot)),
                         )
                         .await;
                 }
-                self.finish_upstream_result(
+                self.finish_backend_result(
+                    backend_snapshot,
                     started_at,
                     request,
                     decoded,
@@ -1281,7 +2401,7 @@ impl ResolveQuery {
                     Some(cache_key),
                     false,
                     event_cache_result,
-                    upstream_result,
+                    backend_result,
                 )
                 .await
             }
@@ -1289,8 +2409,9 @@ impl ResolveQuery {
     }
 
     #[allow(clippy::too_many_arguments)]
-    async fn resolve_upstream_and_finish(
+    async fn resolve_backend_and_finish(
         &self,
+        backend_snapshot: &BackendSnapshot,
         started_at: SystemTime,
         request: &ResolveRequest,
         decoded: &DecodedQuery,
@@ -1299,8 +2420,9 @@ impl ResolveQuery {
         cache_store_allowed: bool,
         event_cache_result: Option<QueryEventCacheResult>,
     ) -> ResolveOutcome {
-        let upstream_result = self.resolve_upstream(decoded).await;
-        self.finish_upstream_result(
+        let backend_result = self.resolve_backend(backend_snapshot, decoded).await;
+        self.finish_backend_result(
+            backend_snapshot,
             started_at,
             request,
             decoded,
@@ -1308,23 +2430,39 @@ impl ResolveQuery {
             cache_key,
             cache_store_allowed,
             event_cache_result,
-            upstream_result,
+            backend_result,
         )
         .await
     }
 
-    async fn resolve_upstream(
+    async fn resolve_backend(
         &self,
+        backend_snapshot: &BackendSnapshot,
         decoded: &DecodedQuery,
-    ) -> Result<UpstreamResponse, UpstreamError> {
-        self.upstream
-            .resolve(UpstreamRequest {
-                query: decoded.clone(),
+    ) -> Result<ResolutionResponse, ResolutionBackendError> {
+        let query = if backend_snapshot.mode == ResolutionMode::Recursive {
+            backend_query_with_configured_udp_limit(
+                decoded,
+                self.protocol.configured_max_udp_payload_size(),
+            )
+        } else {
+            decoded.clone()
+        };
+        backend_snapshot
+            .backend
+            .resolve(ResolutionRequest {
+                query,
+                backend_generation: backend_snapshot.generation,
             })
             .await
     }
 
-    async fn probe_cache(&self, request: &ResolveRequest, decoded: &DecodedQuery) -> CacheProbe {
+    async fn probe_cache(
+        &self,
+        backend_snapshot: &BackendSnapshot,
+        request: &ResolveRequest,
+        decoded: &DecodedQuery,
+    ) -> CacheProbe {
         if !cache_supported(decoded) {
             self.metrics.increment(ResolverMetric::CacheBypass);
             self.metrics.increment(ResolverMetric::CacheMiss);
@@ -1338,7 +2476,7 @@ impl ResolveQuery {
 
         let key = CacheKey::from_query(
             decoded,
-            None,
+            backend_snapshot.cache_namespace.clone(),
             self.protocol.configured_max_udp_payload_size(),
         );
         let lookup = self
@@ -1423,6 +2561,9 @@ impl ResolveQuery {
             self.protocol
                 .serialize_cached_response(decoded, cached, request.received_at.0)?;
         self.metrics.increment(ResolverMetric::CacheHit);
+        if cached.negative_cache.is_some() {
+            self.metrics.increment(ResolverMetric::CacheNegativeHit);
+        }
         if response_is_truncated(&response_bytes) {
             self.metrics
                 .increment(ResolverMetric::CacheResponseTruncated);
@@ -1431,8 +2572,9 @@ impl ResolveQuery {
     }
 
     #[allow(clippy::too_many_arguments)]
-    async fn finish_upstream_result(
+    async fn finish_backend_result(
         &self,
+        backend_snapshot: &BackendSnapshot,
         started_at: SystemTime,
         request: &ResolveRequest,
         decoded: &DecodedQuery,
@@ -1440,16 +2582,17 @@ impl ResolveQuery {
         cache_key: Option<CacheKey>,
         cache_store_allowed: bool,
         event_cache_result: Option<QueryEventCacheResult>,
-        upstream_result: Result<UpstreamResponse, UpstreamError>,
+        backend_result: Result<ResolutionResponse, ResolutionBackendError>,
     ) -> ResolveOutcome {
         let (decision, response_bytes) = self
-            .prepare_upstream_result(
+            .prepare_backend_result(
                 request,
                 decoded,
                 question,
                 cache_key,
                 cache_store_allowed,
-                upstream_result,
+                backend_snapshot.mode,
+                backend_result,
             )
             .await;
         self.finish(
@@ -1459,21 +2602,28 @@ impl ResolveQuery {
             decision,
             response_bytes,
             event_cache_result,
+            Some(QueryEventBackend::from_snapshot(backend_snapshot)),
         )
         .await
     }
 
-    async fn prepare_upstream_result(
+    #[allow(clippy::too_many_arguments)]
+    async fn prepare_backend_result(
         &self,
         request: &ResolveRequest,
         decoded: &DecodedQuery,
         question: QuestionKey,
         cache_key: Option<CacheKey>,
         cache_store_allowed: bool,
-        upstream_result: Result<UpstreamResponse, UpstreamError>,
+        backend_mode: ResolutionMode,
+        backend_result: Result<ResolutionResponse, ResolutionBackendError>,
     ) -> (ResolveDecision, Vec<u8>) {
-        let Ok(response) = upstream_result else {
-            return self.upstream_failure_response(request, decoded, question);
+        let Ok(mut response) = backend_result else {
+            return self.backend_failure_response(request, decoded, question);
+        };
+
+        let Some(response_message) = validate_backend_response(&mut response, decoded) else {
+            return self.backend_failure_response(request, decoded, question);
         };
 
         self.metrics.increment(ResolverMetric::UpstreamSuccess);
@@ -1483,12 +2633,31 @@ impl ResolveQuery {
             .rewrite_response_id(&mut response_bytes, decoded.message.header.id)
             .is_err()
         {
-            return self.upstream_failure_response(request, decoded, decoded.question.clone());
+            return self.backend_failure_response(request, decoded, decoded.question.clone());
         }
 
         if let (true, Some(cache_key)) = (cache_store_allowed, cache_key) {
-            self.store_cache_response(cache_key, response_bytes.clone(), decoded, request)
+            if response.cache_directive.is_cacheable() {
+                self.store_cache_response(
+                    cache_key,
+                    response_bytes.clone(),
+                    &response_message,
+                    decoded,
+                    request,
+                )
                 .await;
+            } else {
+                self.metrics.increment(ResolverMetric::CacheStoreSkipped);
+            }
+        }
+
+        if backend_mode == ResolutionMode::Recursive
+            && decoded.message.response_exceeds_udp_payload(
+                response_bytes.len(),
+                self.protocol.configured_max_udp_payload_size(),
+            )
+        {
+            response_bytes = build_truncated_response(&decoded.message);
         }
 
         let decision = ResolveDecision {
@@ -1499,7 +2668,7 @@ impl ResolveQuery {
         (decision, response_bytes)
     }
 
-    fn upstream_failure_response(
+    fn backend_failure_response(
         &self,
         request: &ResolveRequest,
         decoded: &DecodedQuery,
@@ -1509,7 +2678,7 @@ impl ResolveQuery {
         let decision = ResolveDecision {
             client_ip: request.client_ip,
             question: Some(question),
-            kind: ResolveDecisionKind::UpstreamFailure,
+            kind: ResolveDecisionKind::BackendFailure,
         };
         let response_bytes = self.responses.servfail(Some(decoded));
         (decision, response_bytes)
@@ -1519,12 +2688,17 @@ impl ResolveQuery {
         &self,
         cache_key: CacheKey,
         response_bytes: Vec<u8>,
+        response: &Message,
         decoded: &DecodedQuery,
         request: &ResolveRequest,
     ) {
-        if let Some(store) =
-            self.cache_store_for_response(cache_key, response_bytes, decoded, request.received_at.0)
-        {
+        if let Some(store) = self.cache_store_for_response(
+            cache_key,
+            response_bytes,
+            response,
+            decoded,
+            request.received_at.0,
+        ) {
             if store.negative_cache.is_some() {
                 self.metrics.increment(ResolverMetric::CacheNegativeStore);
             }
@@ -1539,19 +2713,19 @@ impl ResolveQuery {
         &self,
         key: CacheKey,
         mut response_template: Vec<u8>,
+        response: &Message,
         query: &DecodedQuery,
         stored_at: SystemTime,
     ) -> Option<CacheStore> {
-        let response = Message::parse(&response_template).ok()?;
         if !response.header.qr()
             || response.questions.len() != 1
             || query.message.questions.len() != 1
-            || response.questions[0] != query.message.questions[0]
+            || QuestionKey::from_message(response)? != query.question
         {
             return None;
         }
-        let response_code = response_code(&response)?;
-        let (ttl, negative_cache) = self.ttl_policy.ttl_for_response(&response)?;
+        let response_code = response_code(response)?;
+        let (ttl, negative_cache) = self.ttl_policy.ttl_for_response(response)?;
         self.protocol
             .rewrite_response_id(&mut response_template, 0)
             .ok()?;
@@ -1566,6 +2740,7 @@ impl ResolveQuery {
         })
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn finish(
         &self,
         started_at: SystemTime,
@@ -1574,10 +2749,11 @@ impl ResolveQuery {
         decision: ResolveDecision,
         response_bytes: Vec<u8>,
         cache_result: Option<QueryEventCacheResult>,
+        backend: Option<QueryEventBackend>,
     ) -> ResolveOutcome {
         let finished_at = self.clock.now();
         let latency = finished_at.duration_since(started_at).ok();
-        let event = QueryEventV1::from_decision_context(
+        let mut event = QueryEventV1::from_decision_context(
             self.event_sequence.fetch_add(1, Ordering::Relaxed),
             finished_at,
             request.observed_source.clone(),
@@ -1587,7 +2763,9 @@ impl ResolveQuery {
             cache_result,
             latency,
         );
+        event.backend = backend;
         self.record_query_event(event);
+        self.metrics.record_backend_status(&self.backend.status());
         if let Some(duration) = latency {
             self.metrics
                 .observe_duration(ResolverMetric::QueryDuration, duration);
@@ -1626,7 +2804,7 @@ enum SingleFlightTicket {
 }
 
 struct InFlightMiss {
-    result: Mutex<Option<Result<UpstreamResponse, UpstreamError>>>,
+    result: Mutex<Option<Result<ResolutionResponse, ResolutionBackendError>>>,
     notify: Notify,
 }
 
@@ -1657,7 +2835,7 @@ impl SingleFlightMisses {
         &self,
         key: &CacheKey,
         flight: &Arc<InFlightMiss>,
-        result: Result<UpstreamResponse, UpstreamError>,
+        result: Result<ResolutionResponse, ResolutionBackendError>,
     ) {
         *flight.result.lock().unwrap() = Some(result);
         let mut flights = self.flights.lock().unwrap();
@@ -1683,7 +2861,7 @@ impl SingleFlightLeader {
         }
     }
 
-    fn complete(mut self, result: Result<UpstreamResponse, UpstreamError>) {
+    fn complete(mut self, result: Result<ResolutionResponse, ResolutionBackendError>) {
         self.coalescer.finish(&self.key, &self.flight, result);
         self.completed = true;
     }
@@ -1697,7 +2875,7 @@ impl Drop for SingleFlightLeader {
         self.coalescer.finish(
             &self.key,
             &self.flight,
-            Err(UpstreamError::Transport(
+            Err(ResolutionBackendError::Transport(
                 "single-flight leader cancelled".to_string(),
             )),
         );
@@ -1705,7 +2883,7 @@ impl Drop for SingleFlightLeader {
 }
 
 impl InFlightMiss {
-    async fn wait(&self) -> Result<UpstreamResponse, UpstreamError> {
+    async fn wait(&self) -> Result<ResolutionResponse, ResolutionBackendError> {
         loop {
             let notified = self.notify.notified();
             tokio::pin!(notified);
@@ -1889,10 +3067,81 @@ fn decoded_original_question_name(decoded: &DecodedQuery) -> Option<String> {
         .map(|question| question.qname.clone())
 }
 
-fn cache_supported(query: &DecodedQuery) -> bool {
-    if query.message.header.ad() || query.message.header.cd() {
-        return false;
+fn backend_cache_namespace(mode: ResolutionMode, backend_generation: u64) -> Option<String> {
+    Some(format!(
+        "mode:{};generation:{backend_generation}",
+        mode.cache_namespace_label()
+    ))
+}
+
+impl ResolutionMode {
+    fn cache_namespace_label(self) -> &'static str {
+        match self {
+            Self::Forward => "forward",
+            Self::Recursive => "recursive",
+        }
     }
+}
+
+fn validate_backend_response(
+    response: &mut ResolutionResponse,
+    query: &DecodedQuery,
+) -> Option<Message> {
+    if let Some(message) = response.response_message.take() {
+        validate_backend_response_message(&message, query)?;
+        if message.original_bytes.as_ref() != response.bytes.as_slice() {
+            return None;
+        }
+        return Some(message);
+    }
+
+    validate_backend_response_bytes(&response.bytes, query)
+}
+
+fn validate_backend_response_message<'a>(
+    response: &'a Message,
+    query: &DecodedQuery,
+) -> Option<&'a Message> {
+    if !response.header.qr() || response.questions.len() != 1 {
+        return None;
+    }
+    if QuestionKey::from_message(response)? != query.question {
+        return None;
+    }
+    Some(response)
+}
+
+fn validate_backend_response_bytes(bytes: &[u8], query: &DecodedQuery) -> Option<Message> {
+    let response = Message::parse(bytes).ok()?;
+    validate_backend_response_message(&response, query)?;
+    Some(response)
+}
+
+fn backend_query_with_configured_udp_limit(
+    query: &DecodedQuery,
+    configured_max_udp_payload_size: usize,
+) -> DecodedQuery {
+    let mut query = query.clone();
+    let bounded_payload = query
+        .message
+        .effective_udp_payload_size(configured_max_udp_payload_size)
+        .min(u16::MAX as usize) as u16;
+    let Some(edns) = query.message.edns.as_mut() else {
+        return query;
+    };
+    edns.udp_payload_size = bounded_payload;
+    query.features.edns_udp_payload_size = Some(bounded_payload);
+    for record in &mut query.message.additionals {
+        let RecordData::OPT(opt) = &mut record.record else {
+            continue;
+        };
+        record.rclass = bounded_payload;
+        opt.udp_payload_size = bounded_payload;
+    }
+    query
+}
+
+fn cache_supported(query: &DecodedQuery) -> bool {
     query
         .message
         .edns
@@ -3089,11 +4338,279 @@ impl DnsCache for InMemoryDnsCache {
     }
 }
 
-pub trait UpstreamResolver: Send + Sync {
+pub trait ResolutionBackend: Send + Sync {
     fn resolve<'a>(
         &'a self,
-        request: UpstreamRequest,
-    ) -> BoxFuture<'a, Result<UpstreamResponse, UpstreamError>>;
+        request: ResolutionRequest,
+    ) -> BoxFuture<'a, Result<ResolutionResponse, ResolutionBackendError>>;
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RecursiveRootHint {
+    pub name: String,
+    pub endpoints: Vec<SocketAddr>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RecursiveResolverConfig {
+    pub root_hints: Vec<RecursiveRootHint>,
+    pub per_authority_timeout: Duration,
+    pub per_query_deadline: Duration,
+    pub max_recursion_depth: u8,
+    pub max_cname_restarts: u8,
+}
+
+pub trait RecursiveAuthorityTransport: Send + Sync {
+    fn query<'a>(
+        &'a self,
+        authority: SocketAddr,
+        question: QuestionKey,
+        dnssec_ok: bool,
+        timeout: Duration,
+    ) -> BoxFuture<'a, Result<RecursiveAuthorityResponse, ResolutionBackendError>>;
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RecursiveAuthorityResponse {
+    pub bytes: Vec<u8>,
+    pub message: Message,
+}
+
+impl RecursiveAuthorityResponse {
+    pub fn new(bytes: Vec<u8>, message: Message) -> Result<Self, ResolutionBackendError> {
+        if message.original_bytes.as_ref() != bytes.as_slice() {
+            return Err(ResolutionBackendError::MalformedResponse);
+        }
+        Ok(Self { bytes, message })
+    }
+}
+
+pub struct RecursiveResolutionBackend {
+    config: RecursiveResolverConfig,
+    transport: Arc<dyn RecursiveAuthorityTransport>,
+    metrics: Option<Arc<dyn MetricsSink>>,
+}
+
+impl RecursiveResolutionBackend {
+    pub fn new(
+        config: RecursiveResolverConfig,
+        transport: Arc<dyn RecursiveAuthorityTransport>,
+    ) -> Self {
+        Self {
+            config,
+            transport,
+            metrics: None,
+        }
+    }
+
+    pub fn with_metrics(
+        config: RecursiveResolverConfig,
+        transport: Arc<dyn RecursiveAuthorityTransport>,
+        metrics: Arc<dyn MetricsSink>,
+    ) -> Self {
+        Self {
+            config,
+            transport,
+            metrics: Some(metrics),
+        }
+    }
+
+    fn increment_metric(&self, metric: ResolverMetric) {
+        if let Some(metrics) = &self.metrics {
+            metrics.increment(metric);
+        }
+    }
+
+    fn observe_metric(&self, metric: ResolverMetric, duration: Duration) {
+        if let Some(metrics) = &self.metrics {
+            metrics.observe_duration(metric, duration);
+        }
+    }
+
+    async fn resolve_iterative(
+        &self,
+        request: ResolutionRequest,
+    ) -> Result<ResolutionResponse, ResolutionBackendError> {
+        if self.config.root_hints.is_empty() {
+            self.increment_metric(ResolverMetric::RecursiveLimitHit);
+            return Err(ResolutionBackendError::NoBackendsAvailable);
+        }
+
+        let mut question = request.query.question.clone();
+        let mut authorities = self.root_authorities();
+        let mut seen_referrals = HashSet::new();
+        let mut seen_cnames = HashSet::from([question.qname.clone()]);
+        let mut cname_chain = Vec::new();
+        let mut cname_restarts = 0u8;
+        let query_deadline = Instant::now() + self.config.per_query_deadline;
+
+        for _ in 0..self.config.max_recursion_depth {
+            if authorities.is_empty() {
+                self.increment_metric(ResolverMetric::RecursiveLimitHit);
+                return Err(ResolutionBackendError::NoBackendsAvailable);
+            }
+            let mut last_error = None;
+            let mut next_authorities = None;
+
+            for authority in authorities.iter().copied() {
+                let Some(remaining) = query_deadline.checked_duration_since(Instant::now()) else {
+                    self.increment_metric(ResolverMetric::RecursiveAuthorityTimeout);
+                    return Err(ResolutionBackendError::Timeout);
+                };
+                if remaining.is_zero() {
+                    self.increment_metric(ResolverMetric::RecursiveAuthorityTimeout);
+                    return Err(ResolutionBackendError::Timeout);
+                }
+                let attempt_timeout = remaining.min(self.config.per_authority_timeout);
+                self.increment_metric(ResolverMetric::RecursiveAuthorityAttempt);
+                let response = match time::timeout(
+                    attempt_timeout,
+                    self.transport.query(
+                        authority,
+                        question.clone(),
+                        request.query.features.dnssec_ok,
+                        attempt_timeout,
+                    ),
+                )
+                .await
+                {
+                    Ok(Ok(response)) => response,
+                    Ok(Err(error)) => {
+                        if error == ResolutionBackendError::Timeout {
+                            self.increment_metric(ResolverMetric::RecursiveAuthorityTimeout);
+                        } else {
+                            self.increment_metric(ResolverMetric::RecursiveAuthorityError);
+                        }
+                        last_error = Some(error);
+                        continue;
+                    }
+                    Err(_) => {
+                        self.increment_metric(ResolverMetric::RecursiveAuthorityTimeout);
+                        last_error = Some(ResolutionBackendError::Timeout);
+                        continue;
+                    }
+                };
+                let message = &response.message;
+                if let Some(error) = authority_response_error(message, &question) {
+                    self.increment_metric(ResolverMetric::RecursiveAuthorityError);
+                    last_error = Some(error);
+                    continue;
+                }
+
+                if (message.header.aa() && has_requested_answer_for(message, &question))
+                    || is_negative_answer(message)
+                {
+                    return ResolutionResponse::recursive_response(
+                        &request.query,
+                        response,
+                        &cname_chain,
+                        SystemTime::now(),
+                        request.backend_generation,
+                        authority,
+                    );
+                }
+
+                if message.header.aa() {
+                    if let Some(cname_record) = cname_record_for(message, &question) {
+                        let RecordData::CNAME(cname_target) = &cname_record.record else {
+                            unreachable!();
+                        };
+                        let target_question =
+                            QuestionKey::new(cname_target, question.qtype, question.qclass);
+                        if has_requested_answer_for(message, &target_question) {
+                            return ResolutionResponse::recursive_response(
+                                &request.query,
+                                response,
+                                &cname_chain,
+                                SystemTime::now(),
+                                request.backend_generation,
+                                authority,
+                            );
+                        }
+                        let next_name = normalize_question_name(cname_target);
+                        if cname_restarts >= self.config.max_cname_restarts
+                            || !seen_cnames.insert(next_name)
+                        {
+                            self.increment_metric(ResolverMetric::RecursiveLimitHit);
+                            return Err(ResolutionBackendError::NoBackendsAvailable);
+                        }
+                        cname_chain.extend(cname_chain_records(
+                            message,
+                            cname_record,
+                            request.query.features.dnssec_ok,
+                        ));
+                        cname_restarts = cname_restarts.saturating_add(1);
+                        question = QuestionKey::new(cname_target, question.qtype, question.qclass);
+                        seen_referrals.clear();
+                        next_authorities = Some(self.root_authorities());
+                        break;
+                    }
+                }
+
+                let Some(referral) = referral_authorities(message, &question) else {
+                    if has_delegation_for_question(message, &question) {
+                        self.increment_metric(ResolverMetric::RecursiveBailiwickReject);
+                    } else {
+                        self.increment_metric(ResolverMetric::RecursiveLameDelegation);
+                    }
+                    last_error = Some(ResolutionBackendError::NoBackendsAvailable);
+                    continue;
+                };
+                let referral_key = referral_loop_key(&referral);
+                if !seen_referrals.insert(referral_key) {
+                    self.increment_metric(ResolverMetric::RecursiveReferralLoop);
+                    return Err(ResolutionBackendError::NoBackendsAvailable);
+                }
+                next_authorities = Some(referral.endpoints);
+                break;
+            }
+
+            if let Some(next) = next_authorities {
+                authorities = next;
+            } else if let Some(error) = last_error {
+                return Err(error);
+            } else {
+                return Err(ResolutionBackendError::NoBackendsAvailable);
+            }
+        }
+
+        self.increment_metric(ResolverMetric::RecursiveLimitHit);
+        Err(ResolutionBackendError::NoBackendsAvailable)
+    }
+
+    fn root_authorities(&self) -> Vec<SocketAddr> {
+        self.config
+            .root_hints
+            .iter()
+            .flat_map(|hint| hint.endpoints.iter().copied())
+            .collect()
+    }
+}
+
+fn referral_loop_key(referral: &ReferralAuthorities) -> String {
+    let mut endpoints = referral.endpoints.clone();
+    endpoints.sort_unstable();
+    let endpoints = endpoints
+        .iter()
+        .map(SocketAddr::to_string)
+        .collect::<Vec<_>>()
+        .join(",");
+    format!("{}|{endpoints}", referral.owner)
+}
+
+impl ResolutionBackend for RecursiveResolutionBackend {
+    fn resolve<'a>(
+        &'a self,
+        request: ResolutionRequest,
+    ) -> BoxFuture<'a, Result<ResolutionResponse, ResolutionBackendError>> {
+        Box::pin(async move {
+            self.increment_metric(ResolverMetric::RecursiveQuery);
+            let started = Instant::now();
+            let result = self.resolve_iterative(request).await;
+            self.observe_metric(ResolverMetric::RecursiveQueryDuration, started.elapsed());
+            result
+        })
+    }
 }
 
 pub trait ResponseFactory: Send + Sync {
@@ -3125,6 +4642,16 @@ pub trait MetricsSink: Send + Sync {
     fn increment(&self, metric: ResolverMetric);
 
     fn observe_duration(&self, metric: ResolverMetric, duration: Duration);
+
+    fn record_backend_status(&self, _status: &BackendStatus) {}
+}
+
+pub struct NoopMetricsSink;
+
+impl MetricsSink for NoopMetricsSink {
+    fn increment(&self, _metric: ResolverMetric) {}
+
+    fn observe_duration(&self, _metric: ResolverMetric, _duration: Duration) {}
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -3140,6 +4667,7 @@ pub enum ResolverMetric {
     CacheStore,
     CacheStoreSkipped,
     CacheNegativeStore,
+    CacheNegativeHit,
     CacheResponseTruncated,
     CacheCoalescedMiss,
     QueryEventAccepted,
@@ -3149,7 +4677,20 @@ pub enum ResolverMetric {
     QueryEventSampled,
     UpstreamSuccess,
     UpstreamFailure,
+    RecursiveQuery,
+    RecursiveAuthorityAttempt,
+    RecursiveAuthorityTimeout,
+    RecursiveAuthorityError,
+    RecursiveBailiwickReject,
+    RecursiveLameDelegation,
+    RecursiveReferralLoop,
+    RecursiveLimitHit,
+    RecursiveTcpFallbackAttempt,
+    RecursiveTcpFallbackSuccess,
+    RecursiveTcpFallbackFailure,
+    RecursiveTcpFallbackTimeout,
     QueryDuration,
+    RecursiveQueryDuration,
     ProtocolError,
 }
 
@@ -3160,9 +4701,15 @@ mod tests {
     use std::sync::Mutex;
     use std::thread;
 
-    use crate::protocol::{build_a_block_response, question_wire, Header, Question, Record};
+    use crate::protocol::{
+        build_a_block_response, question_wire, EdnsInfo, Header, Question, Record,
+    };
 
     fn a_query(id: u16, name: &str) -> Vec<u8> {
+        query(id, name, 1, 1)
+    }
+
+    fn query(id: u16, name: &str, qtype: u16, qclass: u16) -> Vec<u8> {
         let mut bytes = Vec::new();
         bytes.extend_from_slice(&id.to_be_bytes());
         bytes.extend_from_slice(&0x0100u16.to_be_bytes());
@@ -3175,8 +4722,8 @@ mod tests {
             bytes.extend_from_slice(label.as_bytes());
         }
         bytes.push(0);
-        bytes.extend_from_slice(&1u16.to_be_bytes());
-        bytes.extend_from_slice(&1u16.to_be_bytes());
+        bytes.extend_from_slice(&qtype.to_be_bytes());
+        bytes.extend_from_slice(&qclass.to_be_bytes());
         bytes
     }
 
@@ -3189,6 +4736,13 @@ mod tests {
     fn a_query_with_checking_disabled(id: u16, name: &str) -> Vec<u8> {
         let mut bytes = a_query(id, name);
         let flags = u16::from_be_bytes([bytes[2], bytes[3]]) | 0x0010;
+        bytes[2..4].copy_from_slice(&flags.to_be_bytes());
+        bytes
+    }
+
+    fn a_query_with_authenticated_data(id: u16, name: &str) -> Vec<u8> {
+        let mut bytes = a_query(id, name);
+        let flags = u16::from_be_bytes([bytes[2], bytes[3]]) | 0x0020;
         bytes[2..4].copy_from_slice(&flags.to_be_bytes());
         bytes
     }
@@ -4680,6 +6234,7 @@ mod tests {
     struct RecordingMetrics {
         increments: Mutex<Vec<ResolverMetric>>,
         durations: Mutex<Vec<(ResolverMetric, Duration)>>,
+        backend_statuses: Mutex<Vec<BackendStatus>>,
     }
 
     impl MetricsSink for RecordingMetrics {
@@ -4689,6 +6244,10 @@ mod tests {
 
         fn observe_duration(&self, metric: ResolverMetric, duration: Duration) {
             self.durations.lock().unwrap().push((metric, duration));
+        }
+
+        fn record_backend_status(&self, status: &BackendStatus) {
+            self.backend_statuses.lock().unwrap().push(status.clone());
         }
     }
 
@@ -4771,7 +6330,7 @@ mod tests {
         }
     }
 
-    impl UpstreamResolver for StaticUpstream {
+    impl ResolutionBackend for StaticUpstream {
         fn resolve<'a>(
             &'a self,
             request: UpstreamRequest,
@@ -4779,6 +6338,76 @@ mod tests {
             Box::pin(async move {
                 self.requests.lock().unwrap().push(request);
                 self.response.clone()
+            })
+        }
+    }
+
+    struct ScriptedAuthorityTransport {
+        responses: Mutex<VecDeque<Result<RecursiveAuthorityResponse, ResolutionBackendError>>>,
+        requests: Mutex<Vec<(SocketAddr, QuestionKey, bool)>>,
+        timeouts: Mutex<Vec<Duration>>,
+    }
+
+    impl ScriptedAuthorityTransport {
+        fn new(
+            responses: impl IntoIterator<Item = Result<Message, ResolutionBackendError>>,
+        ) -> Self {
+            Self {
+                responses: Mutex::new(
+                    responses
+                        .into_iter()
+                        .map(|response| {
+                            response.and_then(|message| {
+                                RecursiveAuthorityResponse::new(
+                                    message.original_bytes.to_vec(),
+                                    message,
+                                )
+                            })
+                        })
+                        .collect(),
+                ),
+                requests: Mutex::new(Vec::new()),
+                timeouts: Mutex::new(Vec::new()),
+            }
+        }
+    }
+
+    impl RecursiveAuthorityTransport for ScriptedAuthorityTransport {
+        fn query<'a>(
+            &'a self,
+            authority: SocketAddr,
+            question: QuestionKey,
+            dnssec_ok: bool,
+            timeout: Duration,
+        ) -> BoxFuture<'a, Result<RecursiveAuthorityResponse, ResolutionBackendError>> {
+            Box::pin(async move {
+                self.requests
+                    .lock()
+                    .unwrap()
+                    .push((authority, question, dnssec_ok));
+                self.timeouts.lock().unwrap().push(timeout);
+                self.responses
+                    .lock()
+                    .unwrap()
+                    .pop_front()
+                    .unwrap_or(Err(ResolutionBackendError::NoBackendsAvailable))
+            })
+        }
+    }
+
+    struct HangingAuthorityTransport;
+
+    impl RecursiveAuthorityTransport for HangingAuthorityTransport {
+        fn query<'a>(
+            &'a self,
+            _authority: SocketAddr,
+            _question: QuestionKey,
+            _dnssec_ok: bool,
+            _timeout: Duration,
+        ) -> BoxFuture<'a, Result<RecursiveAuthorityResponse, ResolutionBackendError>> {
+            Box::pin(async move {
+                std::future::pending::<Result<RecursiveAuthorityResponse, ResolutionBackendError>>()
+                    .await
             })
         }
     }
@@ -4809,7 +6438,7 @@ mod tests {
         }
     }
 
-    impl UpstreamResolver for BlockingUpstream {
+    impl ResolutionBackend for BlockingUpstream {
         fn resolve<'a>(
             &'a self,
             request: UpstreamRequest,
@@ -4869,7 +6498,7 @@ mod tests {
     }
 
     fn resolve_service_with_cache(
-        upstream: Arc<dyn UpstreamResolver>,
+        upstream: Arc<dyn ResolutionBackend>,
         cache: Arc<dyn DnsCache>,
         events: Arc<RecordingEvents>,
         metrics: Arc<RecordingMetrics>,
@@ -4892,15 +6521,1701 @@ mod tests {
         build_a_block_response(&query, "192.0.2.10".parse().unwrap(), ttl)
     }
 
+    fn upstream_response(bytes: Vec<u8>) -> UpstreamResponse {
+        UpstreamResponse::forwarded_bytes(bytes, SystemTime::UNIX_EPOCH, 0, "test-forwarder")
+    }
+
+    fn recursive_backend(transport: Arc<ScriptedAuthorityTransport>) -> RecursiveResolutionBackend {
+        recursive_backend_with_root_endpoints(
+            transport,
+            vec!["198.51.100.53:53".parse().unwrap()],
+            8,
+        )
+    }
+
+    fn recursive_backend_with_root_endpoints(
+        transport: Arc<ScriptedAuthorityTransport>,
+        endpoints: Vec<SocketAddr>,
+        max_recursion_depth: u8,
+    ) -> RecursiveResolutionBackend {
+        recursive_backend_with_timing(
+            transport,
+            endpoints,
+            Duration::from_millis(500),
+            Duration::from_secs(2),
+            max_recursion_depth,
+        )
+    }
+
+    fn recursive_backend_with_timing(
+        transport: Arc<ScriptedAuthorityTransport>,
+        endpoints: Vec<SocketAddr>,
+        per_authority_timeout: Duration,
+        per_query_deadline: Duration,
+        max_recursion_depth: u8,
+    ) -> RecursiveResolutionBackend {
+        RecursiveResolutionBackend::new(
+            RecursiveResolverConfig {
+                root_hints: vec![RecursiveRootHint {
+                    name: "a.root-servers.example".to_string(),
+                    endpoints,
+                }],
+                per_authority_timeout,
+                per_query_deadline,
+                max_recursion_depth,
+                max_cname_restarts: 4,
+            },
+            transport,
+        )
+    }
+
+    fn recursive_request(name: &str) -> ResolutionRequest {
+        recursive_request_from_bytes(a_query(0x1234, name))
+    }
+
+    fn recursive_request_from_bytes(bytes: Vec<u8>) -> ResolutionRequest {
+        let query = StandardProtocolCodec::new(1232)
+            .decode_query(&bytes)
+            .unwrap();
+        ResolutionRequest {
+            query,
+            backend_generation: 7,
+        }
+    }
+
+    #[tokio::test]
+    async fn recursive_backend_returns_authoritative_answer() {
+        let question = QuestionKey::new("example.com", 1, 1);
+        let transport = Arc::new(ScriptedAuthorityTransport::new([Ok(
+            response_message_for_question(
+                question.clone(),
+                ResponseCode::NoError,
+                vec![a_record("example.com", 60)],
+                Vec::new(),
+                Vec::new(),
+                true,
+            ),
+        )]));
+        let backend = recursive_backend(transport.clone());
+
+        let response = backend
+            .resolve(recursive_request("example.com"))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            response.source_credibility,
+            SourceCredibility::Authoritative
+        );
+        assert_eq!(response.backend_provenance.mode, ResolutionMode::Recursive);
+        assert_eq!(response.backend_provenance.generation, 7);
+        assert_eq!(response.final_question, Some(question.clone()));
+        assert_eq!(response.answers().len(), 1);
+        assert_eq!(
+            transport.requests.lock().unwrap().as_slice(),
+            &[("198.51.100.53:53".parse().unwrap(), question, false)]
+        );
+    }
+
+    #[tokio::test]
+    async fn recursive_backend_rewrites_authority_response_id() {
+        let question = QuestionKey::new("example.com", 1, 1);
+        let transport = Arc::new(ScriptedAuthorityTransport::new([Ok(
+            response_message_for_question_with_id(
+                0xbeef,
+                question.clone(),
+                ResponseCode::NoError,
+                vec![a_record("example.com", 60)],
+                Vec::new(),
+                Vec::new(),
+                true,
+            ),
+        )]));
+        let backend = recursive_backend(transport);
+
+        let response = backend
+            .resolve(recursive_request("example.com"))
+            .await
+            .unwrap();
+
+        assert_eq!(&response.bytes[0..2], &[0x12, 0x34]);
+        assert_eq!(
+            response
+                .response_message
+                .as_ref()
+                .map(|message| message.header.id),
+            Some(0x1234)
+        );
+    }
+
+    #[tokio::test]
+    async fn recursive_backend_filters_unsupported_records_from_synthesized_response() {
+        let question = QuestionKey::new("example.com", 1, 1);
+        let transport = Arc::new(ScriptedAuthorityTransport::new([Ok(
+            response_message_for_question(
+                question,
+                ResponseCode::NoError,
+                vec![
+                    a_record("example.com", 60),
+                    rrsig_record("example.com", 60, 1),
+                ],
+                Vec::new(),
+                vec![opt_record(1232)],
+                true,
+            ),
+        )]));
+        let backend = recursive_backend(transport);
+
+        let response = backend
+            .resolve(recursive_request("example.com"))
+            .await
+            .unwrap();
+
+        let message = response.response_message.as_ref().unwrap();
+        assert_eq!(message.answers.len(), 1);
+        assert!(message.additionals.is_empty());
+    }
+
+    #[tokio::test]
+    async fn recursive_backend_preserves_supported_non_address_answers() {
+        let question = QuestionKey::new("example.com", 15, 1);
+        let transport = Arc::new(ScriptedAuthorityTransport::new([Ok(
+            response_message_for_question(
+                question,
+                ResponseCode::NoError,
+                vec![mx_record("example.com", 60, "mail.example.com")],
+                Vec::new(),
+                Vec::new(),
+                true,
+            ),
+        )]));
+        let backend = recursive_backend(transport);
+
+        let response = backend
+            .resolve(recursive_request_from_bytes(query(
+                0x1234,
+                "example.com",
+                15,
+                1,
+            )))
+            .await
+            .unwrap();
+
+        let answers = response.answers();
+        assert_eq!(answers.len(), 1);
+        assert!(matches!(answers[0].record, RecordData::MX { .. }));
+    }
+
+    #[tokio::test]
+    async fn recursive_backend_preserves_txt_answers() {
+        let question = QuestionKey::new("example.com", 16, 1);
+        let transport = Arc::new(ScriptedAuthorityTransport::new([Ok(
+            response_message_for_question(
+                question,
+                ResponseCode::NoError,
+                vec![txt_record("example.com", 60, "v=spf1 -all")],
+                Vec::new(),
+                Vec::new(),
+                true,
+            ),
+        )]));
+        let backend = recursive_backend(transport);
+
+        let response = backend
+            .resolve(recursive_request_from_bytes(query(
+                0x1234,
+                "example.com",
+                16,
+                1,
+            )))
+            .await
+            .unwrap();
+
+        let answers = response.answers();
+        assert_eq!(answers.len(), 1);
+        assert!(matches!(answers[0].record, RecordData::TXT(_)));
+    }
+
+    #[tokio::test]
+    async fn recursive_backend_returns_requested_dnssec_type_without_do() {
+        let question = QuestionKey::new("example.com", DNSKEY_RECORD_TYPE, 1);
+        let transport = Arc::new(ScriptedAuthorityTransport::new([Ok(
+            response_message_for_question(
+                question,
+                ResponseCode::NoError,
+                vec![dnskey_record("example.com", 60)],
+                Vec::new(),
+                Vec::new(),
+                true,
+            ),
+        )]));
+        let backend = recursive_backend(transport);
+
+        let response = backend
+            .resolve(recursive_request_from_bytes(query(
+                0x1234,
+                "example.com",
+                DNSKEY_RECORD_TYPE,
+                1,
+            )))
+            .await
+            .unwrap();
+
+        let answers = response.answers();
+        assert_eq!(answers.len(), 1);
+        assert!(matches!(answers[0].record, RecordData::DNSKEY { .. }));
+    }
+
+    #[tokio::test]
+    async fn recursive_backend_returns_requested_dnssec_type_after_cname_without_do() {
+        let first = QuestionKey::new("alias.example.com", DNSKEY_RECORD_TYPE, 1);
+        let second = QuestionKey::new("target.example.com", DNSKEY_RECORD_TYPE, 1);
+        let transport = Arc::new(ScriptedAuthorityTransport::new([
+            Ok(response_message_for_question(
+                first.clone(),
+                ResponseCode::NoError,
+                vec![cname_record("alias.example.com", 60, "target.example.com")],
+                Vec::new(),
+                Vec::new(),
+                true,
+            )),
+            Ok(response_message_for_question(
+                second,
+                ResponseCode::NoError,
+                vec![dnskey_record("target.example.com", 60)],
+                Vec::new(),
+                Vec::new(),
+                true,
+            )),
+        ]));
+        let backend = recursive_backend(transport);
+
+        let response = backend
+            .resolve(recursive_request_from_bytes(query(
+                0x1234,
+                "alias.example.com",
+                DNSKEY_RECORD_TYPE,
+                1,
+            )))
+            .await
+            .unwrap();
+
+        let answers = response.answers();
+        assert_eq!(answers.len(), 2);
+        assert_eq!(answers[0].rtype, CNAME_RECORD_TYPE);
+        assert!(matches!(answers[1].record, RecordData::DNSKEY { .. }));
+    }
+
+    #[tokio::test]
+    async fn recursive_backend_propagates_do_and_returns_dnssec_records_when_requested() {
+        let question = QuestionKey::new("example.com", 1, 1);
+        let transport = Arc::new(ScriptedAuthorityTransport::new([Ok(
+            response_message_for_question(
+                question.clone(),
+                ResponseCode::NoError,
+                vec![
+                    a_record("example.com", 60),
+                    rrsig_record("example.com", 60, 1),
+                ],
+                Vec::new(),
+                Vec::new(),
+                true,
+            ),
+        )]));
+        let backend = recursive_backend(transport.clone());
+
+        let response = backend
+            .resolve(recursive_request_from_bytes(a_query_with_edns(
+                0x1234,
+                "example.com",
+                1232,
+                true,
+            )))
+            .await
+            .unwrap();
+
+        let message = response.response_message.as_ref().unwrap();
+        assert_eq!(message.answers.len(), 2);
+        assert!(!message.header.aa());
+        assert!(message.edns.as_ref().is_some_and(|edns| edns.dnssec_ok));
+        let requests = transport.requests.lock().unwrap();
+        assert_eq!(
+            requests.as_slice(),
+            &[("198.51.100.53:53".parse().unwrap(), question, true)]
+        );
+    }
+
+    #[tokio::test]
+    async fn recursive_backend_preserves_oversized_response_for_resolver_boundary() {
+        let question = QuestionKey::new("example.com", 1, 1);
+        let answers = (0..40)
+            .map(|_| a_record("example.com", 60))
+            .collect::<Vec<_>>();
+        let transport = Arc::new(ScriptedAuthorityTransport::new([Ok(
+            response_message_for_question(
+                question,
+                ResponseCode::NoError,
+                answers,
+                Vec::new(),
+                Vec::new(),
+                true,
+            ),
+        )]));
+        let backend = recursive_backend(transport);
+
+        let response = backend
+            .resolve(recursive_request("example.com"))
+            .await
+            .unwrap();
+
+        let message = response.response_message.as_ref().unwrap();
+        assert!(!message.header.tc());
+        assert_eq!(message.answers.len(), 40);
+    }
+
+    #[tokio::test]
+    async fn recursive_backend_filters_raw_dnssec_records_without_do() {
+        let question = QuestionKey::new("example.com", 1, 1);
+        let raw_dnssec_record = unknown_record("example.com", 59, 60, &[1, 2, 3, 4]);
+        let transport = Arc::new(ScriptedAuthorityTransport::new([
+            Ok(response_message_for_question(
+                question.clone(),
+                ResponseCode::NoError,
+                vec![a_record("example.com", 60), raw_dnssec_record.clone()],
+                Vec::new(),
+                Vec::new(),
+                true,
+            )),
+            Ok(response_message_for_question(
+                question,
+                ResponseCode::NoError,
+                vec![a_record("example.com", 60), raw_dnssec_record],
+                Vec::new(),
+                Vec::new(),
+                true,
+            )),
+        ]));
+        let backend = recursive_backend(transport);
+
+        let without_do = backend
+            .resolve(recursive_request("example.com"))
+            .await
+            .unwrap();
+        assert_eq!(
+            without_do.response_message.as_ref().unwrap().answers.len(),
+            1
+        );
+
+        let with_do = backend
+            .resolve(recursive_request_from_bytes(a_query_with_edns(
+                0x1234,
+                "example.com",
+                1232,
+                true,
+            )))
+            .await
+            .unwrap();
+        let answers = &with_do.response_message.as_ref().unwrap().answers;
+        assert_eq!(answers.len(), 2);
+        assert_eq!(answers[1].rtype, 59);
+    }
+
+    #[tokio::test]
+    async fn recursive_backend_preserves_nsec3_records_when_do_requested() {
+        let question = QuestionKey::new("missing.example.com", 1, 1);
+        let transport = Arc::new(ScriptedAuthorityTransport::new([Ok(
+            response_message_for_question(
+                question,
+                ResponseCode::NoError,
+                Vec::new(),
+                vec![
+                    soa_record("example.com", 60, 60),
+                    nsec3_record("example.com", 60),
+                ],
+                Vec::new(),
+                true,
+            ),
+        )]));
+        let backend = recursive_backend(transport);
+
+        let response = backend
+            .resolve(recursive_request_from_bytes(a_query_with_edns(
+                0x1234,
+                "missing.example.com",
+                1232,
+                true,
+            )))
+            .await
+            .unwrap();
+
+        let authorities = response.authorities();
+        assert_eq!(authorities.len(), 2);
+        assert!(matches!(authorities[1].record, RecordData::NSEC3 { .. }));
+    }
+
+    #[tokio::test]
+    async fn recursive_backend_preserves_cname_dnssec_records_when_restarting() {
+        let first = QuestionKey::new("alias.example.com", 1, 1);
+        let second = QuestionKey::new("target.example.com", 1, 1);
+        let transport = Arc::new(ScriptedAuthorityTransport::new([
+            Ok(response_message_for_question(
+                first.clone(),
+                ResponseCode::NoError,
+                vec![
+                    cname_record("alias.example.com", 60, "target.example.com"),
+                    rrsig_record("alias.example.com", 60, CNAME_RECORD_TYPE),
+                ],
+                Vec::new(),
+                Vec::new(),
+                true,
+            )),
+            Ok(response_message_for_question(
+                second,
+                ResponseCode::NoError,
+                vec![a_record("target.example.com", 60)],
+                Vec::new(),
+                Vec::new(),
+                true,
+            )),
+        ]));
+        let backend = recursive_backend(transport);
+
+        let response = backend
+            .resolve(recursive_request_from_bytes(a_query_with_edns(
+                0x1234,
+                "alias.example.com",
+                1232,
+                true,
+            )))
+            .await
+            .unwrap();
+
+        let answers = response.answers();
+        assert_eq!(answers.len(), 3);
+        assert_eq!(answers[0].rtype, CNAME_RECORD_TYPE);
+        assert!(matches!(
+            answers[1].record,
+            RecordData::RRSIG {
+                type_covered: CNAME_RECORD_TYPE,
+                ..
+            }
+        ));
+        assert_eq!(answers[2].rtype, 1);
+    }
+
+    #[tokio::test]
+    async fn recursive_backend_clears_dnssec_validation_flags_while_disabled() {
+        let question = QuestionKey::new("example.com", 1, 1);
+        let transport = Arc::new(ScriptedAuthorityTransport::new([Ok(
+            response_message_for_question_with_extra_flags(
+                question,
+                ResponseCode::NoError,
+                vec![a_record("example.com", 60)],
+                Vec::new(),
+                Vec::new(),
+                true,
+                0x0030,
+            ),
+        )]));
+        let backend = recursive_backend(transport);
+
+        let response = backend
+            .resolve(recursive_request_from_bytes(
+                a_query_with_checking_disabled(0x1234, "example.com"),
+            ))
+            .await
+            .unwrap();
+
+        let message = response.response_message.as_ref().unwrap();
+        assert!(!message.header.ad());
+        assert!(!message.header.cd());
+    }
+
+    #[tokio::test]
+    async fn recursive_backend_follows_referral_with_glue() {
+        let question = QuestionKey::new("www.example.com", 1, 1);
+        let referred = "203.0.113.10:53".parse().unwrap();
+        let transport = Arc::new(ScriptedAuthorityTransport::new([
+            Ok(response_message_for_question(
+                question.clone(),
+                ResponseCode::NoError,
+                Vec::new(),
+                vec![ns_record("example.com", 300, "ns1.example.com")],
+                vec![glue_a_record(
+                    "ns1.example.com",
+                    300,
+                    "203.0.113.10".parse().unwrap(),
+                )],
+                false,
+            )),
+            Ok(response_message_for_question(
+                question.clone(),
+                ResponseCode::NoError,
+                vec![a_record("www.example.com", 60)],
+                Vec::new(),
+                Vec::new(),
+                true,
+            )),
+        ]));
+        let backend = recursive_backend(transport.clone());
+
+        let response = backend
+            .resolve(recursive_request("www.example.com"))
+            .await
+            .unwrap();
+
+        assert_eq!(response.answers().len(), 1);
+        let requests = transport.requests.lock().unwrap();
+        assert_eq!(requests.len(), 2);
+        assert_eq!(requests[1], (referred, question, false));
+    }
+
+    #[tokio::test]
+    async fn recursive_backend_filters_referrals_by_query_class() {
+        let question = QuestionKey::new("www.example.com", 1, 1);
+        let mut chaos_ns = ns_record("example.com", 300, "ns1.example.com");
+        chaos_ns.rclass = 3;
+        let mut chaos_glue = glue_a_record("ns1.example.com", 300, "203.0.113.10".parse().unwrap());
+        chaos_glue.rclass = 3;
+        let transport = Arc::new(ScriptedAuthorityTransport::new([Ok(
+            response_message_for_question(
+                question,
+                ResponseCode::NoError,
+                Vec::new(),
+                vec![chaos_ns],
+                vec![chaos_glue],
+                false,
+            ),
+        )]));
+        let backend = recursive_backend(transport);
+
+        assert_eq!(
+            backend.resolve(recursive_request("www.example.com")).await,
+            Err(ResolutionBackendError::NoBackendsAvailable)
+        );
+    }
+
+    #[tokio::test]
+    async fn recursive_backend_walks_root_tld_and_authority_for_answer() {
+        let question = QuestionKey::new("www.example.com", 1, 1);
+        let tld_authority = "203.0.113.10:53".parse().unwrap();
+        let domain_authority = "203.0.113.20:53".parse().unwrap();
+        let transport = Arc::new(ScriptedAuthorityTransport::new([
+            Ok(response_message_for_question(
+                question.clone(),
+                ResponseCode::NoError,
+                Vec::new(),
+                vec![ns_record("com", 300, "a.gtld-servers.net")],
+                vec![glue_a_record(
+                    "a.gtld-servers.net",
+                    300,
+                    "203.0.113.10".parse().unwrap(),
+                )],
+                false,
+            )),
+            Ok(response_message_for_question(
+                question.clone(),
+                ResponseCode::NoError,
+                Vec::new(),
+                vec![ns_record("example.com", 300, "ns1.example.com")],
+                vec![glue_a_record(
+                    "ns1.example.com",
+                    300,
+                    "203.0.113.20".parse().unwrap(),
+                )],
+                false,
+            )),
+            Ok(response_message_for_question(
+                question.clone(),
+                ResponseCode::NoError,
+                vec![a_record("www.example.com", 60)],
+                Vec::new(),
+                Vec::new(),
+                true,
+            )),
+        ]));
+        let backend = recursive_backend(transport.clone());
+
+        let response = backend
+            .resolve(recursive_request("www.example.com"))
+            .await
+            .unwrap();
+
+        assert_eq!(response.answers().len(), 1);
+        assert_eq!(
+            response.source_credibility,
+            SourceCredibility::Authoritative
+        );
+        let requests = transport.requests.lock().unwrap();
+        assert_eq!(
+            requests.as_slice(),
+            &[
+                ("198.51.100.53:53".parse().unwrap(), question.clone(), false),
+                (tld_authority, question.clone(), false),
+                (domain_authority, question, false),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn recursive_backend_accepts_parent_zone_glue_for_multilabel_delegation() {
+        let question = QuestionKey::new("www.example.co.uk", 1, 1);
+        let tld_authority = "203.0.113.10:53".parse().unwrap();
+        let domain_authority = "203.0.113.20:53".parse().unwrap();
+        let transport = Arc::new(ScriptedAuthorityTransport::new([
+            Ok(response_message_for_question(
+                question.clone(),
+                ResponseCode::NoError,
+                Vec::new(),
+                vec![ns_record("uk", 300, "dns.nic.uk")],
+                vec![glue_a_record(
+                    "dns.nic.uk",
+                    300,
+                    "203.0.113.10".parse().unwrap(),
+                )],
+                false,
+            )),
+            Ok(response_message_for_question(
+                question.clone(),
+                ResponseCode::NoError,
+                Vec::new(),
+                vec![ns_record("co.uk", 300, "dns.nic.uk")],
+                vec![glue_a_record(
+                    "dns.nic.uk",
+                    300,
+                    "203.0.113.20".parse().unwrap(),
+                )],
+                false,
+            )),
+            Ok(response_message_for_question(
+                question.clone(),
+                ResponseCode::NoError,
+                vec![a_record("www.example.co.uk", 60)],
+                Vec::new(),
+                Vec::new(),
+                true,
+            )),
+        ]));
+        let backend = recursive_backend(transport.clone());
+
+        let response = backend
+            .resolve(recursive_request("www.example.co.uk"))
+            .await
+            .unwrap();
+
+        assert_eq!(response.answers().len(), 1);
+        let requests = transport.requests.lock().unwrap();
+        assert_eq!(
+            requests.as_slice(),
+            &[
+                ("198.51.100.53:53".parse().unwrap(), question.clone(), false),
+                (tld_authority, question.clone(), false),
+                (domain_authority, question, false),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn recursive_backend_walks_root_tld_and_authority_for_negative_answer() {
+        let question = QuestionKey::new("missing.example.com", 1, 1);
+        let tld_authority = "203.0.113.10:53".parse().unwrap();
+        let domain_authority = "203.0.113.20:53".parse().unwrap();
+        let transport = Arc::new(ScriptedAuthorityTransport::new([
+            Ok(response_message_for_question(
+                question.clone(),
+                ResponseCode::NoError,
+                Vec::new(),
+                vec![ns_record("com", 300, "a.gtld-servers.net")],
+                vec![glue_a_record(
+                    "a.gtld-servers.net",
+                    300,
+                    "203.0.113.10".parse().unwrap(),
+                )],
+                false,
+            )),
+            Ok(response_message_for_question(
+                question.clone(),
+                ResponseCode::NoError,
+                Vec::new(),
+                vec![ns_record("example.com", 300, "ns1.example.com")],
+                vec![glue_a_record(
+                    "ns1.example.com",
+                    300,
+                    "203.0.113.20".parse().unwrap(),
+                )],
+                false,
+            )),
+            Ok(response_message_for_question(
+                question.clone(),
+                ResponseCode::NxDomain,
+                Vec::new(),
+                vec![soa_record("example.com", 300, 60)],
+                Vec::new(),
+                true,
+            )),
+        ]));
+        let backend = recursive_backend(transport.clone());
+
+        let response = backend
+            .resolve(recursive_request("missing.example.com"))
+            .await
+            .unwrap();
+
+        assert_eq!(response.response_code, Some(ResponseCode::NxDomain));
+        assert_eq!(
+            response.negative_cache,
+            Some(negative_metadata(
+                "example.com",
+                "missing.example.com",
+                1,
+                1,
+                NegativeCacheKind::NxDomain,
+                Duration::from_secs(60),
+            ))
+        );
+        let requests = transport.requests.lock().unwrap();
+        assert_eq!(
+            requests.as_slice(),
+            &[
+                ("198.51.100.53:53".parse().unwrap(), question.clone(), false),
+                (tld_authority, question.clone(), false),
+                (domain_authority, question, false),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn recursive_backend_rejects_unrelated_referral() {
+        let question = QuestionKey::new("www.example.com", 1, 1);
+        let transport = Arc::new(ScriptedAuthorityTransport::new([Ok(
+            response_message_for_question(
+                question,
+                ResponseCode::NoError,
+                Vec::new(),
+                vec![ns_record("attacker.test", 300, "ns1.attacker.test")],
+                vec![glue_a_record(
+                    "ns1.attacker.test",
+                    300,
+                    "203.0.113.66".parse().unwrap(),
+                )],
+                false,
+            ),
+        )]));
+        let backend = recursive_backend(transport);
+
+        assert_eq!(
+            backend.resolve(recursive_request("www.example.com")).await,
+            Err(ResolutionBackendError::NoBackendsAvailable)
+        );
+    }
+
+    #[tokio::test]
+    async fn recursive_backend_defers_out_of_bailiwick_glue() {
+        let question = QuestionKey::new("www.example.com", 1, 1);
+        let transport = Arc::new(ScriptedAuthorityTransport::new([Ok(
+            response_message_for_question(
+                question,
+                ResponseCode::NoError,
+                Vec::new(),
+                vec![ns_record("example.com", 300, "ns1.attacker.test")],
+                vec![glue_a_record(
+                    "ns1.attacker.test",
+                    300,
+                    "203.0.113.66".parse().unwrap(),
+                )],
+                false,
+            ),
+        )]));
+        let backend = recursive_backend(transport);
+
+        assert_eq!(
+            backend.resolve(recursive_request("www.example.com")).await,
+            Err(ResolutionBackendError::NoBackendsAvailable)
+        );
+    }
+
+    #[tokio::test]
+    async fn recursive_backend_allows_same_authority_for_nested_delegations() {
+        let question = QuestionKey::new("www.child.example.com", 1, 1);
+        let shared_authority = "203.0.113.10:53".parse().unwrap();
+        let transport = Arc::new(ScriptedAuthorityTransport::new([
+            Ok(response_message_for_question(
+                question.clone(),
+                ResponseCode::NoError,
+                Vec::new(),
+                vec![ns_record("example.com", 300, "ns1.example.com")],
+                vec![glue_a_record(
+                    "ns1.example.com",
+                    300,
+                    "203.0.113.10".parse().unwrap(),
+                )],
+                false,
+            )),
+            Ok(response_message_for_question(
+                question.clone(),
+                ResponseCode::NoError,
+                Vec::new(),
+                vec![ns_record("child.example.com", 300, "ns1.child.example.com")],
+                vec![glue_a_record(
+                    "ns1.child.example.com",
+                    300,
+                    "203.0.113.10".parse().unwrap(),
+                )],
+                false,
+            )),
+            Ok(response_message_for_question(
+                question.clone(),
+                ResponseCode::NoError,
+                vec![a_record("www.child.example.com", 60)],
+                Vec::new(),
+                Vec::new(),
+                true,
+            )),
+        ]));
+        let backend = recursive_backend(transport.clone());
+
+        let response = backend
+            .resolve(recursive_request("www.child.example.com"))
+            .await
+            .unwrap();
+
+        assert_eq!(response.answers().len(), 1);
+        let requests = transport.requests.lock().unwrap();
+        assert_eq!(requests.len(), 3);
+        assert_eq!(requests[1], (shared_authority, question.clone(), false));
+        assert_eq!(requests[2], (shared_authority, question, false));
+    }
+
+    #[tokio::test]
+    async fn recursive_backend_restarts_for_cname() {
+        let first = QuestionKey::new("alias.example.com", 1, 1);
+        let second = QuestionKey::new("target.example.com", 1, 1);
+        let transport = Arc::new(ScriptedAuthorityTransport::new([
+            Ok(response_message_for_question(
+                first.clone(),
+                ResponseCode::NoError,
+                vec![cname_record("alias.example.com", 60, "target.example.com")],
+                Vec::new(),
+                Vec::new(),
+                true,
+            )),
+            Ok(response_message_for_question(
+                second.clone(),
+                ResponseCode::NoError,
+                vec![a_record("target.example.com", 60)],
+                Vec::new(),
+                Vec::new(),
+                true,
+            )),
+        ]));
+        let backend = recursive_backend(transport.clone());
+
+        let response = backend
+            .resolve(recursive_request("alias.example.com"))
+            .await
+            .unwrap();
+
+        assert_eq!(response.final_question, Some(first.clone()));
+        assert_eq!(response.answers().len(), 2);
+        let requests = transport.requests.lock().unwrap();
+        assert_eq!(requests[0].1, first);
+        assert!(!requests[0].2);
+        assert_eq!(requests[1].1, second);
+        assert!(!requests[1].2);
+    }
+
+    #[tokio::test]
+    async fn recursive_backend_accepts_complete_cname_answer() {
+        let first = QuestionKey::new("alias.example.com", 1, 1);
+        let transport = Arc::new(ScriptedAuthorityTransport::new([Ok(
+            response_message_for_question(
+                first.clone(),
+                ResponseCode::NoError,
+                vec![
+                    cname_record("alias.example.com", 60, "target.example.com"),
+                    a_record("target.example.com", 60),
+                ],
+                Vec::new(),
+                Vec::new(),
+                true,
+            ),
+        )]));
+        let backend = recursive_backend(transport.clone());
+
+        let response = backend
+            .resolve(recursive_request("alias.example.com"))
+            .await
+            .unwrap();
+
+        assert_eq!(response.final_question, Some(first.clone()));
+        assert_eq!(response.answers().len(), 2);
+        let requests = transport.requests.lock().unwrap();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].1, first);
+        assert!(!requests[0].2);
+    }
+
+    #[tokio::test]
+    async fn recursive_backend_rejects_referral_loop_and_depth_exhaustion() {
+        let question = QuestionKey::new("www.example.com", 1, 1);
+        let referral = response_message_for_question(
+            question.clone(),
+            ResponseCode::NoError,
+            Vec::new(),
+            vec![ns_record("example.com", 300, "ns1.example.com")],
+            vec![glue_a_record(
+                "ns1.example.com",
+                300,
+                "203.0.113.10".parse().unwrap(),
+            )],
+            false,
+        );
+        let transport = Arc::new(ScriptedAuthorityTransport::new([
+            Ok(referral.clone()),
+            Ok(referral),
+        ]));
+        let backend = recursive_backend(transport);
+
+        assert_eq!(
+            backend.resolve(recursive_request("www.example.com")).await,
+            Err(ResolutionBackendError::NoBackendsAvailable)
+        );
+
+        let referral = response_message_for_question(
+            QuestionKey::new("www.example.com", 1, 1),
+            ResponseCode::NoError,
+            Vec::new(),
+            vec![ns_record("example.com", 300, "ns1.example.com")],
+            vec![glue_a_record(
+                "ns1.example.com",
+                300,
+                "203.0.113.10".parse().unwrap(),
+            )],
+            false,
+        );
+        let transport = Arc::new(ScriptedAuthorityTransport::new([Ok(referral)]));
+        let backend = recursive_backend_with_root_endpoints(
+            transport,
+            vec!["198.51.100.53:53".parse().unwrap()],
+            1,
+        );
+        assert_eq!(
+            backend.resolve(recursive_request("www.example.com")).await,
+            Err(ResolutionBackendError::NoBackendsAvailable)
+        );
+
+        let transport = Arc::new(ScriptedAuthorityTransport::new([Ok(
+            response_message_for_question(
+                question,
+                ResponseCode::NoError,
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+                false,
+            ),
+        )]));
+        let backend = RecursiveResolutionBackend::new(
+            RecursiveResolverConfig {
+                root_hints: vec![RecursiveRootHint {
+                    name: "a.root-servers.example".to_string(),
+                    endpoints: vec!["198.51.100.53:53".parse().unwrap()],
+                }],
+                per_authority_timeout: Duration::from_millis(500),
+                per_query_deadline: Duration::from_secs(2),
+                max_recursion_depth: 1,
+                max_cname_restarts: 4,
+            },
+            transport,
+        );
+        assert_eq!(
+            backend.resolve(recursive_request("www.example.com")).await,
+            Err(ResolutionBackendError::NoBackendsAvailable)
+        );
+    }
+
+    #[tokio::test]
+    async fn recursive_backend_records_query_attempt_and_referral_loop_metrics() {
+        let question = QuestionKey::new("www.example.com", 1, 1);
+        let referral = response_message_for_question(
+            question,
+            ResponseCode::NoError,
+            Vec::new(),
+            vec![ns_record("example.com", 300, "ns1.example.com")],
+            vec![glue_a_record(
+                "ns1.example.com",
+                300,
+                "203.0.113.10".parse().unwrap(),
+            )],
+            false,
+        );
+        let transport = Arc::new(ScriptedAuthorityTransport::new([
+            Ok(referral.clone()),
+            Ok(referral),
+        ]));
+        let metrics = Arc::new(RecordingMetrics::default());
+        let backend = RecursiveResolutionBackend::with_metrics(
+            RecursiveResolverConfig {
+                root_hints: vec![RecursiveRootHint {
+                    name: "a.root-servers.example".to_string(),
+                    endpoints: vec!["198.51.100.53:53".parse().unwrap()],
+                }],
+                per_authority_timeout: Duration::from_millis(500),
+                per_query_deadline: Duration::from_secs(2),
+                max_recursion_depth: 8,
+                max_cname_restarts: 4,
+            },
+            transport,
+            metrics.clone(),
+        );
+
+        assert_eq!(
+            backend.resolve(recursive_request("www.example.com")).await,
+            Err(ResolutionBackendError::NoBackendsAvailable)
+        );
+
+        assert_eq!(metrics.count(ResolverMetric::RecursiveQuery), 1);
+        assert_eq!(metrics.count(ResolverMetric::RecursiveAuthorityAttempt), 2);
+        assert_eq!(metrics.count(ResolverMetric::RecursiveReferralLoop), 1);
+        assert!(metrics
+            .durations
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|(metric, _)| *metric == ResolverMetric::RecursiveQueryDuration));
+    }
+
+    #[tokio::test]
+    async fn recursive_backend_detects_reordered_referral_endpoint_loop() {
+        let question = QuestionKey::new("www.example.com", 1, 1);
+        let first_referral = response_message_for_question(
+            question.clone(),
+            ResponseCode::NoError,
+            Vec::new(),
+            vec![
+                ns_record("example.com", 300, "ns1.example.com"),
+                ns_record("example.com", 300, "ns2.example.com"),
+            ],
+            vec![
+                glue_a_record("ns1.example.com", 300, "203.0.113.10".parse().unwrap()),
+                glue_a_record("ns2.example.com", 300, "203.0.113.11".parse().unwrap()),
+            ],
+            false,
+        );
+        let reordered_referral = response_message_for_question(
+            question,
+            ResponseCode::NoError,
+            Vec::new(),
+            vec![
+                ns_record("example.com", 300, "ns2.example.com"),
+                ns_record("example.com", 300, "ns1.example.com"),
+            ],
+            vec![
+                glue_a_record("ns2.example.com", 300, "203.0.113.11".parse().unwrap()),
+                glue_a_record("ns1.example.com", 300, "203.0.113.10".parse().unwrap()),
+            ],
+            false,
+        );
+        let transport = Arc::new(ScriptedAuthorityTransport::new([
+            Ok(first_referral),
+            Ok(reordered_referral),
+        ]));
+        let metrics = Arc::new(RecordingMetrics::default());
+        let backend = RecursiveResolutionBackend::with_metrics(
+            RecursiveResolverConfig {
+                root_hints: vec![RecursiveRootHint {
+                    name: "a.root-servers.example".to_string(),
+                    endpoints: vec!["198.51.100.53:53".parse().unwrap()],
+                }],
+                per_authority_timeout: Duration::from_millis(500),
+                per_query_deadline: Duration::from_secs(2),
+                max_recursion_depth: 8,
+                max_cname_restarts: 4,
+            },
+            transport.clone(),
+            metrics.clone(),
+        );
+
+        assert_eq!(
+            backend.resolve(recursive_request("www.example.com")).await,
+            Err(ResolutionBackendError::NoBackendsAvailable)
+        );
+
+        assert_eq!(metrics.count(ResolverMetric::RecursiveReferralLoop), 1);
+        assert_eq!(transport.requests.lock().unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn recursive_backend_records_lame_delegation_metric() {
+        let question = QuestionKey::new("www.example.com", 1, 1);
+        let transport = Arc::new(ScriptedAuthorityTransport::new([Ok(
+            response_message_for_question(
+                question,
+                ResponseCode::NoError,
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+                false,
+            ),
+        )]));
+        let metrics = Arc::new(RecordingMetrics::default());
+        let backend = RecursiveResolutionBackend::with_metrics(
+            RecursiveResolverConfig {
+                root_hints: vec![RecursiveRootHint {
+                    name: "a.root-servers.example".to_string(),
+                    endpoints: vec!["198.51.100.53:53".parse().unwrap()],
+                }],
+                per_authority_timeout: Duration::from_millis(500),
+                per_query_deadline: Duration::from_secs(2),
+                max_recursion_depth: 8,
+                max_cname_restarts: 4,
+            },
+            transport,
+            metrics.clone(),
+        );
+
+        assert_eq!(
+            backend.resolve(recursive_request("www.example.com")).await,
+            Err(ResolutionBackendError::NoBackendsAvailable)
+        );
+
+        assert_eq!(metrics.count(ResolverMetric::RecursiveLameDelegation), 1);
+        assert_eq!(metrics.count(ResolverMetric::RecursiveBailiwickReject), 0);
+    }
+
+    #[tokio::test]
+    async fn recursive_backend_fails_over_to_alternate_authority() {
+        let question = QuestionKey::new("example.com", 1, 1);
+        let second_authority = "198.51.100.54:53".parse().unwrap();
+        let transport = Arc::new(ScriptedAuthorityTransport::new([
+            Err(ResolutionBackendError::Timeout),
+            Ok(response_message_for_question(
+                question.clone(),
+                ResponseCode::NoError,
+                vec![a_record("example.com", 60)],
+                Vec::new(),
+                Vec::new(),
+                true,
+            )),
+        ]));
+        let backend = recursive_backend_with_root_endpoints(
+            transport.clone(),
+            vec!["198.51.100.53:53".parse().unwrap(), second_authority],
+            8,
+        );
+
+        let response = backend
+            .resolve(recursive_request("example.com"))
+            .await
+            .unwrap();
+
+        assert_eq!(response.answers().len(), 1);
+        let requests = transport.requests.lock().unwrap();
+        assert_eq!(requests.len(), 2);
+        assert_eq!(requests[1], (second_authority, question, false));
+    }
+
+    #[tokio::test]
+    async fn recursive_backend_bounds_attempt_timeout_by_query_deadline() {
+        let question = QuestionKey::new("example.com", 1, 1);
+        let transport = Arc::new(ScriptedAuthorityTransport::new([Ok(
+            response_message_for_question(
+                question,
+                ResponseCode::NoError,
+                vec![a_record("example.com", 60)],
+                Vec::new(),
+                Vec::new(),
+                true,
+            ),
+        )]));
+        let backend = recursive_backend_with_timing(
+            transport.clone(),
+            vec!["198.51.100.53:53".parse().unwrap()],
+            Duration::from_secs(5),
+            Duration::from_millis(50),
+            8,
+        );
+
+        let response = backend
+            .resolve(recursive_request("example.com"))
+            .await
+            .unwrap();
+
+        assert_eq!(response.answers().len(), 1);
+        let timeouts = transport.timeouts.lock().unwrap();
+        assert_eq!(timeouts.len(), 1);
+        assert!(timeouts[0] <= Duration::from_millis(50));
+    }
+
+    #[tokio::test]
+    async fn recursive_backend_enforces_transport_attempt_timeout() {
+        let backend = RecursiveResolutionBackend::new(
+            RecursiveResolverConfig {
+                root_hints: vec![RecursiveRootHint {
+                    name: "a.root-servers.example".to_string(),
+                    endpoints: vec!["198.51.100.53:53".parse().unwrap()],
+                }],
+                per_authority_timeout: Duration::from_millis(20),
+                per_query_deadline: Duration::from_secs(1),
+                max_recursion_depth: 8,
+                max_cname_restarts: 4,
+            },
+            Arc::new(HangingAuthorityTransport),
+        );
+
+        let result = time::timeout(
+            Duration::from_millis(200),
+            backend.resolve(recursive_request("example.com")),
+        )
+        .await;
+
+        assert_eq!(result.unwrap(), Err(ResolutionBackendError::Timeout));
+    }
+
+    #[tokio::test]
+    async fn recursive_backend_fails_over_after_mismatched_question() {
+        let question = QuestionKey::new("example.com", 1, 1);
+        let second_authority = "198.51.100.54:53".parse().unwrap();
+        let transport = Arc::new(ScriptedAuthorityTransport::new([
+            Ok(response_message_for_question(
+                QuestionKey::new("other.example.com", 1, 1),
+                ResponseCode::NoError,
+                vec![a_record("example.com", 60)],
+                Vec::new(),
+                Vec::new(),
+                true,
+            )),
+            Ok(response_message_for_question(
+                question.clone(),
+                ResponseCode::NoError,
+                vec![a_record("example.com", 60)],
+                Vec::new(),
+                Vec::new(),
+                true,
+            )),
+        ]));
+        let backend = recursive_backend_with_root_endpoints(
+            transport.clone(),
+            vec!["198.51.100.53:53".parse().unwrap(), second_authority],
+            8,
+        );
+
+        let response = backend
+            .resolve(recursive_request("example.com"))
+            .await
+            .unwrap();
+
+        assert_eq!(response.answers().len(), 1);
+        let requests = transport.requests.lock().unwrap();
+        assert_eq!(requests.len(), 2);
+        assert_eq!(requests[1], (second_authority, question, false));
+    }
+
+    #[tokio::test]
+    async fn recursive_backend_detects_cname_loop() {
+        let alias = QuestionKey::new("alias.example.com", 1, 1);
+        let target = QuestionKey::new("target.example.com", 1, 1);
+        let transport = Arc::new(ScriptedAuthorityTransport::new([
+            Ok(response_message_for_question(
+                alias.clone(),
+                ResponseCode::NoError,
+                vec![cname_record("alias.example.com", 60, "target.example.com")],
+                Vec::new(),
+                Vec::new(),
+                true,
+            )),
+            Ok(response_message_for_question(
+                target,
+                ResponseCode::NoError,
+                vec![cname_record("target.example.com", 60, "alias.example.com")],
+                Vec::new(),
+                Vec::new(),
+                true,
+            )),
+        ]));
+        let backend = recursive_backend(transport);
+
+        assert_eq!(
+            backend
+                .resolve(recursive_request("alias.example.com"))
+                .await,
+            Err(ResolutionBackendError::NoBackendsAvailable)
+        );
+    }
+
+    #[tokio::test]
+    async fn recursive_backend_allows_same_referral_after_cname_restart() {
+        let alias = QuestionKey::new("alias.example.com", 1, 1);
+        let target = QuestionKey::new("target.example.com", 1, 1);
+        let referral_authority = "203.0.113.10:53".parse().unwrap();
+        let referral_for_alias = response_message_for_question(
+            alias.clone(),
+            ResponseCode::NoError,
+            Vec::new(),
+            vec![ns_record("example.com", 300, "ns1.example.com")],
+            vec![glue_a_record(
+                "ns1.example.com",
+                300,
+                "203.0.113.10".parse().unwrap(),
+            )],
+            false,
+        );
+        let referral_for_target = response_message_for_question(
+            target.clone(),
+            ResponseCode::NoError,
+            Vec::new(),
+            vec![ns_record("example.com", 300, "ns1.example.com")],
+            vec![glue_a_record(
+                "ns1.example.com",
+                300,
+                "203.0.113.10".parse().unwrap(),
+            )],
+            false,
+        );
+        let transport = Arc::new(ScriptedAuthorityTransport::new([
+            Ok(referral_for_alias),
+            Ok(response_message_for_question(
+                alias.clone(),
+                ResponseCode::NoError,
+                vec![cname_record("alias.example.com", 60, "target.example.com")],
+                Vec::new(),
+                Vec::new(),
+                true,
+            )),
+            Ok(referral_for_target),
+            Ok(response_message_for_question(
+                target.clone(),
+                ResponseCode::NoError,
+                vec![a_record("target.example.com", 60)],
+                Vec::new(),
+                Vec::new(),
+                true,
+            )),
+        ]));
+        let backend = recursive_backend(transport.clone());
+
+        let response = backend
+            .resolve(recursive_request("alias.example.com"))
+            .await
+            .unwrap();
+
+        assert_eq!(response.answers().len(), 2);
+        let requests = transport.requests.lock().unwrap();
+        assert_eq!(requests.len(), 4);
+        assert_eq!(requests[1], (referral_authority, alias, false));
+        assert_eq!(requests[3], (referral_authority, target, false));
+    }
+
+    #[tokio::test]
+    async fn recursive_backend_requires_authoritative_negative_answer() {
+        let question = QuestionKey::new("missing.example.com", 1, 1);
+        let transport = Arc::new(ScriptedAuthorityTransport::new([Ok(
+            response_message_for_question(
+                question.clone(),
+                ResponseCode::NxDomain,
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+                false,
+            ),
+        )]));
+        let backend = recursive_backend(transport);
+
+        assert_eq!(
+            backend
+                .resolve(recursive_request("missing.example.com"))
+                .await,
+            Err(ResolutionBackendError::NoBackendsAvailable)
+        );
+
+        let transport = Arc::new(ScriptedAuthorityTransport::new([Ok(
+            response_message_for_question(
+                question,
+                ResponseCode::NxDomain,
+                Vec::new(),
+                vec![soa_record("example.com", 300, 60)],
+                Vec::new(),
+                true,
+            ),
+        )]));
+        let backend = recursive_backend(transport);
+
+        let response = backend
+            .resolve(recursive_request("missing.example.com"))
+            .await
+            .unwrap();
+
+        assert_eq!(response.response_code, Some(ResponseCode::NxDomain));
+        assert_eq!(
+            response
+                .negative_cache
+                .as_ref()
+                .map(|metadata| metadata.soa_minimum_ttl),
+            Some(Duration::from_secs(60))
+        );
+    }
+
+    #[tokio::test]
+    async fn recursive_backend_requires_authoritative_positive_answer() {
+        let question = QuestionKey::new("example.com", 1, 1);
+        let transport = Arc::new(ScriptedAuthorityTransport::new([Ok(
+            response_message_for_question(
+                question,
+                ResponseCode::NoError,
+                vec![a_record("example.com", 60)],
+                Vec::new(),
+                Vec::new(),
+                false,
+            ),
+        )]));
+        let backend = recursive_backend(transport);
+
+        assert_eq!(
+            backend.resolve(recursive_request("example.com")).await,
+            Err(ResolutionBackendError::NoBackendsAvailable)
+        );
+    }
+
+    #[tokio::test]
+    async fn recursive_backend_defers_dname_handling_as_failure() {
+        let question = QuestionKey::new("child.example.com", 1, 1);
+        let transport = Arc::new(ScriptedAuthorityTransport::new([Ok(
+            response_message_for_question(
+                question.clone(),
+                ResponseCode::NoError,
+                vec![dname_record("example.com", 60, "example.net")],
+                Vec::new(),
+                Vec::new(),
+                true,
+            ),
+        )]));
+        let backend = recursive_backend(transport);
+
+        assert_eq!(
+            backend
+                .resolve(recursive_request("child.example.com"))
+                .await,
+            Err(ResolutionBackendError::NoBackendsAvailable)
+        );
+    }
+
+    #[tokio::test]
+    async fn resolve_query_accepts_recursive_backend_response() {
+        let question = QuestionKey::new("example.com", 1, 1);
+        let transport = Arc::new(ScriptedAuthorityTransport::new([Ok(
+            response_message_for_question_with_id(
+                0xbeef,
+                question.clone(),
+                ResponseCode::NoError,
+                vec![a_record("example.com", 60)],
+                Vec::new(),
+                Vec::new(),
+                true,
+            ),
+        )]));
+        let backend = Arc::new(recursive_backend(transport.clone()));
+        let events = Arc::new(RecordingEvents::default());
+        let service = ResolveQuery::with_cache_and_backend_snapshot(
+            Arc::new(StandardProtocolCodec::new(1232)),
+            Arc::new(NoopDnsCache),
+            CacheTtlPolicy::default(),
+            BackendSnapshot::new(
+                backend,
+                ResolutionMode::Recursive,
+                7,
+                BackendHealth::Healthy,
+                Some("mode:recursive;generation:7".to_string()),
+            ),
+            Arc::new(BasicResponseFactory),
+            Arc::new(FixedClock(SystemTime::UNIX_EPOCH)),
+            events.clone(),
+            Arc::new(RecordingMetrics::default()),
+        );
+
+        let outcome = service
+            .resolve(ResolveRequest::new(
+                "192.0.2.10".parse().unwrap(),
+                SystemTime::UNIX_EPOCH,
+                a_query(0x1234, "example.com"),
+            ))
+            .await;
+
+        assert_eq!(outcome.decision.kind, ResolveDecisionKind::Allowed);
+        assert_eq!(&outcome.response_bytes[0..2], &[0x12, 0x34]);
+        assert_eq!(
+            service.backend.current().dnssec_validation,
+            DnssecValidationStatus::Disabled
+        );
+        assert_eq!(transport.requests.lock().unwrap().len(), 1);
+        let recorded_events = events.events.lock().unwrap();
+        assert_eq!(
+            recorded_events[0].backend,
+            Some(QueryEventBackend {
+                mode: ResolutionMode::Recursive,
+                generation: 7,
+                health: BackendHealth::Healthy,
+                cache_namespace: Some("mode:recursive;generation:7".to_string()),
+                dnssec_validation: DnssecValidationStatus::Disabled,
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn resolve_truncates_fresh_recursive_response_to_configured_udp_limit() {
+        let question = QuestionKey::new("example.com", 1, 1);
+        let answers = (0..40)
+            .map(|_| a_record("example.com", 60))
+            .collect::<Vec<_>>();
+        let transport = Arc::new(ScriptedAuthorityTransport::new([Ok(
+            response_message_for_question_with_id(
+                0xbeef,
+                question,
+                ResponseCode::NoError,
+                answers,
+                Vec::new(),
+                Vec::new(),
+                true,
+            ),
+        )]));
+        let backend = Arc::new(recursive_backend(transport));
+        let service = ResolveQuery::with_cache_and_backend_snapshot(
+            Arc::new(StandardProtocolCodec::new(700)),
+            Arc::new(NoopDnsCache),
+            CacheTtlPolicy::default(),
+            BackendSnapshot::new(
+                backend,
+                ResolutionMode::Recursive,
+                7,
+                BackendHealth::Healthy,
+                Some("mode:recursive;generation:7".to_string()),
+            ),
+            Arc::new(BasicResponseFactory),
+            Arc::new(FixedClock(SystemTime::UNIX_EPOCH)),
+            Arc::new(RecordingEvents::default()),
+            Arc::new(RecordingMetrics::default()),
+        );
+
+        let outcome = service
+            .resolve(ResolveRequest::new(
+                "192.0.2.10".parse().unwrap(),
+                SystemTime::UNIX_EPOCH,
+                a_query_with_edns(0x1234, "example.com", 4096, false),
+            ))
+            .await;
+
+        assert_eq!(outcome.decision.kind, ResolveDecisionKind::Allowed);
+        let response = Message::parse(&outcome.response_bytes).unwrap();
+        assert!(response.header.tc());
+        assert!(response.answers.is_empty());
+    }
+
+    #[tokio::test]
+    async fn resolve_bounds_recursive_response_opt_payload_to_configured_udp_limit() {
+        let question = QuestionKey::new("example.com", 1, 1);
+        let transport = Arc::new(ScriptedAuthorityTransport::new([Ok(
+            response_message_for_question_with_id(
+                0xbeef,
+                question,
+                ResponseCode::NoError,
+                vec![a_record("example.com", 60)],
+                Vec::new(),
+                Vec::new(),
+                true,
+            ),
+        )]));
+        let backend = Arc::new(recursive_backend(transport));
+        let service = ResolveQuery::with_cache_and_backend_snapshot(
+            Arc::new(StandardProtocolCodec::new(700)),
+            Arc::new(NoopDnsCache),
+            CacheTtlPolicy::default(),
+            BackendSnapshot::new(
+                backend,
+                ResolutionMode::Recursive,
+                7,
+                BackendHealth::Healthy,
+                Some("mode:recursive;generation:7".to_string()),
+            ),
+            Arc::new(BasicResponseFactory),
+            Arc::new(FixedClock(SystemTime::UNIX_EPOCH)),
+            Arc::new(RecordingEvents::default()),
+            Arc::new(RecordingMetrics::default()),
+        );
+
+        let outcome = service
+            .resolve(ResolveRequest::new(
+                "192.0.2.10".parse().unwrap(),
+                SystemTime::UNIX_EPOCH,
+                a_query_with_edns(0x1234, "example.com", 4096, true),
+            ))
+            .await;
+
+        assert_eq!(outcome.decision.kind, ResolveDecisionKind::Allowed);
+        let response = Message::parse(&outcome.response_bytes).unwrap();
+        assert_eq!(
+            response
+                .edns
+                .as_ref()
+                .map(|edns| (edns.udp_payload_size, edns.dnssec_ok)),
+            Some((700, true))
+        );
+    }
+
+    #[tokio::test]
+    async fn resolve_truncates_fresh_recursive_response_to_default_udp_limit() {
+        let question = QuestionKey::new("example.com", 1, 1);
+        let answers = (0..40)
+            .map(|_| a_record("example.com", 60))
+            .collect::<Vec<_>>();
+        let transport = Arc::new(ScriptedAuthorityTransport::new([Ok(
+            response_message_for_question_with_id(
+                0xbeef,
+                question,
+                ResponseCode::NoError,
+                answers,
+                Vec::new(),
+                Vec::new(),
+                true,
+            ),
+        )]));
+        let backend = Arc::new(recursive_backend(transport));
+        let service = ResolveQuery::with_cache_and_backend_snapshot(
+            Arc::new(StandardProtocolCodec::new(1232)),
+            Arc::new(NoopDnsCache),
+            CacheTtlPolicy::default(),
+            BackendSnapshot::new(
+                backend,
+                ResolutionMode::Recursive,
+                7,
+                BackendHealth::Healthy,
+                Some("mode:recursive;generation:7".to_string()),
+            ),
+            Arc::new(BasicResponseFactory),
+            Arc::new(FixedClock(SystemTime::UNIX_EPOCH)),
+            Arc::new(RecordingEvents::default()),
+            Arc::new(RecordingMetrics::default()),
+        );
+
+        let outcome = service
+            .resolve(ResolveRequest::new(
+                "192.0.2.10".parse().unwrap(),
+                SystemTime::UNIX_EPOCH,
+                a_query(0x1234, "example.com"),
+            ))
+            .await;
+
+        assert_eq!(outcome.decision.kind, ResolveDecisionKind::Allowed);
+        let response = Message::parse(&outcome.response_bytes).unwrap();
+        assert!(response.header.tc());
+        assert!(response.answers.is_empty());
+    }
+
     #[tokio::test]
     async fn resolve_decodes_owned_request_bytes() {
         let request_bytes = a_query(0x1234, "example.com");
         let request_ptr = request_bytes.as_ptr();
         let codec = Arc::new(OwnedOnlyProtocolCodec::expect_owned_ptr(request_ptr));
-        let upstream = Arc::new(StaticUpstream::new(Ok(UpstreamResponse {
-            bytes: a_response_with_answer(0x1234, "example.com", 60),
-            received_at: SystemTime::UNIX_EPOCH,
-        })));
+        let upstream = Arc::new(StaticUpstream::new(Ok(upstream_response(
+            a_response_with_answer(0x1234, "example.com", 60),
+        ))));
         let events = Arc::new(RecordingEvents::default());
         let metrics = Arc::new(RecordingMetrics::default());
         let service = ResolveQuery::new(
@@ -4931,10 +8246,9 @@ mod tests {
 
     #[tokio::test]
     async fn resolve_records_accepted_query_event_metric() {
-        let upstream = Arc::new(StaticUpstream::new(Ok(UpstreamResponse {
-            bytes: a_response_with_answer(0x1234, "example.com", 60),
-            received_at: SystemTime::UNIX_EPOCH,
-        })));
+        let upstream = Arc::new(StaticUpstream::new(Ok(upstream_response(
+            a_response_with_answer(0x1234, "example.com", 60),
+        ))));
         let events = Arc::new(RecordingEvents::default());
         let metrics = Arc::new(RecordingMetrics::default());
         let service = resolve_service(upstream, events.clone(), metrics.clone());
@@ -4957,10 +8271,9 @@ mod tests {
 
     #[tokio::test]
     async fn resolve_isolates_disabled_query_event_sink() {
-        let upstream = Arc::new(StaticUpstream::new(Ok(UpstreamResponse {
-            bytes: a_response_with_answer(0x1234, "example.com", 60),
-            received_at: SystemTime::UNIX_EPOCH,
-        })));
+        let upstream = Arc::new(StaticUpstream::new(Ok(upstream_response(
+            a_response_with_answer(0x1234, "example.com", 60),
+        ))));
         let metrics = Arc::new(RecordingMetrics::default());
         let service = ResolveQuery::new(
             Arc::new(StandardProtocolCodec::new(1232)),
@@ -5059,6 +8372,67 @@ mod tests {
     }
 
     #[test]
+    fn forwarded_resolution_response_exposes_backend_metadata() {
+        let response = ResolutionResponse::forwarded_bytes(
+            nxdomain_response_with_soa(0x1234, "example.com", 30, 120),
+            SystemTime::UNIX_EPOCH,
+            42,
+            "forward-primary",
+        );
+
+        assert_eq!(response.response_code, Some(ResponseCode::NxDomain));
+        assert!(response.response_message.is_some());
+        assert_eq!(
+            response.final_question,
+            Some(QuestionKey::new("example.com", 1, 1))
+        );
+        assert!(response.answers().is_empty());
+        assert_eq!(response.authorities().len(), 1);
+        assert!(response.additionals().is_empty());
+        assert_eq!(
+            response.negative_cache,
+            Some(negative_metadata(
+                "example.com",
+                "example.com",
+                1,
+                1,
+                NegativeCacheKind::NxDomain,
+                Duration::from_secs(30)
+            ))
+        );
+        assert_eq!(
+            response.source_credibility,
+            SourceCredibility::ForwarderValidated
+        );
+        assert_eq!(response.backend_provenance.mode, ResolutionMode::Forward);
+        assert_eq!(response.backend_provenance.generation, 42);
+        assert_eq!(
+            response.backend_provenance.backend_name.as_deref(),
+            Some("forward-primary")
+        );
+        assert_eq!(
+            response.cache_directive,
+            ResolutionCacheDirective::Cacheable
+        );
+    }
+
+    #[test]
+    fn unparsed_forwarded_response_is_marked_not_cacheable() {
+        let response = ResolutionResponse::forwarded_bytes(
+            vec![0x12],
+            SystemTime::UNIX_EPOCH,
+            42,
+            "forward-primary",
+        );
+
+        assert_eq!(response.response_message(), None);
+        assert_eq!(
+            response.cache_directive,
+            ResolutionCacheDirective::DoNotCache(ResolutionNoCacheReason::ValidationIncomplete)
+        );
+    }
+
+    #[test]
     fn question_key_normalizes_case_and_trailing_root() {
         let key = QuestionKey::new("Example.COM.", 1, 1);
 
@@ -5085,6 +8459,8 @@ mod tests {
                     .to_vec(),
                 QueryFeatures {
                     recursion_desired: true,
+                    authenticated_data: false,
+                    checking_disabled: false,
                     dnssec_ok: false,
                     edns_udp_payload_size: None,
                 },
@@ -5100,10 +8476,7 @@ mod tests {
         };
 
         assert_eq!(entry.key.question.qname, "example.com");
-        assert_eq!(
-            entry.key.upstream_policy_variant.as_deref(),
-            Some("primary")
-        );
+        assert_eq!(entry.key.cache_namespace.as_deref(), Some("primary"));
         assert_eq!(entry.key.effective_udp_payload_size, 512);
         assert_eq!(entry.response_template, vec![1, 2, 3]);
         assert_eq!(entry.response_code, ResponseCode::NoError);
@@ -5118,6 +8491,8 @@ mod tests {
             question_wire(&a_query(0x1000, name)).unwrap().to_vec(),
             QueryFeatures {
                 recursion_desired: true,
+                authenticated_data: false,
+                checking_disabled: false,
                 dnssec_ok: false,
                 edns_udp_payload_size: None,
             },
@@ -5165,6 +8540,72 @@ mod tests {
         }
     }
 
+    fn response_message_for_question(
+        question: QuestionKey,
+        response_code: ResponseCode,
+        answers: Vec<Record>,
+        authorities: Vec<Record>,
+        additionals: Vec<Record>,
+        authoritative: bool,
+    ) -> Message {
+        response_message_for_question_with_id(
+            0x1234,
+            question,
+            response_code,
+            answers,
+            authorities,
+            additionals,
+            authoritative,
+        )
+    }
+
+    fn response_message_for_question_with_id(
+        id: u16,
+        question: QuestionKey,
+        response_code: ResponseCode,
+        answers: Vec<Record>,
+        authorities: Vec<Record>,
+        additionals: Vec<Record>,
+        authoritative: bool,
+    ) -> Message {
+        let original_query =
+            Message::parse_owned(query(id, &question.qname, question.qtype, question.qclass))
+                .unwrap();
+        let bytes = serialize_recursive_response(
+            &original_query,
+            response_code,
+            authoritative,
+            &answers,
+            &authorities,
+            &additionals,
+        )
+        .unwrap();
+        Message::parse_owned(bytes).unwrap()
+    }
+
+    fn response_message_for_question_with_extra_flags(
+        question: QuestionKey,
+        response_code: ResponseCode,
+        answers: Vec<Record>,
+        authorities: Vec<Record>,
+        additionals: Vec<Record>,
+        authoritative: bool,
+        extra_flags: u16,
+    ) -> Message {
+        let response = response_message_for_question(
+            question,
+            response_code,
+            answers,
+            authorities,
+            additionals,
+            authoritative,
+        );
+        let mut bytes = response.original_bytes.to_vec();
+        let flags = u16::from_be_bytes([bytes[2], bytes[3]]) | extra_flags;
+        bytes[2..4].copy_from_slice(&flags.to_be_bytes());
+        Message::parse_owned(bytes).unwrap()
+    }
+
     fn a_record(name: &str, ttl: u32) -> Record {
         Record {
             name: name.to_string(),
@@ -5175,6 +8616,44 @@ mod tests {
         }
     }
 
+    fn mx_record(name: &str, ttl: u32, exchange: &str) -> Record {
+        Record {
+            name: name.to_string(),
+            rtype: 15,
+            rclass: 1,
+            ttl,
+            record: RecordData::MX {
+                preference: 10,
+                exchange: exchange.to_string(),
+            },
+        }
+    }
+
+    fn dnskey_record(name: &str, ttl: u32) -> Record {
+        Record {
+            name: name.to_string(),
+            rtype: DNSKEY_RECORD_TYPE,
+            rclass: 1,
+            ttl,
+            record: RecordData::DNSKEY {
+                flags: 256,
+                protocol: 3,
+                algorithm: 8,
+                public_key: vec![1, 2, 3, 4],
+            },
+        }
+    }
+
+    fn txt_record(name: &str, ttl: u32, text: &str) -> Record {
+        Record {
+            name: name.to_string(),
+            rtype: 16,
+            rclass: 1,
+            ttl,
+            record: RecordData::TXT(text.to_string()),
+        }
+    }
+
     fn cname_record(name: &str, ttl: u32, target: &str) -> Record {
         Record {
             name: name.to_string(),
@@ -5182,6 +8661,55 @@ mod tests {
             rclass: 1,
             ttl,
             record: RecordData::CNAME(target.to_string()),
+        }
+    }
+
+    fn ns_record(zone: &str, ttl: u32, ns: &str) -> Record {
+        Record {
+            name: zone.to_string(),
+            rtype: 2,
+            rclass: 1,
+            ttl,
+            record: RecordData::NS(ns.to_string()),
+        }
+    }
+
+    fn glue_a_record(name: &str, ttl: u32, address: std::net::Ipv4Addr) -> Record {
+        Record {
+            name: name.to_string(),
+            rtype: 1,
+            rclass: 1,
+            ttl,
+            record: RecordData::A(address),
+        }
+    }
+
+    fn dname_record(name: &str, ttl: u32, target: &str) -> Record {
+        let mut bytes = Vec::new();
+        write_dns_name(&mut bytes, target);
+        Record {
+            name: name.to_string(),
+            rtype: 39,
+            rclass: 1,
+            ttl,
+            record: RecordData::Unknown { rtype: 39, bytes },
+        }
+    }
+
+    fn opt_record(udp_payload_size: u16) -> Record {
+        Record {
+            name: String::new(),
+            rtype: 41,
+            rclass: udp_payload_size,
+            ttl: 0,
+            record: RecordData::OPT(EdnsInfo {
+                udp_payload_size,
+                extended_rcode: 0,
+                version: 0,
+                flags: 0,
+                dnssec_ok: false,
+                options: Vec::new(),
+            }),
         }
     }
 
@@ -5205,6 +8733,38 @@ mod tests {
         }
     }
 
+    fn nsec3_record(name: &str, ttl: u32) -> Record {
+        Record {
+            name: name.to_string(),
+            rtype: 50,
+            rclass: 1,
+            ttl,
+            record: RecordData::NSEC3 {
+                hash_algorithm: 1,
+                flags: 0,
+                iterations: 1,
+                salt_length: 1,
+                salt: vec![0xaa],
+                hash_length: 2,
+                next_domain: "bbcc".to_string(),
+                type_bit_maps: vec![0, 1, 0x40],
+            },
+        }
+    }
+
+    fn unknown_record(name: &str, rtype: u16, ttl: u32, bytes: &[u8]) -> Record {
+        Record {
+            name: name.to_string(),
+            rtype,
+            rclass: 1,
+            ttl,
+            record: RecordData::Unknown {
+                rtype,
+                bytes: bytes.to_vec(),
+            },
+        }
+    }
+
     fn soa_record(name: &str, ttl: u32, minimum: u32) -> Record {
         Record {
             name: name.to_string(),
@@ -5221,6 +8781,25 @@ mod tests {
                 expire: 4,
                 minimum,
             },
+        }
+    }
+
+    fn negative_metadata(
+        authority_zone: &str,
+        covered_name: &str,
+        qtype: u16,
+        qclass: u16,
+        kind: NegativeCacheKind,
+        ttl: Duration,
+    ) -> NegativeCacheMetadata {
+        NegativeCacheMetadata {
+            authority_zone: authority_zone.to_string(),
+            covered_name: covered_name.to_string(),
+            qtype,
+            qclass,
+            kind,
+            soa_owner: authority_zone.to_string(),
+            soa_minimum_ttl: ttl,
         }
     }
 
@@ -5284,20 +8863,39 @@ mod tests {
         assert_eq!(ttl, Duration::from_secs(90));
         assert_eq!(
             metadata,
-            Some(NegativeCacheMetadata {
-                authority_name: "example.com".to_string(),
-                soa_minimum_ttl: Duration::from_secs(90),
-            })
+            Some(negative_metadata(
+                "example.com",
+                "example.com",
+                1,
+                1,
+                NegativeCacheKind::NxDomain,
+                Duration::from_secs(90)
+            ))
         );
+    }
+
+    #[test]
+    fn ttl_policy_rejects_negative_cache_when_soa_does_not_cover_name() {
+        let policy = CacheTtlPolicy::default();
+        let response = response_message(
+            ResponseCode::NxDomain,
+            Vec::new(),
+            vec![soa_record("attacker.test", 90, 300)],
+        );
+
+        assert_eq!(policy.ttl_for_response(&response), None);
     }
 
     #[test]
     fn ttl_policy_preserves_negative_metadata_for_nxdomain_with_cname_answer() {
         let policy = CacheTtlPolicy::default();
-        let response = response_message(
+        let response = response_message_for_question(
+            QuestionKey::new("www.example.com", 1, 1),
             ResponseCode::NxDomain,
             vec![cname_record("www.example.com", 300, "missing.example.com")],
             vec![soa_record("example.com", 60, 120)],
+            Vec::new(),
+            true,
         );
 
         let (ttl, metadata) = policy.ttl_for_response(&response).unwrap();
@@ -5305,20 +8903,27 @@ mod tests {
         assert_eq!(ttl, Duration::from_secs(60));
         assert_eq!(
             metadata,
-            Some(NegativeCacheMetadata {
-                authority_name: "example.com".to_string(),
-                soa_minimum_ttl: Duration::from_secs(60),
-            })
+            Some(negative_metadata(
+                "example.com",
+                "missing.example.com",
+                1,
+                1,
+                NegativeCacheKind::NxDomain,
+                Duration::from_secs(60)
+            ))
         );
     }
 
     #[test]
     fn ttl_policy_preserves_negative_metadata_for_nodata_with_cname_answer() {
         let policy = CacheTtlPolicy::default();
-        let response = response_message(
+        let response = response_message_for_question(
+            QuestionKey::new("www.example.com", 1, 1),
             ResponseCode::NoError,
             vec![cname_record("www.example.com", 300, "target.example.com")],
             vec![soa_record("example.com", 30, 120)],
+            Vec::new(),
+            true,
         );
 
         let (ttl, metadata) = policy.ttl_for_response(&response).unwrap();
@@ -5326,23 +8931,129 @@ mod tests {
         assert_eq!(ttl, Duration::from_secs(30));
         assert_eq!(
             metadata,
-            Some(NegativeCacheMetadata {
-                authority_name: "example.com".to_string(),
-                soa_minimum_ttl: Duration::from_secs(30),
-            })
+            Some(negative_metadata(
+                "example.com",
+                "target.example.com",
+                1,
+                1,
+                NegativeCacheKind::NoData,
+                Duration::from_secs(30)
+            ))
+        );
+    }
+
+    #[test]
+    fn ttl_policy_rejects_cname_nodata_when_soa_does_not_cover_target() {
+        let policy = CacheTtlPolicy::default();
+        let response = response_message_for_question(
+            QuestionKey::new("www.example.com", 1, 1),
+            ResponseCode::NoError,
+            vec![cname_record("www.example.com", 300, "target.attacker.test")],
+            vec![soa_record("example.com", 30, 120)],
+            Vec::new(),
+            true,
+        );
+
+        assert_eq!(policy.ttl_for_response(&response), None);
+    }
+
+    #[test]
+    fn ttl_policy_ignores_unrelated_cname_when_validating_negative_coverage() {
+        let policy = CacheTtlPolicy::default();
+        let response = response_message_for_question(
+            QuestionKey::new("www.example.com", 1, 1),
+            ResponseCode::NoError,
+            vec![
+                cname_record("www.example.com", 300, "target.attacker.test"),
+                cname_record("unrelated.example.com", 300, "target.example.com"),
+            ],
+            vec![soa_record("example.com", 30, 120)],
+            Vec::new(),
+            true,
+        );
+
+        assert_eq!(policy.ttl_for_response(&response), None);
+    }
+
+    #[test]
+    fn ttl_policy_treats_unrelated_answer_as_cname_nodata() {
+        let policy = CacheTtlPolicy::default();
+        let response = response_message_for_question(
+            QuestionKey::new("www.example.com", 1, 1),
+            ResponseCode::NoError,
+            vec![
+                cname_record("www.example.com", 300, "target.example.com"),
+                a_record("unrelated.example.com", 300),
+            ],
+            vec![soa_record("example.com", 30, 120)],
+            Vec::new(),
+            true,
+        );
+
+        let (ttl, metadata) = policy.ttl_for_response(&response).unwrap();
+
+        assert_eq!(ttl, Duration::from_secs(30));
+        assert_eq!(
+            metadata,
+            Some(negative_metadata(
+                "example.com",
+                "target.example.com",
+                1,
+                1,
+                NegativeCacheKind::NoData,
+                Duration::from_secs(30)
+            ))
+        );
+    }
+
+    #[test]
+    fn ttl_policy_rejects_negative_cache_when_soa_class_differs() {
+        let policy = CacheTtlPolicy::default();
+        let mut soa = soa_record("example.com", 30, 120);
+        soa.rclass = 3;
+        let response = response_message(ResponseCode::NxDomain, Vec::new(), vec![soa]);
+
+        assert_eq!(policy.ttl_for_response(&response), None);
+    }
+
+    #[test]
+    fn ttl_policy_allows_root_soa_negative_cache() {
+        let policy = CacheTtlPolicy::default();
+        let response = response_message(
+            ResponseCode::NxDomain,
+            Vec::new(),
+            vec![soa_record("", 30, 120)],
+        );
+
+        let (ttl, metadata) = policy.ttl_for_response(&response).unwrap();
+
+        assert_eq!(ttl, Duration::from_secs(30));
+        assert_eq!(
+            metadata,
+            Some(negative_metadata(
+                "",
+                "example.com",
+                1,
+                1,
+                NegativeCacheKind::NxDomain,
+                Duration::from_secs(30)
+            ))
         );
     }
 
     #[test]
     fn ttl_policy_preserves_negative_metadata_for_dnssec_signed_cname_nodata() {
         let policy = CacheTtlPolicy::default();
-        let response = response_message(
+        let response = response_message_for_question(
+            QuestionKey::new("www.example.com", 1, 1),
             ResponseCode::NoError,
             vec![
                 cname_record("www.example.com", 300, "target.example.com"),
                 rrsig_record("www.example.com", 300, CNAME_RECORD_TYPE),
             ],
             vec![soa_record("example.com", 30, 120)],
+            Vec::new(),
+            true,
         );
 
         let (ttl, metadata) = policy.ttl_for_response(&response).unwrap();
@@ -5350,10 +9061,14 @@ mod tests {
         assert_eq!(ttl, Duration::from_secs(30));
         assert_eq!(
             metadata,
-            Some(NegativeCacheMetadata {
-                authority_name: "example.com".to_string(),
-                soa_minimum_ttl: Duration::from_secs(30),
-            })
+            Some(negative_metadata(
+                "example.com",
+                "target.example.com",
+                1,
+                1,
+                NegativeCacheKind::NoData,
+                Duration::from_secs(30)
+            ))
         );
     }
 
@@ -5370,6 +9085,27 @@ mod tests {
         let (ttl, metadata) = policy.ttl_for_response(&response).unwrap();
 
         assert_eq!(ttl, Duration::from_secs(300));
+        assert_eq!(metadata, None);
+    }
+
+    #[test]
+    fn ttl_policy_keeps_cname_chain_with_target_answer_positive() {
+        let policy = CacheTtlPolicy::default();
+        let response = response_message_for_question(
+            QuestionKey::new("www.example.com", 1, 1),
+            ResponseCode::NoError,
+            vec![
+                cname_record("www.example.com", 300, "target.example.com"),
+                a_record("target.example.com", 120),
+            ],
+            Vec::new(),
+            Vec::new(),
+            true,
+        );
+
+        let (ttl, metadata) = policy.ttl_for_response(&response).unwrap();
+
+        assert_eq!(ttl, Duration::from_secs(120));
         assert_eq!(metadata, None);
     }
 
@@ -5474,8 +9210,93 @@ mod tests {
         assert_eq!(event.terminal_outcome, QueryEventOutcome::AllowedFromCache);
         assert_eq!(event.response_code, Some(ResponseCode::NoError as u16));
         assert_eq!(event.cache_result, Some(QueryEventCacheResult::Hit));
+        assert_eq!(event.backend, None);
         assert_eq!(event.latency, Some(Duration::from_millis(12)));
         assert!(event.advisory_findings.is_empty());
+    }
+
+    #[test]
+    fn backend_snapshot_status_reports_backend_and_root_hints() {
+        let loaded_at = SystemTime::UNIX_EPOCH + Duration::from_secs(100);
+        let snapshot = BackendSnapshot::new(
+            Arc::new(StaticUpstream::new(Err(UpstreamError::Timeout))),
+            ResolutionMode::Recursive,
+            7,
+            BackendHealth::Healthy,
+            Some("mode:recursive;generation:7".to_string()),
+        )
+        .with_root_hints_status(BackendRootHintsStatus::loaded(
+            "bundled",
+            "root-hints:v1",
+            loaded_at,
+        ));
+
+        let status = snapshot.status();
+
+        assert_eq!(status.mode, ResolutionMode::Recursive);
+        assert_eq!(status.generation, 7);
+        assert_eq!(status.health, BackendHealth::Healthy);
+        assert_eq!(status.dnssec_validation, DnssecValidationStatus::Disabled);
+        assert_eq!(
+            status.cache_namespace.as_deref(),
+            Some("mode:recursive;generation:7")
+        );
+        let root_hints = status.root_hints.unwrap();
+        assert_eq!(root_hints.source, "bundled");
+        assert_eq!(root_hints.version, "root-hints:v1");
+        assert_eq!(
+            root_hints.age_at(loaded_at + Duration::from_secs(5)),
+            Some(Duration::from_secs(5))
+        );
+
+        let metrics = Arc::new(RecordingMetrics::default());
+        let service = ResolveQuery::with_cache_and_backend_snapshot(
+            Arc::new(StandardProtocolCodec::new(1232)),
+            Arc::new(NoopDnsCache),
+            CacheTtlPolicy::default(),
+            snapshot,
+            Arc::new(BasicResponseFactory),
+            Arc::new(FixedClock(SystemTime::UNIX_EPOCH)),
+            Arc::new(RecordingEvents::default()),
+            metrics.clone(),
+        );
+
+        assert_eq!(
+            metrics.backend_statuses.lock().unwrap().as_slice(),
+            &[service.backend_status()]
+        );
+
+        service.publish_backend_snapshot(BackendSnapshot::new(
+            Arc::new(StaticUpstream::new(Err(UpstreamError::NoBackendsAvailable))),
+            ResolutionMode::Forward,
+            8,
+            BackendHealth::Degraded,
+            Some("mode:forward;generation:8".to_string()),
+        ));
+
+        let status = service.backend_status();
+        assert_eq!(status.mode, ResolutionMode::Forward);
+        assert_eq!(status.generation, 8);
+        assert_eq!(status.health, BackendHealth::Degraded);
+        assert_eq!(status.root_hints, None);
+        assert_eq!(
+            metrics.backend_statuses.lock().unwrap().as_slice(),
+            &[
+                BackendStatus {
+                    mode: ResolutionMode::Recursive,
+                    generation: 7,
+                    health: BackendHealth::Healthy,
+                    dnssec_validation: DnssecValidationStatus::Disabled,
+                    cache_namespace: Some("mode:recursive;generation:7".to_string()),
+                    root_hints: Some(BackendRootHintsStatus::loaded(
+                        "bundled",
+                        "root-hints:v1",
+                        loaded_at,
+                    )),
+                },
+                status,
+            ]
+        );
     }
 
     #[test]
@@ -5744,11 +9565,13 @@ mod tests {
             key.features,
             QueryFeatures {
                 recursion_desired: true,
+                authenticated_data: false,
+                checking_disabled: false,
                 dnssec_ok: true,
                 edns_udp_payload_size: Some(4096),
             }
         );
-        assert_eq!(key.upstream_policy_variant.as_deref(), Some("primary"));
+        assert_eq!(key.cache_namespace.as_deref(), Some("primary"));
         assert_eq!(key.effective_udp_payload_size, 1232);
     }
 
@@ -5815,13 +9638,45 @@ mod tests {
         );
     }
 
+    #[test]
+    fn cache_key_separates_dnssec_request_flags() {
+        let codec = StandardProtocolCodec::new(1232);
+        let base = codec.decode_query(&a_query(0x1000, "example.com")).unwrap();
+        let ad = codec
+            .decode_query(&a_query_with_authenticated_data(0x1000, "example.com"))
+            .unwrap();
+        let cd = codec
+            .decode_query(&a_query_with_checking_disabled(0x1000, "example.com"))
+            .unwrap();
+        let do_query = codec
+            .decode_query(&a_query_with_edns(0x1000, "example.com", 1232, true))
+            .unwrap();
+
+        let base_key = CacheKey::from_query(&base, None, 1232);
+        assert_ne!(base_key, CacheKey::from_query(&ad, None, 1232));
+        assert_ne!(base_key, CacheKey::from_query(&cd, None, 1232));
+        assert_ne!(base_key, CacheKey::from_query(&do_query, None, 1232));
+        assert!(
+            CacheKey::from_query(&ad, None, 1232)
+                .features
+                .authenticated_data
+        );
+        assert!(
+            CacheKey::from_query(&cd, None, 1232)
+                .features
+                .checking_disabled
+        );
+        assert!(
+            CacheKey::from_query(&do_query, None, 1232)
+                .features
+                .dnssec_ok
+        );
+    }
+
     #[tokio::test]
     async fn resolve_forwards_valid_query_to_upstream() {
-        let response = vec![0xab, 0xcd, 0x81, 0x80];
-        let upstream = Arc::new(StaticUpstream::new(Ok(UpstreamResponse {
-            bytes: response.clone(),
-            received_at: SystemTime::UNIX_EPOCH,
-        })));
+        let response = a_response_with_answer(0xabcd, "Example.COM", 60);
+        let upstream = Arc::new(StaticUpstream::new(Ok(upstream_response(response.clone()))));
         let events = Arc::new(RecordingEvents::default());
         let metrics = Arc::new(RecordingMetrics::default());
         let service = resolve_service(upstream.clone(), events.clone(), metrics.clone());
@@ -5874,17 +9729,104 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn resolve_preserves_forwarding_backend_query_edns_payload() {
+        let response = a_response_with_answer(0xabcd, "example.com", 60);
+        let upstream = Arc::new(StaticUpstream::new(Ok(upstream_response(response))));
+        let service = ResolveQuery::with_cache(
+            Arc::new(StandardProtocolCodec::new(700)),
+            Arc::new(NoopDnsCache),
+            CacheTtlPolicy::default(),
+            upstream.clone(),
+            Arc::new(BasicResponseFactory),
+            Arc::new(FixedClock(SystemTime::UNIX_EPOCH)),
+            Arc::new(RecordingEvents::default()),
+            Arc::new(RecordingMetrics::default()),
+        );
+
+        let outcome = service
+            .resolve(ResolveRequest::new(
+                "192.0.2.10".parse().unwrap(),
+                SystemTime::UNIX_EPOCH,
+                a_query_with_edns(0x1234, "example.com", 4096, true),
+            ))
+            .await;
+
+        assert_eq!(outcome.decision.kind, ResolveDecisionKind::Allowed);
+        let requests = upstream.requests.lock().unwrap();
+        assert_eq!(
+            requests[0]
+                .query
+                .message
+                .edns
+                .as_ref()
+                .map(|edns| edns.udp_payload_size),
+            Some(4096)
+        );
+    }
+
+    #[tokio::test]
+    async fn resolve_preserves_large_forwarded_response_with_client_edns_payload() {
+        let question = QuestionKey::new("example.com", 1, 1);
+        let response = response_message_for_question_with_id(
+            0xabcd,
+            question,
+            ResponseCode::NoError,
+            (0..40).map(|_| a_record("example.com", 60)).collect(),
+            Vec::new(),
+            Vec::new(),
+            true,
+        )
+        .original_bytes
+        .to_vec();
+        let upstream = Arc::new(StaticUpstream::new(Ok(upstream_response(response))));
+        let service = ResolveQuery::with_cache(
+            Arc::new(StandardProtocolCodec::new(700)),
+            Arc::new(NoopDnsCache),
+            CacheTtlPolicy::default(),
+            upstream,
+            Arc::new(BasicResponseFactory),
+            Arc::new(FixedClock(SystemTime::UNIX_EPOCH)),
+            Arc::new(RecordingEvents::default()),
+            Arc::new(RecordingMetrics::default()),
+        );
+
+        let outcome = service
+            .resolve(ResolveRequest::new(
+                "192.0.2.10".parse().unwrap(),
+                SystemTime::UNIX_EPOCH,
+                a_query_with_edns(0x1234, "example.com", 4096, false),
+            ))
+            .await;
+
+        assert_eq!(outcome.decision.kind, ResolveDecisionKind::Allowed);
+        let response = Message::parse(&outcome.response_bytes).unwrap();
+        assert!(!response.header.tc());
+        assert_eq!(response.answers.len(), 40);
+    }
+
+    #[tokio::test]
     async fn resolve_returns_cached_template_with_current_request_id() {
         let cache = Arc::new(InMemoryDnsCache::new(16));
         let cached_query = StandardProtocolCodec::new(1232)
             .decode_query(&a_query(0xaaaa, "example.com"))
             .unwrap();
         cache.store_now(CacheStore {
-            key: CacheKey::from_query(&cached_query, None, 1232),
+            key: CacheKey::from_query(
+                &cached_query,
+                backend_cache_namespace(ResolutionMode::Forward, 0),
+                1232,
+            ),
             response_template: a_response_with_answer(0, "example.com", 60),
             response_code: ResponseCode::NoError,
             minimum_ttl: Duration::from_secs(60),
-            negative_cache: None,
+            negative_cache: Some(negative_metadata(
+                "example.com",
+                "example.com",
+                1,
+                1,
+                NegativeCacheKind::NoData,
+                Duration::from_secs(60),
+            )),
             stored_at: SystemTime::UNIX_EPOCH,
             ttl: Duration::from_secs(60),
         });
@@ -5927,6 +9869,7 @@ mod tests {
             );
         }
         assert_eq!(metrics.count(ResolverMetric::CacheHit), 1);
+        assert_eq!(metrics.count(ResolverMetric::CacheNegativeHit), 1);
         assert_eq!(metrics.count(ResolverMetric::CacheMiss), 0);
     }
 
@@ -5937,7 +9880,11 @@ mod tests {
             .decode_query(&a_query_without_rd(0xaaaa, "example.com"))
             .unwrap();
         cache.store_now(CacheStore {
-            key: CacheKey::from_query(&cached_query, None, 1232),
+            key: CacheKey::from_query(
+                &cached_query,
+                backend_cache_namespace(ResolutionMode::Forward, 0),
+                1232,
+            ),
             response_template: a_response_with_answer(0, "example.com", 60),
             response_code: ResponseCode::NoError,
             minimum_ttl: Duration::from_secs(60),
@@ -5970,7 +9917,11 @@ mod tests {
             .decode_query(&a_query(0xaaaa, "example.com"))
             .unwrap();
         cache.store_now(CacheStore {
-            key: CacheKey::from_query(&cached_query, None, 1232),
+            key: CacheKey::from_query(
+                &cached_query,
+                backend_cache_namespace(ResolutionMode::Forward, 0),
+                1232,
+            ),
             response_template: a_response_with_answer(0, "example.com", 60),
             response_code: ResponseCode::NoError,
             minimum_ttl: Duration::from_secs(60),
@@ -6003,7 +9954,11 @@ mod tests {
             .decode_query(&a_query(0xaaaa, "example.com"))
             .unwrap();
         cache.store_now(CacheStore {
-            key: CacheKey::from_query(&cached_query, None, 1232),
+            key: CacheKey::from_query(
+                &cached_query,
+                backend_cache_namespace(ResolutionMode::Forward, 0),
+                1232,
+            ),
             response_template: a_response_with_answer(0, "example.com", 3600),
             response_code: ResponseCode::NoError,
             minimum_ttl: Duration::from_secs(60),
@@ -6076,10 +10031,9 @@ mod tests {
             expires_at: SystemTime::UNIX_EPOCH + Duration::from_secs(30),
         };
         let cache = Arc::new(RecordingCache::with_lookup(CacheLookup::Hit(cached)));
-        let upstream = Arc::new(StaticUpstream::new(Ok(UpstreamResponse {
-            bytes: a_response_with_answer(0x8888, "example.com", 60),
-            received_at: SystemTime::UNIX_EPOCH,
-        })));
+        let upstream = Arc::new(StaticUpstream::new(Ok(upstream_response(
+            a_response_with_answer(0x8888, "example.com", 60),
+        ))));
         let events = Arc::new(RecordingEvents::default());
         let metrics = Arc::new(RecordingMetrics::default());
         let service = resolve_service_with_cache(
@@ -6109,10 +10063,9 @@ mod tests {
     #[tokio::test]
     async fn resolve_coalesces_duplicate_cache_misses() {
         let cache = Arc::new(InMemoryDnsCache::new(16));
-        let upstream = Arc::new(BlockingUpstream::new(Ok(UpstreamResponse {
-            bytes: a_response_with_answer(0xaaaa, "example.com", 60),
-            received_at: SystemTime::UNIX_EPOCH,
-        })));
+        let upstream = Arc::new(BlockingUpstream::new(Ok(upstream_response(
+            a_response_with_answer(0xaaaa, "example.com", 60),
+        ))));
         let events = Arc::new(RecordingEvents::default());
         let metrics = Arc::new(RecordingMetrics::default());
         let service = Arc::new(resolve_service_with_cache(
@@ -6192,10 +10145,9 @@ mod tests {
     #[tokio::test]
     async fn resolve_stores_upstream_response_as_neutral_id_template() {
         let cache = Arc::new(RecordingCache::with_lookup(CacheLookup::Miss));
-        let upstream = Arc::new(StaticUpstream::new(Ok(UpstreamResponse {
-            bytes: a_response_with_answer(0xbeef, "example.com", 45),
-            received_at: SystemTime::UNIX_EPOCH,
-        })));
+        let upstream = Arc::new(StaticUpstream::new(Ok(upstream_response(
+            a_response_with_answer(0xbeef, "example.com", 45),
+        ))));
         let events = Arc::new(RecordingEvents::default());
         let metrics = Arc::new(RecordingMetrics::default());
         let service =
@@ -6229,10 +10181,9 @@ mod tests {
     #[tokio::test]
     async fn resolve_records_negative_cache_store_metrics() {
         let cache = Arc::new(RecordingCache::with_lookup(CacheLookup::Miss));
-        let upstream = Arc::new(StaticUpstream::new(Ok(UpstreamResponse {
-            bytes: nxdomain_response_with_soa(0xabcd, "example.com", 30, 120),
-            received_at: SystemTime::UNIX_EPOCH,
-        })));
+        let upstream = Arc::new(StaticUpstream::new(Ok(upstream_response(
+            nxdomain_response_with_soa(0xabcd, "example.com", 30, 120),
+        ))));
         let events = Arc::new(RecordingEvents::default());
         let metrics = Arc::new(RecordingMetrics::default());
         let service =
@@ -6252,10 +10203,14 @@ mod tests {
         assert_eq!(stores[0].response_code, ResponseCode::NxDomain);
         assert_eq!(
             stores[0].negative_cache,
-            Some(NegativeCacheMetadata {
-                authority_name: "example.com".to_string(),
-                soa_minimum_ttl: Duration::from_secs(30),
-            })
+            Some(negative_metadata(
+                "example.com",
+                "example.com",
+                1,
+                1,
+                NegativeCacheKind::NxDomain,
+                Duration::from_secs(30)
+            ))
         );
         drop(stores);
         assert_eq!(metrics.count(ResolverMetric::CacheStore), 1);
@@ -6263,27 +10218,181 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn resolve_does_not_store_malformed_or_question_mismatched_upstream_response() {
-        for (response, skipped_store_count) in [
-            (vec![0x12], 0),
-            (a_response_with_answer(0x5555, "other.example", 60), 1),
-            (a_response_with_answer(0x5555, "Example.COM", 60), 1),
-            (
-                multi_question_a_response_with_answer(0x5555, "example.com", 60),
-                1,
-            ),
+    async fn resolve_honors_backend_do_not_cache_directive() {
+        let cache = Arc::new(RecordingCache::with_lookup(CacheLookup::Miss));
+        let mut response = upstream_response(a_response_with_answer(0x6666, "example.com", 60));
+        response.cache_directive =
+            ResolutionCacheDirective::DoNotCache(ResolutionNoCacheReason::BackendPolicy);
+        let upstream = Arc::new(StaticUpstream::new(Ok(response)));
+        let events = Arc::new(RecordingEvents::default());
+        let metrics = Arc::new(RecordingMetrics::default());
+        let service =
+            resolve_service_with_cache(upstream, cache.clone(), events, metrics.clone(), 1232);
+
+        let outcome = service
+            .resolve(ResolveRequest::new(
+                "192.0.2.10".parse().unwrap(),
+                SystemTime::UNIX_EPOCH,
+                a_query(0x6666, "example.com"),
+            ))
+            .await;
+
+        assert_eq!(outcome.decision.kind, ResolveDecisionKind::Allowed);
+        assert!(cache.stores.lock().unwrap().is_empty());
+        assert_eq!(metrics.count(ResolverMetric::CacheStoreSkipped), 1);
+    }
+
+    #[tokio::test]
+    async fn resolve_passes_backend_generation_to_backend_request() {
+        let upstream = Arc::new(StaticUpstream::new(Ok(upstream_response(
+            a_response_with_answer(0x1234, "example.com", 60),
+        ))));
+        let events = Arc::new(RecordingEvents::default());
+        let metrics = Arc::new(RecordingMetrics::default());
+        let service = ResolveQuery::with_cache_and_backend_generation(
+            Arc::new(StandardProtocolCodec::new(1232)),
+            Arc::new(NoopDnsCache),
+            CacheTtlPolicy::default(),
+            upstream.clone(),
+            99,
+            Arc::new(BasicResponseFactory),
+            Arc::new(FixedClock(SystemTime::UNIX_EPOCH)),
+            events,
+            metrics,
+        );
+
+        let outcome = service
+            .resolve(ResolveRequest::new(
+                "192.0.2.10".parse().unwrap(),
+                SystemTime::UNIX_EPOCH,
+                a_query(0x1234, "example.com"),
+            ))
+            .await;
+
+        assert_eq!(outcome.decision.kind, ResolveDecisionKind::Allowed);
+        let requests = upstream.requests.lock().unwrap();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].backend_generation, 99);
+    }
+
+    #[tokio::test]
+    async fn resolve_uses_latest_backend_handle_snapshot() {
+        let first_backend = Arc::new(StaticUpstream::new(Ok(upstream_response(
+            a_response_with_answer(0x1234, "example.com", 60),
+        ))));
+        let second_backend = Arc::new(StaticUpstream::new(Ok(upstream_response(
+            a_response_with_answer(0x1234, "example.com", 60),
+        ))));
+        let handle = BackendHandle::new(BackendSnapshot::forwarding(first_backend.clone(), 1));
+        let metrics = Arc::new(RecordingMetrics::default());
+        let service = ResolveQuery::with_cache_and_backend_handle(
+            Arc::new(StandardProtocolCodec::new(1232)),
+            Arc::new(NoopDnsCache),
+            CacheTtlPolicy::default(),
+            handle.clone(),
+            Arc::new(BasicResponseFactory),
+            Arc::new(FixedClock(SystemTime::UNIX_EPOCH)),
+            Arc::new(RecordingEvents::default()),
+            metrics.clone(),
+        );
+        assert_eq!(metrics.backend_statuses.lock().unwrap().len(), 1);
+
+        service.publish_backend_snapshot(BackendSnapshot::new(
+            second_backend.clone(),
+            ResolutionMode::Forward,
+            2,
+            BackendHealth::Degraded,
+            Some("mode:forward;generation:2".to_string()),
+        ));
+        assert_eq!(metrics.backend_statuses.lock().unwrap().len(), 2);
+        let outcome = service
+            .resolve(ResolveRequest::new(
+                "192.0.2.10".parse().unwrap(),
+                SystemTime::UNIX_EPOCH,
+                a_query(0x1234, "example.com"),
+            ))
+            .await;
+
+        assert_eq!(outcome.decision.kind, ResolveDecisionKind::Allowed);
+        assert!(first_backend.requests.lock().unwrap().is_empty());
+        let requests = second_backend.requests.lock().unwrap();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].backend_generation, 2);
+        let statuses = metrics.backend_statuses.lock().unwrap();
+        assert_eq!(statuses.len(), 3);
+        assert_eq!(statuses[2].generation, 2);
+    }
+
+    #[tokio::test]
+    async fn backend_generation_separates_cache_entries() {
+        let cache = Arc::new(InMemoryDnsCache::new(16));
+        let first_backend = Arc::new(StaticUpstream::new(Ok(upstream_response(
+            a_response_with_answer(0x1111, "example.com", 60),
+        ))));
+        let events = Arc::new(RecordingEvents::default());
+        let metrics = Arc::new(RecordingMetrics::default());
+        let first_service = ResolveQuery::with_cache_and_backend_generation(
+            Arc::new(StandardProtocolCodec::new(1232)),
+            cache.clone(),
+            CacheTtlPolicy::default(),
+            first_backend.clone(),
+            1,
+            Arc::new(BasicResponseFactory),
+            Arc::new(FixedClock(SystemTime::UNIX_EPOCH)),
+            events.clone(),
+            metrics.clone(),
+        );
+        let second_backend = Arc::new(StaticUpstream::new(Ok(upstream_response(
+            a_response_with_answer(0x2222, "example.com", 60),
+        ))));
+        let second_service = ResolveQuery::with_cache_and_backend_generation(
+            Arc::new(StandardProtocolCodec::new(1232)),
+            cache,
+            CacheTtlPolicy::default(),
+            second_backend.clone(),
+            2,
+            Arc::new(BasicResponseFactory),
+            Arc::new(FixedClock(SystemTime::UNIX_EPOCH)),
+            events,
+            metrics,
+        );
+
+        let first = first_service
+            .resolve(ResolveRequest::new(
+                "192.0.2.10".parse().unwrap(),
+                SystemTime::UNIX_EPOCH,
+                a_query(0x1111, "example.com"),
+            ))
+            .await;
+        let second = second_service
+            .resolve(ResolveRequest::new(
+                "192.0.2.10".parse().unwrap(),
+                SystemTime::UNIX_EPOCH,
+                a_query(0x2222, "example.com"),
+            ))
+            .await;
+
+        assert_eq!(first.decision.kind, ResolveDecisionKind::Allowed);
+        assert_eq!(second.decision.kind, ResolveDecisionKind::Allowed);
+        assert_eq!(first_backend.requests.lock().unwrap().len(), 1);
+        assert_eq!(second_backend.requests.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn resolve_rejects_invalid_backend_response_bytes() {
+        for response in [
+            vec![0x12],
+            a_response_with_answer(0x5555, "other.example", 60),
+            multi_question_a_response_with_answer(0x5555, "example.com", 60),
         ] {
             let cache = Arc::new(RecordingCache::with_lookup(CacheLookup::Miss));
-            let upstream = Arc::new(StaticUpstream::new(Ok(UpstreamResponse {
-                bytes: response,
-                received_at: SystemTime::UNIX_EPOCH,
-            })));
+            let upstream = Arc::new(StaticUpstream::new(Ok(upstream_response(response))));
             let events = Arc::new(RecordingEvents::default());
             let metrics = Arc::new(RecordingMetrics::default());
             let service =
                 resolve_service_with_cache(upstream, cache.clone(), events, metrics.clone(), 1232);
 
-            let _ = service
+            let outcome = service
                 .resolve(ResolveRequest::new(
                     "192.0.2.10".parse().unwrap(),
                     SystemTime::UNIX_EPOCH,
@@ -6291,12 +10400,68 @@ mod tests {
                 ))
                 .await;
 
+            assert_eq!(outcome.decision.kind, ResolveDecisionKind::BackendFailure);
             assert!(cache.stores.lock().unwrap().is_empty());
-            assert_eq!(
-                metrics.count(ResolverMetric::CacheStoreSkipped),
-                skipped_store_count
-            );
+            assert_eq!(metrics.count(ResolverMetric::CacheStoreSkipped), 0);
+            assert_eq!(metrics.count(ResolverMetric::UpstreamSuccess), 0);
+            assert_eq!(metrics.count(ResolverMetric::UpstreamFailure), 1);
         }
+    }
+
+    #[tokio::test]
+    async fn resolve_rejects_backend_response_when_metadata_and_bytes_drift() {
+        let cache = Arc::new(RecordingCache::with_lookup(CacheLookup::Miss));
+        let mut response = upstream_response(a_response_with_answer(0x5555, "example.com", 60));
+        response.bytes = a_response_with_answer(0x5555, "other.example", 60);
+        let upstream = Arc::new(StaticUpstream::new(Ok(response)));
+        let events = Arc::new(RecordingEvents::default());
+        let metrics = Arc::new(RecordingMetrics::default());
+        let service =
+            resolve_service_with_cache(upstream, cache.clone(), events, metrics.clone(), 1232);
+
+        let outcome = service
+            .resolve(ResolveRequest::new(
+                "192.0.2.10".parse().unwrap(),
+                SystemTime::UNIX_EPOCH,
+                a_query(0x5555, "example.com"),
+            ))
+            .await;
+
+        assert_eq!(outcome.decision.kind, ResolveDecisionKind::BackendFailure);
+        assert!(cache.stores.lock().unwrap().is_empty());
+        assert_eq!(metrics.count(ResolverMetric::CacheStoreSkipped), 0);
+        assert_eq!(metrics.count(ResolverMetric::UpstreamSuccess), 0);
+        assert_eq!(metrics.count(ResolverMetric::UpstreamFailure), 1);
+    }
+
+    #[tokio::test]
+    async fn resolve_caches_response_when_question_differs_only_by_case() {
+        let cache = Arc::new(RecordingCache::with_lookup(CacheLookup::Miss));
+        let upstream = Arc::new(StaticUpstream::new(Ok(upstream_response(
+            a_response_with_answer(0x5555, "example.com", 60),
+        ))));
+        let events = Arc::new(RecordingEvents::default());
+        let metrics = Arc::new(RecordingMetrics::default());
+        let service =
+            resolve_service_with_cache(upstream, cache.clone(), events, metrics.clone(), 1232);
+
+        let outcome = service
+            .resolve(ResolveRequest::new(
+                "192.0.2.10".parse().unwrap(),
+                SystemTime::UNIX_EPOCH,
+                a_query(0x5555, "Example.COM"),
+            ))
+            .await;
+
+        assert_eq!(outcome.decision.kind, ResolveDecisionKind::Allowed);
+        let stores = cache.stores.lock().unwrap();
+        assert_eq!(stores.len(), 1);
+        assert_eq!(
+            stores[0].key.question,
+            QuestionKey::new("example.com", 1, 1)
+        );
+        assert_eq!(metrics.count(ResolverMetric::CacheStore), 1);
+        assert_eq!(metrics.count(ResolverMetric::CacheStoreSkipped), 0);
     }
 
     #[tokio::test]
@@ -6309,10 +10474,9 @@ mod tests {
             (CacheLookup::Unavailable, ResolverMetric::CacheUnavailable),
         ] {
             let cache = Arc::new(RecordingCache::with_lookup(lookup));
-            let upstream = Arc::new(StaticUpstream::new(Ok(UpstreamResponse {
-                bytes: a_response_with_answer(0x6666, "example.com", 60),
-                received_at: SystemTime::UNIX_EPOCH,
-            })));
+            let upstream = Arc::new(StaticUpstream::new(Ok(upstream_response(
+                a_response_with_answer(0x6666, "example.com", 60),
+            ))));
             let events = Arc::new(RecordingEvents::default());
             let metrics = Arc::new(RecordingMetrics::default());
             let service =
@@ -6335,10 +10499,9 @@ mod tests {
     #[tokio::test]
     async fn resolve_bypasses_cache_for_unsupported_edns_options() {
         let cache = Arc::new(RecordingCache::with_lookup(CacheLookup::Miss));
-        let upstream = Arc::new(StaticUpstream::new(Ok(UpstreamResponse {
-            bytes: a_response_with_answer(0x7777, "example.com", 60),
-            received_at: SystemTime::UNIX_EPOCH,
-        })));
+        let upstream = Arc::new(StaticUpstream::new(Ok(upstream_response(
+            a_response_with_answer(0x7777, "example.com", 60),
+        ))));
         let events = Arc::new(RecordingEvents::default());
         let metrics = Arc::new(RecordingMetrics::default());
         let service =
@@ -6360,17 +10523,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn resolve_bypasses_cache_for_unsupported_flags_and_edns_version() {
+    async fn resolve_bypasses_cache_for_unsupported_edns_flags_and_version() {
         for request in [
-            a_query_with_checking_disabled(0x7777, "example.com"),
             a_query_with_edns_details(0x7777, "example.com", 1232, false, 0, 1, &[]),
             a_query_with_edns_flags(0x7777, "example.com", 1232, false, 0, 0, 0x4000, &[]),
         ] {
             let cache = Arc::new(RecordingCache::with_lookup(CacheLookup::Miss));
-            let upstream = Arc::new(StaticUpstream::new(Ok(UpstreamResponse {
-                bytes: a_response_with_answer(0x7777, "example.com", 60),
-                received_at: SystemTime::UNIX_EPOCH,
-            })));
+            let upstream = Arc::new(StaticUpstream::new(Ok(upstream_response(
+                a_response_with_answer(0x7777, "example.com", 60),
+            ))));
             let events = Arc::new(RecordingEvents::default());
             let metrics = Arc::new(RecordingMetrics::default());
             let service =
@@ -6435,7 +10596,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn resolve_maps_upstream_failure_to_servfail() {
+    async fn resolve_maps_backend_failure_to_servfail() {
         let upstream = Arc::new(StaticUpstream::new(Err(UpstreamError::Timeout)));
         let events = Arc::new(RecordingEvents::default());
         let metrics = Arc::new(RecordingMetrics::default());
@@ -6453,7 +10614,7 @@ mod tests {
             outcome.response_bytes[3] & 0x0f,
             ResponseCode::ServFail as u8
         );
-        assert_eq!(outcome.decision.kind, ResolveDecisionKind::UpstreamFailure);
+        assert_eq!(outcome.decision.kind, ResolveDecisionKind::BackendFailure);
         {
             let recorded_events = events.events.lock().unwrap();
             assert_eq!(recorded_events.len(), 1);
@@ -6478,10 +10639,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn resolve_maps_no_upstreams_to_servfail() {
-        let upstream = Arc::new(StaticUpstream::new(Err(
-            UpstreamError::NoUpstreamsAvailable,
-        )));
+    async fn resolve_maps_no_backends_to_servfail() {
+        let upstream = Arc::new(StaticUpstream::new(Err(UpstreamError::NoBackendsAvailable)));
         let events = Arc::new(RecordingEvents::default());
         let metrics = Arc::new(RecordingMetrics::default());
         let service = resolve_service(upstream, events, metrics.clone());
@@ -6498,7 +10657,7 @@ mod tests {
             outcome.response_bytes[3] & 0x0f,
             ResponseCode::ServFail as u8
         );
-        assert_eq!(outcome.decision.kind, ResolveDecisionKind::UpstreamFailure);
+        assert_eq!(outcome.decision.kind, ResolveDecisionKind::BackendFailure);
         assert!(metrics
             .increments
             .lock()

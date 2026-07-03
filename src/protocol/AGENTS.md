@@ -10,7 +10,7 @@ This directory owns DNS protocol parsing, validation, and wire-format helpers.
 - Parses UDP DNS messages and TCP DNS frames.
 - Validates supported query shape and DNS semantics.
 - Builds protocol-level responses and rewrites byte-level request/response fields.
-- Handles TTL aging/capping, question extraction, EDNS behavior, compression pointers, and record parsing.
+- Handles TTL aging/capping, question extraction, EDNS and DO-bit behavior, compression pointers, and record parsing for supported address, alias, authority, service, DNSSEC, and metadata record types.
 
 ## Boundaries
 

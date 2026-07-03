@@ -7,7 +7,7 @@ High-level summary for `src`.
 This directory contains the crate's public module tree and executable entry point.
 
 - `lib.rs` exposes the library modules used by the binary and tests.
-- `main.rs` assembles runtime configuration, resolver dependencies, UDP listeners, query event handling, and metrics for the executable.
+- `main.rs` assembles runtime configuration, forward or recursive resolver backends, UDP listeners, query event handling, root-hints status, and metrics for the executable.
 - Subdirectories own the main architectural layers: configuration, network delivery, DNS protocol handling, and resolver domain logic.
 
 ## Boundaries

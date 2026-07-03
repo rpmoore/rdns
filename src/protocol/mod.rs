@@ -221,6 +221,12 @@ pub enum RecordData {
         type_bit_maps: Vec<u8>,
     },
     NSEC3 {
+        hash_algorithm: u8,
+        flags: u8,
+        iterations: u16,
+        salt_length: u8,
+        salt: Vec<u8>,
+        hash_length: u8,
         next_domain: String,
         type_bit_maps: Vec<u8>,
     },
@@ -1254,17 +1260,23 @@ fn parse_nsec_record(
 
 fn parse_nsec3_record(dns_message: &[u8], offset: usize, end: usize) -> Result<RecordData> {
     let mut reader = Reader::new(dns_message, offset)?;
-    let _hash_algorithm = reader.read_u8()?;
-    let _flags = reader.read_u8()?;
-    let _iterations = reader.read_u16()?;
+    let hash_algorithm = reader.read_u8()?;
+    let flags = reader.read_u8()?;
+    let iterations = reader.read_u16()?;
     let salt_len = reader.read_u8()? as usize;
-    reader.read_exact(salt_len)?;
+    let salt = reader.read_exact(salt_len)?.to_vec();
     let hash_len = reader.read_u8()? as usize;
     let next_hashed_owner_name = reader.read_exact(hash_len)?;
     if reader.position() > end {
         return Err(DnsParseError::MalformedRecord);
     }
     Ok(RecordData::NSEC3 {
+        hash_algorithm,
+        flags,
+        iterations,
+        salt_length: salt_len as u8,
+        salt,
+        hash_length: hash_len as u8,
         next_domain: to_hex(next_hashed_owner_name),
         type_bit_maps: dns_message[reader.position()..end].to_vec(),
     })
@@ -2438,6 +2450,12 @@ mod tests {
         assert_eq!(
             parse_test_record(&nsec3_bytes).record,
             RecordData::NSEC3 {
+                hash_algorithm: 1,
+                flags: 0,
+                iterations: 1,
+                salt_length: 1,
+                salt: vec![0xaa],
+                hash_length: 2,
                 next_domain: "bbcc".to_string(),
                 type_bit_maps: vec![0, 1, 0x40]
             }
