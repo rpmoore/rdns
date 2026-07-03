@@ -48,9 +48,9 @@ Guidance for Codex and other coding agents working in this repository.
 
 ## Change Logging
 
-If an `mcp__obsidian__*` tool is available in the session, record every completed step (edit, command, decision) — other than the log write itself — to Obsidian's daily note, under a heading/section for `rdns_change_log`. Use `mcp__obsidian__vault_patch` (or `vault_append` if no daily note structure exists yet) to append entries as work happens, not just at session end. Each entry must include why the tool/step was run, not just what was run.
+After code changes are complete, write one summary of what changed and why to Obsidian's daily note, under a heading/section for `rdns_change_log`, if an `mcp__obsidian__*` tool is available in the session. Use `mcp__obsidian__vault_patch` (or `vault_append` if no daily note structure exists yet). Do not log per-step; one entry per logical change is enough.
 
-If no `mcp__obsidian__*` tool is available, skip Obsidian logging and instead summarize the session's steps and rationale in the PR description or final response.
+If no `mcp__obsidian__*` tool is available, skip Obsidian logging and instead summarize what changed and why in the PR description or final response.
 
 ## Directory Summary Instructions
 
