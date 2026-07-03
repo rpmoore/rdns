@@ -12,5 +12,7 @@ idna = "1"
 opentelemetry = { version = "0.32.0", default-features = false, features = ["metrics"] }
 opentelemetry-otlp = { version = "0.32.0", default-features = false, features = ["grpc-tonic", "metrics"] }
 opentelemetry_sdk = { version = "0.32.1", default-features = false, features = ["metrics", "rt-tokio"] }
+serde = { version = "1", features = ["derive"] }
 socket2 = "0.6"
 tokio = { version = "1.28.2", features = ["full"] }
+toml = "0.8"

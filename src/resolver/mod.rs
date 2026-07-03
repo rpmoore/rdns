@@ -1542,6 +1542,35 @@ impl BackendHandle {
     }
 }
 
+#[derive(Clone)]
+pub struct LocalDnsEntriesHandle {
+    entries: Arc<RwLock<Arc<dyn LocalDnsEntries>>>,
+}
+
+impl LocalDnsEntriesHandle {
+    pub fn new(entries: Arc<dyn LocalDnsEntries>) -> Self {
+        Self {
+            entries: Arc::new(RwLock::new(entries)),
+        }
+    }
+
+    pub fn current(&self) -> Arc<dyn LocalDnsEntries> {
+        let entries = self
+            .entries
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        Arc::clone(&entries)
+    }
+
+    pub fn publish(&self, entries: Arc<dyn LocalDnsEntries>) {
+        let mut current = self
+            .entries
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        *current = entries;
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SourceCredibility {
     ForwarderValidated,
@@ -2429,7 +2458,7 @@ struct CacheProbe {
 pub struct ResolveQuery {
     protocol: Arc<dyn ProtocolCodec>,
     policy: Arc<dyn PolicyEvaluator>,
-    local_entries: Arc<dyn LocalDnsEntries>,
+    local_entries: LocalDnsEntriesHandle,
     cache: Arc<dyn DnsCache>,
     ttl_policy: CacheTtlPolicy,
     miss_coalescer: Arc<SingleFlightMisses>,
@@ -2557,7 +2586,7 @@ impl ResolveQuery {
         Self {
             protocol,
             policy,
-            local_entries,
+            local_entries: LocalDnsEntriesHandle::new(local_entries),
             cache,
             ttl_policy,
             miss_coalescer: Arc::new(SingleFlightMisses::default()),
@@ -2578,6 +2607,10 @@ impl ResolveQuery {
         let status = snapshot.status();
         self.backend.publish(snapshot);
         self.metrics.record_backend_status(&status);
+    }
+
+    pub fn publish_local_entries(&self, entries: Arc<dyn LocalDnsEntries>) {
+        self.local_entries.publish(entries);
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -2622,7 +2655,7 @@ impl ResolveQuery {
         Self {
             protocol,
             policy,
-            local_entries,
+            local_entries: LocalDnsEntriesHandle::new(local_entries),
             cache,
             ttl_policy,
             miss_coalescer: Arc::new(SingleFlightMisses::default()),
@@ -2716,7 +2749,7 @@ impl ResolveQuery {
                 )
                 .await;
         }
-        match self.local_entries.lookup(&decoded.question) {
+        match self.local_entries.current().lookup(&decoded.question) {
             LocalDnsLookup::Answer(entry) => {
                 self.metrics.increment(ResolverMetric::QueryAllowed);
                 let response_bytes = self.local_entry_response(&decoded, &entry);
@@ -11064,6 +11097,79 @@ mod tests {
                 family: LocalAnswerFamily::A,
                 ttl: 120,
             })
+        );
+    }
+
+    #[tokio::test]
+    async fn publish_local_entries_updates_lookups_without_restarting_resolver() {
+        let upstream = Arc::new(StaticUpstream::new(Ok(upstream_response(
+            a_response_with_answer(0xabcd, "host.example", 60),
+        ))));
+        let cache = Arc::new(RecordingCache::with_lookup(CacheLookup::Miss));
+        let events = Arc::new(RecordingEvents::default());
+        let service = ResolveQuery::with_cache_and_policy(
+            Arc::new(StandardProtocolCodec::new(1232)),
+            cache.clone(),
+            Arc::new(NoopPolicyEvaluator),
+            Arc::new(NoopLocalDnsEntries),
+            CacheTtlPolicy::default(),
+            upstream.clone(),
+            Arc::new(BasicResponseFactory),
+            Arc::new(FixedClock(SystemTime::UNIX_EPOCH)),
+            events.clone(),
+            Arc::new(RecordingMetrics::default()),
+        );
+
+        let before = service
+            .resolve(ResolveRequest::new(
+                "192.0.2.10".parse().unwrap(),
+                SystemTime::UNIX_EPOCH,
+                a_query(0x1234, "host.example"),
+            ))
+            .await;
+        assert_ne!(
+            before.decision.kind,
+            ResolveDecisionKind::LocalAnswer(LocalAnswerMetadata {
+                entry_id: None,
+                generation: 0,
+                family: LocalAnswerFamily::A,
+                ttl: 120,
+            })
+        );
+        assert_eq!(upstream.requests.lock().unwrap().len(), 1);
+
+        service.publish_local_entries(Arc::new(InMemoryLocalDnsEntries::new(vec![
+            LocalDnsEntry::new(
+                DomainName::parse("host.example").unwrap(),
+                vec![Ipv4Addr::new(192, 0, 2, 44)],
+                Vec::new(),
+                120,
+                true,
+            ),
+        ])));
+
+        let after = service
+            .resolve(ResolveRequest::new(
+                "192.0.2.10".parse().unwrap(),
+                SystemTime::UNIX_EPOCH,
+                a_query(0x1235, "host.example"),
+            ))
+            .await;
+
+        assert_eq!(
+            after.decision.kind,
+            ResolveDecisionKind::LocalAnswer(LocalAnswerMetadata {
+                entry_id: None,
+                generation: 0,
+                family: LocalAnswerFamily::A,
+                ttl: 120,
+            })
+        );
+        assert_eq!(upstream.requests.lock().unwrap().len(), 1);
+        let response = Message::parse(&after.response_bytes).unwrap();
+        assert_eq!(
+            response.answers[0].record,
+            RecordData::A(Ipv4Addr::new(192, 0, 2, 44))
         );
     }
 

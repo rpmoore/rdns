@@ -13,8 +13,12 @@
 // limitations under the License.
 
 use std::collections::HashSet;
-use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::time::Duration;
+
+use serde::Deserialize;
+
+use crate::resolver::{DomainName, LocalDnsEntry, LocalDnsEntryValidationError};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RuntimeConfig {
@@ -23,6 +27,7 @@ pub struct RuntimeConfig {
     pub upstreams: Vec<UpstreamConfig>,
     pub per_query_deadline: Duration,
     pub max_udp_payload_size: usize,
+    pub local_dns_entries: Vec<LocalDnsEntryConfig>,
 }
 
 impl RuntimeConfig {
@@ -54,6 +59,7 @@ impl RuntimeConfig {
             upstreams,
             per_query_deadline,
             max_udp_payload_size,
+            local_dns_entries: Vec::new(),
         };
         config.validate()?;
         Ok(config)
@@ -76,7 +82,16 @@ impl RuntimeConfig {
             }],
             per_query_deadline: Duration::from_secs(2),
             max_udp_payload_size: 1232,
+            local_dns_entries: Vec::new(),
         }
+    }
+
+    pub fn from_toml_str(source: &str) -> Result<Self, ConfigError> {
+        let raw: RawRuntimeConfig =
+            toml::from_str(source).map_err(|error| ConfigError::InvalidTomlConfig {
+                message: error.to_string(),
+            })?;
+        raw.try_into()
     }
 
     pub fn validate(&self) -> Result<(), ConfigError> {
@@ -99,6 +114,16 @@ impl RuntimeConfig {
         }
         for upstream in &self.upstreams {
             upstream.validate()?;
+        }
+
+        let mut normalized_local_names = HashSet::with_capacity(self.local_dns_entries.len());
+        for entry in &self.local_dns_entries {
+            let local_entry = entry.to_local_dns_entry()?;
+            if !normalized_local_names.insert(local_entry.name.clone()) {
+                return Err(ConfigError::DuplicateLocalDnsEntryName {
+                    name: entry.name.clone(),
+                });
+            }
         }
 
         validate_duration(
@@ -443,23 +468,55 @@ fn is_usable_authority_address(address: IpAddr) -> bool {
     }
 }
 
+/// IANA/InterNIC's root hints zone file, as published at
+/// <https://www.internic.net/domain/named.root>. Update by re-fetching that
+/// URL over this file; `parse_named_root` re-derives the bundled hints from
+/// it at compile time, so no other code needs to change.
+const BUNDLED_NAMED_ROOT: &str = include_str!("named.root");
+
 fn bundled_root_hints() -> Vec<RootHintConfig> {
-    vec![
-        RootHintConfig::new(
-            "a.root-servers.net",
-            vec![SocketAddr::new(
-                IpAddr::V4(Ipv4Addr::new(198, 41, 0, 4)),
-                53,
-            )],
-        ),
-        RootHintConfig::new(
-            "b.root-servers.net",
-            vec![SocketAddr::new(
-                IpAddr::V4(Ipv4Addr::new(170, 247, 170, 2)),
-                53,
-            )],
-        ),
-    ]
+    parse_named_root(BUNDLED_NAMED_ROOT)
+        .unwrap_or_else(|error| panic!("bundled named.root asset failed to parse: {error}"))
+}
+
+/// Parses a BIND-style root hints zone file (the format IANA/InterNIC
+/// publish as `named.root`/`named.cache`): comment lines start with `;`,
+/// data lines are `<name> <ttl> <type> <rdata>` with no explicit class.
+/// Only `A`/`AAAA` records are kept (`NS` records are redundant with the
+/// owner names of the address records and carry no addresses of their
+/// own); root names are returned in first-seen order with all of their
+/// glue addresses attached.
+fn parse_named_root(source: &str) -> Result<Vec<RootHintConfig>, String> {
+    let mut hints: Vec<RootHintConfig> = Vec::new();
+    for (line_number, line) in source.lines().enumerate() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with(';') {
+            continue;
+        }
+        let fields: Vec<&str> = line.split_whitespace().collect();
+        let [name, _ttl, record_type, rdata] = fields[..] else {
+            return Err(format!(
+                "line {}: expected `<name> <ttl> <type> <rdata>`, got `{line}`",
+                line_number + 1
+            ));
+        };
+        if record_type != "A" && record_type != "AAAA" {
+            continue;
+        }
+        let address: IpAddr = rdata
+            .parse()
+            .map_err(|_| format!("line {}: invalid IP address `{rdata}`", line_number + 1))?;
+        let name = name.trim_end_matches('.').to_ascii_lowercase();
+        let endpoint = SocketAddr::new(address, 53);
+        match hints.iter_mut().find(|hint| hint.name == name) {
+            Some(hint) => hint.endpoints.push(endpoint),
+            None => hints.push(RootHintConfig::new(name, vec![endpoint])),
+        }
+    }
+    if hints.is_empty() {
+        return Err("no A/AAAA root hint records found".to_string());
+    }
+    Ok(hints)
 }
 
 fn canonical_authority_name(name: &str) -> Result<String, ConfigError> {
@@ -581,6 +638,39 @@ impl UpstreamProtocol {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LocalDnsEntryConfig {
+    pub name: String,
+    pub ipv4: Vec<Ipv4Addr>,
+    pub ipv6: Vec<Ipv6Addr>,
+    pub ttl: u32,
+    pub enabled: bool,
+    pub public_address_acknowledged: bool,
+}
+
+impl LocalDnsEntryConfig {
+    pub fn to_local_dns_entry(&self) -> Result<LocalDnsEntry, ConfigError> {
+        let name =
+            DomainName::parse(&self.name).map_err(|_| ConfigError::InvalidLocalDnsEntryName {
+                name: self.name.clone(),
+            })?;
+        let entry = LocalDnsEntry::new(
+            name,
+            self.ipv4.clone(),
+            self.ipv6.clone(),
+            self.ttl,
+            self.enabled,
+        );
+        entry
+            .validate(self.public_address_acknowledged)
+            .map_err(|reason| ConfigError::InvalidLocalDnsEntry {
+                name: self.name.clone(),
+                reason,
+            })?;
+        Ok(entry)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ConfigError {
     NoDnsListenAddress,
     InvalidListenAddress {
@@ -629,6 +719,305 @@ pub enum ConfigError {
     DuplicateRecursiveTransport {
         transport: RecursiveTransport,
     },
+    InvalidLocalDnsEntryName {
+        name: String,
+    },
+    InvalidLocalDnsEntry {
+        name: String,
+        reason: LocalDnsEntryValidationError,
+    },
+    DuplicateLocalDnsEntryName {
+        name: String,
+    },
+    InvalidTomlConfig {
+        message: String,
+    },
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawRuntimeConfig {
+    dns_listen: Vec<String>,
+    per_query_deadline_ms: u64,
+    max_udp_payload_size: usize,
+    #[serde(default)]
+    resolution: Option<RawResolutionConfig>,
+    #[serde(default)]
+    upstreams: Vec<RawUpstreamConfig>,
+    #[serde(default)]
+    local_dns_entries: Vec<RawLocalDnsEntryConfig>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawResolutionConfig {
+    mode: String,
+    #[serde(default)]
+    generation: u64,
+    #[serde(default)]
+    recursive: Option<RawRecursiveResolutionConfig>,
+}
+
+impl RawResolutionConfig {
+    fn try_into_resolution_config(self) -> Result<ResolutionConfig, ConfigError> {
+        match self.mode.as_str() {
+            "forward" => Ok(ResolutionConfig {
+                mode: ResolutionMode::Forward,
+                generation: self.generation,
+                recursive: None,
+            }),
+            "recursive" => {
+                let recursive = self
+                    .recursive
+                    .ok_or(ConfigError::MissingRecursiveResolutionConfig)?
+                    .try_into_recursive_resolution_config()?;
+                Ok(ResolutionConfig::recursive(self.generation, recursive))
+            }
+            other => Err(ConfigError::InvalidTomlConfig {
+                message: format!("unknown resolution mode: {other}"),
+            }),
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawRecursiveResolutionConfig {
+    root_hints: String,
+    root_hints_version: String,
+    #[serde(default)]
+    root_hints_entries: Vec<RawRootHintConfig>,
+    #[serde(default = "default_per_authority_timeout_ms")]
+    per_authority_timeout_ms: u64,
+    #[serde(default = "default_max_recursion_depth")]
+    max_recursion_depth: u8,
+    #[serde(default = "default_max_cname_restarts")]
+    max_cname_restarts: u8,
+    #[serde(default = "default_allowed_transports")]
+    allowed_transports: Vec<String>,
+    #[serde(default)]
+    dnssec_validation: Option<String>,
+    #[serde(default)]
+    dname_handling: Option<String>,
+}
+
+fn default_per_authority_timeout_ms() -> u64 {
+    750
+}
+
+fn default_max_recursion_depth() -> u8 {
+    16
+}
+
+fn default_max_cname_restarts() -> u8 {
+    8
+}
+
+fn default_allowed_transports() -> Vec<String> {
+    vec!["udp".to_string(), "tcp".to_string()]
+}
+
+impl RawRecursiveResolutionConfig {
+    fn try_into_recursive_resolution_config(
+        self,
+    ) -> Result<RecursiveResolutionConfig, ConfigError> {
+        let dnssec_validation = match self.dnssec_validation.as_deref() {
+            None | Some("disabled") => DnssecValidationMode::Disabled,
+            Some(other) => {
+                return Err(ConfigError::InvalidTomlConfig {
+                    message: format!("unknown dnssec_validation mode: {other}"),
+                })
+            }
+        };
+        let dname_handling = match self.dname_handling.as_deref() {
+            None | Some("defer") => DnameHandlingPolicy::Defer,
+            Some(other) => {
+                return Err(ConfigError::InvalidTomlConfig {
+                    message: format!("unknown dname_handling policy: {other}"),
+                })
+            }
+        };
+        let allowed_transports = self
+            .allowed_transports
+            .iter()
+            .map(|value| match value.as_str() {
+                "udp" => Ok(RecursiveTransport::Udp),
+                "tcp" => Ok(RecursiveTransport::Tcp),
+                other => Err(ConfigError::InvalidTomlConfig {
+                    message: format!("unknown recursive transport: {other}"),
+                }),
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+
+        let mut config = match self.root_hints.as_str() {
+            "bundled" => RecursiveResolutionConfig::bundled(self.root_hints_version),
+            "custom" => {
+                let entries = self
+                    .root_hints_entries
+                    .into_iter()
+                    .map(RawRootHintConfig::try_into_root_hint_config)
+                    .collect::<Result<Vec<_>, _>>()?;
+                RecursiveResolutionConfig::new(self.root_hints_version, entries, dnssec_validation)
+            }
+            other => {
+                return Err(ConfigError::InvalidTomlConfig {
+                    message: format!("unknown root_hints source: {other}"),
+                })
+            }
+        };
+        config.dnssec_validation = dnssec_validation;
+        config.dname_handling = dname_handling;
+        config.per_authority_timeout = Duration::from_millis(self.per_authority_timeout_ms);
+        config.max_recursion_depth = self.max_recursion_depth;
+        config.max_cname_restarts = self.max_cname_restarts;
+        config.allowed_transports = allowed_transports;
+        Ok(config)
+    }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawRootHintConfig {
+    name: String,
+    endpoints: Vec<String>,
+}
+
+impl RawRootHintConfig {
+    fn try_into_root_hint_config(self) -> Result<RootHintConfig, ConfigError> {
+        let endpoints = self
+            .endpoints
+            .iter()
+            .map(|endpoint| parse_socket_addr(endpoint))
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(RootHintConfig::new(self.name, endpoints))
+    }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawUpstreamConfig {
+    name: String,
+    endpoint: String,
+    protocol: String,
+    enabled: bool,
+    priority: u16,
+    timeout_ms: u64,
+}
+
+impl RawUpstreamConfig {
+    fn try_into_upstream_config(self) -> Result<UpstreamConfig, ConfigError> {
+        let endpoint = parse_socket_addr(&self.endpoint)?;
+        let protocol = match self.protocol.as_str() {
+            "udp" => UpstreamProtocol::Udp,
+            "tcp" => UpstreamProtocol::Tcp,
+            other => {
+                return Err(ConfigError::InvalidTomlConfig {
+                    message: format!("unknown upstream protocol: {other}"),
+                })
+            }
+        };
+        Ok(UpstreamConfig {
+            name: self.name,
+            endpoint,
+            protocol,
+            enabled: self.enabled,
+            priority: self.priority,
+            timeout: Duration::from_millis(self.timeout_ms),
+        })
+    }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawLocalDnsEntryConfig {
+    name: String,
+    #[serde(default)]
+    ipv4: Vec<String>,
+    #[serde(default)]
+    ipv6: Vec<String>,
+    ttl: u32,
+    enabled: bool,
+    #[serde(default)]
+    public_address_acknowledged: bool,
+}
+
+impl RawLocalDnsEntryConfig {
+    fn try_into_local_dns_entry_config(self) -> Result<LocalDnsEntryConfig, ConfigError> {
+        let ipv4 = self
+            .ipv4
+            .iter()
+            .map(|address| parse_ipv4(address))
+            .collect::<Result<Vec<_>, _>>()?;
+        let ipv6 = self
+            .ipv6
+            .iter()
+            .map(|address| parse_ipv6(address))
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(LocalDnsEntryConfig {
+            name: self.name,
+            ipv4,
+            ipv6,
+            ttl: self.ttl,
+            enabled: self.enabled,
+            public_address_acknowledged: self.public_address_acknowledged,
+        })
+    }
+}
+
+impl TryFrom<RawRuntimeConfig> for RuntimeConfig {
+    type Error = ConfigError;
+
+    fn try_from(raw: RawRuntimeConfig) -> Result<Self, ConfigError> {
+        let dns_listen = raw
+            .dns_listen
+            .iter()
+            .map(|address| parse_socket_addr(address))
+            .collect::<Result<Vec<_>, _>>()?;
+        let resolution = raw
+            .resolution
+            .map(RawResolutionConfig::try_into_resolution_config)
+            .transpose()?
+            .unwrap_or_else(ResolutionConfig::forwarding_default);
+        let upstreams = raw
+            .upstreams
+            .into_iter()
+            .map(RawUpstreamConfig::try_into_upstream_config)
+            .collect::<Result<Vec<_>, _>>()?;
+        let local_dns_entries = raw
+            .local_dns_entries
+            .into_iter()
+            .map(RawLocalDnsEntryConfig::try_into_local_dns_entry_config)
+            .collect::<Result<Vec<_>, _>>()?;
+
+        let config = RuntimeConfig {
+            dns_listen,
+            resolution,
+            upstreams,
+            per_query_deadline: Duration::from_millis(raw.per_query_deadline_ms),
+            max_udp_payload_size: raw.max_udp_payload_size,
+            local_dns_entries,
+        };
+        config.validate()?;
+        Ok(config)
+    }
+}
+
+fn parse_socket_addr(value: &str) -> Result<SocketAddr, ConfigError> {
+    value.parse().map_err(|_| ConfigError::InvalidTomlConfig {
+        message: format!("invalid socket address: {value}"),
+    })
+}
+
+fn parse_ipv4(value: &str) -> Result<Ipv4Addr, ConfigError> {
+    value.parse().map_err(|_| ConfigError::InvalidTomlConfig {
+        message: format!("invalid IPv4 address: {value}"),
+    })
+}
+
+fn parse_ipv6(value: &str) -> Result<Ipv6Addr, ConfigError> {
+    value.parse().map_err(|_| ConfigError::InvalidTomlConfig {
+        message: format!("invalid IPv6 address: {value}"),
+    })
 }
 
 const DEFAULT_DNS_LISTEN_PORT: u16 = 5300;
@@ -646,7 +1035,7 @@ const FNV1A64_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
 const FNV1A64_PRIME: u64 = 0x0000_0100_0000_01b3;
 
 fn validate_listen_address(address: SocketAddr) -> Result<(), ConfigError> {
-    if address.port() <= 1024 {
+    if address.port() == 0 {
         return Err(ConfigError::InvalidListenAddress { address });
     }
     Ok(())
@@ -752,16 +1141,16 @@ mod tests {
     }
 
     #[test]
-    fn config_rejects_privileged_listen_address_for_static_runtime() {
-        let error = RuntimeConfig::new(
+    fn config_allows_privileged_listen_address_for_static_runtime() {
+        let config = RuntimeConfig::new(
             vec![SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 53)],
             vec![upstream("primary", 10, true)],
             Duration::from_secs(2),
             1232,
         )
-        .unwrap_err();
+        .unwrap();
 
-        assert!(matches!(error, ConfigError::InvalidListenAddress { .. }));
+        assert_eq!(config.dns_listen[0].port(), 53);
     }
 
     #[test]
@@ -1027,10 +1416,70 @@ mod tests {
     }
 
     #[test]
+    fn parse_named_root_extracts_glue_addresses_grouped_by_owner_in_first_seen_order() {
+        let source = "\
+; comment line, ignored
+.                        3600000      NS    A.ROOT-SERVERS.NET.
+A.ROOT-SERVERS.NET.      3600000      A     198.41.0.4
+A.ROOT-SERVERS.NET.      3600000      AAAA  2001:503:ba3e::2:30
+; another comment
+.                        3600000      NS    B.ROOT-SERVERS.NET.
+B.ROOT-SERVERS.NET.      3600000      A     170.247.170.2
+; End of file
+";
+
+        let hints = parse_named_root(source).unwrap();
+
+        assert_eq!(
+            hints,
+            vec![
+                RootHintConfig::new(
+                    "a.root-servers.net",
+                    vec![
+                        "198.41.0.4:53".parse().unwrap(),
+                        "[2001:503:ba3e::2:30]:53".parse().unwrap(),
+                    ],
+                ),
+                RootHintConfig::new(
+                    "b.root-servers.net",
+                    vec!["170.247.170.2:53".parse().unwrap()]
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn parse_named_root_rejects_malformed_or_empty_input() {
+        assert!(parse_named_root("").is_err());
+        assert!(parse_named_root("; only comments\n").is_err());
+        assert!(parse_named_root("A.ROOT-SERVERS.NET. 3600000 A\n").is_err());
+        assert!(parse_named_root("A.ROOT-SERVERS.NET. 3600000 A not-an-ip\n").is_err());
+    }
+
+    #[test]
+    fn parse_named_root_parses_the_bundled_asset() {
+        let hints = parse_named_root(BUNDLED_NAMED_ROOT).unwrap();
+        assert_eq!(hints.len(), 13);
+        assert_eq!(hints[0].name, "a.root-servers.net");
+        assert_eq!(hints[12].name, "m.root-servers.net");
+    }
+
+    #[test]
     fn recursive_config_validates_root_hints_and_authority_limits() {
         let bundled = RecursiveResolutionConfig::bundled("bundled:v1");
         assert!(bundled.validate().is_ok());
-        assert!(!bundled.load_root_hints().unwrap().is_empty());
+        let root_hints = bundled.load_root_hints().unwrap();
+        assert_eq!(root_hints.len(), 13, "expected all 13 root servers");
+        for root_hint in &root_hints {
+            assert_eq!(
+                root_hint.endpoints.len(),
+                2,
+                "{} should have IPv4 and IPv6 endpoints",
+                root_hint.name
+            );
+            assert!(root_hint.endpoints.iter().any(|e| e.is_ipv4()));
+            assert!(root_hint.endpoints.iter().any(|e| e.is_ipv6()));
+        }
         assert_eq!(bundled.dname_handling, DnameHandlingPolicy::Defer);
 
         let missing_roots = RecursiveResolutionConfig::new(
@@ -1230,6 +1679,269 @@ mod tests {
                 field: "upstream.timeout",
                 ..
             }
+        ));
+    }
+
+    fn valid_toml() -> String {
+        r#"
+            dns_listen = ["127.0.0.1:5300"]
+            per_query_deadline_ms = 2000
+            max_udp_payload_size = 1232
+
+            [[upstreams]]
+            name = "cloudflare"
+            endpoint = "1.1.1.1:53"
+            protocol = "udp"
+            enabled = true
+            priority = 10
+            timeout_ms = 750
+
+            [[local_dns_entries]]
+            name = "nas.lan"
+            ipv4 = ["192.168.1.10"]
+            ttl = 300
+            enabled = true
+            public_address_acknowledged = false
+        "#
+        .to_string()
+    }
+
+    #[test]
+    fn toml_config_round_trip_loads_upstreams_and_local_dns_entries() {
+        let config = RuntimeConfig::from_toml_str(&valid_toml()).unwrap();
+
+        assert_eq!(
+            config.dns_listen,
+            vec![SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 5300)]
+        );
+        assert_eq!(config.per_query_deadline, Duration::from_secs(2));
+        assert_eq!(config.max_udp_payload_size, 1232);
+        assert_eq!(config.upstreams.len(), 1);
+        assert_eq!(config.upstreams[0].name, "cloudflare");
+        assert_eq!(config.local_dns_entries.len(), 1);
+        let entry = config.local_dns_entries[0].to_local_dns_entry().unwrap();
+        assert_eq!(entry.name, DomainName::parse("nas.lan").unwrap());
+        assert_eq!(entry.ipv4, vec![Ipv4Addr::new(192, 168, 1, 10)]);
+    }
+
+    #[test]
+    fn toml_config_rejects_invalid_syntax() {
+        let error = RuntimeConfig::from_toml_str("not valid toml [[[").unwrap_err();
+
+        assert!(matches!(error, ConfigError::InvalidTomlConfig { .. }));
+    }
+
+    #[test]
+    fn toml_config_rejects_unknown_resolution_mode_instead_of_ignoring_it() {
+        // Unknown/unsupported values in `resolution.mode` must fail to load
+        // rather than being silently ignored and falling back to forwarding.
+        let mut toml = valid_toml();
+        toml.push_str(
+            r#"
+            [resolution]
+            mode = "bogus"
+            "#,
+        );
+
+        let error = RuntimeConfig::from_toml_str(&toml).unwrap_err();
+
+        assert!(matches!(error, ConfigError::InvalidTomlConfig { .. }));
+    }
+
+    #[test]
+    fn toml_config_rejects_recursive_mode_without_recursive_section() {
+        let mut toml = valid_toml();
+        toml.push_str(
+            r#"
+            [resolution]
+            mode = "recursive"
+            "#,
+        );
+
+        let error = RuntimeConfig::from_toml_str(&toml).unwrap_err();
+
+        assert!(matches!(
+            error,
+            ConfigError::MissingRecursiveResolutionConfig
+        ));
+    }
+
+    #[test]
+    fn toml_config_round_trip_loads_bundled_recursive_resolution() {
+        let mut toml = valid_toml();
+        toml.push_str(
+            r#"
+            [resolution]
+            mode = "recursive"
+
+            [resolution.recursive]
+            root_hints = "bundled"
+            root_hints_version = "bundled:v1"
+            "#,
+        );
+
+        let config = RuntimeConfig::from_toml_str(&toml).unwrap();
+
+        assert_eq!(config.resolution.mode, ResolutionMode::Recursive);
+        let recursive = config.resolution.recursive.as_ref().unwrap();
+        assert_eq!(recursive.root_hints_source, RootHintsSource::Bundled);
+        assert_eq!(recursive.root_hints_version, "bundled:v1");
+        assert_eq!(recursive.per_authority_timeout, Duration::from_millis(750));
+        assert_eq!(recursive.max_recursion_depth, 16);
+        assert_eq!(recursive.max_cname_restarts, 8);
+        assert_eq!(
+            recursive.allowed_transports,
+            vec![RecursiveTransport::Udp, RecursiveTransport::Tcp]
+        );
+        assert_eq!(recursive.dnssec_validation, DnssecValidationMode::Disabled);
+        assert_eq!(recursive.dname_handling, DnameHandlingPolicy::Defer);
+    }
+
+    #[test]
+    fn toml_config_round_trip_loads_custom_recursive_root_hints() {
+        // Recursive mode doesn't require any forwarding upstreams to be configured.
+        let toml = r#"
+            dns_listen = ["127.0.0.1:5300"]
+            per_query_deadline_ms = 2000
+            max_udp_payload_size = 1232
+
+            [resolution]
+            mode = "recursive"
+            generation = 3
+
+            [resolution.recursive]
+            root_hints = "custom"
+            root_hints_version = "custom:v1"
+            per_authority_timeout_ms = 500
+            max_recursion_depth = 8
+            max_cname_restarts = 4
+            allowed_transports = ["udp"]
+            dnssec_validation = "disabled"
+            dname_handling = "defer"
+
+            [[resolution.recursive.root_hints_entries]]
+            name = "a.root-servers.net"
+            endpoints = ["198.41.0.4:53"]
+        "#;
+
+        let config = RuntimeConfig::from_toml_str(toml).unwrap();
+
+        assert_eq!(config.resolution.generation, 3);
+        let recursive = config.resolution.recursive.as_ref().unwrap();
+        assert_eq!(
+            recursive.root_hints_source,
+            RootHintsSource::Static(vec![RootHintConfig::new(
+                "a.root-servers.net",
+                vec!["198.41.0.4:53".parse().unwrap()],
+            )])
+        );
+        assert_eq!(recursive.per_authority_timeout, Duration::from_millis(500));
+        assert_eq!(recursive.max_recursion_depth, 8);
+        assert_eq!(recursive.max_cname_restarts, 4);
+        assert_eq!(recursive.allowed_transports, vec![RecursiveTransport::Udp]);
+    }
+
+    #[test]
+    fn toml_config_rejects_custom_recursive_root_hints_with_no_entries() {
+        let toml = r#"
+            dns_listen = ["127.0.0.1:5300"]
+            per_query_deadline_ms = 2000
+            max_udp_payload_size = 1232
+
+            [resolution]
+            mode = "recursive"
+
+            [resolution.recursive]
+            root_hints = "custom"
+            root_hints_version = "custom:v1"
+        "#;
+
+        let error = RuntimeConfig::from_toml_str(toml).unwrap_err();
+
+        assert!(matches!(error, ConfigError::MissingRootHints));
+    }
+
+    #[test]
+    fn toml_config_rejects_invalid_local_entry_address() {
+        let toml = valid_toml().replace("192.168.1.10", "not-an-ip");
+
+        let error = RuntimeConfig::from_toml_str(&toml).unwrap_err();
+
+        assert!(matches!(error, ConfigError::InvalidTomlConfig { .. }));
+    }
+
+    #[test]
+    fn toml_config_rejects_public_address_without_acknowledgement() {
+        let toml = valid_toml().replace("192.168.1.10", "8.8.8.8");
+
+        let error = RuntimeConfig::from_toml_str(&toml).unwrap_err();
+
+        assert!(matches!(
+            error,
+            ConfigError::InvalidLocalDnsEntry {
+                reason: LocalDnsEntryValidationError::PublicAddressRequiresAcknowledgement,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn toml_config_allows_public_address_with_acknowledgement() {
+        let toml = valid_toml().replace("192.168.1.10", "8.8.8.8").replace(
+            "public_address_acknowledged = false",
+            "public_address_acknowledged = true",
+        );
+
+        let config = RuntimeConfig::from_toml_str(&toml).unwrap();
+
+        assert_eq!(
+            config.local_dns_entries[0].ipv4,
+            vec![Ipv4Addr::new(8, 8, 8, 8)]
+        );
+    }
+
+    #[test]
+    fn toml_config_rejects_zero_ttl_and_empty_addresses() {
+        let no_addresses = valid_toml().replace(r#"ipv4 = ["192.168.1.10"]"#, "");
+        let error = RuntimeConfig::from_toml_str(&no_addresses).unwrap_err();
+        assert!(matches!(
+            error,
+            ConfigError::InvalidLocalDnsEntry {
+                reason: LocalDnsEntryValidationError::NoAddresses,
+                ..
+            }
+        ));
+
+        let zero_ttl = valid_toml().replace("ttl = 300", "ttl = 0");
+        let error = RuntimeConfig::from_toml_str(&zero_ttl).unwrap_err();
+        assert!(matches!(
+            error,
+            ConfigError::InvalidLocalDnsEntry {
+                reason: LocalDnsEntryValidationError::TtlTooLow,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn toml_config_rejects_duplicate_local_entry_names() {
+        let mut toml = valid_toml();
+        toml.push_str(
+            r#"
+            [[local_dns_entries]]
+            name = "NAS.lan."
+            ipv4 = ["192.168.1.11"]
+            ttl = 300
+            enabled = true
+            public_address_acknowledged = false
+            "#,
+        );
+
+        let error = RuntimeConfig::from_toml_str(&toml).unwrap_err();
+
+        assert!(matches!(
+            error,
+            ConfigError::DuplicateLocalDnsEntryName { .. }
         ));
     }
 }

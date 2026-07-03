@@ -13,6 +13,7 @@
 // limitations under the License.
 
 use std::io;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
@@ -28,9 +29,10 @@ use rdns::delivery::upstream::{ForwardingResolutionBackend, RecursiveAuthorityTr
 use rdns::resolver::{
     BackendHealth, BackendRootHintsStatus, BackendSnapshot, BackendStatus, BasicResponseFactory,
     CacheTtlPolicy, ChannelQueryEventSink, Clock, DnssecValidationStatus, InMemoryDnsCache,
-    InMemoryQueryEventStore, InMemoryQueryEventStoreConfig, InMemorySuspiciousLookupClassifier,
-    InMemorySuspiciousLookupClassifierConfig, MetricsSink, QueryEventRecordResult, QueryEventSink,
-    QueryEventV1, RecursiveResolutionBackend, RecursiveResolverConfig, RecursiveRootHint,
+    InMemoryLocalDnsEntries, InMemoryQueryEventStore, InMemoryQueryEventStoreConfig,
+    InMemorySuspiciousLookupClassifier, InMemorySuspiciousLookupClassifierConfig, MetricsSink,
+    NoopPolicyEvaluator, QueryEventRecordResult, QueryEventSink, QueryEventV1,
+    RecursiveResolutionBackend, RecursiveResolverConfig, RecursiveRootHint,
     ResolutionMode as ResolverResolutionMode, ResolveQuery, ResolverMetric, StandardProtocolCodec,
 };
 use tokio::task::{JoinError, JoinSet};
@@ -38,13 +40,20 @@ use tokio::task::{JoinError, JoinSet};
 const DEFAULT_CACHE_ENTRIES: usize = 10_000;
 const DEFAULT_QUERY_EVENT_STORE_ENTRIES: usize = 10_000;
 const QUERY_EVENT_QUEUE_CAPACITY: usize = 1024;
+const CONFIG_PATH_ENV_VAR: &str = "RDNS_CONFIG";
+const DEFAULT_CONFIG_PATH: &str = "config.toml";
 
 #[tokio::main]
 async fn main() -> io::Result<()> {
-    let config = RuntimeConfig::development_default();
+    let config_path = resolve_config_path();
+    let config = load_runtime_config(config_path.as_deref())?;
     config
         .validate()
         .map_err(|error| io::Error::other(format!("invalid runtime config: {error:?}")))?;
+    match &config_path {
+        Some(path) => println!("loaded config from {}", path.display()),
+        None => println!("no config file found; using built-in development defaults"),
+    }
 
     let stdout_events = Arc::new(StdoutEvents);
     let query_event_store = Arc::new(InMemoryQueryEventStore::new(
@@ -76,9 +85,13 @@ async fn main() -> io::Result<()> {
             Arc::new(NoopMetrics)
         });
     let backend_snapshot = build_backend_snapshot(&config, Arc::clone(&metrics))?;
-    let resolver = Arc::new(ResolveQuery::with_cache_and_backend_snapshot(
+    let local_entries = build_local_entries(&config)?;
+    let reload_metrics = Arc::clone(&metrics);
+    let resolver = Arc::new(ResolveQuery::with_cache_policy_and_backend_snapshot(
         Arc::new(StandardProtocolCodec::new(config.max_udp_payload_size)),
         Arc::new(InMemoryDnsCache::new(DEFAULT_CACHE_ENTRIES)),
+        Arc::new(NoopPolicyEvaluator),
+        local_entries,
         CacheTtlPolicy::default(),
         backend_snapshot,
         Arc::new(BasicResponseFactory),
@@ -89,6 +102,9 @@ async fn main() -> io::Result<()> {
         )),
         metrics,
     ));
+
+    let sighup_task =
+        spawn_sighup_reload_task(Arc::clone(&resolver), reload_metrics, config_path.clone());
 
     let servers = UdpDnsServer::bind_configured(&config, Arc::clone(&resolver)).await?;
     if servers.is_empty() {
@@ -135,6 +151,9 @@ async fn main() -> io::Result<()> {
         listener_task_result_to_io(result)?;
     }
 
+    sighup_task.abort();
+    let _ = sighup_task.await;
+
     drop(resolver);
     match event_drain.await {
         Ok(()) => {}
@@ -146,6 +165,98 @@ async fn main() -> io::Result<()> {
     }
 
     Ok(())
+}
+
+fn resolve_config_path() -> Option<PathBuf> {
+    if let Ok(path) = std::env::var(CONFIG_PATH_ENV_VAR) {
+        return Some(PathBuf::from(path));
+    }
+    let default_path = PathBuf::from(DEFAULT_CONFIG_PATH);
+    default_path.exists().then_some(default_path)
+}
+
+fn load_runtime_config(path: Option<&Path>) -> io::Result<RuntimeConfig> {
+    let Some(path) = path else {
+        return Ok(RuntimeConfig::development_default());
+    };
+    let source = std::fs::read_to_string(path)
+        .map_err(|error| io::Error::other(format!("failed to read {}: {error}", path.display())))?;
+    RuntimeConfig::from_toml_str(&source).map_err(|error| {
+        io::Error::other(format!("invalid config at {}: {error:?}", path.display()))
+    })
+}
+
+fn build_local_entries(config: &RuntimeConfig) -> io::Result<Arc<InMemoryLocalDnsEntries>> {
+    let entries = config
+        .local_dns_entries
+        .iter()
+        .map(|entry| entry.to_local_dns_entry())
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| io::Error::other(format!("invalid local DNS entry config: {error:?}")))?;
+    Ok(Arc::new(InMemoryLocalDnsEntries::new(entries)))
+}
+
+fn reload_resolver(
+    resolver: &ResolveQuery,
+    config: &RuntimeConfig,
+    metrics: Arc<dyn MetricsSink>,
+) -> io::Result<()> {
+    let backend_snapshot = build_backend_snapshot(config, metrics)?;
+    let local_entries = build_local_entries(config)?;
+    resolver.publish_backend_snapshot(backend_snapshot);
+    resolver.publish_local_entries(local_entries);
+    Ok(())
+}
+
+#[cfg(unix)]
+fn spawn_sighup_reload_task(
+    resolver: Arc<ResolveQuery>,
+    metrics: Arc<dyn MetricsSink>,
+    config_path: Option<PathBuf>,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut hangup = match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup())
+        {
+            Ok(signal) => signal,
+            Err(error) => {
+                eprintln!("failed to install SIGHUP handler: {error}");
+                return;
+            }
+        };
+        loop {
+            hangup.recv().await;
+            let Some(path) = config_path.as_deref() else {
+                eprintln!("SIGHUP received but no config file was loaded at startup; ignoring");
+                continue;
+            };
+            match load_runtime_config(Some(path)) {
+                Ok(config) => match reload_resolver(&resolver, &config, Arc::clone(&metrics)) {
+                    Ok(()) => println!(
+                        "reloaded config from {} ({} upstream(s), {} local DNS entr{})",
+                        path.display(),
+                        config.upstreams.len(),
+                        config.local_dns_entries.len(),
+                        if config.local_dns_entries.len() == 1 {
+                            "y"
+                        } else {
+                            "ies"
+                        }
+                    ),
+                    Err(error) => eprintln!("failed to apply reloaded config: {error}"),
+                },
+                Err(error) => eprintln!("failed to reload config from {}: {error}", path.display()),
+            }
+        }
+    })
+}
+
+#[cfg(not(unix))]
+fn spawn_sighup_reload_task(
+    _resolver: Arc<ResolveQuery>,
+    _metrics: Arc<dyn MetricsSink>,
+    _config_path: Option<PathBuf>,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async {})
 }
 
 fn build_backend_snapshot(
@@ -548,7 +659,61 @@ fn dnssec_validation_label(status: DnssecValidationStatus) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rdns::resolver::{QueryEventReadModel, QuestionKey, ResolveDecision, ResolveDecisionKind};
+    use rdns::resolver::{
+        LocalDnsEntries, LocalDnsLookup, QueryEventReadModel, QuestionKey, ResolveDecision,
+        ResolveDecisionKind,
+    };
+
+    fn sample_config_toml() -> &'static str {
+        r#"
+            dns_listen = ["127.0.0.1:5300"]
+            per_query_deadline_ms = 2000
+            max_udp_payload_size = 1232
+
+            [[upstreams]]
+            name = "cloudflare"
+            endpoint = "1.1.1.1:53"
+            protocol = "udp"
+            enabled = true
+            priority = 10
+            timeout_ms = 750
+
+            [[local_dns_entries]]
+            name = "nas.lan"
+            ipv4 = ["192.168.1.10"]
+            ttl = 300
+            enabled = true
+            public_address_acknowledged = false
+        "#
+    }
+
+    #[test]
+    fn config_driven_local_entries_answer_configured_names_only() {
+        let config = RuntimeConfig::from_toml_str(sample_config_toml()).unwrap();
+
+        let local_entries = build_local_entries(&config).unwrap();
+
+        let local_question = QuestionKey::new("nas.lan", 1, 1);
+        match local_entries.lookup(&local_question) {
+            LocalDnsLookup::Answer(entry) => {
+                assert_eq!(entry.ipv4[0].to_string(), "192.168.1.10");
+            }
+            other => panic!("expected a local answer, got {other:?}"),
+        }
+
+        let unrelated_question = QuestionKey::new("example.com", 1, 1);
+        assert_eq!(
+            local_entries.lookup(&unrelated_question),
+            LocalDnsLookup::NoMatch
+        );
+    }
+
+    #[test]
+    fn load_runtime_config_falls_back_to_development_default_without_a_path() {
+        let config = load_runtime_config(None).unwrap();
+
+        assert_eq!(config, RuntimeConfig::development_default());
+    }
 
     fn event_for(name: &str) -> QueryEventV1 {
         let decision = ResolveDecision {
