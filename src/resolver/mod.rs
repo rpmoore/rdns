@@ -3352,7 +3352,8 @@ impl ResolveQuery {
             latency,
         );
         if let ResolveDecisionKind::Blocked(block) = &decision.kind {
-            event.block_response_mode = Some(self.responses.block_response_mode(block));
+            let qtype = decision.question.as_ref().map(|q| q.qtype).unwrap_or(0);
+            event.block_response_mode = Some(self.responses.block_response_mode(block, qtype));
         }
         event.backend = backend;
         self.record_query_event(event);
@@ -3864,8 +3865,21 @@ impl ResponseFactory for ConfiguredResponseFactory {
         BasicResponseFactory.protocol_error(request_id, error)
     }
 
-    fn block_response_mode(&self, block: &PolicyBlock) -> BlockResponseMode {
-        self.block_config.mode_for(&block.reason)
+    fn block_response_mode(&self, block: &PolicyBlock, qtype: u16) -> BlockResponseMode {
+        let mode = self.block_config.mode_for(&block.reason);
+        if mode != BlockResponseMode::Sinkhole {
+            return mode;
+        }
+        match qtype {
+            A_RECORD_TYPE if self.block_config.sinkhole_ipv4.is_some() => {
+                BlockResponseMode::Sinkhole
+            }
+            AAAA_RECORD_TYPE if self.block_config.sinkhole_ipv6.is_some() => {
+                BlockResponseMode::Sinkhole
+            }
+            A_RECORD_TYPE | AAAA_RECORD_TYPE => BlockResponseMode::NoData,
+            _ => BlockResponseMode::Refused,
+        }
     }
 
     fn blocked(&self, query: &DecodedQuery, block: &PolicyBlock) -> Vec<u8> {
@@ -5307,7 +5321,7 @@ impl ResolutionBackend for RecursiveResolutionBackend {
 pub trait ResponseFactory: Send + Sync {
     fn protocol_error(&self, request_id: Option<u16>, error: &QueryValidationError) -> Vec<u8>;
 
-    fn block_response_mode(&self, _block: &PolicyBlock) -> BlockResponseMode {
+    fn block_response_mode(&self, _block: &PolicyBlock, _qtype: u16) -> BlockResponseMode {
         BlockResponseMode::Refused
     }
 
@@ -10791,6 +10805,66 @@ mod tests {
             recorded_events[0].terminal_outcome,
             QueryEventOutcome::Blocked(BlockReason::LocalRule)
         );
+        assert_eq!(
+            recorded_events[0].block_response_mode,
+            Some(BlockResponseMode::NoData)
+        );
+    }
+
+    #[tokio::test]
+    async fn resolve_logs_nodata_mode_for_sinkhole_family_without_configured_address() {
+        let upstream = Arc::new(StaticUpstream::new(Ok(upstream_response(
+            a_response_with_answer(0xabcd, "blocked.example", 60),
+        ))));
+        let cache = Arc::new(RecordingCache::with_lookup(CacheLookup::Miss));
+        let events = Arc::new(RecordingEvents::default());
+        let policy = Arc::new(LocalPolicyEvaluator::new(vec![LocalDenyRule::new(
+            "rule-1",
+            ClientSelector::exact_ip("192.0.2.10".parse().unwrap()),
+            DomainSelector::exact("blocked.example").unwrap(),
+            true,
+        )]));
+        let responses = Arc::new(
+            ConfiguredResponseFactory::new(
+                BlockResponseConfig::new(
+                    BlockResponseMode::Sinkhole,
+                    BlockResponseMode::Refused,
+                    BlockResponseMode::Refused,
+                    0,
+                    false,
+                    Some("198.51.100.1".parse().unwrap()),
+                    None,
+                )
+                .unwrap(),
+            )
+            .unwrap(),
+        );
+        let service = ResolveQuery::with_cache_and_policy(
+            Arc::new(StandardProtocolCodec::new(1232)),
+            cache.clone(),
+            policy,
+            Arc::new(NoopLocalDnsEntries),
+            CacheTtlPolicy::default(),
+            upstream.clone(),
+            responses,
+            Arc::new(FixedClock(SystemTime::UNIX_EPOCH)),
+            events.clone(),
+            Arc::new(RecordingMetrics::default()),
+        );
+
+        let outcome = service
+            .resolve(ResolveRequest::new(
+                "192.0.2.10".parse().unwrap(),
+                SystemTime::UNIX_EPOCH,
+                aaaa_query(0x1234, "blocked.example"),
+            ))
+            .await;
+
+        let response = Message::parse(&outcome.response_bytes).unwrap();
+        assert_eq!(response.header.r_code(), ResponseCode::NoError as u8);
+        assert!(response.answers.is_empty());
+        let recorded_events = events.events.lock().unwrap();
+        assert_eq!(recorded_events.len(), 1);
         assert_eq!(
             recorded_events[0].block_response_mode,
             Some(BlockResponseMode::NoData)
