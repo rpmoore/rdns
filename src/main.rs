@@ -228,12 +228,16 @@ fn spawn_sighup_reload_task(
                 eprintln!("SIGHUP signal stream closed; stopping reload task");
                 return;
             }
-            let Some(path) = config_path.as_deref() else {
+            let Some(path) = config_path.clone() else {
                 eprintln!("SIGHUP received but no config file was loaded at startup; ignoring");
                 continue;
             };
-            match load_runtime_config(Some(path)) {
-                Ok(config) => match reload_resolver(&resolver, &config, Arc::clone(&metrics)) {
+            let load_path = path.clone();
+            let loaded =
+                tokio::task::spawn_blocking(move || load_runtime_config(Some(load_path.as_path())))
+                    .await;
+            match loaded {
+                Ok(Ok(config)) => match reload_resolver(&resolver, &config, Arc::clone(&metrics)) {
                     Ok(()) => println!(
                         "reloaded config from {} ({} upstream(s), {} local DNS entr{})",
                         path.display(),
@@ -247,7 +251,12 @@ fn spawn_sighup_reload_task(
                     ),
                     Err(error) => eprintln!("failed to apply reloaded config: {error}"),
                 },
-                Err(error) => eprintln!("failed to reload config from {}: {error}", path.display()),
+                Ok(Err(error)) => {
+                    eprintln!("failed to reload config from {}: {error}", path.display())
+                }
+                Err(join_error) => {
+                    eprintln!("reload task for {} panicked: {join_error}", path.display())
+                }
             }
         }
     })

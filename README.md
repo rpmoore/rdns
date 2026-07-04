@@ -208,8 +208,8 @@ kill -HUP <pid>
 
 - The file is re-read, re-parsed, and fully re-validated before anything is
   applied. A broken edit (bad TOML, invalid address, duplicate name, etc.)
-  is logged and the server keeps serving the last-good config — never a
-  partial apply.
+  is logged and rejected in full — the server keeps serving the last-good
+  config, with no fields changed from the rejected reload.
 - `[resolution]`, `[[upstreams]]`, and `[[local_dns_entries]]` are all
   reloadable this way — including switching between `forward` and
   `recursive` mode.
