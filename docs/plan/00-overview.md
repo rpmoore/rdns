@@ -2,20 +2,55 @@
 
 ## Current State
 
-The repository is a Rust crate named `rdns` with phases 1 through 3 complete.
+The repository is a Rust crate named `rdns` with phases 1 through 6 complete,
+plus an MVP wiring pass that makes the binary actually runnable and
+configurable ahead of Phase 7's SQLite persistence layer (see "MVP Wiring"
+below).
 
 - `src/protocol/mod.rs` contains the safe DNS protocol core: checked parsing, structured parse errors, full-message compression handling, unknown-record support, EDNS visibility, UDP truncation helpers, response builders, transaction-ID rewrite helpers, and TCP framing helpers.
-- `src/resolver/mod.rs` contains the `ResolveQuery` application service, resolver ports, query decision metadata, in-memory TTL cache, cache key/value modeling, positive and negative TTL policy, safe cached-response template handling, cache bypass rules, single-flight miss coalescing, and cache metrics hooks.
+- `src/resolver/mod.rs` contains the `ResolveQuery` application service, resolver ports, query decision metadata, in-memory TTL cache, cache key/value modeling, positive and negative TTL policy, safe cached-response template handling, cache bypass rules, single-flight miss coalescing, cache metrics hooks, the generalized `ResolutionBackend` port (`ForwardingResolutionBackend`/`RecursiveResolutionBackend` behind a hot-swappable `BackendHandle`/`BackendSnapshot`), local policy/deny-rule evaluation, and a hot-swappable local DNS entry lookup (`LocalDnsEntriesHandle`) answered ahead of cache/backend.
 - `src/delivery/dns.rs` contains the Tokio UDP DNS listener adapter.
-- `src/delivery/upstream.rs` contains UDP upstream forwarding, fresh upstream transaction IDs, source/ID/question validation, priority-ordered failover, per-upstream timeouts, per-query deadlines, health snapshots, and TCP fallback for truncated upstream UDP responses.
-- `src/config/mod.rs` contains validated static runtime configuration for DNS listeners, upstream resolvers, timing bounds, and UDP payload limits.
-- `src/main.rs` starts the configured UDP DNS server with the development default runtime configuration and graceful shutdown handling.
+- `src/delivery/upstream.rs` contains UDP upstream forwarding, fresh upstream transaction IDs, source/ID/question validation, priority-ordered failover, per-upstream timeouts, per-query deadlines, health snapshots, TCP fallback for truncated upstream UDP responses, and the recursive-mode authority transport client.
+- `src/config/mod.rs` contains validated runtime configuration for DNS listeners, upstream resolvers, resolution mode (forward or recursive, including recursive root hints/timeouts/transports/DNSSEC-validation-mode/DNAME-handling), local DNS entries, and UDP payload limits — loadable from a TOML file (`RuntimeConfig::from_toml_str`) as well as constructed in-process. Bundled recursive-mode root hints are parsed at compile time from a committed IANA zone file (`src/config/named.root`) via `parse_named_root`, not hand-maintained.
+- `src/main.rs` loads `RuntimeConfig` from a file (`RDNS_CONFIG` env var, or `./config.toml`, falling back to loopback development defaults), starts the configured UDP DNS server with real local DNS entries and policy wired in, watches `SIGHUP` to validate-and-hot-swap resolution mode/upstreams/local entries without a restart, and shuts down gracefully.
 - `src/lib.rs` exports `config`, `delivery`, `protocol`, and `resolver`.
-- `Cargo.toml` currently depends only on `tokio`.
+- `Cargo.toml` depends on `tokio`, plus `serde`/`toml` for config file loading.
 
-The resolver can now accept UDP queries, forward them to configured upstreams, use TCP fallback for truncated upstream responses, cache eligible responses in memory, rewrite cached responses for the current request, and emit decision/metric hooks.
+The resolver can now accept UDP queries, evaluate local deny-rule policy and local DNS entries before touching cache/backend, forward to configured upstreams or perform local iterative recursion (administrator's choice, reloadable live), use TCP fallback for truncated upstream responses, cache eligible responses in memory, rewrite cached responses for the current request, and emit decision/metric hooks.
 
-Remaining major planned areas are local policy blocking, persistent/runtime-reloadable configuration, blocklist ingestion, admin API/UI, DNS TCP listener support for clients, and operational hardening.
+Remaining major planned areas are external blocklist ingestion, SQLite persistence (settings/rules/blocklists/query-events currently live in a TOML file plus in-memory state, not a database), admin API/UI, DNS TCP listener support for clients, and further operational hardening (see `docs/steps.md` Phase 7 onward).
+
+### MVP Wiring (bridging Phase 6 domain logic into a runnable server)
+
+Phase 6 (PR #99) added local policy and local-DNS-entry *domain logic* to
+`ResolveQuery`, but nothing wired it into the actual binary yet — `main.rs`
+still hardcoded a single upstream and `NoopLocalDnsEntries`, and there was
+no way to configure anything without recompiling. A follow-up MVP pass
+(branch `make_mvp`, off post-merge `main`) closed that gap ahead of Phase
+7's SQLite work, since a file-based config was enough to make the server
+actually useful:
+
+- TOML config file loading (`RuntimeConfig::from_toml_str`), covering
+  listen addresses, resolution mode (forward and recursive), upstreams,
+  and local DNS entries, with `#[serde(deny_unknown_fields)]` so a typo'd
+  or unsupported key fails closed instead of being silently ignored.
+- `SIGHUP`-triggered reload: re-read and fully re-validate the config file,
+  and only on success hot-swap resolution mode/upstreams (`BackendSnapshot`)
+  and local DNS entries (`LocalDnsEntriesHandle`) — never a partial apply,
+  and `dns_listen` intentionally stays restart-only (rebinding sockets is
+  out of scope for a data reload).
+- Recursive-mode root hints parsed from a real, committed IANA zone file
+  (`src/config/named.root`) instead of a hardcoded list.
+- `validate_listen_address` relaxed to allow privileged ports (still
+  rejects port `0`), so the server can bind `:53` for real LAN use (with
+  root or `setcap cap_net_bind_service`).
+
+This is an interim mechanism, not a replacement for Phase 7: it satisfies
+[Persistence And Configuration](05-persistence-config.md#configuration-reload)'s
+validate-before-publish/atomic-snapshot intent using a config file and
+`Arc<RwLock<Arc<T>>>` handles instead of SQLite-backed repositories and an
+admin API. Phase 7 should extend or replace this reload path, not
+re-derive it from scratch.
 
 ## Target Capabilities
 
@@ -89,13 +124,12 @@ Infrastructure implementations should be injected behind traits:
 
 ## Remaining Primary Risks
 
-- There is no policy engine yet, so local client/domain rules and known-malicious blocklist decisions are not enforced.
-- There is no local DNS entry model yet, so administrator-defined LAN hostnames such as `dev1.local` cannot be answered locally.
-- Query-event review is currently limited to the in-process decision hooks; there is no bounded review store, source-centric view, suspicious classifier, or durable query-event history yet.
-- Recursive resolution is not implemented yet; the current runtime can only forward cache misses to configured upstream recursive resolvers.
-- Configuration is static and in-memory; upstreams, settings, and future rules are not durable or reloadable at runtime.
-- There is no persistence layer, blocklist updater, admin API, UI server, structured metrics exporter, or durable query logging.
+- There is a local deny-rule policy engine and local DNS entry model (Phase 6), but no known-malicious blocklist ingestion yet — blocklist-sourced blocking decisions are not enforced.
+- Query-event review is currently limited to the in-process decision hooks and bounded in-memory store; there is no durable (SQLite-backed) query-event history yet, so history and suspicious-lookup findings do not survive a restart.
+- Configuration (resolution mode, upstreams, local DNS entries) is file-based and hot-reloadable via `SIGHUP` (see "MVP Wiring" above), but not durable/queryable SQL storage, and there is no admin API/UI to change it at runtime without editing the file.
+- There is no persistence layer, blocklist updater, admin API, UI server, structured metrics exporter (beyond the existing OpenTelemetry OTLP hook), or durable query logging.
 - DNS TCP support exists for protocol framing and upstream fallback, but the resolver does not yet expose a client-facing TCP listener.
+- Forwarding upstreams only ever send queries over UDP; a `protocol = "tcp"` upstream entry validates but is silently excluded from the active forwarding set (`ordered_enabled_udp_upstreams`), so a TCP-only upstream list fails closed with no enabled upstream rather than actually querying over TCP.
 - The cache is process-local and memory-only; entries are lost on restart and are intentionally conservative around unsupported DNS semantics.
 
 ## Plan Files

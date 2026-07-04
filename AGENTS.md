@@ -48,7 +48,7 @@ Guidance for Codex and other coding agents working in this repository.
 
 ## Change Logging
 
-After code changes are complete, write one summary of what changed and why to Obsidian's daily note, under a heading/section for `rdns_change_log`, if an `mcp__obsidian__*` tool is available in the session. Use `mcp__obsidian__vault_patch` (or `vault_append` if no daily note structure exists yet). Do not log per-step; one entry per logical change is enough.
+After code changes are complete, write one summary of what changed and why to Obsidian's daily note, under a heading/section for `rdns_change_log`, if an `mcp__obsidian__*` tool is available in the session. Daily notes for this project live under the vault directory `rdns_change_log/` (e.g. `rdns_change_log/2026-07-03.md`), not at the vault root — get the current daily note's path with `mcp__obsidian__periodic_note_get_path` (period `daily`) rather than guessing a root-level `YYYY-MM-DD.md` path. Use `mcp__obsidian__vault_patch` targeting the `rdns_change_log` heading (or `vault_append` if no daily note structure exists yet). Do not log per-step; one entry per logical change is enough.
 
 If no `mcp__obsidian__*` tool is available, skip Obsidian logging and instead summarize what changed and why in the PR description or final response.
 

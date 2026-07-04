@@ -58,6 +58,7 @@ Apply latency requirements in every phase, not only after Phase 4.
 11. Add static runtime configuration for DNS listen and upstreams.
     - Implements: [Forwarding Resolution](plan/02-resolver-cache.md#forwarding-resolution), [Configuration Reload](plan/05-persistence-config.md#configuration-reload), [Deployment Notes](plan/07-operations-testing.md#deployment-notes).
     - Start with validated static settings on high local ports and at least one enabled upstream.
+    - Superseded by [step 96](#phase-65-mvp-wiring-bridge-to-a-runnable-file-configured-server): configuration is now TOML-file-loadable and privileged listen ports are allowed (still validated).
 
 12. Add UDP DNS listener delivery adapter.
     - Implements: [Architectural Direction](plan/00-overview.md#architectural-direction), [Milestone 2 Tasks](plan/08-implementation-roadmap.md#milestone-2-dns-server-and-upstream-forwarding), [Runtime Concerns](plan/07-operations-testing.md#runtime-concerns).
@@ -218,6 +219,49 @@ Apply latency requirements in every phase, not only after Phase 4.
 49. [Add policy tests](https://github.com/rpmoore/rdns/issues/43).
     - Implements: [Policy Tests](plan/03-policy-blocking.md#tests), [Milestone 6 Exit Criteria](plan/08-implementation-roadmap.md#milestone-6-local-policy-and-local-dns-entries).
     - Cover normalization, exact/subtree matching, suffix edge cases, client selectors, local-rule precedence, local DNS entry precedence and validation, `.local` warning metadata, generated `NODATA`, reason codes, block response selection, and CNAME-based malicious blocking.
+
+**Phase 6 status: done.** Merged via PR #99. Steps 43-49 landed as scoped,
+including the block-response-mode sinkhole-family fix found in PR review
+(family-aware `Sinkhole`/`NoData` selection so a query family without a
+configured sinkhole address reports `NoData` instead of a false
+`Sinkhole`, both in the wire response and in telemetry).
+
+## Phase 6.5: MVP Wiring (bridge to a runnable, file-configured server)
+
+Not part of the original phase plan — added because Phase 6 landed
+*domain logic* (`ResolveQuery` policy/local-entry support) with nothing
+wiring it into the actual binary: `main.rs` still hardcoded
+`NoopPolicyEvaluator`/`NoopLocalDnsEntries` and a single hardcoded
+upstream, and there was no config file loading at all. Forwarding,
+caching, the event pipeline, and configurable forward/recursive
+resolution (Phases 2-5) already worked end-to-end in `main.rs`; only local
+policy/entries and file-based configuration were missing to satisfy "run
+the server, answer local network names, resolve everything else
+normally." Done ahead of Phase 7's SQLite persistence layer since a file
+was sufficient to unblock real use; see the "MVP Wiring" note in
+[Overview](plan/00-overview.md#mvp-wiring-bridging-phase-6-domain-logic-into-a-runnable-server)
+and the interim-implementation note in
+[Configuration Reload](plan/05-persistence-config.md#configuration-reload).
+
+96. Add `LocalDnsEntryConfig` and TOML config file loading.
+    - Implements: [Repository Ports](plan/05-persistence-config.md#repository-ports) (file-backed interim), [Local DNS Entries](plan/03-policy-blocking.md#local-dns-entries), [Configuration Reload](plan/05-persistence-config.md#configuration-reload).
+    - Add `RuntimeConfig::from_toml_str` (`serde` + `toml`, `#[serde(deny_unknown_fields)]` so unsupported keys fail closed) covering `dns_listen`, `[resolution]` (forward and recursive, including recursive root hints/timeouts/transports/DNSSEC-mode/DNAME-handling), `[[upstreams]]`, and `[[local_dns_entries]]` (with required public-address acknowledgement for routable targets). Relax `validate_listen_address` to allow privileged ports (still reject port `0`) so the server can bind `:53` for real LAN use.
+
+97. Wire `main.rs` to build real policy/local-entries from config.
+    - Implements: [Resolver Flow](plan/02-resolver-cache.md#flow), [Core Runtime Flow](plan/00-overview.md#core-runtime-flow).
+    - Load config from `RDNS_CONFIG` or `./config.toml`, falling back to loopback development defaults; build `ResolveQuery` with real `InMemoryLocalDnsEntries` and a real backend snapshot instead of no-ops; ship a runnable example `config.toml` at the repo root (local-entry sample disabled by default so a fresh checkout never answers a fake record).
+
+98. Make local DNS entries hot-swappable and add `SIGHUP` reload.
+    - Implements: [Configuration Reload](plan/05-persistence-config.md#configuration-reload), [Concurrency](plan/02-resolver-cache.md#cache-design).
+    - Add `LocalDnsEntriesHandle` (`Arc<RwLock<Arc<dyn LocalDnsEntries>>>`, mirroring the existing `BackendHandle`) so local entries can be republished without restarting `ResolveQuery`. Add a `#[cfg(unix)]` SIGHUP task that re-reads and fully re-validates the config file and only on success republishes the backend snapshot and local entries — never a partial apply. `dns_listen` stays restart-only. Found and fixed via adversarial review: the reload task's `JoinHandle` must be aborted and awaited before dropping the resolver/awaiting the query-event drain on shutdown, or the task's held `Arc<ResolveQuery>` clone keeps the event channel open and shutdown hangs.
+
+99. Parse bundled recursive-mode root hints from a real zone file.
+    - Implements: [Recursive Resolution](plan/02-resolver-cache.md#recursive-resolution), [Repository Ports](plan/05-persistence-config.md#repository-ports).
+    - Commit `src/config/named.root` (verbatim copy of IANA/InterNIC's published root hints zone file) and parse it at compile time via `parse_named_root()`/`include_str!` instead of hand-maintaining root server addresses in Rust. Covers all 13 root servers, IPv4 and IPv6. Refreshing is a `curl` over that file plus a rebuild, no code changes.
+
+100. Add MVP wiring tests.
+    - Implements: [Persistence Tests](plan/05-persistence-config.md#tests) (file-config variant), [Resolver Tests](plan/02-resolver-cache.md#tests).
+    - Cover TOML round-trip and validation (valid/invalid local entries, duplicate names, unknown fields, recursive-mode round-trip for bundled and custom root hints, `parse_named_root` parsing/grouping/malformed-input), local-entry hot-swap without a resolver restart, and config-driven end-to-end resolver assembly in `main.rs`'s own test module. Manually verified live: zero-config and file-config startup, `SIGHUP` reload of upstreams/local-entries/resolution-mode, `SIGHUP` rejecting a broken config while preserving the last good one, and clean shutdown via `SIGINT` with and without a prior `SIGHUP`.
 
 ## Phase 7: SQLite Persistence And Runtime Config
 
