@@ -224,7 +224,10 @@ fn spawn_sighup_reload_task(
             }
         };
         loop {
-            hangup.recv().await;
+            if hangup.recv().await.is_none() {
+                eprintln!("SIGHUP signal stream closed; stopping reload task");
+                return;
+            }
             let Some(path) = config_path.as_deref() else {
                 eprintln!("SIGHUP received but no config file was loaded at startup; ignoring");
                 continue;

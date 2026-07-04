@@ -480,25 +480,31 @@ fn bundled_root_hints() -> Vec<RootHintConfig> {
 }
 
 /// Parses a BIND-style root hints zone file (the format IANA/InterNIC
-/// publish as `named.root`/`named.cache`): comment lines start with `;`,
-/// data lines are `<name> <ttl> <type> <rdata>` with no explicit class.
-/// Only `A`/`AAAA` records are kept (`NS` records are redundant with the
-/// owner names of the address records and carry no addresses of their
-/// own); root names are returned in first-seen order with all of their
-/// glue addresses attached.
+/// publish as `named.root`/`named.cache`): `;` starts a comment, whether on
+/// its own line or trailing data; data lines are `<name> <ttl> [class]
+/// <type> <rdata>`, with the class (e.g. `IN`) optional. Only `A`/`AAAA`
+/// records are kept (`NS` records are redundant with the owner names of the
+/// address records and carry no addresses of their own); root names are
+/// returned in first-seen order with all of their glue addresses attached.
 fn parse_named_root(source: &str) -> Result<Vec<RootHintConfig>, String> {
     let mut hints: Vec<RootHintConfig> = Vec::new();
-    for (line_number, line) in source.lines().enumerate() {
-        let line = line.trim();
-        if line.is_empty() || line.starts_with(';') {
+    for (line_number, raw_line) in source.lines().enumerate() {
+        let line = raw_line.split(';').next().unwrap_or("").trim();
+        if line.is_empty() {
             continue;
         }
         let fields: Vec<&str> = line.split_whitespace().collect();
-        let [name, _ttl, record_type, rdata] = fields[..] else {
-            return Err(format!(
-                "line {}: expected `<name> <ttl> <type> <rdata>`, got `{line}`",
-                line_number + 1
-            ));
+        let (name, record_type, rdata) = match fields[..] {
+            [name, _ttl, record_type, rdata] => (name, record_type, rdata),
+            [name, _ttl, class, record_type, rdata] if class.eq_ignore_ascii_case("IN") => {
+                (name, record_type, rdata)
+            }
+            _ => {
+                return Err(format!(
+                    "line {}: expected `<name> <ttl> [class] <type> <rdata>`, got `{line}`",
+                    line_number + 1
+                ));
+            }
         };
         if record_type != "A" && record_type != "AAAA" {
             continue;
@@ -1445,6 +1451,28 @@ B.ROOT-SERVERS.NET.      3600000      A     170.247.170.2
                     vec!["170.247.170.2:53".parse().unwrap()]
                 ),
             ]
+        );
+    }
+
+    #[test]
+    fn parse_named_root_accepts_optional_class_and_inline_comments() {
+        let source = "\
+.                        3600000  IN  NS    A.ROOT-SERVERS.NET.
+A.ROOT-SERVERS.NET.      3600000  IN  A     198.41.0.4      ; glue address
+A.ROOT-SERVERS.NET.      3600000      AAAA  2001:503:ba3e::2:30
+";
+
+        let hints = parse_named_root(source).unwrap();
+
+        assert_eq!(
+            hints,
+            vec![RootHintConfig::new(
+                "a.root-servers.net",
+                vec![
+                    "198.41.0.4:53".parse().unwrap(),
+                    "[2001:503:ba3e::2:30]:53".parse().unwrap(),
+                ],
+            )]
         );
     }
 

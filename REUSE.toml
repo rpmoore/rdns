@@ -10,6 +10,7 @@ path = [
     "Cargo.toml",
     "LICENSE",
     "README.md",
+    "config.toml",
     "deny.toml",
     "docs/**",
     "scripts/**",

@@ -77,9 +77,12 @@ timeout_ms = 750
 ```
 
 Multiple entries give failover, not fan-out: rdns tries them in priority
-order and falls through on failure/timeout. `protocol` only supports `"udp"`
-right now — a `"tcp"` value parses but forwarding queries always go out over
-UDP.
+order and falls through on failure/timeout. `protocol` parses `"tcp"` but
+forwarding only considers `enabled` upstreams with `protocol = "udp"` —
+`"tcp"`-configured upstreams are skipped entirely (an all-`"tcp"` upstream
+list leaves no backend to forward to). Initial forwarding queries always go
+out over UDP; rdns retries the same upstream over TCP if the UDP response
+comes back truncated (`TC` bit set).
 
 ### Recursive resolution (acting as your own root-to-leaf resolver)
 
