@@ -16,8 +16,10 @@ Startup config resolution order:
 3. Otherwise, built-in loopback dev defaults (listens on `127.0.0.1:5300`,
    forwards to `1.1.1.1:53`, no local entries).
 
-A sample `config.toml` ships at the repo root and loads automatically.
-Point at a different file:
+A sample `config.toml` ships at the repo root and loads automatically. Its
+`[[local_dns_entries]]` sample (`nas.lan`) is `enabled = false` out of the
+box — enable it and set your own address, or add your own entries — so a
+plain checkout never answers a fake record. Point at a different file:
 
 ```bash
 RDNS_CONFIG=/etc/rdns/config.toml cargo run
@@ -26,7 +28,7 @@ RDNS_CONFIG=/etc/rdns/config.toml cargo run
 Test it:
 
 ```bash
-dig @127.0.0.1 -p 5300 nas.lan A        # local entry
+dig @127.0.0.1 -p 5300 nas.lan A        # local entry, once enabled in config.toml
 dig @127.0.0.1 -p 5300 example.com A    # forwarded upstream
 ```
 
@@ -136,6 +138,28 @@ endpoints = ["199.9.14.201:53"]
 `[resolution]`/`[[upstreams]]` reload on SIGHUP too — you can flip between
 `forward` and `recursive`, or change recursive settings, without a restart.
 Only `dns_listen` is restart-only, see below.
+
+#### Updating the bundled (`root_hints = "bundled"`) root server list
+
+The bundled list (currently all 13 root servers, IPv4 + IPv6) isn't
+hand-maintained Rust — it's parsed at compile time from a committed copy of
+IANA/InterNIC's root hints zone file at `src/config/named.root`, via
+`parse_named_root()` in `src/config/mod.rs`. To refresh it when a root
+server's address changes:
+
+```bash
+curl -sS https://www.internic.net/domain/named.root -o src/config/named.root
+```
+
+Then rebuild — `parse_named_root` re-derives `bundled_root_hints()` from
+the new file automatically, no other code changes needed. It reads the
+standard BIND zone-file shape IANA publishes (`;`-prefixed comments,
+`<name> <ttl> <type> <rdata>` data lines) and keeps only the `A`/`AAAA`
+glue records, grouped by root server name in first-seen order; `NS`
+records are ignored (redundant with the address records' owner names).
+Bump `root_hints_version` in your config after a refresh if you want the
+new file to invalidate the resolver's recursive-mode cache namespace on
+next load/reload.
 
 ### Local DNS entries
 
