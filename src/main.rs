@@ -673,6 +673,8 @@ fn dnssec_validation_label(status: DnssecValidationStatus) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Mutex;
+
     use rdns::resolver::{
         LocalDnsEntries, LocalDnsLookup, QueryEventReadModel, QuestionKey, ResolveDecision,
         ResolveDecisionKind,
@@ -722,30 +724,42 @@ mod tests {
         );
     }
 
+    static CONFIG_PATH_ENV_VAR_LOCK: Mutex<()> = Mutex::new(());
+
+    /// Restores `RDNS_CONFIG` to its pre-test value on drop, including on
+    /// panic, so a failed assertion (or a panic inside `resolve_config_path`
+    /// itself) can't leak the mutated env var to later tests.
+    struct RestoreConfigPathEnvVar(Option<String>);
+
+    impl Drop for RestoreConfigPathEnvVar {
+        fn drop(&mut self) {
+            match self.0.take() {
+                Some(value) => unsafe { std::env::set_var(CONFIG_PATH_ENV_VAR, value) },
+                None => unsafe { std::env::remove_var(CONFIG_PATH_ENV_VAR) },
+            }
+        }
+    }
+
     #[test]
     fn resolve_config_path_treats_blank_env_var_as_unset() {
-        // No other test reads or writes RDNS_CONFIG, so this doesn't race.
-        let expected = {
-            let saved = std::env::var(CONFIG_PATH_ENV_VAR).ok();
-            unsafe {
-                std::env::remove_var(CONFIG_PATH_ENV_VAR);
-            }
-            let expected = resolve_config_path();
-            if let Some(saved) = saved {
-                unsafe {
-                    std::env::set_var(CONFIG_PATH_ENV_VAR, saved);
-                }
-            }
-            expected
-        };
+        // Serializes access to RDNS_CONFIG across tests in this binary; the
+        // env mutation functions are unsafe precisely because concurrent
+        // reads/writes from other threads are UB, so every test that
+        // touches this var must take this lock first.
+        let _guard = CONFIG_PATH_ENV_VAR_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _restore = RestoreConfigPathEnvVar(std::env::var(CONFIG_PATH_ENV_VAR).ok());
+
+        unsafe {
+            std::env::remove_var(CONFIG_PATH_ENV_VAR);
+        }
+        let expected = resolve_config_path();
 
         unsafe {
             std::env::set_var(CONFIG_PATH_ENV_VAR, "   ");
         }
         let actual = resolve_config_path();
-        unsafe {
-            std::env::remove_var(CONFIG_PATH_ENV_VAR);
-        }
 
         assert_eq!(actual, expected);
     }

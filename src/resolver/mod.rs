@@ -2699,6 +2699,7 @@ impl ResolveQuery {
         self.metrics.increment(ResolverMetric::QueryReceived);
         let started_at = self.clock.now();
         let backend_snapshot = self.backend.current();
+        let local_entries = self.local_entries.current();
         let request_id = request_id_from_wire(&request.bytes);
         let request_bytes = std::mem::take(&mut request.bytes);
 
@@ -2749,7 +2750,7 @@ impl ResolveQuery {
                 )
                 .await;
         }
-        match self.local_entries.current().lookup(&decoded.question) {
+        match local_entries.lookup(&decoded.question) {
             LocalDnsLookup::Answer(entry) => {
                 self.metrics.increment(ResolverMetric::QueryAllowed);
                 let response_bytes = self.local_entry_response(&decoded, &entry);
