@@ -169,7 +169,9 @@ async fn main() -> io::Result<()> {
 
 fn resolve_config_path() -> Option<PathBuf> {
     if let Ok(path) = std::env::var(CONFIG_PATH_ENV_VAR) {
-        return Some(PathBuf::from(path));
+        if !path.trim().is_empty() {
+            return Some(PathBuf::from(path));
+        }
     }
     let default_path = PathBuf::from(DEFAULT_CONFIG_PATH);
     default_path.exists().then_some(default_path)
@@ -718,6 +720,34 @@ mod tests {
             local_entries.lookup(&unrelated_question),
             LocalDnsLookup::NoMatch
         );
+    }
+
+    #[test]
+    fn resolve_config_path_treats_blank_env_var_as_unset() {
+        // No other test reads or writes RDNS_CONFIG, so this doesn't race.
+        let expected = {
+            let saved = std::env::var(CONFIG_PATH_ENV_VAR).ok();
+            unsafe {
+                std::env::remove_var(CONFIG_PATH_ENV_VAR);
+            }
+            let expected = resolve_config_path();
+            if let Some(saved) = saved {
+                unsafe {
+                    std::env::set_var(CONFIG_PATH_ENV_VAR, saved);
+                }
+            }
+            expected
+        };
+
+        unsafe {
+            std::env::set_var(CONFIG_PATH_ENV_VAR, "   ");
+        }
+        let actual = resolve_config_path();
+        unsafe {
+            std::env::remove_var(CONFIG_PATH_ENV_VAR);
+        }
+
+        assert_eq!(actual, expected);
     }
 
     #[test]

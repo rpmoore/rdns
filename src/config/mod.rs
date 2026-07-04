@@ -506,7 +506,7 @@ fn parse_named_root(source: &str) -> Result<Vec<RootHintConfig>, String> {
                 ));
             }
         };
-        if record_type != "A" && record_type != "AAAA" {
+        if !record_type.eq_ignore_ascii_case("A") && !record_type.eq_ignore_ascii_case("AAAA") {
             continue;
         }
         let address: IpAddr = rdata
@@ -1460,6 +1460,27 @@ B.ROOT-SERVERS.NET.      3600000      A     170.247.170.2
 .                        3600000  IN  NS    A.ROOT-SERVERS.NET.
 A.ROOT-SERVERS.NET.      3600000  IN  A     198.41.0.4      ; glue address
 A.ROOT-SERVERS.NET.      3600000      AAAA  2001:503:ba3e::2:30
+";
+
+        let hints = parse_named_root(source).unwrap();
+
+        assert_eq!(
+            hints,
+            vec![RootHintConfig::new(
+                "a.root-servers.net",
+                vec![
+                    "198.41.0.4:53".parse().unwrap(),
+                    "[2001:503:ba3e::2:30]:53".parse().unwrap(),
+                ],
+            )]
+        );
+    }
+
+    #[test]
+    fn parse_named_root_accepts_lowercase_and_mixed_case_record_types() {
+        let source = "\
+a.root-servers.net.      3600000      a     198.41.0.4
+a.root-servers.net.      3600000      Aaaa  2001:503:ba3e::2:30
 ";
 
         let hints = parse_named_root(source).unwrap();
