@@ -205,8 +205,7 @@ fn reload_resolver(
 ) -> io::Result<()> {
     let backend_snapshot = build_backend_snapshot(config, metrics)?;
     let local_entries = build_local_entries(config)?;
-    resolver.publish_backend_snapshot(backend_snapshot);
-    resolver.publish_local_entries(local_entries);
+    resolver.publish_reload(backend_snapshot, local_entries);
     Ok(())
 }
 

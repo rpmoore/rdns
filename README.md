@@ -211,11 +211,9 @@ kill -HUP <pid>
   is logged and rejected in full — the server keeps serving the last-good
   config, with no fields changed from the rejected reload.
 - On a successful reload, the new backend (upstreams/recursive settings)
-  and new local DNS entries are published as two separate atomic swaps, not
-  one combined transaction — a query that lands in the brief window between
-  those two swaps can see one field from the new config and the other from
-  the old one. Each swap on its own is race-free (a query never sees a
-  half-written backend or half-written entry list).
+  and new local DNS entries are published together as one atomic step: a
+  query in flight during the reload sees either the fully old pair or the
+  fully new pair, never one field from each.
 - `[resolution]`, `[[upstreams]]`, and `[[local_dns_entries]]` are all
   reloadable this way — including switching between `forward` and
   `recursive` mode.
