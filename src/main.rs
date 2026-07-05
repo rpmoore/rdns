@@ -295,8 +295,19 @@ fn build_local_entries(
     // error at all, so this check is the only thing standing between a
     // duplicate name and undefined-which-entry-wins behavior. It must run,
     // and fail, before `InMemoryLocalDnsEntries::new` is ever called.
-    let mut seen: HashSet<DomainName> = entries.iter().map(|entry| entry.name.clone()).collect();
-    let inline_count = entries.len();
+    //
+    // Only *enabled* entries are seeded here: `InMemoryLocalDnsEntries::new`
+    // filters disabled entries out before they ever reach its name-keyed
+    // map, so a disabled inline entry can't actually collide with anything
+    // there — treating it as claiming the name would wrongly reject an
+    // enabled zone entry sharing that name, and would over-report the
+    // "entries actually served" count below.
+    let mut seen: HashSet<DomainName> = entries
+        .iter()
+        .filter(|entry| entry.enabled)
+        .map(|entry| entry.name.clone())
+        .collect();
+    let inline_count = entries.iter().filter(|entry| entry.enabled).count();
     let mut zone_derived_count = 0;
     let mut zone_file_count = 0;
 
@@ -1107,6 +1118,63 @@ mod tests {
         let error = build_local_entries(&config, None).unwrap_err();
 
         assert!(error.to_string().contains("duplicate local DNS entry name"));
+    }
+
+    #[test]
+    fn build_local_entries_allows_zone_entry_to_reuse_a_disabled_inline_entrys_name() {
+        // A disabled inline entry is filtered out by `InMemoryLocalDnsEntries::new`
+        // before it ever reaches the served name-keyed map, so it can't
+        // actually collide with anything there. Treating it as claiming
+        // the name in `build_local_entries`'s duplicate check would wrongly
+        // reject an enabled zone entry sharing that name, and would
+        // over-report the "entries actually served" count.
+        let zone_file = ScratchFile::write(
+            "reuse.zone",
+            "$ORIGIN lan.\n$TTL 300\nnas IN A 192.168.1.99\n",
+        );
+        let mut config = config_with_one_zone(zone_file.path(), "lan");
+        let disabled_toml = r#"
+            dns_listen = ["127.0.0.1:5300"]
+            per_query_deadline_ms = 2000
+            max_udp_payload_size = 1232
+
+            [[upstreams]]
+            name = "cloudflare"
+            endpoint = "1.1.1.1:53"
+            protocol = "udp"
+            enabled = true
+            priority = 10
+            timeout_ms = 750
+
+            [[local_dns_entries]]
+            name = "nas.lan"
+            ipv4 = ["192.168.1.10"]
+            ttl = 300
+            enabled = false
+            public_address_acknowledged = false
+        "#;
+        config.local_dns_entries.push(
+            RuntimeConfig::from_toml_str(disabled_toml)
+                .unwrap()
+                .local_dns_entries
+                .remove(0),
+        );
+
+        let (local_entries, counts) = build_local_entries(&config, None).unwrap();
+
+        assert_eq!(
+            counts.inline, 0,
+            "disabled inline entry must not be counted as served"
+        );
+        assert_eq!(counts.zone_derived, 1);
+
+        let question = QuestionKey::new("nas.lan", 1, 1);
+        match local_entries.lookup(&question) {
+            LocalDnsLookup::Answer(entry) => {
+                assert_eq!(entry.ipv4[0].to_string(), "192.168.1.99");
+            }
+            other => panic!("expected the zone-derived entry to win, got {other:?}"),
+        }
     }
 
     #[test]
