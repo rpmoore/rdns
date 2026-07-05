@@ -209,6 +209,21 @@ Examples:
 
 ## Configuration Reload
 
+**Interim implementation note:** ahead of this domain's SQLite-backed
+repositories, an MVP pass implemented the snapshot-based reload behavior
+described below using a TOML config file and `SIGHUP` instead of an admin
+API and database transactions. `RuntimeConfig::from_toml_str` validates
+the whole file before anything is applied; `main.rs` only calls
+`publish_backend_snapshot`/`publish_local_entries` after that validation
+succeeds, and a failed reload logs an error and keeps serving the last
+good snapshot. This already satisfies "publish new snapshots only after
+[changes are durably recorded and] commit" in spirit (file-write instead
+of DB transaction) and "avoid direct database reads on the DNS hot path"
+(the hot path reads `Arc` handles, never the file). When Phase 7 lands,
+extend this reload path onto `SettingsRepository`/`UpstreamRepository`/etc.
+rather than replacing the `BackendHandle`/`LocalDnsEntriesHandle` publish
+mechanism — that part of the design already works and is tested.
+
 Runtime configuration should be snapshot-based.
 
 - Validate admin changes before saving.

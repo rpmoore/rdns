@@ -1542,6 +1542,35 @@ impl BackendHandle {
     }
 }
 
+#[derive(Clone)]
+pub struct LocalDnsEntriesHandle {
+    entries: Arc<RwLock<Arc<dyn LocalDnsEntries>>>,
+}
+
+impl LocalDnsEntriesHandle {
+    pub fn new(entries: Arc<dyn LocalDnsEntries>) -> Self {
+        Self {
+            entries: Arc::new(RwLock::new(entries)),
+        }
+    }
+
+    pub fn current(&self) -> Arc<dyn LocalDnsEntries> {
+        let entries = self
+            .entries
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        Arc::clone(&entries)
+    }
+
+    pub fn publish(&self, entries: Arc<dyn LocalDnsEntries>) {
+        let mut current = self
+            .entries
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        *current = entries;
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SourceCredibility {
     ForwarderValidated,
@@ -2429,11 +2458,15 @@ struct CacheProbe {
 pub struct ResolveQuery {
     protocol: Arc<dyn ProtocolCodec>,
     policy: Arc<dyn PolicyEvaluator>,
-    local_entries: Arc<dyn LocalDnsEntries>,
+    local_entries: LocalDnsEntriesHandle,
     cache: Arc<dyn DnsCache>,
     ttl_policy: CacheTtlPolicy,
     miss_coalescer: Arc<SingleFlightMisses>,
     backend: BackendHandle,
+    // Guards `backend` and `local_entries` together: a writer publishing a
+    // reload holds this for both swaps, so a query never observes the new
+    // value of one field paired with the stale value of the other.
+    reload_gate: RwLock<()>,
     responses: Arc<dyn ResponseFactory>,
     clock: Arc<dyn Clock>,
     events: Arc<dyn QueryEventSink>,
@@ -2557,11 +2590,12 @@ impl ResolveQuery {
         Self {
             protocol,
             policy,
-            local_entries,
+            local_entries: LocalDnsEntriesHandle::new(local_entries),
             cache,
             ttl_policy,
             miss_coalescer: Arc::new(SingleFlightMisses::default()),
             backend: BackendHandle::new(backend_snapshot),
+            reload_gate: RwLock::new(()),
             responses,
             clock,
             events,
@@ -2575,8 +2609,34 @@ impl ResolveQuery {
     }
 
     pub fn publish_backend_snapshot(&self, snapshot: BackendSnapshot) {
+        let _gate = self
+            .reload_gate
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let status = snapshot.status();
         self.backend.publish(snapshot);
+        self.metrics.record_backend_status(&status);
+    }
+
+    pub fn publish_local_entries(&self, entries: Arc<dyn LocalDnsEntries>) {
+        let _gate = self
+            .reload_gate
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        self.local_entries.publish(entries);
+    }
+
+    /// Publishes a new backend snapshot and local DNS entries as a single
+    /// atomic reload: no query can observe one field from the new config
+    /// paired with the other from the old one.
+    pub fn publish_reload(&self, snapshot: BackendSnapshot, entries: Arc<dyn LocalDnsEntries>) {
+        let _gate = self
+            .reload_gate
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let status = snapshot.status();
+        self.backend.publish(snapshot);
+        self.local_entries.publish(entries);
         self.metrics.record_backend_status(&status);
     }
 
@@ -2622,11 +2682,12 @@ impl ResolveQuery {
         Self {
             protocol,
             policy,
-            local_entries,
+            local_entries: LocalDnsEntriesHandle::new(local_entries),
             cache,
             ttl_policy,
             miss_coalescer: Arc::new(SingleFlightMisses::default()),
             backend: backend_handle,
+            reload_gate: RwLock::new(()),
             responses,
             clock,
             events,
@@ -2665,7 +2726,13 @@ impl ResolveQuery {
     pub async fn resolve(&self, mut request: ResolveRequest) -> ResolveOutcome {
         self.metrics.increment(ResolverMetric::QueryReceived);
         let started_at = self.clock.now();
-        let backend_snapshot = self.backend.current();
+        let (backend_snapshot, local_entries) = {
+            let _gate = self
+                .reload_gate
+                .read()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            (self.backend.current(), self.local_entries.current())
+        };
         let request_id = request_id_from_wire(&request.bytes);
         let request_bytes = std::mem::take(&mut request.bytes);
 
@@ -2716,7 +2783,7 @@ impl ResolveQuery {
                 )
                 .await;
         }
-        match self.local_entries.lookup(&decoded.question) {
+        match local_entries.lookup(&decoded.question) {
             LocalDnsLookup::Answer(entry) => {
                 self.metrics.increment(ResolverMetric::QueryAllowed);
                 let response_bytes = self.local_entry_response(&decoded, &entry);
@@ -11064,6 +11131,173 @@ mod tests {
                 family: LocalAnswerFamily::A,
                 ttl: 120,
             })
+        );
+    }
+
+    // Needs a real second OS thread: the reload task blocks inside a std
+    // (non-async-aware) RwLock::write() while this task still holds the
+    // paired read lock, so a single-thread runtime would deadlock instead
+    // of letting this task run concurrently to drop its guard. Holding the
+    // read guard across the yield below is the point of the test (it
+    // proves the writer can't proceed until this guard drops), hence the
+    // clippy allow.
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn publish_reload_blocks_concurrent_query_until_both_fields_are_swapped() {
+        let upstream = Arc::new(StaticUpstream::new(Ok(upstream_response(
+            a_response_with_answer(0xabcd, "host.example", 60),
+        ))));
+        let events = Arc::new(RecordingEvents::default());
+        let service = Arc::new(ResolveQuery::with_cache_and_policy(
+            Arc::new(StandardProtocolCodec::new(1232)),
+            Arc::new(NoopDnsCache),
+            Arc::new(NoopPolicyEvaluator),
+            Arc::new(NoopLocalDnsEntries),
+            CacheTtlPolicy::default(),
+            upstream.clone(),
+            Arc::new(BasicResponseFactory),
+            Arc::new(FixedClock(SystemTime::UNIX_EPOCH)),
+            events.clone(),
+            Arc::new(RecordingMetrics::default()),
+        ));
+
+        // Hold the same read lock a query holds while capturing its
+        // backend/local-entries pair, simulating a query in flight.
+        let in_flight_query_guard = service
+            .reload_gate
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+
+        let reload_service = Arc::clone(&service);
+        let new_backend = BackendSnapshot::forwarding(upstream.clone(), 7);
+        let new_local_entries: Arc<dyn LocalDnsEntries> =
+            Arc::new(InMemoryLocalDnsEntries::new(vec![LocalDnsEntry::new(
+                DomainName::parse("host.example").unwrap(),
+                vec![Ipv4Addr::new(192, 0, 2, 44)],
+                Vec::new(),
+                120,
+                true,
+            )]));
+        // The task proves its own contention before signaling, rather than
+        // the test asserting contention from outside (which would only show
+        // the guard blocks writers in general, not that this task hit it):
+        // it spins on try_write() until it observes Err itself, then signals
+        // and immediately (no intervening await) makes the real blocking
+        // write call via publish_reload. That ordering guarantees the
+        // is_finished() check below can't pass merely because the task
+        // hasn't been polled far enough yet.
+        let (about_to_reload_tx, about_to_reload_rx) = tokio::sync::oneshot::channel::<()>();
+        let reload_task = tokio::spawn(async move {
+            while reload_service.reload_gate.try_write().is_ok() {
+                tokio::task::yield_now().await;
+            }
+            let _ = about_to_reload_tx.send(());
+            reload_service.publish_reload(new_backend, new_local_entries);
+        });
+
+        about_to_reload_rx.await.unwrap();
+        assert!(
+            !reload_task.is_finished(),
+            "publish_reload must block while a query holds the paired-read lock, \
+             otherwise a query could read one field before the swap and the other after"
+        );
+
+        drop(in_flight_query_guard);
+        reload_task.await.unwrap();
+
+        // Once the reload completes, both fields must have swapped together:
+        // the backend generation is the new one, and the local entry (which
+        // only exists in the new config) now answers instead of forwarding.
+        assert_eq!(service.backend_status().generation, 7);
+        let outcome = service
+            .resolve(ResolveRequest::new(
+                "192.0.2.10".parse().unwrap(),
+                SystemTime::UNIX_EPOCH,
+                a_query(0x2222, "host.example"),
+            ))
+            .await;
+        assert_eq!(
+            outcome.decision.kind,
+            ResolveDecisionKind::LocalAnswer(LocalAnswerMetadata {
+                entry_id: None,
+                generation: 0,
+                family: LocalAnswerFamily::A,
+                ttl: 120,
+            })
+        );
+        assert_eq!(upstream.requests.lock().unwrap().len(), 0);
+    }
+
+    #[tokio::test]
+    async fn publish_local_entries_updates_lookups_without_restarting_resolver() {
+        let upstream = Arc::new(StaticUpstream::new(Ok(upstream_response(
+            a_response_with_answer(0xabcd, "host.example", 60),
+        ))));
+        let cache = Arc::new(RecordingCache::with_lookup(CacheLookup::Miss));
+        let events = Arc::new(RecordingEvents::default());
+        let service = ResolveQuery::with_cache_and_policy(
+            Arc::new(StandardProtocolCodec::new(1232)),
+            cache.clone(),
+            Arc::new(NoopPolicyEvaluator),
+            Arc::new(NoopLocalDnsEntries),
+            CacheTtlPolicy::default(),
+            upstream.clone(),
+            Arc::new(BasicResponseFactory),
+            Arc::new(FixedClock(SystemTime::UNIX_EPOCH)),
+            events.clone(),
+            Arc::new(RecordingMetrics::default()),
+        );
+
+        let before = service
+            .resolve(ResolveRequest::new(
+                "192.0.2.10".parse().unwrap(),
+                SystemTime::UNIX_EPOCH,
+                a_query(0x1234, "host.example"),
+            ))
+            .await;
+        assert_ne!(
+            before.decision.kind,
+            ResolveDecisionKind::LocalAnswer(LocalAnswerMetadata {
+                entry_id: None,
+                generation: 0,
+                family: LocalAnswerFamily::A,
+                ttl: 120,
+            })
+        );
+        assert_eq!(upstream.requests.lock().unwrap().len(), 1);
+
+        service.publish_local_entries(Arc::new(InMemoryLocalDnsEntries::new(vec![
+            LocalDnsEntry::new(
+                DomainName::parse("host.example").unwrap(),
+                vec![Ipv4Addr::new(192, 0, 2, 44)],
+                Vec::new(),
+                120,
+                true,
+            ),
+        ])));
+
+        let after = service
+            .resolve(ResolveRequest::new(
+                "192.0.2.10".parse().unwrap(),
+                SystemTime::UNIX_EPOCH,
+                a_query(0x1235, "host.example"),
+            ))
+            .await;
+
+        assert_eq!(
+            after.decision.kind,
+            ResolveDecisionKind::LocalAnswer(LocalAnswerMetadata {
+                entry_id: None,
+                generation: 0,
+                family: LocalAnswerFamily::A,
+                ttl: 120,
+            })
+        );
+        assert_eq!(upstream.requests.lock().unwrap().len(), 1);
+        let response = Message::parse(&after.response_bytes).unwrap();
+        assert_eq!(
+            response.answers[0].record,
+            RecordData::A(Ipv4Addr::new(192, 0, 2, 44))
         );
     }
 
