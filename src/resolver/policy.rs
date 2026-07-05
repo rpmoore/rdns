@@ -51,7 +51,7 @@ impl DomainName {
         self.0.is_empty()
     }
 
-    fn is_at_or_below(&self, base: &Self) -> bool {
+    pub(crate) fn is_at_or_below(&self, base: &Self) -> bool {
         if base.is_root() {
             return true;
         }

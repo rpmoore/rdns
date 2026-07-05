@@ -2,6 +2,7 @@
 # Keep policy explicit; allow common permissive licenses used by our deps.
 allow = [
     "Apache-2.0",
+    "BSD-3-Clause",
     "MIT",
     "Unicode-3.0",
 ]

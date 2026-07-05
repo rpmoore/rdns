@@ -124,6 +124,25 @@ Guardrails:
 
 Defer wildcard entries, subtree zones, CNAME aliases, TXT/MX/SRV records, and reverse PTR generation until they have explicit precedence, validation, and UI requirements.
 
+**Update:** a bounded exception to "exact names only"/deferred "subtree
+zones" shipped as `[[local_zones]]` (TOML config, `src/config/mod.rs`,
+`parse_local_zone_file`) — administrators can point rdns at a real
+BIND-format zone file, with a mandatory `root_domain` field constraining
+which names it may define. This is a *load-time validation constraint* on
+which names a zone file may define, not general wildcard/subtree
+query-time matching: every record loaded from a zone file still becomes
+an individual exact-name entry in the same model described above, subject
+to the same guardrails (address-family validation, public-address
+acknowledgement, `.local` mDNS warning). `SOA`/`NS` records in a zone file
+are recognized and ignored as zone-management boilerplate; CNAME/TXT/MX/SRV
+remain deferred exactly as above, now enforced as a load-time error when
+found in an ingested zone file rather than silently absent. Zone-derived
+and inline `[[local_dns_entries]]` names alike are also rejected if their
+effective top-level domain is a real, currently-delegated IANA TLD (a
+local override must never be able to claim authority over a real public
+domain) — see `README.md`'s "Local zones" section for the operator-facing
+explanation.
+
 ## Known-Malicious Domain Blocklists
 
 Blocklists should be activated as immutable snapshots.

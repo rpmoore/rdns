@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use std::collections::HashSet;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -22,18 +23,20 @@ use opentelemetry::KeyValue;
 use opentelemetry_otlp::MetricExporter;
 use opentelemetry_sdk::metrics::{PeriodicReader, SdkMeterProvider};
 use rdns::config::{
-    ResolutionMode as ConfigResolutionMode, RootHintsSource as ConfigRootHintsSource, RuntimeConfig,
+    parse_local_zone_file, LocalZoneConfig, ResolutionMode as ConfigResolutionMode,
+    RootHintsSource as ConfigRootHintsSource, RuntimeConfig, MAX_LOCAL_ZONE_FILE_BYTES,
 };
 use rdns::delivery::dns::UdpDnsServer;
 use rdns::delivery::upstream::{ForwardingResolutionBackend, RecursiveAuthorityTransportClient};
 use rdns::resolver::{
     BackendHealth, BackendRootHintsStatus, BackendSnapshot, BackendStatus, BasicResponseFactory,
-    CacheTtlPolicy, ChannelQueryEventSink, Clock, DnssecValidationStatus, InMemoryDnsCache,
-    InMemoryLocalDnsEntries, InMemoryQueryEventStore, InMemoryQueryEventStoreConfig,
-    InMemorySuspiciousLookupClassifier, InMemorySuspiciousLookupClassifierConfig, MetricsSink,
-    NoopPolicyEvaluator, QueryEventRecordResult, QueryEventSink, QueryEventV1,
-    RecursiveResolutionBackend, RecursiveResolverConfig, RecursiveRootHint,
-    ResolutionMode as ResolverResolutionMode, ResolveQuery, ResolverMetric, StandardProtocolCodec,
+    CacheTtlPolicy, ChannelQueryEventSink, Clock, DnssecValidationStatus, DomainName,
+    InMemoryDnsCache, InMemoryLocalDnsEntries, InMemoryQueryEventStore,
+    InMemoryQueryEventStoreConfig, InMemorySuspiciousLookupClassifier,
+    InMemorySuspiciousLookupClassifierConfig, MetricsSink, NoopPolicyEvaluator,
+    QueryEventRecordResult, QueryEventSink, QueryEventV1, RecursiveResolutionBackend,
+    RecursiveResolverConfig, RecursiveRootHint, ResolutionMode as ResolverResolutionMode,
+    ResolveQuery, ResolverMetric, StandardProtocolCodec,
 };
 use tokio::task::{JoinError, JoinSet};
 
@@ -82,7 +85,24 @@ async fn main() -> io::Result<()> {
             Arc::new(NoopMetrics)
         });
     let backend_snapshot = build_backend_snapshot(&config, Arc::clone(&metrics))?;
-    let local_entries = build_local_entries(&config)?;
+    let (local_entries, local_entry_counts) = build_local_entries(&config, config_path.as_deref())?;
+    println!(
+        "loaded {} local DNS entr{} ({} inline, {} from {} zone file{})",
+        local_entry_counts.inline + local_entry_counts.zone_derived,
+        if local_entry_counts.inline + local_entry_counts.zone_derived == 1 {
+            "y"
+        } else {
+            "ies"
+        },
+        local_entry_counts.inline,
+        local_entry_counts.zone_derived,
+        local_entry_counts.zone_files,
+        if local_entry_counts.zone_files == 1 {
+            ""
+        } else {
+            "s"
+        },
+    );
     let reload_metrics = Arc::clone(&metrics);
     let resolver = Arc::new(ResolveQuery::with_cache_policy_and_backend_snapshot(
         Arc::new(StandardProtocolCodec::new(config.max_udp_payload_size)),
@@ -190,25 +210,152 @@ fn load_runtime_config(path: Option<&Path>) -> io::Result<RuntimeConfig> {
     })
 }
 
-fn build_local_entries(config: &RuntimeConfig) -> io::Result<Arc<InMemoryLocalDnsEntries>> {
-    let entries = config
+/// Counts of local DNS entries actually served after merging
+/// `[[local_dns_entries]]` with every `[[local_zones]]` file, for
+/// operator-facing reload logging.
+#[derive(Debug)]
+struct LocalEntryCounts {
+    inline: usize,
+    zone_derived: usize,
+    zone_files: usize,
+}
+
+/// Zone `path` values are resolved relative to the main config file's
+/// directory when relative (so a config stays portable across machines/
+/// deploy paths, and matches how BIND admins already expect zone paths in
+/// `named.conf` to work); absolute paths are used as-is. With no config
+/// file loaded (dev defaults), a relative path resolves against the
+/// process's current working directory.
+fn resolve_zone_path(config_path: Option<&Path>, zone_path: &Path) -> PathBuf {
+    if zone_path.is_absolute() {
+        return zone_path.to_path_buf();
+    }
+    match config_path.and_then(Path::parent) {
+        Some(dir) if !dir.as_os_str().is_empty() => dir.join(zone_path),
+        _ => zone_path.to_path_buf(),
+    }
+}
+
+fn read_local_zone_file(config_path: Option<&Path>, zone: &LocalZoneConfig) -> io::Result<String> {
+    use std::io::Read;
+
+    let resolved_path = resolve_zone_path(config_path, &zone.path);
+    let mut file = std::fs::File::open(&resolved_path).map_err(|error| {
+        io::Error::other(format!(
+            "failed to read local zone file {}: {error}",
+            resolved_path.display()
+        ))
+    })?;
+    // Bound the read itself (not just the post-hoc size check in
+    // `parse_local_zone_file`) so an oversized or unbounded file (e.g. a
+    // path pointed at a device or a maliciously huge file) can't be fully
+    // allocated into memory before the size ceiling is enforced. Reading
+    // one byte past the cap lets the size check below distinguish
+    // "exactly at the cap" from "over it" without needing a separate
+    // metadata call, which would be racy against a file that grows
+    // between the check and the read anyway.
+    let mut buffer = Vec::new();
+    file.by_ref()
+        .take(MAX_LOCAL_ZONE_FILE_BYTES + 1)
+        .read_to_end(&mut buffer)
+        .map_err(|error| {
+            io::Error::other(format!(
+                "failed to read local zone file {}: {error}",
+                resolved_path.display()
+            ))
+        })?;
+    if buffer.len() as u64 > MAX_LOCAL_ZONE_FILE_BYTES {
+        return Err(io::Error::other(format!(
+            "local zone file {} exceeds the {MAX_LOCAL_ZONE_FILE_BYTES}-byte size limit",
+            resolved_path.display()
+        )));
+    }
+    String::from_utf8(buffer).map_err(|error| {
+        io::Error::other(format!(
+            "local zone file {} is not valid UTF-8: {error}",
+            resolved_path.display()
+        ))
+    })
+}
+
+fn build_local_entries(
+    config: &RuntimeConfig,
+    config_path: Option<&Path>,
+) -> io::Result<(Arc<InMemoryLocalDnsEntries>, LocalEntryCounts)> {
+    let mut entries = config
         .local_dns_entries
         .iter()
         .map(|entry| entry.to_local_dns_entry())
         .collect::<Result<Vec<_>, _>>()
         .map_err(|error| io::Error::other(format!("invalid local DNS entry config: {error:?}")))?;
-    Ok(Arc::new(InMemoryLocalDnsEntries::new(entries)))
+
+    // Duplicate detection across every source (inline + every zone file)
+    // must happen here, after zone files are actually read: `InMemoryLocalDnsEntries::new`
+    // silently keeps the last-inserted entry on a name collision with no
+    // error at all, so this check is the only thing standing between a
+    // duplicate name and undefined-which-entry-wins behavior. It must run,
+    // and fail, before `InMemoryLocalDnsEntries::new` is ever called.
+    let mut seen: HashSet<DomainName> = entries.iter().map(|entry| entry.name.clone()).collect();
+    let inline_count = entries.len();
+    let mut zone_derived_count = 0;
+    let mut zone_file_count = 0;
+
+    for zone in config.local_zones.iter().filter(|zone| zone.enabled) {
+        let content = read_local_zone_file(config_path, zone)?;
+        let zone_entries = parse_local_zone_file(zone, &content).map_err(|error| {
+            io::Error::other(format!(
+                "invalid local zone {}: {error:?}",
+                zone.path.display()
+            ))
+        })?;
+        zone_file_count += 1;
+        for entry_config in zone_entries {
+            let entry = entry_config.to_local_dns_entry().map_err(|error| {
+                io::Error::other(format!(
+                    "invalid local zone {}: {error:?}",
+                    zone.path.display()
+                ))
+            })?;
+            if !seen.insert(entry.name.clone()) {
+                return Err(io::Error::other(format!(
+                    "duplicate local DNS entry name across local_dns_entries/local_zones: {}",
+                    entry.name
+                )));
+            }
+            zone_derived_count += 1;
+            entries.push(entry);
+        }
+    }
+
+    Ok((
+        Arc::new(InMemoryLocalDnsEntries::new(entries)),
+        LocalEntryCounts {
+            inline: inline_count,
+            zone_derived: zone_derived_count,
+            zone_files: zone_file_count,
+        },
+    ))
 }
 
-fn reload_resolver(
-    resolver: &ResolveQuery,
-    config: &RuntimeConfig,
+/// Loads and fully builds everything a reload needs to publish — reading
+/// the config file, reading every enabled zone file, and constructing the
+/// backend snapshot — without touching the resolver. Kept separate from
+/// publishing so the whole thing (file I/O and zone parsing included) can
+/// run inside `spawn_blocking` on the SIGHUP path: publishing itself is a
+/// cheap in-memory swap and doesn't need to be.
+fn build_reload_materials(
+    config_path: &Path,
     metrics: Arc<dyn MetricsSink>,
-) -> io::Result<()> {
-    let backend_snapshot = build_backend_snapshot(config, metrics)?;
-    let local_entries = build_local_entries(config)?;
-    resolver.publish_reload(backend_snapshot, local_entries);
-    Ok(())
+) -> io::Result<(
+    RuntimeConfig,
+    BackendSnapshot,
+    Arc<InMemoryLocalDnsEntries>,
+    LocalEntryCounts,
+)> {
+    let config = load_runtime_config(Some(config_path))?;
+    let backend_snapshot = build_backend_snapshot(&config, metrics)?;
+    let (local_entries, counts) = build_local_entries(&config, Some(config_path))?;
+    Ok((config, backend_snapshot, local_entries, counts))
 }
 
 #[cfg(unix)]
@@ -235,25 +382,32 @@ fn spawn_sighup_reload_task(
                 eprintln!("SIGHUP received but no config file was loaded at startup; ignoring");
                 continue;
             };
+            // Config parsing, every enabled zone file's disk read/parse,
+            // and backend-snapshot construction all happen inside this one
+            // `spawn_blocking` call — none of it should run on a Tokio
+            // worker thread while the server is actively serving queries.
             let load_path = path.clone();
-            let loaded =
-                tokio::task::spawn_blocking(move || load_runtime_config(Some(load_path.as_path())))
-                    .await;
-            match loaded {
-                Ok(Ok(config)) => match reload_resolver(&resolver, &config, Arc::clone(&metrics)) {
-                    Ok(()) => println!(
-                        "reloaded config from {} ({} upstream(s), {} local DNS entr{})",
+            let reload_metrics = Arc::clone(&metrics);
+            let built = tokio::task::spawn_blocking(move || {
+                build_reload_materials(&load_path, reload_metrics)
+            })
+            .await;
+            match built {
+                Ok(Ok((config, backend_snapshot, local_entries, counts))) => {
+                    resolver.publish_reload(backend_snapshot, local_entries);
+                    let total = counts.inline + counts.zone_derived;
+                    println!(
+                        "reloaded config from {} ({} upstream(s), {} local DNS entr{} ({} inline, {} from {} zone file{}))",
                         path.display(),
                         config.upstreams.len(),
-                        config.local_dns_entries.len(),
-                        if config.local_dns_entries.len() == 1 {
-                            "y"
-                        } else {
-                            "ies"
-                        }
-                    ),
-                    Err(error) => eprintln!("failed to apply reloaded config: {error}"),
-                },
+                        total,
+                        if total == 1 { "y" } else { "ies" },
+                        counts.inline,
+                        counts.zone_derived,
+                        counts.zone_files,
+                        if counts.zone_files == 1 { "" } else { "s" },
+                    )
+                }
                 Ok(Err(error)) => {
                     eprintln!("failed to reload config from {}: {error}", path.display())
                 }
@@ -714,7 +868,7 @@ mod tests {
     fn config_driven_local_entries_answer_configured_names_only() {
         let config = RuntimeConfig::from_toml_str(sample_config_toml()).unwrap();
 
-        let local_entries = build_local_entries(&config).unwrap();
+        let (local_entries, _counts) = build_local_entries(&config, None).unwrap();
 
         let local_question = QuestionKey::new("nas.lan", 1, 1);
         match local_entries.lookup(&local_question) {
@@ -821,5 +975,213 @@ mod tests {
 
         assert!(!event.advisory_findings.is_empty());
         assert_eq!(store.suspicious_query_events(8).len(), 1);
+    }
+
+    #[test]
+    fn resolve_zone_path_passes_through_absolute_paths() {
+        let absolute = PathBuf::from("/etc/rdns/zones/mynetwork.zone");
+        assert_eq!(
+            resolve_zone_path(Some(Path::new("/etc/rdns/config.toml")), &absolute),
+            absolute
+        );
+        assert_eq!(resolve_zone_path(None, &absolute), absolute);
+    }
+
+    #[test]
+    fn resolve_zone_path_resolves_relative_paths_against_the_config_files_directory() {
+        let resolved = resolve_zone_path(
+            Some(Path::new("/etc/rdns/config.toml")),
+            Path::new("zones/mynetwork.zone"),
+        );
+        assert_eq!(resolved, PathBuf::from("/etc/rdns/zones/mynetwork.zone"));
+    }
+
+    #[test]
+    fn resolve_zone_path_resolves_relative_paths_against_cwd_without_a_config_file() {
+        let resolved = resolve_zone_path(None, Path::new("zones/mynetwork.zone"));
+        assert_eq!(resolved, PathBuf::from("zones/mynetwork.zone"));
+    }
+
+    /// A scratch file under `std::env::temp_dir()`, removed on drop
+    /// (including on panic). Avoids adding a `tempfile` dependency just
+    /// for these tests, per "add dependencies conservatively".
+    struct ScratchFile(PathBuf);
+
+    impl ScratchFile {
+        fn write(name: &str, content: &str) -> Self {
+            static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            let unique = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let path = std::env::temp_dir().join(format!(
+                "rdns-test-{}-{}-{name}",
+                std::process::id(),
+                unique
+            ));
+            std::fs::write(&path, content).expect("write scratch zone file");
+            Self(path)
+        }
+
+        fn path(&self) -> &Path {
+            &self.0
+        }
+    }
+
+    impl Drop for ScratchFile {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.0);
+        }
+    }
+
+    fn config_with_one_zone(zone_path: &Path, root_domain: &str) -> RuntimeConfig {
+        let toml = format!(
+            r#"
+            dns_listen = ["127.0.0.1:5300"]
+            per_query_deadline_ms = 2000
+            max_udp_payload_size = 1232
+
+            [[upstreams]]
+            name = "cloudflare"
+            endpoint = "1.1.1.1:53"
+            protocol = "udp"
+            enabled = true
+            priority = 10
+            timeout_ms = 750
+
+            [[local_zones]]
+            path = "{}"
+            root_domain = "{root_domain}"
+            "#,
+            zone_path.display(),
+        );
+        RuntimeConfig::from_toml_str(&toml).unwrap()
+    }
+
+    #[test]
+    fn build_local_entries_merges_inline_and_zone_file_entries() {
+        let zone_file = ScratchFile::write(
+            "merge.zone",
+            "$ORIGIN mynetwork.\n$TTL 300\nprinter IN A 192.168.1.50\n",
+        );
+        let mut config = config_with_one_zone(zone_file.path(), "mynetwork");
+        config.local_dns_entries.push(
+            RuntimeConfig::from_toml_str(sample_config_toml())
+                .unwrap()
+                .local_dns_entries
+                .remove(0),
+        );
+
+        let (local_entries, counts) = build_local_entries(&config, None).unwrap();
+
+        assert_eq!(counts.inline, 1);
+        assert_eq!(counts.zone_derived, 1);
+        assert_eq!(counts.zone_files, 1);
+
+        let inline_question = QuestionKey::new("nas.lan", 1, 1);
+        assert!(matches!(
+            local_entries.lookup(&inline_question),
+            LocalDnsLookup::Answer(_)
+        ));
+        let zone_question = QuestionKey::new("printer.mynetwork", 1, 1);
+        match local_entries.lookup(&zone_question) {
+            LocalDnsLookup::Answer(entry) => {
+                assert_eq!(entry.ipv4[0].to_string(), "192.168.1.50");
+            }
+            other => panic!("expected a zone-derived local answer, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn build_local_entries_rejects_duplicate_name_across_inline_and_zone_sources() {
+        let zone_file = ScratchFile::write(
+            "dup.zone",
+            "$ORIGIN lan.\n$TTL 300\nnas IN A 192.168.1.99\n",
+        );
+        let mut config = config_with_one_zone(zone_file.path(), "lan");
+        config.local_dns_entries.push(
+            RuntimeConfig::from_toml_str(sample_config_toml())
+                .unwrap()
+                .local_dns_entries
+                .remove(0),
+        );
+
+        let error = build_local_entries(&config, None).unwrap_err();
+
+        assert!(error.to_string().contains("duplicate local DNS entry name"));
+    }
+
+    #[test]
+    fn build_local_entries_errors_on_missing_zone_file_instead_of_panicking() {
+        let missing_path = std::env::temp_dir().join(format!(
+            "rdns-test-missing-{}-{}.zone",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let config = config_with_one_zone(&missing_path, "mynetwork");
+
+        let result = build_local_entries(&config, None);
+
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn read_local_zone_file_rejects_oversized_files_without_reading_them_whole() {
+        // One byte over the cap: `read_local_zone_file` must reject this
+        // via its bounded `Read::take` reader, not by fully allocating the
+        // file and checking its length afterward.
+        let oversized = "x".repeat((MAX_LOCAL_ZONE_FILE_BYTES + 2) as usize);
+        let zone_file = ScratchFile::write("oversized.zone", &oversized);
+        let zone = LocalZoneConfig {
+            path: zone_file.path().to_path_buf(),
+            root_domain: DomainName::parse("mynetwork").unwrap(),
+            public_address_acknowledged: false,
+            enabled: true,
+        };
+
+        let error = read_local_zone_file(None, &zone).unwrap_err();
+
+        assert!(error.to_string().contains("exceeds"));
+    }
+
+    #[test]
+    fn build_local_entries_skips_disk_io_for_disabled_zones() {
+        // Points at a file that doesn't exist; a disabled zone must never
+        // be read, so this must succeed with zero zone-derived entries.
+        let missing_path = std::env::temp_dir().join(format!(
+            "rdns-test-disabled-{}-{}.zone",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let toml = format!(
+            r#"
+            dns_listen = ["127.0.0.1:5300"]
+            per_query_deadline_ms = 2000
+            max_udp_payload_size = 1232
+
+            [[upstreams]]
+            name = "cloudflare"
+            endpoint = "1.1.1.1:53"
+            protocol = "udp"
+            enabled = true
+            priority = 10
+            timeout_ms = 750
+
+            [[local_zones]]
+            path = "{}"
+            root_domain = "mynetwork"
+            enabled = false
+            "#,
+            missing_path.display(),
+        );
+        let config = RuntimeConfig::from_toml_str(&toml).unwrap();
+
+        let (_local_entries, counts) = build_local_entries(&config, None).unwrap();
+
+        assert_eq!(counts.zone_files, 0);
+        assert_eq!(counts.zone_derived, 0);
     }
 }
