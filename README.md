@@ -145,10 +145,10 @@ Only `dns_listen` is restart-only, see below.
 #### Updating the bundled (`root_hints = "bundled"`) root server list
 
 The bundled list (currently all 13 root servers, IPv4 + IPv6) isn't
-hand-maintained Rust — it's parsed at compile time from a committed copy of
-IANA/InterNIC's root hints zone file at `src/config/named.root`, via
-`parse_named_root()` in `src/config/mod.rs`. To refresh it when a root
-server's address changes:
+hand-maintained Rust — it's parsed at runtime from a committed copy of
+IANA/InterNIC's root hints zone file at `src/config/named.root` (embedded
+into the binary at compile time via `include_str!`), via `parse_named_root()`
+in `src/config/mod.rs`. To refresh it when a root server's address changes:
 
 ```bash
 curl -sS https://www.internic.net/domain/named.root -o src/config/named.root

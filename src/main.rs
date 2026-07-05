@@ -169,8 +169,9 @@ async fn main() -> io::Result<()> {
 
 fn resolve_config_path() -> Option<PathBuf> {
     if let Ok(path) = std::env::var(CONFIG_PATH_ENV_VAR) {
-        if !path.trim().is_empty() {
-            return Some(PathBuf::from(path));
+        let trimmed = path.trim();
+        if !trimmed.is_empty() {
+            return Some(PathBuf::from(trimmed));
         }
     }
     let default_path = PathBuf::from(DEFAULT_CONFIG_PATH);
@@ -254,6 +255,12 @@ fn spawn_sighup_reload_task(
                 },
                 Ok(Err(error)) => {
                     eprintln!("failed to reload config from {}: {error}", path.display())
+                }
+                Err(join_error) if join_error.is_cancelled() => {
+                    eprintln!(
+                        "reload task for {} was cancelled: {join_error}",
+                        path.display()
+                    )
                 }
                 Err(join_error) => {
                     eprintln!("reload task for {} panicked: {join_error}", path.display())

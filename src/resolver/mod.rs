@@ -11178,13 +11178,19 @@ mod tests {
                 120,
                 true,
             )]));
-        // Handshake instead of a bare yield: once this resolves, the reload
-        // task has actually been polled up to the call into
-        // publish_reload(), so the is_finished() check below proves it's
-        // genuinely blocked on the write lock rather than just not yet
-        // scheduled.
+        // The task proves its own contention before signaling, rather than
+        // the test asserting contention from outside (which would only show
+        // the guard blocks writers in general, not that this task hit it):
+        // it spins on try_write() until it observes Err itself, then signals
+        // and immediately (no intervening await) makes the real blocking
+        // write call via publish_reload. That ordering guarantees the
+        // is_finished() check below can't pass merely because the task
+        // hasn't been polled far enough yet.
         let (about_to_reload_tx, about_to_reload_rx) = tokio::sync::oneshot::channel::<()>();
         let reload_task = tokio::spawn(async move {
+            while reload_service.reload_gate.try_write().is_ok() {
+                tokio::task::yield_now().await;
+            }
             let _ = about_to_reload_tx.send(());
             reload_service.publish_reload(new_backend, new_local_entries);
         });

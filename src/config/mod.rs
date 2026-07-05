@@ -470,8 +470,9 @@ fn is_usable_authority_address(address: IpAddr) -> bool {
 
 /// IANA/InterNIC's root hints zone file, as published at
 /// <https://www.internic.net/domain/named.root>. Update by re-fetching that
-/// URL over this file; `parse_named_root` re-derives the bundled hints from
-/// it at compile time, so no other code needs to change.
+/// URL over this file; the file's contents are embedded at compile time via
+/// `include_str!`, but `parse_named_root` re-derives the bundled hints from
+/// it at runtime (see `bundled_root_hints`), so no other code needs to change.
 const BUNDLED_NAMED_ROOT: &str = include_str!("named.root");
 
 fn bundled_root_hints() -> Vec<RootHintConfig> {
