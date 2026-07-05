@@ -2440,10 +2440,11 @@ a.root-servers.net.      3600000      Aaaa  2001:503:ba3e::2:30
         assert!(tlds.contains("com"));
         assert!(tlds.contains("net"));
         assert!(tlds.contains("org"));
-        // Special-use names (RFC 6761) are never delegated TLDs, so they
-        // must not appear in this list.
-        assert!(!tlds.contains("lab"));
-        assert!(!tlds.contains("mynet"));
+        // RFC 6761 special-use names are reserved by IANA policy and
+        // guaranteed to never be delegated as real TLDs, unlike arbitrary
+        // strings like `lab`/`mynet` which could in principle become real
+        // gTLDs in a future list update — so only these are safe to assert
+        // absent here.
         assert!(!tlds.contains("local"));
         assert!(!tlds.contains("test"));
         assert!(!tlds.contains("example"));
@@ -2455,7 +2456,11 @@ a.root-servers.net.      3600000      Aaaa  2001:503:ba3e::2:30
         assert!(is_registered_iana_tld("com"));
         assert!(is_registered_iana_tld("COM"));
         assert!(is_registered_iana_tld("CoM"));
-        assert!(!is_registered_iana_tld("lab"));
+        // `invalid` is an RFC 6761 special-use name, reserved by IANA policy
+        // and guaranteed to never be delegated as a real TLD — unlike an
+        // arbitrary string such as `lab`, which could in principle become a
+        // real gTLD in a future list update.
+        assert!(!is_registered_iana_tld("invalid"));
     }
 
     #[test]
