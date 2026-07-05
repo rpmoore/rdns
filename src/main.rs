@@ -47,9 +47,6 @@ const DEFAULT_CONFIG_PATH: &str = "config.toml";
 async fn main() -> io::Result<()> {
     let config_path = resolve_config_path();
     let config = load_runtime_config(config_path.as_deref())?;
-    config
-        .validate()
-        .map_err(|error| io::Error::other(format!("invalid runtime config: {error:?}")))?;
     match &config_path {
         Some(path) => println!("loaded config from {}", path.display()),
         None => println!("no config file found; using built-in development defaults"),
