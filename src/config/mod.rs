@@ -833,6 +833,14 @@ pub fn parse_local_zone_file(
     }
 
     let mut zonefile = Zonefile::from(content);
+    // BIND-style zone files commonly omit the class on every record (it's
+    // almost always IN), relying on it being inherited from an earlier
+    // record. The scanner has nothing to inherit from on a file whose very
+    // first record omits it, and errors instead of assuming IN. Since rdns
+    // rejects non-IN records anyway (see the class check below), seeding
+    // IN as the default costs nothing and avoids spuriously rejecting
+    // otherwise-valid zone files.
+    zonefile.set_default_class(Class::IN);
     // Accumulate by owner name, preserving first-seen order (same approach
     // as `parse_named_root`). The first TTL seen for a name (across either
     // family) wins for the whole entry, since rdns's `LocalDnsEntry` model
@@ -2626,6 +2634,26 @@ a.root-servers.net.      3600000      Aaaa  2001:503:ba3e::2:30
     }
 
     #[test]
+    fn parse_local_zone_file_accepts_records_that_omit_the_class() {
+        // BIND zone files commonly omit `IN` entirely (it's the near-universal
+        // default), including on the very first record, where the scanner has
+        // no earlier record to inherit a class from. Without an explicit
+        // default class this would fail to parse even though it's a
+        // perfectly ordinary local zone file.
+        let zone = concat!(
+            "$ORIGIN mynetwork.\n",
+            "$TTL 300\n",
+            "router A 192.168.1.1\n",
+        );
+
+        let entries = parse_local_zone_file(&local_zone("mynetwork"), zone).unwrap();
+
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].name, "router.mynetwork");
+        assert_eq!(entries[0].ipv4, vec![Ipv4Addr::new(192, 168, 1, 1)]);
+    }
+
+    #[test]
     fn parse_local_zone_file_rejects_record_outside_root_domain() {
         let zone = concat!(
             "$ORIGIN example.\n",
@@ -2660,6 +2688,17 @@ a.root-servers.net.      3600000      Aaaa  2001:503:ba3e::2:30
 
     #[test]
     fn parse_local_zone_file_rejects_non_in_class_records() {
+        // The scanner is seeded with a default class of IN (so files that
+        // omit the class entirely, the common BIND style, still parse — see
+        // `parse_local_zone_file_accepts_records_that_omit_the_class`). That
+        // means an *explicit* non-IN class now conflicts with the
+        // already-established IN default and is rejected by the scanner
+        // itself (RFC 1035 §5.2's "all RRs in the file should have the same
+        // class") before it ever reaches our own `record.class()` check, so
+        // this now surfaces as a `LocalZoneParseError` rather than
+        // `LocalZoneUnsupportedClass`. The `record.class()` check stays in
+        // place as defense-in-depth in case that scanner behavior ever
+        // changes; either way, non-IN records must never be loaded.
         for (label, line) in [
             ("CH A", "host CH A 192.168.1.10\n"),
             ("HS AAAA", "host HS AAAA fd00::1\n"),
@@ -2667,7 +2706,7 @@ a.root-servers.net.      3600000      Aaaa  2001:503:ba3e::2:30
             let zone = format!("$ORIGIN mynetwork.\n{line}");
             let error = parse_local_zone_file(&local_zone("mynetwork"), &zone).unwrap_err();
             assert!(
-                matches!(error, ConfigError::LocalZoneUnsupportedClass { .. }),
+                matches!(error, ConfigError::LocalZoneParseError { .. }),
                 "expected {label} to be rejected, got {error:?}"
             );
         }
