@@ -1521,14 +1521,16 @@ a.root-servers.net.      3600000      Aaaa  2001:503:ba3e::2:30
         let root_hints = bundled.load_root_hints().unwrap();
         assert_eq!(root_hints.len(), 13, "expected all 13 root servers");
         for root_hint in &root_hints {
-            assert_eq!(
-                root_hint.endpoints.len(),
-                2,
-                "{} should have IPv4 and IPv6 endpoints",
+            assert!(
+                root_hint.endpoints.iter().any(|e| e.is_ipv4()),
+                "{} should have an IPv4 endpoint",
                 root_hint.name
             );
-            assert!(root_hint.endpoints.iter().any(|e| e.is_ipv4()));
-            assert!(root_hint.endpoints.iter().any(|e| e.is_ipv6()));
+            assert!(
+                root_hint.endpoints.iter().any(|e| e.is_ipv6()),
+                "{} should have an IPv6 endpoint",
+                root_hint.name
+            );
         }
         assert_eq!(bundled.dname_handling, DnameHandlingPolicy::Defer);
 

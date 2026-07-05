@@ -177,7 +177,11 @@ fn resolve_config_path() -> Option<PathBuf> {
 
 fn load_runtime_config(path: Option<&Path>) -> io::Result<RuntimeConfig> {
     let Some(path) = path else {
-        return Ok(RuntimeConfig::development_default());
+        let config = RuntimeConfig::development_default();
+        config.validate().map_err(|error| {
+            io::Error::other(format!("invalid development default config: {error:?}"))
+        })?;
+        return Ok(config);
     };
     let source = std::fs::read_to_string(path)
         .map_err(|error| io::Error::other(format!("failed to read {}: {error}", path.display())))?;
