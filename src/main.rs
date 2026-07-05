@@ -301,11 +301,12 @@ fn build_local_entries(
     let mut zone_file_count = 0;
 
     for zone in config.local_zones.iter().filter(|zone| zone.enabled) {
+        let resolved_path = resolve_zone_path(config_path, &zone.path);
         let content = read_local_zone_file(config_path, zone)?;
         let zone_entries = parse_local_zone_file(zone, &content).map_err(|error| {
             io::Error::other(format!(
                 "invalid local zone {}: {error:?}",
-                zone.path.display()
+                resolved_path.display()
             ))
         })?;
         zone_file_count += 1;
@@ -313,7 +314,7 @@ fn build_local_entries(
             let entry = entry_config.to_local_dns_entry().map_err(|error| {
                 io::Error::other(format!(
                     "invalid local zone {}: {error:?}",
-                    zone.path.display()
+                    resolved_path.display()
                 ))
             })?;
             if !seen.insert(entry.name.clone()) {

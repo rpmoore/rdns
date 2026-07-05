@@ -602,6 +602,13 @@ fn is_registered_iana_tld(label: &str) -> bool {
 /// only the rightmost label (the name's effective TLD), so `nas.lan`
 /// checks `lan`, and a bare single-label root domain like `lab` checks
 /// `lab` itself.
+fn home_arpa() -> &'static DomainName {
+    static HOME_ARPA: OnceLock<DomainName> = OnceLock::new();
+    HOME_ARPA.get_or_init(|| {
+        DomainName::parse("home.arpa").expect("\"home.arpa\" is a valid domain name")
+    })
+}
+
 fn validate_not_registered_tld(name: &DomainName) -> Result<(), ConfigError> {
     // `home.arpa` is IANA's own Special-Use Domain Name for exactly this
     // purpose (RFC 8375), even though `arpa` itself is a real, delegated
@@ -610,10 +617,8 @@ fn validate_not_registered_tld(name: &DomainName) -> Result<(), ConfigError> {
     // explicit exception, not a general subdomain-of-`arpa` allowance —
     // nothing else under `arpa` (e.g. `in-addr.arpa`) is a local-zone
     // concern.
-    if let Ok(home_arpa) = DomainName::parse("home.arpa") {
-        if name.is_at_or_below(&home_arpa) {
-            return Ok(());
-        }
+    if name.is_at_or_below(home_arpa()) {
+        return Ok(());
     }
 
     let rightmost_label = name.as_str().rsplit('.').next().unwrap_or(name.as_str());
