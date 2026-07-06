@@ -1020,10 +1020,6 @@ pub enum ConfigError {
     InvalidLocalZoneRootDomain {
         root_domain: String,
     },
-    LocalZoneReadError {
-        path: PathBuf,
-        message: String,
-    },
     LocalZoneParseError {
         path: PathBuf,
         message: String,
@@ -1055,9 +1051,6 @@ pub enum ConfigError {
         path: PathBuf,
         count: usize,
         max: usize,
-    },
-    DuplicateLocalDnsEntryNameAcrossSources {
-        name: String,
     },
     InvalidTomlConfig {
         message: String,
