@@ -5188,10 +5188,13 @@ pub struct RecursiveResolverConfig {
     pub per_query_deadline: Duration,
     pub max_recursion_depth: u8,
     pub max_cname_restarts: u8,
-    pub max_concurrent_authority_queries: usize,
 }
 
-pub const DEFAULT_MAX_CONCURRENT_AUTHORITY_QUERIES: usize = 3;
+/// How many authorities within a delegation set to race concurrently.
+/// Internal tuning, not caller-configurable -- keeping it out of the public
+/// `RecursiveResolverConfig` means adding/changing it later isn't a
+/// breaking change for anything constructing that struct.
+const MAX_CONCURRENT_AUTHORITY_QUERIES: usize = 3;
 
 /// Bounds nested glueless-delegation NS-name resolution: each glueless
 /// referral encountered while resolving another glueless NS name's address
@@ -5438,7 +5441,7 @@ impl RecursiveResolutionBackend {
             let mut last_error = None;
             let mut next_authorities = None;
 
-            let chunk_size = self.config.max_concurrent_authority_queries.max(1);
+            let chunk_size = MAX_CONCURRENT_AUTHORITY_QUERIES;
 
             'chunks: for authority_chunk in authorities.chunks(chunk_size) {
                 let Some(remaining) = query_deadline.checked_duration_since(Instant::now()) else {
@@ -5712,7 +5715,7 @@ impl RecursiveResolutionBackend {
                     return (Vec::new(), 0);
                 }
 
-                let chunk_size = self.config.max_concurrent_authority_queries.max(1);
+                let chunk_size = MAX_CONCURRENT_AUTHORITY_QUERIES;
                 let mut next_authorities = None;
 
                 'chunks: for authority_chunk in authorities.chunks(chunk_size) {
@@ -7869,7 +7872,6 @@ mod tests {
                 per_query_deadline,
                 max_recursion_depth,
                 max_cname_restarts: 4,
-                max_concurrent_authority_queries: DEFAULT_MAX_CONCURRENT_AUTHORITY_QUERIES,
             },
             transport,
         )
@@ -8775,7 +8777,6 @@ mod tests {
                 per_query_deadline: Duration::from_secs(2),
                 max_recursion_depth: 8,
                 max_cname_restarts: 4,
-                max_concurrent_authority_queries: DEFAULT_MAX_CONCURRENT_AUTHORITY_QUERIES,
             },
             transport,
             metrics.clone(),
@@ -9011,7 +9012,6 @@ mod tests {
                 per_query_deadline: Duration::from_secs(2),
                 max_recursion_depth: 1,
                 max_cname_restarts: 4,
-                max_concurrent_authority_queries: DEFAULT_MAX_CONCURRENT_AUTHORITY_QUERIES,
             },
             transport,
         );
@@ -9051,7 +9051,6 @@ mod tests {
                 per_query_deadline: Duration::from_secs(2),
                 max_recursion_depth: 8,
                 max_cname_restarts: 4,
-                max_concurrent_authority_queries: DEFAULT_MAX_CONCURRENT_AUTHORITY_QUERIES,
             },
             transport,
             metrics.clone(),
@@ -9119,7 +9118,6 @@ mod tests {
                 per_query_deadline: Duration::from_secs(2),
                 max_recursion_depth: 8,
                 max_cname_restarts: 4,
-                max_concurrent_authority_queries: DEFAULT_MAX_CONCURRENT_AUTHORITY_QUERIES,
             },
             transport.clone(),
             metrics.clone(),
@@ -9132,7 +9130,7 @@ mod tests {
 
         assert_eq!(metrics.count(ResolverMetric::RecursiveReferralLoop), 1);
         // Root query, plus both ns1/ns2 raced concurrently within the same
-        // delegation set (bounded by max_concurrent_authority_queries).
+        // delegation set (bounded by MAX_CONCURRENT_AUTHORITY_QUERIES).
         assert_eq!(transport.requests.lock().unwrap().len(), 3);
     }
 
@@ -9160,7 +9158,6 @@ mod tests {
                 per_query_deadline: Duration::from_secs(2),
                 max_recursion_depth: 8,
                 max_cname_restarts: 4,
-                max_concurrent_authority_queries: DEFAULT_MAX_CONCURRENT_AUTHORITY_QUERIES,
             },
             transport,
             metrics.clone(),
@@ -9251,7 +9248,6 @@ mod tests {
                 per_query_deadline: Duration::from_secs(1),
                 max_recursion_depth: 8,
                 max_cname_restarts: 4,
-                max_concurrent_authority_queries: DEFAULT_MAX_CONCURRENT_AUTHORITY_QUERIES,
             },
             Arc::new(HangingAuthorityTransport),
         );
@@ -13838,7 +13834,6 @@ mod tests {
                 per_query_deadline: Duration::from_secs(3),
                 max_recursion_depth: 8,
                 max_cname_restarts: 4,
-                max_concurrent_authority_queries: DEFAULT_MAX_CONCURRENT_AUTHORITY_QUERIES,
             },
             transport.clone(),
         );
