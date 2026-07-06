@@ -6,6 +6,7 @@ on:
   push:
     branches:
       - main
+  workflow_dispatch:
 
 env:
   CARGO_TERM_COLOR: always
@@ -68,3 +69,24 @@ jobs:
       - name: Run optional live DNS tests
         continue-on-error: true
         run: cargo test --locked --test live_dns -- --ignored
+
+  recursive-resolver-perf:
+    name: Recursive resolver perf (manual)
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Run recursive resolver perf tests
+        run: cargo test --locked --test recursive_perf -- --ignored --nocapture --test-threads=1
