@@ -90,3 +90,16 @@ jobs:
 
       - name: Run recursive resolver perf tests
         run: cargo test --locked --test recursive_perf -- --ignored --nocapture --test-threads=1
+
+  bundled-data-freshness:
+    name: Bundled IANA data freshness
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Check bundled IANA data freshness
+        run: make check-bundled-data-freshness
