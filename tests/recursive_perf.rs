@@ -57,16 +57,16 @@ const DOMAINS: [&str; 5] = [
     "cloudflare.com",
     "wikipedia.org",
 ];
-const ITERATIONS: usize = 10;
+const ITERATIONS: usize = 30;
 
-fn a_query(id: u16, name: &str) -> Vec<u8> {
+fn a_query(id: u16, name: &str, edns_payload_size: u16) -> Vec<u8> {
     let mut bytes = Vec::new();
     bytes.extend_from_slice(&id.to_be_bytes());
     bytes.extend_from_slice(&0x0100u16.to_be_bytes());
-    bytes.extend_from_slice(&1u16.to_be_bytes());
-    bytes.extend_from_slice(&0u16.to_be_bytes());
-    bytes.extend_from_slice(&0u16.to_be_bytes());
-    bytes.extend_from_slice(&0u16.to_be_bytes());
+    bytes.extend_from_slice(&1u16.to_be_bytes()); // qdcount
+    bytes.extend_from_slice(&0u16.to_be_bytes()); // ancount
+    bytes.extend_from_slice(&0u16.to_be_bytes()); // nscount
+    bytes.extend_from_slice(&1u16.to_be_bytes()); // arcount: EDNS0 OPT record
     for label in name.split('.') {
         bytes.push(label.len() as u8);
         bytes.extend_from_slice(label.as_bytes());
@@ -74,6 +74,15 @@ fn a_query(id: u16, name: &str) -> Vec<u8> {
     bytes.push(0);
     bytes.extend_from_slice(&1u16.to_be_bytes());
     bytes.extend_from_slice(&1u16.to_be_bytes());
+
+    // EDNS0 OPT pseudo-record advertising the configured UDP payload size, so
+    // the request exercises the same wire path as the configured runtime
+    // instead of the legacy 512-byte default.
+    bytes.push(0); // root name
+    bytes.extend_from_slice(&41u16.to_be_bytes()); // TYPE = OPT
+    bytes.extend_from_slice(&edns_payload_size.to_be_bytes()); // CLASS = UDP payload size
+    bytes.extend_from_slice(&0u32.to_be_bytes()); // extended RCODE + version + flags
+    bytes.extend_from_slice(&0u16.to_be_bytes()); // RDLENGTH
     bytes
 }
 
@@ -152,6 +161,17 @@ struct Summary {
     max_ms: f64,
     max_iter: usize,
     stddev_ms: f64,
+    p50_ms: f64,
+    p95_ms: f64,
+    p99_ms: f64,
+}
+
+// Nearest-rank percentile over an already-sorted sample.
+fn percentile(sorted_millis: &[f64], pct: f64) -> f64 {
+    let n = sorted_millis.len();
+    let rank = ((pct / 100.0) * n as f64).ceil() as usize;
+    let idx = rank.clamp(1, n) - 1;
+    sorted_millis[idx]
 }
 
 fn summarize(domain: &'static str, results: &[IterationResult]) -> Summary {
@@ -182,6 +202,12 @@ fn summarize(domain: &'static str, results: &[IterationResult]) -> Summary {
     };
     let stddev_ms = variance.sqrt();
 
+    let mut sorted_millis = millis.clone();
+    sorted_millis.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    let p50_ms = percentile(&sorted_millis, 50.0);
+    let p95_ms = percentile(&sorted_millis, 95.0);
+    let p99_ms = percentile(&sorted_millis, 99.0);
+
     Summary {
         domain,
         avg_ms,
@@ -190,6 +216,9 @@ fn summarize(domain: &'static str, results: &[IterationResult]) -> Summary {
         max_ms,
         max_iter,
         stddev_ms,
+        p50_ms,
+        p95_ms,
+        p99_ms,
     }
 }
 
@@ -227,16 +256,37 @@ fn print_table(headers: &[&str], rows: &[Vec<String>]) {
     }
 }
 
+// Issues one untimed request so a cache-enabled resolver is warm before the
+// measured loop begins; the with-cache benchmark then asserts every measured
+// iteration is a cache hit.
+async fn warm_domain(resolver: &ResolveQuery, domain: &'static str, edns_payload_size: u16) {
+    let client_ip = IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1));
+    let request_bytes = a_query(0, domain, edns_payload_size);
+    let request = ResolveRequest::new(client_ip, SystemTime::now(), request_bytes);
+
+    let outcome = resolver.resolve(request).await;
+    let message = Message::parse(&outcome.response_bytes)
+        .unwrap_or_else(|error| panic!("{domain} warmup: malformed response: {error:?}"));
+    assert_eq!(
+        message.header.r_code(),
+        0,
+        "{domain} warmup: expected NOERROR, got rcode {}",
+        message.header.r_code()
+    );
+}
+
 async fn run_domain(
     resolver: &ResolveQuery,
     domain: &'static str,
     detail_rows: &mut Vec<Vec<String>>,
+    edns_payload_size: u16,
+    expect_cache_hit: bool,
 ) -> Vec<IterationResult> {
     let client_ip = IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1));
     let mut results = Vec::with_capacity(ITERATIONS);
 
     for iteration in 1..=ITERATIONS {
-        let request_bytes = a_query(iteration as u16, domain);
+        let request_bytes = a_query(iteration as u16, domain, edns_payload_size);
         let request = ResolveRequest::new(client_ip, SystemTime::now(), request_bytes);
 
         let started_at = Instant::now();
@@ -256,6 +306,15 @@ async fn run_domain(
             !message.answers.is_empty(),
             "{domain} iteration {iteration}: expected at least one answer record"
         );
+
+        if expect_cache_hit {
+            assert_eq!(
+                outcome.decision.kind,
+                ResolveDecisionKind::CacheHit,
+                "{domain} iteration {iteration}: expected cache hit after warmup, got {:?}",
+                outcome.decision.kind
+            );
+        }
 
         let outcome_label = match outcome.decision.kind {
             ResolveDecisionKind::CacheHit => "hit",
@@ -277,14 +336,18 @@ async fn run_domain(
     results
 }
 
-async fn run_benchmark(resolver: ResolveQuery, title: &str) {
+async fn run_benchmark(resolver: ResolveQuery, title: &str, edns_payload_size: u16, warm: bool) {
     println!("\n== recursive resolver perf: {title} ==\n");
 
     let mut detail_rows = Vec::new();
     let mut summaries = Vec::new();
 
     for &domain in DOMAINS.iter() {
-        let results = run_domain(&resolver, domain, &mut detail_rows).await;
+        if warm {
+            warm_domain(&resolver, domain, edns_payload_size).await;
+        }
+        let results =
+            run_domain(&resolver, domain, &mut detail_rows, edns_payload_size, warm).await;
         summaries.push(summarize(domain, &results));
     }
 
@@ -301,6 +364,9 @@ async fn run_benchmark(resolver: ResolveQuery, title: &str) {
                 format!("{:.2} (#{})", s.min_ms, s.min_iter),
                 format!("{:.2} (#{})", s.max_ms, s.max_iter),
                 format!("{:.2}", s.stddev_ms),
+                format!("{:.2}", s.p50_ms),
+                format!("{:.2}", s.p95_ms),
+                format!("{:.2}", s.p99_ms),
             ]
         })
         .collect();
@@ -312,6 +378,9 @@ async fn run_benchmark(resolver: ResolveQuery, title: &str) {
             "min_ms (iter)",
             "max_ms (iter)",
             "stddev_ms",
+            "p50_ms",
+            "p95_ms",
+            "p99_ms",
         ],
         &summary_rows,
     );
@@ -321,14 +390,16 @@ async fn run_benchmark(resolver: ResolveQuery, title: &str) {
 #[ignore = "requires outbound UDP/TCP DNS access to public root/TLD servers"]
 async fn recursive_resolver_perf_without_cache() {
     let config = recursive_runtime_config();
+    let edns_payload_size = config.max_udp_payload_size as u16;
     let resolver = resolver_without_cache(&config);
-    run_benchmark(resolver, "cache DISABLED").await;
+    run_benchmark(resolver, "cache DISABLED", edns_payload_size, false).await;
 }
 
 #[tokio::test]
 #[ignore = "requires outbound UDP/TCP DNS access to public root/TLD servers"]
 async fn recursive_resolver_perf_with_cache() {
     let config = recursive_runtime_config();
+    let edns_payload_size = config.max_udp_payload_size as u16;
     let resolver = resolver_with_cache(&config);
-    run_benchmark(resolver, "cache ENABLED").await;
+    run_benchmark(resolver, "cache ENABLED", edns_payload_size, true).await;
 }
