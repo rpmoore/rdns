@@ -109,6 +109,8 @@ fn recursive_backend(config: &RuntimeConfig) -> Arc<RecursiveResolutionBackend> 
             per_query_deadline: config.per_query_deadline,
             max_recursion_depth: recursive.max_recursion_depth,
             max_cname_restarts: recursive.max_cname_restarts,
+            max_concurrent_authority_queries:
+                rdns::resolver::DEFAULT_MAX_CONCURRENT_AUTHORITY_QUERIES,
         },
         transport,
     ))
@@ -257,7 +259,8 @@ async fn run_domain(
 
         let outcome_label = match outcome.decision.kind {
             ResolveDecisionKind::CacheHit => "hit",
-            ResolveDecisionKind::Allowed | ResolveDecisionKind::CacheMiss => "miss",
+            ResolveDecisionKind::CacheMiss => "miss",
+            ResolveDecisionKind::Allowed => "resolved",
             _ => "n/a",
         };
 
