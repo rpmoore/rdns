@@ -13524,7 +13524,7 @@ mod tests {
         assert_eq!(cache.lookup("example.com", 1), None);
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn delegation_cache_treats_expired_entry_as_miss() {
         let cache = DelegationCache::new(DEFAULT_DELEGATION_CACHE_CAPACITY);
         cache.insert(
@@ -13533,7 +13533,7 @@ mod tests {
             vec!["203.0.113.10:53".parse().unwrap()],
             1,
         );
-        tokio::time::sleep(Duration::from_millis(1100)).await;
+        tokio::time::advance(Duration::from_millis(1100)).await;
         assert_eq!(cache.lookup("example.com", 1), None);
     }
 
@@ -13577,14 +13577,14 @@ mod tests {
         assert_eq!(cache.insertion_order_len(), 1);
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn delegation_cache_purges_expired_entries_on_insert() {
         let cache = DelegationCache::new(DEFAULT_DELEGATION_CACHE_CAPACITY);
         let endpoints = vec!["203.0.113.10:53".parse().unwrap()];
         cache.insert("expiring.example".to_string(), 1, endpoints.clone(), 1);
         assert_eq!(cache.len(), 1);
 
-        tokio::time::sleep(Duration::from_millis(1100)).await;
+        tokio::time::advance(Duration::from_millis(1100)).await;
 
         // A later insert opportunistically purges the now-expired entry
         // instead of only relying on a lookup that happens to hit it.

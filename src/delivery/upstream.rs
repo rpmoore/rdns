@@ -795,10 +795,10 @@ fn validate_authority_response_question_prefix(
 }
 
 /// Whether a received UDP datagram is plausibly the reply to the exchange
-/// identified by `(authority, question, authority_id)`, rather than a stale
-/// or foreign packet. Pooled sockets are reused across queries, so a reply
-/// delivered after its query's deadline can still sit in the socket's
-/// receive buffer and be handed back on a later, unrelated query.
+/// identified by `(authority, question, authority_id)`, rather than a
+/// foreign or off-path-spoofed packet (e.g. a duplicate/retransmitted reply,
+/// or an unrelated datagram from another source hitting this same
+/// ephemeral port).
 fn response_belongs_to_exchange(
     source: SocketAddr,
     authority: SocketAddr,
