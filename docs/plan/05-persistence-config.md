@@ -96,6 +96,19 @@ Resolution-mode settings should include:
   - `UNIQUE (entry_id, address_family, address)`
   - SQLite connections must enable `PRAGMA foreign_keys = ON` so cascade deletes are enforced.
 
+**Forward-looking note:** the TOML-only implementation added
+`[[local_zones]]` (BIND-format zone file ingestion, additive to
+`local_dns_entries`, see `03-policy-blocking.md`'s "Local DNS Entries"
+section and `README.md`'s "Local zones" section) ahead of this
+persistence layer. When `local_dns_entries` moves to SQLite, add a source
+discriminator — e.g. `source_kind: 'inline' | 'zone_file'` plus
+`source_zone_path`/`source_root_domain` columns (nullable, populated only
+for `zone_file`-sourced rows) — so a zone file's contents can be diffed
+and replaced on re-import without clobbering hand-entered rows, and so an
+admin UI can show provenance per entry. Not needed for the current
+TOML-only implementation, but the schema above doesn't have anywhere to
+record it yet, so it's flagged here now rather than discovered later.
+
 `blocklist_sources`
 
 - `id`

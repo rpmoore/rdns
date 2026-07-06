@@ -196,11 +196,102 @@ Rules enforced at load time:
 - `enabled = false` keeps the entry in the file but disabled — no lookup
   match, useful for keeping a device's known address around without serving
   it.
+- **The entry's name cannot use a real, currently-delegated top-level
+  domain as its suffix** (checked against a bundled copy of IANA's TLD
+  registry — see "Local zones" below for the full explanation). `nas.lan`
+  is fine; `nas.dev`/`nas.app`/`nas.io` are rejected, because those are
+  real, currently-registered gTLDs — a local override should never be able
+  to shadow a real public domain. If you were relying on a real TLD suffix
+  for a local name, rename it to something like `.lab`, `.home`, or
+  `.internal` instead.
+
+### Local zones (BIND-style zone files)
+
+For a larger local-network record set, or to migrate an existing BIND
+setup, point rdns at a real zone file instead of (or alongside)
+`[[local_dns_entries]]`:
+
+```toml
+[[local_zones]]
+path = "zones/mynetwork.zone"
+root_domain = "mynetwork"
+public_address_acknowledged = false
+enabled = true
+```
+
+- `path` is resolved relative to the directory containing the config file
+  (`RDNS_CONFIG`/`./config.toml`) when relative; absolute paths are used
+  as-is. With no config file loaded, a relative path resolves against the
+  current working directory.
+- The zone file uses standard BIND zone-file syntax (`$ORIGIN`, `$TTL`,
+  `SOA`, `NS`, multi-line parenthesized records, comments, owner-name
+  inheritance, etc.) — parsed with [the `domain` crate's zone-file
+  scanner](https://docs.rs/domain), the same crate other Rust DNS tooling
+  uses. Zone files are expected to declare their own `$ORIGIN`; rdns never
+  programmatically overrides it.
+- Only `A`, `AAAA`, `SOA`, and `NS` records are supported. `SOA`/`NS` are
+  recognized and ignored (they're zone-management boilerplate, not
+  answerable local records). Any other record type (`CNAME`, `MX`, `TXT`,
+  `SRV`, DNSSEC records, etc.) or a `$INCLUDE` directive causes the whole
+  config to be rejected rather than silently dropping data — this is a
+  deliberate limitation, not an oversight.
+- Multiple `A`/`AAAA` records under the same owner name are grouped into
+  one local entry, same as listing multiple addresses in one
+  `[[local_dns_entries]]` block's `ipv4`/`ipv6` arrays. If the same owner
+  name has records with different TTLs, the first one seen wins for the
+  whole entry (rdns has one TTL per entry, not one per address family).
+- A zone file is capped at 10 MiB and 10,000 `A`/`AAAA` records; an
+  oversized file is rejected rather than parsed, to bound worst-case parse
+  time/memory from a misconfigured or unexpected file.
+- `root_domain` is mandatory and enforced: every record's owner name in
+  the zone file must be at or below it, and `root_domain` itself is
+  checked with the same **not-a-registered-TLD** rule described above for
+  `[[local_dns_entries]]` — a zone can never claim authority over a real
+  public domain. Most of IANA's Special-Use Domain Names (RFC 6761:
+  `local`, `test`, `invalid`, `example`, `onion`, `localhost`) remain legal
+  choices simply because they're **not** delegated TLDs at all — `.local`
+  specifically still carries the existing mDNS conflict warning.
+  `home.arpa` (RFC 8375) is a narrow, explicit exception rather than an
+  instance of that same rule: `arpa` itself *is* a real, delegated
+  infrastructure TLD, so `home.arpa`/`*.home.arpa` are allowed only because
+  they're special-cased, not because `arpa` is absent from the checked
+  list — nothing else under `.arpa` is exempted.
+- `public_address_acknowledged` here is **zone-wide** (BIND zone files
+  have no per-record acknowledgement syntax) — set it only if you
+  intentionally have a public/routable address somewhere in that zone
+  file; otherwise any public/routable `A`/`AAAA` record in the file is
+  rejected, same fail-closed default as inline entries.
+- `enabled = false` (default `true`) skips the zone entirely, including
+  never reading the file from disk — useful for keeping a zone file
+  configured but temporarily out of service without needing the file to
+  even exist.
+- `local_zones` entries merge with `[[local_dns_entries]]`: both are
+  checked for duplicate names against each other (across every zone file
+  and the inline list together), and the not-a-registered-TLD rule
+  applies to **both** kinds of entries, not just zone-file ones.
+- Reloadable via `SIGHUP` exactly like `[[local_dns_entries]]` — see below.
+
+#### Updating the bundled IANA TLD list
+
+The list of real, currently-delegated top-level domains checked against
+(for both `[[local_dns_entries]]` names and `[[local_zones]]`
+`root_domain`s) is a committed, verbatim copy of IANA's published TLD
+registry at `src/config/tlds-alpha-by-domain.txt`, embedded into the
+binary at compile time. Refresh it the same way as the root hints list:
+
+```bash
+curl -sS https://data.iana.org/TLD/tlds-alpha-by-domain.txt -o src/config/tlds-alpha-by-domain.txt
+```
+
+Then rebuild — `parse_iana_tlds`/`bundled_iana_tlds()` re-derive the
+checked set from the new file automatically, no other code changes
+needed.
 
 ## Reloading config without a restart
 
 Send `SIGHUP` to the running process to reload resolution mode, upstreams,
-and local DNS entries from the same config file:
+and local DNS entries (inline and zone-file-sourced) from the same config
+file:
 
 ```bash
 kill -HUP <pid>
@@ -214,9 +305,11 @@ kill -HUP <pid>
   and new local DNS entries are published together as one atomic step: a
   query in flight during the reload sees either the fully old pair or the
   fully new pair, never one field from each.
-- `[resolution]`, `[[upstreams]]`, and `[[local_dns_entries]]` are all
-  reloadable this way — including switching between `forward` and
-  `recursive` mode.
+- `[resolution]`, `[[upstreams]]`, `[[local_dns_entries]]`, and
+  `[[local_zones]]` are all reloadable this way — including switching
+  between `forward` and `recursive` mode. A `[[local_zones]]` file is
+  re-read from disk on every reload, so editing the zone file itself and
+  sending `SIGHUP` picks up the change too, without touching `config.toml`.
 - `dns_listen` changes are **not** picked up on SIGHUP — changing listen
   addresses/ports requires a restart.
 - No effect if rdns started with no config file (built-in dev defaults) —
