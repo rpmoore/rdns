@@ -36,7 +36,7 @@ use rdns::resolver::{
     InMemorySuspiciousLookupClassifierConfig, MetricsSink, NoopPolicyEvaluator,
     QueryEventRecordResult, QueryEventSink, QueryEventV1, RecursiveResolutionBackend,
     RecursiveResolverConfig, RecursiveRootHint, ResolutionMode as ResolverResolutionMode,
-    ResolveQuery, ResolverMetric, StandardProtocolCodec,
+    ResolveQuery, ResolverMetric, StandardProtocolCodec, DEFAULT_MAX_CONCURRENT_AUTHORITY_QUERIES,
 };
 use tokio::task::{JoinError, JoinSet};
 
@@ -494,6 +494,7 @@ fn build_backend_snapshot(
                     per_query_deadline: config.per_query_deadline,
                     max_recursion_depth: recursive.max_recursion_depth,
                     max_cname_restarts: recursive.max_cname_restarts,
+                    max_concurrent_authority_queries: DEFAULT_MAX_CONCURRENT_AUTHORITY_QUERIES,
                 },
                 transport,
                 metrics,

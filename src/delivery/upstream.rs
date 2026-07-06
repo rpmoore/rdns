@@ -37,6 +37,11 @@ const DEGRADED_FAILURE_THRESHOLD: u32 = 2;
 const DEGRADED_RETRY_AFTER: Duration = Duration::from_secs(30);
 const SPLITMIX_INCREMENT: u64 = 0x9e37_79b9_7f4a_7c15;
 const MAX_TCP_MESSAGE_SIZE: usize = u16::MAX as usize;
+/// Cap on stray/foreign datagrams discarded per UDP authority exchange.
+/// Bounds the CPU/recv work a hostile or noisy source can force onto a
+/// single query before it gives up, rather than letting it burn the full
+/// per-authority timeout on an unbounded discard loop.
+const MAX_STRAY_DATAGRAMS_PER_EXCHANGE: u32 = 16;
 
 pub trait TransactionIdGenerator: Send + Sync {
     fn next_id(&self) -> u16;
@@ -451,23 +456,44 @@ impl RecursiveAuthorityTransportClient {
         authority_id: u16,
         deadline: Instant,
     ) -> Result<RecursiveAuthorityResponse, UpstreamError> {
+        // A fresh ephemeral socket (and thus a fresh, randomized source port)
+        // per query preserves DNS source-port entropy against off-path
+        // response spoofing; do not pool/reuse sockets across queries here.
         let socket = bind_ephemeral_for(authority).await?;
         socket
             .send_to(query, authority)
             .await
             .map_err(transport_error)?;
 
-        let mut response_bytes = vec![0; self.max_udp_payload_size];
-        let (response_len, source) = time::timeout(
-            remaining_until(deadline)?,
-            socket.recv_from(&mut response_bytes),
-        )
-        .await
-        .map_err(|_| UpstreamError::Timeout)?
-        .map_err(transport_error)?;
+        let mut buffer = vec![0; self.max_udp_payload_size];
+        let mut stray_datagrams = 0u32;
+        let response_len = loop {
+            let (len, source) =
+                time::timeout(remaining_until(deadline)?, socket.recv_from(&mut buffer))
+                    .await
+                    .map_err(|_| UpstreamError::Timeout)?
+                    .map_err(transport_error)?;
+            if response_belongs_to_exchange(
+                source,
+                authority,
+                &buffer[..len],
+                question,
+                authority_id,
+            ) {
+                break len;
+            }
+            // Foreign or off-path-spoofed datagram (wrong source, id, or
+            // question); discard and keep waiting for the real reply, but
+            // only up to a bounded number of strays so a hostile or noisy
+            // source can't pin this task for the full per-authority timeout.
+            stray_datagrams += 1;
+            if stray_datagrams >= MAX_STRAY_DATAGRAMS_PER_EXCHANGE {
+                return Err(UpstreamError::MalformedResponse);
+            }
+        };
+        let mut response_bytes = buffer;
         response_bytes.truncate(response_len);
 
-        validate_upstream_response_source(source, authority)?;
         if truncated_authority_response_matches_question(question, &response_bytes, authority_id)? {
             if self.transport_allowed(RecursiveTransport::Tcp) {
                 return self
@@ -766,6 +792,30 @@ fn validate_authority_response_question_prefix(
         return Err(UpstreamError::QuestionMismatch);
     }
     Ok(())
+}
+
+/// Whether a received UDP datagram is plausibly the reply to the exchange
+/// identified by `(authority, question, authority_id)`, rather than a stale
+/// or foreign packet. Pooled sockets are reused across queries, so a reply
+/// delivered after its query's deadline can still sit in the socket's
+/// receive buffer and be handed back on a later, unrelated query.
+fn response_belongs_to_exchange(
+    source: SocketAddr,
+    authority: SocketAddr,
+    response_bytes: &[u8],
+    question: &QuestionKey,
+    authority_id: u16,
+) -> bool {
+    if source != authority {
+        return false;
+    }
+    let Ok(header) = response_header_prefix(response_bytes) else {
+        return false;
+    };
+    if header.id != authority_id || !header.qr {
+        return false;
+    }
+    validate_authority_response_question_prefix(question, response_bytes).is_ok()
 }
 
 impl ResolutionBackend for ForwardingResolutionBackend {
@@ -1155,7 +1205,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn recursive_authority_udp_rejects_response_from_wrong_source() {
+    async fn recursive_authority_udp_ignores_response_from_wrong_source() {
+        // A reply from an unexpected source (off-path spoof, or a stale
+        // datagram from another exchange) must be discarded rather than
+        // failing the query outright; since nothing else ever arrives, the
+        // query should instead time out.
         let authority_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let authority_addr = authority_socket.local_addr().unwrap();
         let rogue_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
@@ -1177,17 +1231,21 @@ mod tests {
                 authority_addr,
                 authority_question("example.com"),
                 false,
-                Duration::from_secs(1),
+                Duration::from_millis(200),
             )
             .await
             .unwrap_err();
 
         authority_task.await.unwrap();
-        assert!(matches!(error, UpstreamError::Transport(_)));
+        assert_eq!(error, UpstreamError::Timeout);
     }
 
     #[tokio::test]
-    async fn recursive_authority_udp_rejects_question_mismatch() {
+    async fn recursive_authority_udp_ignores_question_mismatch() {
+        // A reply whose question doesn't match ours (e.g. a stale datagram
+        // left over from a prior exchange on a reused pooled socket) must be
+        // discarded rather than failing the query outright; since nothing
+        // else ever arrives, the query should instead time out.
         let authority_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let authority_addr = authority_socket.local_addr().unwrap();
         let authority_task = tokio::spawn(async move {
@@ -1208,13 +1266,13 @@ mod tests {
                 authority_addr,
                 authority_question("example.com"),
                 false,
-                Duration::from_secs(1),
+                Duration::from_millis(200),
             )
             .await
             .unwrap_err();
 
         authority_task.await.unwrap();
-        assert_eq!(error, UpstreamError::QuestionMismatch);
+        assert_eq!(error, UpstreamError::Timeout);
     }
 
     #[tokio::test]
@@ -2119,5 +2177,75 @@ mod tests {
         assert_eq!(health[0].name, "primary");
         assert!(!health[0].degraded);
         assert_eq!(resolver.attempt_order(Instant::now()), vec![0, 1]);
+    }
+
+    #[tokio::test]
+    async fn query_authority_udp_discards_mismatched_datagram_before_real_reply() {
+        let authority_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let authority_addr = authority_socket.local_addr().unwrap();
+
+        let transport = RecursiveAuthorityTransportClient::with_id_generator(
+            vec![RecursiveTransport::Udp],
+            1232,
+            Arc::new(SequenceTransactionIds::new([0xaaaa])),
+        );
+
+        let server = tokio::spawn(async move {
+            let mut buf = [0u8; 512];
+            let (len, source) = authority_socket.recv_from(&mut buf).await.unwrap();
+            let request = Message::parse(&buf[..len]).unwrap();
+            // A stray/off-path datagram with a mismatched transaction id
+            // arrives first; it must be discarded rather than failing the
+            // query outright.
+            authority_socket
+                .send_to(&a_response(0xdead, "stale.example.com"), source)
+                .await
+                .unwrap();
+            let response = a_response(request.header.id, "example.com");
+            authority_socket.send_to(&response, source).await.unwrap();
+        });
+
+        let question = QuestionKey::new("example.com", 1, 1);
+        let response = transport
+            .query(authority_addr, question, false, Duration::from_secs(2))
+            .await
+            .unwrap();
+
+        server.await.unwrap();
+        assert_eq!(response.message.header.r_code(), 0);
+    }
+
+    #[tokio::test]
+    async fn query_authority_udp_bails_out_after_stray_datagram_budget_exceeded() {
+        let authority_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let authority_addr = authority_socket.local_addr().unwrap();
+
+        let transport = RecursiveAuthorityTransportClient::with_id_generator(
+            vec![RecursiveTransport::Udp],
+            1232,
+            Arc::new(SequenceTransactionIds::new([0xaaaa])),
+        );
+
+        let server = tokio::spawn(async move {
+            let mut buf = [0u8; 512];
+            let (_, source) = authority_socket.recv_from(&mut buf).await.unwrap();
+            // Flood with mismatched-id datagrams and never send a real reply;
+            // this must not be allowed to pin the query for the full deadline.
+            for _ in 0..(MAX_STRAY_DATAGRAMS_PER_EXCHANGE as usize + 4) {
+                authority_socket
+                    .send_to(&a_response(0xdead, "stale.example.com"), source)
+                    .await
+                    .unwrap();
+            }
+        });
+
+        let question = QuestionKey::new("example.com", 1, 1);
+        let error = transport
+            .query(authority_addr, question, false, Duration::from_secs(5))
+            .await
+            .unwrap_err();
+
+        server.await.unwrap();
+        assert_eq!(error, UpstreamError::MalformedResponse);
     }
 }

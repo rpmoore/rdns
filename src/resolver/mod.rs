@@ -24,6 +24,7 @@ use std::time::{Duration, SystemTime};
 
 use bytes::Bytes;
 use tokio::sync::{mpsc, Notify};
+use tokio::task::JoinSet;
 use tokio::time::{self, Instant};
 
 use crate::protocol::{
@@ -858,6 +859,7 @@ fn authority_response_error(
 struct ReferralAuthorities {
     owner: String,
     endpoints: Vec<SocketAddr>,
+    min_ttl: u32,
 }
 
 fn referral_authorities(message: &Message, question: &QuestionKey) -> Option<ReferralAuthorities> {
@@ -879,6 +881,7 @@ fn referral_authorities(message: &Message, question: &QuestionKey) -> Option<Ref
             }
         })
         .max_by_key(|owner| owner.len())?;
+    let mut min_ttl: Option<u32> = None;
     let names: HashSet<_> = message
         .authorities
         .iter()
@@ -888,6 +891,7 @@ fn referral_authorities(message: &Message, question: &QuestionKey) -> Option<Ref
                     && record.rclass == question.qclass
                     && ns_name_allowed_for_delegation(&owner, name) =>
             {
+                min_ttl = Some(min_ttl.map_or(record.ttl, |ttl| ttl.min(record.ttl)));
                 Some(normalize_question_name(name))
             }
             _ => None,
@@ -907,17 +911,28 @@ fn referral_authorities(message: &Message, question: &QuestionKey) -> Option<Ref
             if !names.contains(&normalize_question_name(&record.name)) {
                 return None;
             }
-            match record.record {
+            let endpoint = match record.record {
                 RecordData::A(address) => Some(SocketAddr::new(IpAddr::V4(address), 53)),
                 RecordData::AAAA(address) => Some(SocketAddr::new(IpAddr::V6(address), 53)),
                 _ => None,
+            };
+            // Bound the cached delegation lifetime by the glue address TTLs
+            // too, not just the NS TTL, so a shorter-lived A/AAAA record
+            // can't outlive its own freshness in the delegation cache.
+            if endpoint.is_some() {
+                min_ttl = Some(min_ttl.map_or(record.ttl, |ttl| ttl.min(record.ttl)));
             }
+            endpoint
         })
         .collect::<Vec<_>>();
     if endpoints.is_empty() {
         return None;
     }
-    Some(ReferralAuthorities { owner, endpoints })
+    Some(ReferralAuthorities {
+        owner,
+        endpoints,
+        min_ttl: min_ttl.unwrap_or(0),
+    })
 }
 
 fn has_delegation_for_question(message: &Message, question: &QuestionKey) -> bool {
@@ -5130,7 +5145,10 @@ pub struct RecursiveResolverConfig {
     pub per_query_deadline: Duration,
     pub max_recursion_depth: u8,
     pub max_cname_restarts: u8,
+    pub max_concurrent_authority_queries: usize,
 }
+
+pub const DEFAULT_MAX_CONCURRENT_AUTHORITY_QUERIES: usize = 3;
 
 pub trait RecursiveAuthorityTransport: Send + Sync {
     fn query<'a>(
@@ -5157,10 +5175,150 @@ impl RecursiveAuthorityResponse {
     }
 }
 
+struct DelegationEntry {
+    endpoints: Vec<SocketAddr>,
+    expires_at: Instant,
+}
+
+/// Hard cap on distinct zone-cut entries the delegation cache will retain.
+/// Bounds memory even if a client drives resolution of many unique delegated
+/// zones (e.g. many distinct subdomains under an attacker-controlled zone
+/// with high-TTL glue records).
+const DEFAULT_DELEGATION_CACHE_CAPACITY: usize = 4096;
+
+/// Ceiling on how long a learned delegation is trusted, regardless of the
+/// NS/glue TTL an authority returned. Mirrors `CacheTtlPolicy::default`'s
+/// 24h positive-answer cap so a malicious or misconfigured authority can't
+/// pin resolver-wide routing for a zone cut indefinitely via an oversized TTL.
+const DELEGATION_CACHE_MAX_TTL_SECONDS: u32 = 24 * 60 * 60;
+
+#[derive(Default)]
+struct DelegationCacheState {
+    entries: HashMap<String, DelegationEntry>,
+    insertion_order: VecDeque<String>,
+}
+
+impl DelegationCacheState {
+    /// Purges expired entries, then evicts oldest-inserted entries (FIFO)
+    /// until at or under `max_entries`. Also trims stale duplicate keys out
+    /// of `insertion_order` so it can't grow unbounded from repeated
+    /// refreshes of the same zone cut.
+    fn evict(&mut self, max_entries: usize) {
+        let now = Instant::now();
+        self.entries.retain(|_, entry| entry.expires_at > now);
+        while self.entries.len() > max_entries {
+            let Some(key) = self.insertion_order.pop_front() else {
+                break;
+            };
+            self.entries.remove(&key);
+        }
+        self.insertion_order
+            .retain(|key| self.entries.contains_key(key));
+    }
+}
+
+struct DelegationCache {
+    max_entries: usize,
+    state: Mutex<DelegationCacheState>,
+}
+
+impl DelegationCache {
+    fn new(max_entries: usize) -> Self {
+        Self {
+            max_entries,
+            state: Mutex::new(DelegationCacheState::default()),
+        }
+    }
+
+    fn insert(&self, owner: String, qclass: u16, endpoints: Vec<SocketAddr>, ttl_seconds: u32) {
+        if ttl_seconds == 0 || self.max_entries == 0 {
+            return;
+        }
+        let ttl_seconds = ttl_seconds.min(DELEGATION_CACHE_MAX_TTL_SECONDS);
+        let key = delegation_cache_key(&owner, qclass);
+        let expires_at = Instant::now() + Duration::from_secs(u64::from(ttl_seconds));
+        let mut state = self.state.lock().unwrap();
+        state.entries.insert(
+            key.clone(),
+            DelegationEntry {
+                endpoints,
+                expires_at,
+            },
+        );
+        // A refresh of an already-live key must not leave a second, stale
+        // entry behind in insertion_order -- evict() only drops keys whose
+        // entry is gone, so a duplicate for a key that's never evicted (kept
+        // alive by repeated refreshes) would otherwise accumulate forever.
+        state.insertion_order.retain(|existing| existing != &key);
+        state.insertion_order.push_back(key);
+        state.evict(self.max_entries);
+    }
+
+    /// Longest-suffix match against cached zone cuts, e.g. for "www.example.com"
+    /// tries "www.example.com", then "example.com", then "com". Scoped by
+    /// `qclass` so a referral learned for one DNS class (e.g. CHAOS) can
+    /// never be reused to route a query in another class (e.g. IN). Returns
+    /// the matched zone cut alongside the endpoints so the caller can track
+    /// which zone it's currently querying within.
+    fn lookup(&self, qname: &str, qclass: u16) -> Option<(String, Vec<SocketAddr>)> {
+        let now = Instant::now();
+        let mut state = self.state.lock().unwrap();
+        for suffix in zone_suffixes(qname) {
+            let key = delegation_cache_key(suffix, qclass);
+            match state.entries.get(&key) {
+                Some(entry) if entry.expires_at > now => {
+                    return Some((suffix.to_string(), entry.endpoints.clone()));
+                }
+                Some(_) => {
+                    state.entries.remove(&key);
+                }
+                None => {}
+            }
+        }
+        None
+    }
+
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.state.lock().unwrap().entries.len()
+    }
+
+    #[cfg(test)]
+    fn insertion_order_len(&self) -> usize {
+        self.state.lock().unwrap().insertion_order.len()
+    }
+
+    #[cfg(test)]
+    fn ttl_remaining_secs(&self, qname: &str, qclass: u16) -> Option<u64> {
+        let now = Instant::now();
+        let state = self.state.lock().unwrap();
+        for suffix in zone_suffixes(qname) {
+            if let Some(entry) = state.entries.get(&delegation_cache_key(suffix, qclass)) {
+                return Some(entry.expires_at.saturating_duration_since(now).as_secs());
+            }
+        }
+        None
+    }
+}
+
+fn delegation_cache_key(owner: &str, qclass: u16) -> String {
+    format!("{qclass}:{owner}")
+}
+
+fn zone_suffixes(qname: &str) -> impl Iterator<Item = &str> {
+    let mut current = if qname.is_empty() { None } else { Some(qname) };
+    std::iter::from_fn(move || {
+        let value = current?;
+        current = value.split_once('.').map(|(_, rest)| rest);
+        Some(value)
+    })
+}
+
 pub struct RecursiveResolutionBackend {
     config: RecursiveResolverConfig,
     transport: Arc<dyn RecursiveAuthorityTransport>,
     metrics: Option<Arc<dyn MetricsSink>>,
+    delegation_cache: DelegationCache,
 }
 
 impl RecursiveResolutionBackend {
@@ -5172,6 +5330,7 @@ impl RecursiveResolutionBackend {
             config,
             transport,
             metrics: None,
+            delegation_cache: DelegationCache::new(DEFAULT_DELEGATION_CACHE_CAPACITY),
         }
     }
 
@@ -5184,6 +5343,7 @@ impl RecursiveResolutionBackend {
             config,
             transport,
             metrics: Some(metrics),
+            delegation_cache: DelegationCache::new(DEFAULT_DELEGATION_CACHE_CAPACITY),
         }
     }
 
@@ -5209,7 +5369,8 @@ impl RecursiveResolutionBackend {
         }
 
         let mut question = request.query.question.clone();
-        let mut authorities = self.root_authorities();
+        let (mut current_zone, mut authorities) =
+            self.authorities_for(&question.qname, question.qclass);
         let mut seen_referrals = HashSet::new();
         let mut seen_cnames = HashSet::from([question.qname.clone()]);
         let mut cname_chain = Vec::new();
@@ -5224,7 +5385,9 @@ impl RecursiveResolutionBackend {
             let mut last_error = None;
             let mut next_authorities = None;
 
-            for authority in authorities.iter().copied() {
+            let chunk_size = self.config.max_concurrent_authority_queries.max(1);
+
+            'chunks: for authority_chunk in authorities.chunks(chunk_size) {
                 let Some(remaining) = query_deadline.checked_duration_since(Instant::now()) else {
                     self.increment_metric(ResolverMetric::RecursiveAuthorityTimeout);
                     return Err(ResolutionBackendError::Timeout);
@@ -5234,107 +5397,144 @@ impl RecursiveResolutionBackend {
                     return Err(ResolutionBackendError::Timeout);
                 }
                 let attempt_timeout = remaining.min(self.config.per_authority_timeout);
-                self.increment_metric(ResolverMetric::RecursiveAuthorityAttempt);
-                let response = match time::timeout(
-                    attempt_timeout,
-                    self.transport.query(
-                        authority,
-                        question.clone(),
-                        request.query.features.dnssec_ok,
-                        attempt_timeout,
-                    ),
-                )
-                .await
-                {
-                    Ok(Ok(response)) => response,
-                    Ok(Err(error)) => {
-                        if error == ResolutionBackendError::Timeout {
-                            self.increment_metric(ResolverMetric::RecursiveAuthorityTimeout);
-                        } else {
-                            self.increment_metric(ResolverMetric::RecursiveAuthorityError);
+
+                let mut join_set = JoinSet::new();
+                for &authority in authority_chunk {
+                    self.increment_metric(ResolverMetric::RecursiveAuthorityAttempt);
+                    let transport = Arc::clone(&self.transport);
+                    let question_for_task = question.clone();
+                    let dnssec_ok = request.query.features.dnssec_ok;
+                    join_set.spawn(async move {
+                        let outcome = time::timeout(
+                            attempt_timeout,
+                            transport.query(
+                                authority,
+                                question_for_task,
+                                dnssec_ok,
+                                attempt_timeout,
+                            ),
+                        )
+                        .await;
+                        (authority, outcome)
+                    });
+                }
+
+                while let Some(joined) = join_set.join_next().await {
+                    let Ok((authority, outcome)) = joined else {
+                        continue;
+                    };
+                    let response = match outcome {
+                        Ok(Ok(response)) => response,
+                        Ok(Err(error)) => {
+                            if error == ResolutionBackendError::Timeout {
+                                self.increment_metric(ResolverMetric::RecursiveAuthorityTimeout);
+                            } else {
+                                self.increment_metric(ResolverMetric::RecursiveAuthorityError);
+                            }
+                            last_error = Some(error);
+                            continue;
                         }
+                        Err(_) => {
+                            self.increment_metric(ResolverMetric::RecursiveAuthorityTimeout);
+                            last_error = Some(ResolutionBackendError::Timeout);
+                            continue;
+                        }
+                    };
+                    let message = &response.message;
+                    if let Some(error) = authority_response_error(message, &question) {
+                        self.increment_metric(ResolverMetric::RecursiveAuthorityError);
                         last_error = Some(error);
                         continue;
                     }
-                    Err(_) => {
-                        self.increment_metric(ResolverMetric::RecursiveAuthorityTimeout);
-                        last_error = Some(ResolutionBackendError::Timeout);
+
+                    if (message.header.aa() && has_requested_answer_for(message, &question))
+                        || is_negative_answer(message)
+                    {
+                        return ResolutionResponse::recursive_response(
+                            &request.query,
+                            response,
+                            &cname_chain,
+                            SystemTime::now(),
+                            request.backend_generation,
+                            authority,
+                        );
+                    }
+
+                    if message.header.aa() {
+                        if let Some(cname_record) = cname_record_for(message, &question) {
+                            let RecordData::CNAME(cname_target) = &cname_record.record else {
+                                unreachable!();
+                            };
+                            let target_question =
+                                QuestionKey::new(cname_target, question.qtype, question.qclass);
+                            if has_requested_answer_for(message, &target_question) {
+                                return ResolutionResponse::recursive_response(
+                                    &request.query,
+                                    response,
+                                    &cname_chain,
+                                    SystemTime::now(),
+                                    request.backend_generation,
+                                    authority,
+                                );
+                            }
+                            let next_name = normalize_question_name(cname_target);
+                            if cname_restarts >= self.config.max_cname_restarts
+                                || !seen_cnames.insert(next_name)
+                            {
+                                self.increment_metric(ResolverMetric::RecursiveLimitHit);
+                                return Err(ResolutionBackendError::NoBackendsAvailable);
+                            }
+                            cname_chain.extend(cname_chain_records(
+                                message,
+                                cname_record,
+                                request.query.features.dnssec_ok,
+                            ));
+                            cname_restarts = cname_restarts.saturating_add(1);
+                            question =
+                                QuestionKey::new(cname_target, question.qtype, question.qclass);
+                            seen_referrals.clear();
+                            let (zone, next) =
+                                self.authorities_for(&question.qname, question.qclass);
+                            current_zone = zone;
+                            next_authorities = Some(next);
+                            break 'chunks;
+                        }
+                    }
+
+                    let Some(referral) = referral_authorities(message, &question) else {
+                        if has_delegation_for_question(message, &question) {
+                            self.increment_metric(ResolverMetric::RecursiveBailiwickReject);
+                        } else {
+                            self.increment_metric(ResolverMetric::RecursiveLameDelegation);
+                        }
+                        last_error = Some(ResolutionBackendError::NoBackendsAvailable);
+                        continue;
+                    };
+                    if !is_valid_zone_progression(&current_zone, &referral.owner) {
+                        // An authority reached via `current_zone` claimed a
+                        // referral to an ancestor, sibling, or its own zone
+                        // instead of a proper child -- reject outright rather
+                        // than follow it or let it poison the shared
+                        // delegation cache for unrelated future queries.
+                        self.increment_metric(ResolverMetric::RecursiveBailiwickReject);
+                        last_error = Some(ResolutionBackendError::NoBackendsAvailable);
                         continue;
                     }
-                };
-                let message = &response.message;
-                if let Some(error) = authority_response_error(message, &question) {
-                    self.increment_metric(ResolverMetric::RecursiveAuthorityError);
-                    last_error = Some(error);
-                    continue;
-                }
-
-                if (message.header.aa() && has_requested_answer_for(message, &question))
-                    || is_negative_answer(message)
-                {
-                    return ResolutionResponse::recursive_response(
-                        &request.query,
-                        response,
-                        &cname_chain,
-                        SystemTime::now(),
-                        request.backend_generation,
-                        authority,
+                    let referral_key = referral_loop_key(&referral);
+                    if !seen_referrals.insert(referral_key) {
+                        self.increment_metric(ResolverMetric::RecursiveReferralLoop);
+                        return Err(ResolutionBackendError::NoBackendsAvailable);
+                    }
+                    self.delegation_cache.insert(
+                        referral.owner.clone(),
+                        question.qclass,
+                        referral.endpoints.clone(),
+                        referral.min_ttl,
                     );
+                    current_zone = referral.owner.clone();
+                    next_authorities = Some(referral.endpoints);
+                    break 'chunks;
                 }
-
-                if message.header.aa() {
-                    if let Some(cname_record) = cname_record_for(message, &question) {
-                        let RecordData::CNAME(cname_target) = &cname_record.record else {
-                            unreachable!();
-                        };
-                        let target_question =
-                            QuestionKey::new(cname_target, question.qtype, question.qclass);
-                        if has_requested_answer_for(message, &target_question) {
-                            return ResolutionResponse::recursive_response(
-                                &request.query,
-                                response,
-                                &cname_chain,
-                                SystemTime::now(),
-                                request.backend_generation,
-                                authority,
-                            );
-                        }
-                        let next_name = normalize_question_name(cname_target);
-                        if cname_restarts >= self.config.max_cname_restarts
-                            || !seen_cnames.insert(next_name)
-                        {
-                            self.increment_metric(ResolverMetric::RecursiveLimitHit);
-                            return Err(ResolutionBackendError::NoBackendsAvailable);
-                        }
-                        cname_chain.extend(cname_chain_records(
-                            message,
-                            cname_record,
-                            request.query.features.dnssec_ok,
-                        ));
-                        cname_restarts = cname_restarts.saturating_add(1);
-                        question = QuestionKey::new(cname_target, question.qtype, question.qclass);
-                        seen_referrals.clear();
-                        next_authorities = Some(self.root_authorities());
-                        break;
-                    }
-                }
-
-                let Some(referral) = referral_authorities(message, &question) else {
-                    if has_delegation_for_question(message, &question) {
-                        self.increment_metric(ResolverMetric::RecursiveBailiwickReject);
-                    } else {
-                        self.increment_metric(ResolverMetric::RecursiveLameDelegation);
-                    }
-                    last_error = Some(ResolutionBackendError::NoBackendsAvailable);
-                    continue;
-                };
-                let referral_key = referral_loop_key(&referral);
-                if !seen_referrals.insert(referral_key) {
-                    self.increment_metric(ResolverMetric::RecursiveReferralLoop);
-                    return Err(ResolutionBackendError::NoBackendsAvailable);
-                }
-                next_authorities = Some(referral.endpoints);
-                break;
             }
 
             if let Some(next) = next_authorities {
@@ -5357,6 +5557,30 @@ impl RecursiveResolutionBackend {
             .flat_map(|hint| hint.endpoints.iter().copied())
             .collect()
     }
+
+    /// Resolves the authority set to start querying for `qname`, either from
+    /// a cached delegation or (on a miss) the root hints. Returns the zone
+    /// cut the returned authorities are for ("" for root), so the caller can
+    /// track its current position in the delegation chain.
+    fn authorities_for(&self, qname: &str, qclass: u16) -> (String, Vec<SocketAddr>) {
+        match self.delegation_cache.lookup(qname, qclass) {
+            Some((zone, endpoints)) => (zone, endpoints),
+            None => (String::new(), self.root_authorities()),
+        }
+    }
+}
+
+/// Whether a referral learned while querying within `current_zone` may
+/// legitimately delegate to `candidate_owner`. `candidate_owner` must be
+/// `current_zone` itself (an authority re-affirming the zone it's already
+/// known for) or a proper descendant of it; an authority reached via a valid
+/// delegation must never be able to redirect the resolver back up to an
+/// ancestor or sideways to an unrelated zone (e.g. an `example.com`
+/// authority claiming to redelegate `com`), which would otherwise let one
+/// bad response poison unrelated future queries through the shared
+/// delegation cache.
+fn is_valid_zone_progression(current_zone: &str, candidate_owner: &str) -> bool {
+    is_delegation_owner_for_question(current_zone, candidate_owner)
 }
 
 fn referral_loop_key(referral: &ReferralAuthorities) -> String {
@@ -7363,6 +7587,7 @@ mod tests {
                 per_query_deadline,
                 max_recursion_depth,
                 max_cname_restarts: 4,
+                max_concurrent_authority_queries: DEFAULT_MAX_CONCURRENT_AUTHORITY_QUERIES,
             },
             transport,
         )
@@ -8109,6 +8334,75 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn recursive_backend_rejects_and_does_not_cache_upward_referral_from_child_authority() {
+        let question = QuestionKey::new("www.example.com", 1, 1);
+        let legit_referral = response_message_for_question(
+            question.clone(),
+            ResponseCode::NoError,
+            Vec::new(),
+            vec![ns_record("example.com", 300, "ns1.example.com")],
+            vec![glue_a_record(
+                "ns1.example.com",
+                300,
+                "203.0.113.10".parse().unwrap(),
+            )],
+            false,
+        );
+        // A compromised/misbehaving ns1.example.com, reached via the
+        // legitimate referral above, tries to claim a referral for the
+        // *parent* zone "com" pointing at attacker-controlled endpoints.
+        let malicious_upward_referral = response_message_for_question(
+            question.clone(),
+            ResponseCode::NoError,
+            Vec::new(),
+            vec![ns_record("com", 300, "attacker-ns.evil")],
+            vec![Record {
+                name: "attacker-ns.evil".to_string(),
+                rtype: 1,
+                rclass: 1,
+                ttl: 300,
+                record: RecordData::A("198.51.100.66".parse().unwrap()),
+            }],
+            false,
+        );
+
+        let transport = Arc::new(ScriptedAuthorityTransport::new([
+            Ok(legit_referral),
+            Ok(malicious_upward_referral),
+        ]));
+        let metrics = Arc::new(RecordingMetrics::default());
+        let backend = RecursiveResolutionBackend::with_metrics(
+            RecursiveResolverConfig {
+                root_hints: vec![RecursiveRootHint {
+                    name: "a.root-servers.example".to_string(),
+                    endpoints: vec!["198.51.100.53:53".parse().unwrap()],
+                }],
+                per_authority_timeout: Duration::from_millis(500),
+                per_query_deadline: Duration::from_secs(2),
+                max_recursion_depth: 8,
+                max_cname_restarts: 4,
+                max_concurrent_authority_queries: DEFAULT_MAX_CONCURRENT_AUTHORITY_QUERIES,
+            },
+            transport,
+            metrics.clone(),
+        );
+
+        assert_eq!(
+            backend.resolve(recursive_request("www.example.com")).await,
+            Err(ResolutionBackendError::NoBackendsAvailable)
+        );
+
+        // The malicious "com" referral must never be cached -- otherwise
+        // every future .com lookup would start from attacker endpoints
+        // instead of root hints.
+        assert!(backend.delegation_cache.lookup("com", 1).is_none());
+        assert!(
+            metrics.count(ResolverMetric::RecursiveBailiwickReject) >= 1,
+            "expected the upward referral to be rejected as a bailiwick violation"
+        );
+    }
+
+    #[tokio::test]
     async fn recursive_backend_defers_out_of_bailiwick_glue() {
         let question = QuestionKey::new("www.example.com", 1, 1);
         let transport = Arc::new(ScriptedAuthorityTransport::new([Ok(
@@ -8323,6 +8617,7 @@ mod tests {
                 per_query_deadline: Duration::from_secs(2),
                 max_recursion_depth: 1,
                 max_cname_restarts: 4,
+                max_concurrent_authority_queries: DEFAULT_MAX_CONCURRENT_AUTHORITY_QUERIES,
             },
             transport,
         );
@@ -8362,6 +8657,7 @@ mod tests {
                 per_query_deadline: Duration::from_secs(2),
                 max_recursion_depth: 8,
                 max_cname_restarts: 4,
+                max_concurrent_authority_queries: DEFAULT_MAX_CONCURRENT_AUTHORITY_QUERIES,
             },
             transport,
             metrics.clone(),
@@ -8429,6 +8725,7 @@ mod tests {
                 per_query_deadline: Duration::from_secs(2),
                 max_recursion_depth: 8,
                 max_cname_restarts: 4,
+                max_concurrent_authority_queries: DEFAULT_MAX_CONCURRENT_AUTHORITY_QUERIES,
             },
             transport.clone(),
             metrics.clone(),
@@ -8440,7 +8737,9 @@ mod tests {
         );
 
         assert_eq!(metrics.count(ResolverMetric::RecursiveReferralLoop), 1);
-        assert_eq!(transport.requests.lock().unwrap().len(), 2);
+        // Root query, plus both ns1/ns2 raced concurrently within the same
+        // delegation set (bounded by max_concurrent_authority_queries).
+        assert_eq!(transport.requests.lock().unwrap().len(), 3);
     }
 
     #[tokio::test]
@@ -8467,6 +8766,7 @@ mod tests {
                 per_query_deadline: Duration::from_secs(2),
                 max_recursion_depth: 8,
                 max_cname_restarts: 4,
+                max_concurrent_authority_queries: DEFAULT_MAX_CONCURRENT_AUTHORITY_QUERIES,
             },
             transport,
             metrics.clone(),
@@ -8557,6 +8857,7 @@ mod tests {
                 per_query_deadline: Duration::from_secs(1),
                 max_recursion_depth: 8,
                 max_cname_restarts: 4,
+                max_concurrent_authority_queries: DEFAULT_MAX_CONCURRENT_AUTHORITY_QUERIES,
             },
             Arc::new(HangingAuthorityTransport),
         );
@@ -12781,5 +13082,388 @@ mod tests {
             .lock()
             .unwrap()
             .contains(&ResolverMetric::UpstreamFailure));
+    }
+
+    #[test]
+    fn zone_suffixes_walks_from_full_name_to_tld() {
+        let suffixes: Vec<&str> = zone_suffixes("www.example.com").collect();
+        assert_eq!(suffixes, vec!["www.example.com", "example.com", "com"]);
+    }
+
+    #[test]
+    fn delegation_cache_hits_on_matching_suffix_and_misses_otherwise() {
+        let cache = DelegationCache::new(DEFAULT_DELEGATION_CACHE_CAPACITY);
+        let endpoints = vec!["203.0.113.10:53".parse().unwrap()];
+        cache.insert("example.com".to_string(), 1, endpoints.clone(), 300);
+
+        assert_eq!(
+            cache.lookup("www.example.com", 1),
+            Some(("example.com".to_string(), endpoints.clone()))
+        );
+        assert_eq!(
+            cache.lookup("example.com", 1),
+            Some(("example.com".to_string(), endpoints))
+        );
+        assert_eq!(cache.lookup("other.org", 1), None);
+    }
+
+    #[test]
+    fn delegation_cache_does_not_leak_across_dns_classes() {
+        let cache = DelegationCache::new(DEFAULT_DELEGATION_CACHE_CAPACITY);
+        let endpoints = vec!["203.0.113.10:53".parse().unwrap()];
+        // Learned from a CHAOS (class 3) referral.
+        cache.insert("example.com".to_string(), 3, endpoints, 300);
+
+        // An IN (class 1) query for the same owner name must not reuse it.
+        assert_eq!(cache.lookup("example.com", 1), None);
+    }
+
+    #[test]
+    fn delegation_cache_does_not_store_zero_ttl_entries() {
+        let cache = DelegationCache::new(DEFAULT_DELEGATION_CACHE_CAPACITY);
+        cache.insert(
+            "example.com".to_string(),
+            1,
+            vec!["203.0.113.10:53".parse().unwrap()],
+            0,
+        );
+        assert_eq!(cache.lookup("example.com", 1), None);
+    }
+
+    #[tokio::test]
+    async fn delegation_cache_treats_expired_entry_as_miss() {
+        let cache = DelegationCache::new(DEFAULT_DELEGATION_CACHE_CAPACITY);
+        cache.insert(
+            "example.com".to_string(),
+            1,
+            vec!["203.0.113.10:53".parse().unwrap()],
+            1,
+        );
+        tokio::time::sleep(Duration::from_millis(1100)).await;
+        assert_eq!(cache.lookup("example.com", 1), None);
+    }
+
+    #[test]
+    fn delegation_cache_evicts_oldest_entry_once_over_capacity() {
+        let cache = DelegationCache::new(2);
+        let endpoints = vec!["203.0.113.10:53".parse().unwrap()];
+        cache.insert("first.example".to_string(), 1, endpoints.clone(), 300);
+        cache.insert("second.example".to_string(), 1, endpoints.clone(), 300);
+        assert_eq!(cache.len(), 2);
+
+        // Inserting a third distinct entry over a capacity of 2 must evict
+        // the oldest one (first.example) rather than growing unbounded.
+        cache.insert("third.example".to_string(), 1, endpoints.clone(), 300);
+        assert_eq!(cache.len(), 2);
+        assert_eq!(cache.lookup("first.example", 1), None);
+        assert_eq!(
+            cache.lookup("second.example", 1),
+            Some(("second.example".to_string(), endpoints.clone()))
+        );
+        assert_eq!(
+            cache.lookup("third.example", 1),
+            Some(("third.example".to_string(), endpoints))
+        );
+    }
+
+    #[test]
+    fn delegation_cache_repeated_refresh_does_not_grow_insertion_order_unbounded() {
+        let cache = DelegationCache::new(DEFAULT_DELEGATION_CACHE_CAPACITY);
+        let endpoints = vec!["203.0.113.10:53".parse().unwrap()];
+
+        // Refreshing the same live delegation many times (e.g. repeated
+        // referrals for names under one already-cached zone) must not leave
+        // stale duplicate keys behind in the FIFO eviction order -- that
+        // would bypass the capacity cap even while entries.len() stays 1.
+        for _ in 0..1000 {
+            cache.insert("example.com".to_string(), 1, endpoints.clone(), 300);
+        }
+
+        assert_eq!(cache.len(), 1);
+        assert_eq!(cache.insertion_order_len(), 1);
+    }
+
+    #[tokio::test]
+    async fn delegation_cache_purges_expired_entries_on_insert() {
+        let cache = DelegationCache::new(DEFAULT_DELEGATION_CACHE_CAPACITY);
+        let endpoints = vec!["203.0.113.10:53".parse().unwrap()];
+        cache.insert("expiring.example".to_string(), 1, endpoints.clone(), 1);
+        assert_eq!(cache.len(), 1);
+
+        tokio::time::sleep(Duration::from_millis(1100)).await;
+
+        // A later insert opportunistically purges the now-expired entry
+        // instead of only relying on a lookup that happens to hit it.
+        cache.insert("other.example".to_string(), 1, endpoints, 300);
+        assert_eq!(cache.len(), 1);
+    }
+
+    #[test]
+    fn delegation_cache_caps_excessive_referral_ttl() {
+        let cache = DelegationCache::new(DEFAULT_DELEGATION_CACHE_CAPACITY);
+        let endpoints = vec!["203.0.113.10:53".parse().unwrap()];
+        // A hostile or misconfigured authority returns a huge TTL; it must be
+        // clamped rather than pinning this delegation for years.
+        cache.insert("example.com".to_string(), 1, endpoints, u32::MAX);
+
+        let remaining = cache
+            .ttl_remaining_secs("example.com", 1)
+            .expect("entry should be cached");
+        assert!(
+            remaining <= u64::from(DELEGATION_CACHE_MAX_TTL_SECONDS),
+            "expected remaining TTL to be capped at {DELEGATION_CACHE_MAX_TTL_SECONDS}s, got {remaining}s"
+        );
+        // Sanity: the cap actually kicked in rather than happening to be
+        // small for some unrelated reason.
+        assert!(remaining > u64::from(DELEGATION_CACHE_MAX_TTL_SECONDS) - 5);
+    }
+
+    #[test]
+    fn referral_authorities_bounds_ttl_by_shorter_of_ns_and_glue() {
+        let question = QuestionKey::new("www.example.com", 1, 1);
+        let message = response_message_for_question(
+            question.clone(),
+            ResponseCode::NoError,
+            Vec::new(),
+            vec![ns_record("example.com", 300, "ns1.example.com")],
+            vec![glue_a_record(
+                "ns1.example.com",
+                60,
+                "203.0.113.10".parse().unwrap(),
+            )],
+            false,
+        );
+        let referral = referral_authorities(&message, &question).unwrap();
+        assert_eq!(referral.min_ttl, 60);
+    }
+
+    #[tokio::test]
+    async fn recursive_backend_does_not_reuse_delegation_cache_across_dns_classes() {
+        // qclass 3 is CHAOS; the test helpers (ns_record/glue_a_record/a_record)
+        // hardcode rclass 1 (IN), so the referral/answer records are built by
+        // hand here with rclass 3 to exercise the non-IN path.
+        let chaos_question = QuestionKey::new("example.com", 1, 3);
+        let chaos_ns_record = Record {
+            name: "example.com".to_string(),
+            rtype: 2,
+            rclass: 3,
+            ttl: 300,
+            record: RecordData::NS("ns1.example.com".to_string()),
+        };
+        let chaos_glue_record = Record {
+            name: "ns1.example.com".to_string(),
+            rtype: 1,
+            rclass: 3,
+            ttl: 300,
+            record: RecordData::A("203.0.113.10".parse().unwrap()),
+        };
+        let chaos_answer_record = Record {
+            name: "example.com".to_string(),
+            rtype: 1,
+            rclass: 3,
+            ttl: 60,
+            record: RecordData::A("192.0.2.10".parse().unwrap()),
+        };
+
+        let transport = Arc::new(ScriptedAuthorityTransport::new([
+            Ok(response_message_for_question(
+                chaos_question.clone(),
+                ResponseCode::NoError,
+                Vec::new(),
+                vec![chaos_ns_record],
+                vec![chaos_glue_record],
+                false,
+            )),
+            Ok(response_message_for_question(
+                chaos_question.clone(),
+                ResponseCode::NoError,
+                vec![chaos_answer_record],
+                Vec::new(),
+                Vec::new(),
+                true,
+            )),
+        ]));
+        let backend = recursive_backend(transport.clone());
+
+        backend
+            .resolve(recursive_request_from_bytes(query(
+                0x1234,
+                "example.com",
+                1,
+                3,
+            )))
+            .await
+            .unwrap();
+
+        // Delegation learned under CHAOS (class 3) must stay scoped to class 3.
+        assert!(backend.delegation_cache.lookup("example.com", 3).is_some());
+        // An IN (class 1) query for the same owner name must not reuse it.
+        assert_eq!(backend.delegation_cache.lookup("example.com", 1), None);
+    }
+
+    #[tokio::test]
+    async fn recursive_backend_reuses_delegation_cache_for_repeat_zone() {
+        let first_question = QuestionKey::new("www.example.com", 1, 1);
+        let second_question = QuestionKey::new("other.example.com", 1, 1);
+        let ns1: SocketAddr = "203.0.113.10:53".parse().unwrap();
+
+        let transport = Arc::new(ScriptedAuthorityTransport::new([
+            Ok(response_message_for_question(
+                first_question.clone(),
+                ResponseCode::NoError,
+                Vec::new(),
+                vec![ns_record("example.com", 300, "ns1.example.com")],
+                vec![glue_a_record(
+                    "ns1.example.com",
+                    300,
+                    "203.0.113.10".parse().unwrap(),
+                )],
+                false,
+            )),
+            Ok(response_message_for_question(
+                first_question.clone(),
+                ResponseCode::NoError,
+                vec![a_record("www.example.com", 60)],
+                Vec::new(),
+                Vec::new(),
+                true,
+            )),
+            Ok(response_message_for_question(
+                second_question.clone(),
+                ResponseCode::NoError,
+                vec![a_record("other.example.com", 60)],
+                Vec::new(),
+                Vec::new(),
+                true,
+            )),
+        ]));
+        let backend = recursive_backend(transport.clone());
+
+        backend
+            .resolve(recursive_request("www.example.com"))
+            .await
+            .unwrap();
+        backend
+            .resolve(recursive_request("other.example.com"))
+            .await
+            .unwrap();
+
+        let requests = transport.requests.lock().unwrap();
+        assert_eq!(requests.len(), 3);
+        // Second top-level query reuses the cached example.com delegation and
+        // skips straight to ns1, never re-querying the root hint.
+        assert_eq!(requests[2].0, ns1);
+    }
+
+    struct DelayedAuthorityTransport {
+        responses: HashMap<SocketAddr, (Duration, Result<Message, ResolutionBackendError>)>,
+        requests: Mutex<Vec<SocketAddr>>,
+    }
+
+    impl DelayedAuthorityTransport {
+        fn new(
+            responses: HashMap<SocketAddr, (Duration, Result<Message, ResolutionBackendError>)>,
+        ) -> Self {
+            Self {
+                responses,
+                requests: Mutex::new(Vec::new()),
+            }
+        }
+    }
+
+    impl RecursiveAuthorityTransport for DelayedAuthorityTransport {
+        fn query<'a>(
+            &'a self,
+            authority: SocketAddr,
+            _question: QuestionKey,
+            _dnssec_ok: bool,
+            _timeout: Duration,
+        ) -> BoxFuture<'a, Result<RecursiveAuthorityResponse, ResolutionBackendError>> {
+            Box::pin(async move {
+                self.requests.lock().unwrap().push(authority);
+                let (delay, result) = self
+                    .responses
+                    .get(&authority)
+                    .expect("unexpected authority queried");
+                time::sleep(*delay).await;
+                match result {
+                    Ok(message) => RecursiveAuthorityResponse::new(
+                        message.original_bytes.to_vec(),
+                        message.clone(),
+                    ),
+                    Err(error) => Err(error.clone()),
+                }
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn race_within_delegation_set_prefers_fastest_authority() {
+        let question = QuestionKey::new("example.com", 1, 1);
+        let slow: SocketAddr = "198.51.100.1:53".parse().unwrap();
+        let fast: SocketAddr = "198.51.100.2:53".parse().unwrap();
+
+        let mut responses = HashMap::new();
+        responses.insert(
+            slow,
+            (
+                Duration::from_secs(5),
+                Ok(response_message_for_question(
+                    question.clone(),
+                    ResponseCode::NoError,
+                    vec![a_record("example.com", 60)],
+                    Vec::new(),
+                    Vec::new(),
+                    true,
+                )),
+            ),
+        );
+        responses.insert(
+            fast,
+            (
+                Duration::from_millis(10),
+                Ok(response_message_for_question(
+                    question.clone(),
+                    ResponseCode::NoError,
+                    vec![a_record("example.com", 60)],
+                    Vec::new(),
+                    Vec::new(),
+                    true,
+                )),
+            ),
+        );
+
+        let transport = Arc::new(DelayedAuthorityTransport::new(responses));
+        let backend = RecursiveResolutionBackend::new(
+            RecursiveResolverConfig {
+                root_hints: vec![RecursiveRootHint {
+                    name: "a.root-servers.example".to_string(),
+                    endpoints: vec![slow, fast],
+                }],
+                per_authority_timeout: Duration::from_secs(2),
+                per_query_deadline: Duration::from_secs(3),
+                max_recursion_depth: 8,
+                max_cname_restarts: 4,
+                max_concurrent_authority_queries: DEFAULT_MAX_CONCURRENT_AUTHORITY_QUERIES,
+            },
+            transport.clone(),
+        );
+
+        let started = Instant::now();
+        let response = backend
+            .resolve(recursive_request("example.com"))
+            .await
+            .unwrap();
+        let elapsed = started.elapsed();
+
+        assert_eq!(response.answers().len(), 1);
+        assert!(
+            elapsed < Duration::from_secs(1),
+            "expected the fast authority to win the race, took {elapsed:?}"
+        );
+        // Both authorities were queried concurrently rather than serially
+        // (a serial fallback would have paid the slow authority's full
+        // per_authority_timeout before ever trying the fast one).
+        assert_eq!(transport.requests.lock().unwrap().len(), 2);
     }
 }
