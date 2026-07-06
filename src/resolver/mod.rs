@@ -862,8 +862,11 @@ struct ReferralAuthorities {
     min_ttl: u32,
 }
 
-fn referral_authorities(message: &Message, question: &QuestionKey) -> Option<ReferralAuthorities> {
-    let owner = message
+/// The longest NS-record owner in `message.authorities` that is an
+/// ancestor-or-equal of `question.qname` -- i.e. the zone cut a delegation
+/// response claims to be for.
+fn delegation_owner(message: &Message, question: &QuestionKey) -> Option<String> {
+    message
         .authorities
         .iter()
         .filter_map(|record| {
@@ -880,16 +883,33 @@ fn referral_authorities(message: &Message, question: &QuestionKey) -> Option<Ref
                 None
             }
         })
-        .max_by_key(|owner| owner.len())?;
+        .max_by_key(|owner| owner.len())
+}
+
+/// NS record target names owned by `owner`, plus their minimum TTL.
+///
+/// When `require_bailiwick` is true, only in-bailiwick names are returned --
+/// safe to use for *trusting glue addresses* supplied in the same response,
+/// since accepting glue for an arbitrary out-of-bailiwick name is a classic
+/// cache-poisoning vector. When false, all target names are returned
+/// regardless of bailiwick -- safe only when those names will subsequently
+/// be resolved via an independent, fully-validated recursive lookup rather
+/// than trusted from this response directly (see glueless delegations).
+fn ns_names_for_owner(
+    message: &Message,
+    owner: &str,
+    qclass: u16,
+    require_bailiwick: bool,
+) -> (HashSet<String>, u32) {
     let mut min_ttl: Option<u32> = None;
-    let names: HashSet<_> = message
+    let names = message
         .authorities
         .iter()
         .filter_map(|record| match &record.record {
             RecordData::NS(name)
                 if normalize_question_name(&record.name) == owner
-                    && record.rclass == question.qclass
-                    && ns_name_allowed_for_delegation(&owner, name) =>
+                    && record.rclass == qclass
+                    && (!require_bailiwick || ns_name_allowed_for_delegation(owner, name)) =>
             {
                 min_ttl = Some(min_ttl.map_or(record.ttl, |ttl| ttl.min(record.ttl)));
                 Some(normalize_question_name(name))
@@ -897,6 +917,12 @@ fn referral_authorities(message: &Message, question: &QuestionKey) -> Option<Ref
             _ => None,
         })
         .collect();
+    (names, min_ttl.unwrap_or(0))
+}
+
+fn referral_authorities(message: &Message, question: &QuestionKey) -> Option<ReferralAuthorities> {
+    let owner = delegation_owner(message, question)?;
+    let (names, mut min_ttl) = ns_names_for_owner(message, &owner, question.qclass, true);
     if names.is_empty() {
         return None;
     }
@@ -920,7 +946,7 @@ fn referral_authorities(message: &Message, question: &QuestionKey) -> Option<Ref
             // too, not just the NS TTL, so a shorter-lived A/AAAA record
             // can't outlive its own freshness in the delegation cache.
             if endpoint.is_some() {
-                min_ttl = Some(min_ttl.map_or(record.ttl, |ttl| ttl.min(record.ttl)));
+                min_ttl = min_ttl.min(record.ttl);
             }
             endpoint
         })
@@ -931,8 +957,25 @@ fn referral_authorities(message: &Message, question: &QuestionKey) -> Option<Ref
     Some(ReferralAuthorities {
         owner,
         endpoints,
-        min_ttl: min_ttl.unwrap_or(0),
+        min_ttl,
     })
+}
+
+/// A valid NS delegation for the question with no usable glue in this
+/// response (a "glueless" delegation) -- e.g. a zone delegating to
+/// nameservers hosted under a different, unrelated domain that the parent
+/// zone can't supply glue for. The returned names still need to be resolved
+/// independently (their own A/AAAA lookup) before they can be queried.
+fn glueless_delegation_names(
+    message: &Message,
+    question: &QuestionKey,
+) -> Option<(String, HashSet<String>, u32)> {
+    let owner = delegation_owner(message, question)?;
+    let (names, min_ttl) = ns_names_for_owner(message, &owner, question.qclass, false);
+    if names.is_empty() {
+        return None;
+    }
+    Some((owner, names, min_ttl))
 }
 
 fn has_delegation_for_question(message: &Message, question: &QuestionKey) -> bool {
@@ -5150,6 +5193,16 @@ pub struct RecursiveResolverConfig {
 
 pub const DEFAULT_MAX_CONCURRENT_AUTHORITY_QUERIES: usize = 3;
 
+/// Bounds nested glueless-delegation NS-name resolution: each glueless
+/// referral encountered while resolving another glueless NS name's address
+/// decrements this budget by one, so a cycle of NS names that keep
+/// requiring each other's glueless resolution can't recurse forever.
+const MAX_GLUELESS_NS_DEPTH: u8 = 4;
+/// How many candidate NS hostnames a glueless delegation will try to
+/// resolve before giving up, stopping early at the first success. Bounds
+/// the worst-case extra latency added when names are also unresolvable.
+const MAX_GLUELESS_NS_NAMES: usize = 2;
+
 pub trait RecursiveAuthorityTransport: Send + Sync {
     fn query<'a>(
         &'a self,
@@ -5502,6 +5555,36 @@ impl RecursiveResolutionBackend {
                     }
 
                     let Some(referral) = referral_authorities(message, &question) else {
+                        // No trustable glue in this response -- if there's
+                        // still a valid NS delegation for the question, try
+                        // resolving one of its nameservers' addresses
+                        // ourselves (a "glueless" delegation) before giving
+                        // up on this response entirely.
+                        if let Some((owner, names, min_ttl)) =
+                            glueless_delegation_names(message, &question)
+                        {
+                            if is_valid_zone_progression(&current_zone, &owner) {
+                                let (resolved, resolved_ttl) = self
+                                    .resolve_glueless_endpoints(
+                                        &names,
+                                        question.qclass,
+                                        query_deadline,
+                                        MAX_GLUELESS_NS_DEPTH,
+                                    )
+                                    .await;
+                                if !resolved.is_empty() {
+                                    self.delegation_cache.insert(
+                                        owner.clone(),
+                                        question.qclass,
+                                        resolved.clone(),
+                                        min_ttl.min(resolved_ttl),
+                                    );
+                                    current_zone = owner;
+                                    next_authorities = Some(resolved);
+                                    break 'chunks;
+                                }
+                            }
+                        }
                         if has_delegation_for_question(message, &question) {
                             self.increment_metric(ResolverMetric::RecursiveBailiwickReject);
                         } else {
@@ -5568,6 +5651,205 @@ impl RecursiveResolutionBackend {
             None => (String::new(), self.root_authorities()),
         }
     }
+
+    /// Tries NS hostnames in turn (each via its own independent, fully
+    /// bailiwick-validated recursive lookup) and returns the first one that
+    /// resolves to at least one address (plus that address record's TTL),
+    /// to fill in a glueless delegation. Stops at the first success rather
+    /// than resolving every candidate, to bound the extra latency this adds
+    /// to the outer query.
+    async fn resolve_glueless_endpoints(
+        &self,
+        names: &HashSet<String>,
+        qclass: u16,
+        deadline: Instant,
+        depth_budget: u8,
+    ) -> (Vec<SocketAddr>, u32) {
+        for name in names.iter().take(MAX_GLUELESS_NS_NAMES) {
+            if Instant::now() >= deadline {
+                break;
+            }
+            let (addresses, ttl) = self
+                .resolve_ns_addresses(name, qclass, deadline, depth_budget)
+                .await;
+            if !addresses.is_empty() {
+                return (addresses, ttl);
+            }
+        }
+        (Vec::new(), 0)
+    }
+
+    /// Resolves a bare hostname (an NS target with no glue) to its A/AAAA
+    /// addresses via its own independent iterative walk -- the same
+    /// referral-following, bailiwick validation, and delegation caching as
+    /// the main query path, just returning raw addresses instead of a
+    /// client-facing response. `depth_budget` bounds nested glueless
+    /// resolutions specifically (separate from `max_recursion_depth`, which
+    /// bounds this walk's own referral chain), so a cycle of NS names that
+    /// keep requiring each other's glueless resolution can't recurse
+    /// forever. NS records must not point to CNAMEs (RFC 2181), so unlike
+    /// the main path this walk does not need to follow CNAME chains.
+    fn resolve_ns_addresses<'a>(
+        &'a self,
+        ns_name: &'a str,
+        qclass: u16,
+        deadline: Instant,
+        depth_budget: u8,
+    ) -> BoxFuture<'a, (Vec<SocketAddr>, u32)> {
+        Box::pin(async move {
+            if depth_budget == 0 {
+                return (Vec::new(), 0);
+            }
+            let question = QuestionKey::new(ns_name, 1, qclass);
+            let (mut current_zone, mut authorities) = self.authorities_for(&question.qname, qclass);
+            let mut seen_referrals = HashSet::new();
+
+            for _ in 0..self.config.max_recursion_depth {
+                if authorities.is_empty() {
+                    return (Vec::new(), 0);
+                }
+                if Instant::now() >= deadline {
+                    return (Vec::new(), 0);
+                }
+
+                let chunk_size = self.config.max_concurrent_authority_queries.max(1);
+                let mut next_authorities = None;
+
+                'chunks: for authority_chunk in authorities.chunks(chunk_size) {
+                    let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
+                        return (Vec::new(), 0);
+                    };
+                    if remaining.is_zero() {
+                        return (Vec::new(), 0);
+                    }
+                    let attempt_timeout = remaining.min(self.config.per_authority_timeout);
+
+                    let mut join_set = JoinSet::new();
+                    for &authority in authority_chunk {
+                        self.increment_metric(ResolverMetric::RecursiveAuthorityAttempt);
+                        let transport = Arc::clone(&self.transport);
+                        let question_for_task = question.clone();
+                        join_set.spawn(async move {
+                            let outcome = time::timeout(
+                                attempt_timeout,
+                                transport.query(
+                                    authority,
+                                    question_for_task,
+                                    false,
+                                    attempt_timeout,
+                                ),
+                            )
+                            .await;
+                            outcome
+                        });
+                    }
+
+                    while let Some(joined) = join_set.join_next().await {
+                        let Ok(outcome) = joined else {
+                            continue;
+                        };
+                        let response = match outcome {
+                            Ok(Ok(response)) => response,
+                            _ => continue,
+                        };
+                        let message = &response.message;
+                        if authority_response_error(message, &question).is_some() {
+                            continue;
+                        }
+                        if is_negative_answer(message) {
+                            return (Vec::new(), 0);
+                        }
+                        if message.header.aa() && has_requested_answer_for(message, &question) {
+                            return a_record_endpoints(message, &question);
+                        }
+
+                        if let Some(referral) = referral_authorities(message, &question) {
+                            if !is_valid_zone_progression(&current_zone, &referral.owner) {
+                                continue;
+                            }
+                            let referral_key = referral_loop_key(&referral);
+                            if !seen_referrals.insert(referral_key) {
+                                return (Vec::new(), 0);
+                            }
+                            self.delegation_cache.insert(
+                                referral.owner.clone(),
+                                qclass,
+                                referral.endpoints.clone(),
+                                referral.min_ttl,
+                            );
+                            current_zone = referral.owner;
+                            next_authorities = Some(referral.endpoints);
+                            break 'chunks;
+                        }
+
+                        if let Some((owner, names, min_ttl)) =
+                            glueless_delegation_names(message, &question)
+                        {
+                            if !is_valid_zone_progression(&current_zone, &owner) {
+                                continue;
+                            }
+                            let (resolved, resolved_ttl) = self
+                                .resolve_glueless_endpoints(
+                                    &names,
+                                    qclass,
+                                    deadline,
+                                    depth_budget - 1,
+                                )
+                                .await;
+                            if resolved.is_empty() {
+                                continue;
+                            }
+                            self.delegation_cache.insert(
+                                owner.clone(),
+                                qclass,
+                                resolved.clone(),
+                                min_ttl.min(resolved_ttl),
+                            );
+                            current_zone = owner;
+                            next_authorities = Some(resolved);
+                            break 'chunks;
+                        }
+                    }
+                }
+
+                match next_authorities {
+                    Some(next) => authorities = next,
+                    None => return (Vec::new(), 0),
+                }
+            }
+
+            (Vec::new(), 0)
+        })
+    }
+}
+
+/// Extracts A/AAAA answer endpoints for `question`, plus their minimum TTL
+/// -- callers resolving a glueless NS name's address need that TTL to bound
+/// how long the resulting delegation-cache entry can be trusted, the same
+/// way in-response glue TTLs already bound normal referrals.
+fn a_record_endpoints(message: &Message, question: &QuestionKey) -> (Vec<SocketAddr>, u32) {
+    let mut min_ttl: Option<u32> = None;
+    let endpoints = message
+        .answers
+        .iter()
+        .filter_map(|record| {
+            if record.rclass != question.qclass
+                || normalize_question_name(&record.name) != question.qname
+            {
+                return None;
+            }
+            let endpoint = match record.record {
+                RecordData::A(address) => Some(SocketAddr::new(IpAddr::V4(address), 53)),
+                RecordData::AAAA(address) => Some(SocketAddr::new(IpAddr::V6(address), 53)),
+                _ => None,
+            };
+            if endpoint.is_some() {
+                min_ttl = Some(min_ttl.map_or(record.ttl, |ttl| ttl.min(record.ttl)));
+            }
+            endpoint
+        })
+        .collect();
+    (endpoints, min_ttl.unwrap_or(0))
 }
 
 /// Whether a referral learned while querying within `current_zone` may
@@ -8092,6 +8374,118 @@ mod tests {
         let requests = transport.requests.lock().unwrap();
         assert_eq!(requests.len(), 2);
         assert_eq!(requests[1], (referred, question, false));
+    }
+
+    #[tokio::test]
+    async fn recursive_backend_resolves_glueless_delegation_by_querying_ns_name_directly() {
+        // A zone cut delegates to a nameserver hosted under a completely
+        // different, unrelated domain -- the parent zone (e.g. a TLD) can't
+        // supply glue for it (a "glueless" delegation, as seen with e.g.
+        // redis.io -> ns-*.awsdns-*.{org,com,co.uk,net}). The resolver must
+        // fall back to resolving the NS hostname's address itself instead
+        // of giving up.
+        let question = QuestionKey::new("example.io", 1, 1);
+        let ns_question = QuestionKey::new("ns1.example.net", 1, 1);
+        let resolved_ns_addr: SocketAddr = "192.0.2.10:53".parse().unwrap();
+
+        let transport = Arc::new(ScriptedAuthorityTransport::new([
+            Ok(response_message_for_question(
+                question.clone(),
+                ResponseCode::NoError,
+                Vec::new(),
+                vec![ns_record("example.io", 300, "ns1.example.net")],
+                Vec::new(),
+                false,
+            )),
+            Ok(response_message_for_question(
+                ns_question,
+                ResponseCode::NoError,
+                vec![a_record("ns1.example.net", 60)],
+                Vec::new(),
+                Vec::new(),
+                true,
+            )),
+            Ok(response_message_for_question(
+                question.clone(),
+                ResponseCode::NoError,
+                vec![a_record("example.io", 60)],
+                Vec::new(),
+                Vec::new(),
+                true,
+            )),
+        ]));
+        let backend = recursive_backend(transport.clone());
+
+        let response = backend
+            .resolve(recursive_request("example.io"))
+            .await
+            .unwrap();
+
+        assert_eq!(response.answers().len(), 1);
+        {
+            let requests = transport.requests.lock().unwrap();
+            assert_eq!(requests.len(), 3);
+            // The final answer was fetched from the address resolved for
+            // the glueless NS name, not straight from the root.
+            assert_eq!(requests[2].0, resolved_ns_addr);
+        }
+
+        // The glueless delegation gets cached like a normal referral, so a
+        // repeat query for the same zone skips straight to it.
+        assert!(backend.delegation_cache.lookup("example.io", 1).is_some());
+    }
+
+    #[tokio::test]
+    async fn recursive_backend_bounds_glueless_delegation_ttl_by_resolved_address_ttl() {
+        // The referral's own NS TTL is long-lived, but the address record
+        // we resolve for the glueless NS name is short-lived. The cached
+        // delegation must be bounded by the shorter of the two -- otherwise
+        // the resolver could keep routing to a stale/changed authority
+        // address long after that address record itself expired.
+        let question = QuestionKey::new("example.io", 1, 1);
+        let ns_question = QuestionKey::new("ns1.example.net", 1, 1);
+
+        let transport = Arc::new(ScriptedAuthorityTransport::new([
+            Ok(response_message_for_question(
+                question.clone(),
+                ResponseCode::NoError,
+                Vec::new(),
+                vec![ns_record("example.io", 300, "ns1.example.net")],
+                Vec::new(),
+                false,
+            )),
+            Ok(response_message_for_question(
+                ns_question,
+                ResponseCode::NoError,
+                vec![a_record("ns1.example.net", 5)],
+                Vec::new(),
+                Vec::new(),
+                true,
+            )),
+            Ok(response_message_for_question(
+                question,
+                ResponseCode::NoError,
+                vec![a_record("example.io", 60)],
+                Vec::new(),
+                Vec::new(),
+                true,
+            )),
+        ]));
+        let backend = recursive_backend(transport);
+
+        backend
+            .resolve(recursive_request("example.io"))
+            .await
+            .unwrap();
+
+        let remaining = backend
+            .delegation_cache
+            .ttl_remaining_secs("example.io", 1)
+            .expect("glueless delegation should be cached");
+        assert!(
+            remaining <= 5,
+            "expected delegation TTL bounded by the resolved address's 5s TTL, got {remaining}s"
+        );
     }
 
     #[tokio::test]

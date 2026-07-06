@@ -50,12 +50,15 @@ impl MetricsSink for NoopMetrics {
     fn observe_duration(&self, _metric: ResolverMetric, _duration: Duration) {}
 }
 
-const DOMAINS: [&str; 5] = [
+const DOMAINS: [&str; 8] = [
     "google.com",
     "facebook.com",
     "amazon.com",
     "cloudflare.com",
     "wikipedia.org",
+    "nic.io",
+    "bbc.co.uk",
+    "redis.io",
 ];
 const ITERATIONS: usize = 30;
 
