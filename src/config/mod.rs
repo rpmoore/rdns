@@ -765,6 +765,15 @@ impl LocalDnsEntryConfig {
             DomainName::parse(&self.name).map_err(|_| ConfigError::InvalidLocalDnsEntryName {
                 name: self.name.clone(),
             })?;
+        // `DomainName::parse` accepts "" and "." as the DNS root; without
+        // this check a local entry could claim to be an override for the
+        // root itself, which isn't a real name a local override should ever
+        // be able to claim.
+        if name.is_root() {
+            return Err(ConfigError::InvalidLocalDnsEntryName {
+                name: self.name.clone(),
+            });
+        }
         validate_not_registered_tld(&name)?;
         let entry = LocalDnsEntry::new(
             name,
@@ -797,6 +806,17 @@ pub struct LocalZoneConfig {
 
 impl LocalZoneConfig {
     pub fn validate_root_domain(&self) -> Result<(), ConfigError> {
+        // The DNS root (`""`/`"."`) is a valid `DomainName`, but
+        // `is_at_or_below` treats it as containing every name — a zone
+        // declaring `root_domain = "."` would make the root-domain
+        // containment check in `parse_local_zone_file` a no-op, letting the
+        // zone define records anywhere rather than under a scoped local
+        // suffix, which defeats the whole point of the guardrail.
+        if self.root_domain.is_root() {
+            return Err(ConfigError::InvalidLocalZoneRootDomain {
+                root_domain: self.root_domain.to_string(),
+            });
+        }
         validate_not_registered_tld(&self.root_domain)
     }
 }
@@ -2536,6 +2556,27 @@ a.root-servers.net.      3600000      Aaaa  2001:503:ba3e::2:30
         ));
     }
 
+    #[test]
+    fn to_local_dns_entry_rejects_the_dns_root_as_a_name() {
+        for root_spelling in ["", "."] {
+            let entry = LocalDnsEntryConfig {
+                name: root_spelling.to_string(),
+                ipv4: vec![Ipv4Addr::new(192, 168, 1, 20)],
+                ipv6: Vec::new(),
+                ttl: 300,
+                enabled: true,
+                public_address_acknowledged: false,
+            };
+
+            let error = entry.to_local_dns_entry().unwrap_err();
+
+            assert!(
+                matches!(error, ConfigError::InvalidLocalDnsEntryName { .. }),
+                "expected {root_spelling:?} to be rejected, got {error:?}"
+            );
+        }
+    }
+
     fn local_zone(root_domain: &str) -> LocalZoneConfig {
         LocalZoneConfig {
             path: PathBuf::from("zones/test.zone"),
@@ -2577,6 +2618,25 @@ a.root-servers.net.      3600000      Aaaa  2001:503:ba3e::2:30
             error,
             ConfigError::InvalidLocalZoneRootDomain { .. }
         ));
+    }
+
+    #[test]
+    fn raw_local_zone_config_rejects_the_dns_root_as_a_root_domain() {
+        for root_spelling in ["", "."] {
+            let raw = RawLocalZoneConfig {
+                path: "zones/test.zone".to_string(),
+                root_domain: root_spelling.to_string(),
+                public_address_acknowledged: false,
+                enabled: true,
+            };
+
+            let error = raw.try_into_local_zone_config().unwrap_err();
+
+            assert!(
+                matches!(error, ConfigError::InvalidLocalZoneRootDomain { .. }),
+                "expected {root_spelling:?} to be rejected, got {error:?}"
+            );
+        }
     }
 
     #[test]
