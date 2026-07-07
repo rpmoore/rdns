@@ -15,6 +15,7 @@ path = [
     "docs/**",
     "justfile",
     "scripts/**",
+    "skills-lock.json",
     "src/**",
     "tests/**",
     "RUST.md",
