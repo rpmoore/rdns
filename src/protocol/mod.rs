@@ -19,6 +19,7 @@ use std::str;
 use std::time::Duration;
 
 use bytes::Bytes;
+use serde::Serialize;
 
 const DNS_HEADER_LEN: usize = 12;
 pub const DNS_DEFAULT_UDP_PAYLOAD_SIZE: usize = 512;
@@ -68,7 +69,7 @@ impl From<DnsParseError> for QueryValidationError {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub enum ResponseCode {
     NoError = 0,
     FormErr = 1,

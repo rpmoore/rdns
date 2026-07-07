@@ -39,6 +39,8 @@ use rdns::resolver::{
     ResolveQuery, ResolverMetric, StandardProtocolCodec,
 };
 use tokio::task::{JoinError, JoinSet};
+use tracing::{error, info, warn};
+use tracing_subscriber::EnvFilter;
 
 const DEFAULT_CACHE_ENTRIES: usize = 10_000;
 const DEFAULT_QUERY_EVENT_STORE_ENTRIES: usize = 10_000;
@@ -46,13 +48,26 @@ const QUERY_EVENT_QUEUE_CAPACITY: usize = 1024;
 const CONFIG_PATH_ENV_VAR: &str = "RDNS_CONFIG";
 const DEFAULT_CONFIG_PATH: &str = "config.toml";
 
+/// Installs the global `tracing` subscriber: JSON-formatted events on
+/// stdout, level controlled by `RUST_LOG` (defaults to `info`).
+fn init_logging() {
+    tracing_subscriber::fmt()
+        .json()
+        .flatten_event(true)
+        .with_env_filter(EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")))
+        .with_writer(io::stdout)
+        .init();
+}
+
 #[tokio::main]
 async fn main() -> io::Result<()> {
+    init_logging();
+
     let config_path = resolve_config_path();
     let config = load_runtime_config(config_path.as_deref())?;
     match &config_path {
-        Some(path) => println!("loaded config from {}", path.display()),
-        None => println!("no config file found; using built-in development defaults"),
+        Some(path) => info!(path = %path.display(), "loaded config"),
+        None => info!("no config file found; using built-in development defaults"),
     }
 
     let stdout_events = Arc::new(StdoutEvents);
@@ -81,12 +96,12 @@ async fn main() -> io::Result<()> {
     let metrics = OpenTelemetryMetrics::new()
         .map(|metrics| Arc::new(metrics) as Arc<dyn MetricsSink>)
         .unwrap_or_else(|error| {
-            eprintln!("failed to initialize OpenTelemetry metrics exporter: {error}");
+            error!(%error, "failed to initialize OpenTelemetry metrics exporter");
             Arc::new(NoopMetrics)
         });
     let backend_snapshot = build_backend_snapshot(&config, Arc::clone(&metrics))?;
     let (local_entries, local_entry_counts) = build_local_entries(&config, config_path.as_deref())?;
-    println!("loaded {}", local_entry_summary(&local_entry_counts));
+    info!(summary = %local_entry_summary(&local_entry_counts), "loaded local dns entries");
     let reload_metrics = Arc::clone(&metrics);
     let resolver = Arc::new(ResolveQuery::with_cache_policy_and_backend_snapshot(
         Arc::new(StandardProtocolCodec::new(config.max_udp_payload_size)),
@@ -132,7 +147,7 @@ async fn serve_until_shutdown(
         let address = server.local_addr()?;
         let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
         shutdown_senders.push(shutdown_tx);
-        println!("rdns listening on udp://{address}");
+        info!(%address, "rdns listening on udp");
         server_tasks.spawn(async move {
             server
                 .serve_until(async {
@@ -145,13 +160,13 @@ async fn serve_until_shutdown(
     tokio::select! {
         signal = tokio::signal::ctrl_c() => {
             signal?;
-            println!("shutdown requested");
+            info!("shutdown requested");
         }
         result = server_tasks.join_next() => {
             match result {
                 Some(result) => {
                     listener_task_result_to_io(result)?;
-                    println!("DNS listener stopped");
+                    warn!("DNS listener stopped");
                 }
                 None => return Ok(()),
             }
@@ -179,6 +194,9 @@ async fn serve_until_shutdown(
 }
 
 fn resolve_config_path() -> Option<PathBuf> {
+    if let Some(path) = parse_config_flag(std::env::args().skip(1)) {
+        return Some(path);
+    }
     if let Ok(path) = std::env::var(CONFIG_PATH_ENV_VAR) {
         let trimmed = path.trim();
         if !trimmed.is_empty() {
@@ -187,6 +205,27 @@ fn resolve_config_path() -> Option<PathBuf> {
     }
     let default_path = PathBuf::from(DEFAULT_CONFIG_PATH);
     default_path.exists().then_some(default_path)
+}
+
+/// Parses a `--config <path>` or `--config=<path>` flag out of an argv
+/// iterator (excluding argv[0]). A blank value is treated as absent so it
+/// falls through to the env var / default-file lookup, mirroring how the
+/// `RDNS_CONFIG` env var handles blank values.
+fn parse_config_flag<I: Iterator<Item = String>>(mut args: I) -> Option<PathBuf> {
+    while let Some(arg) = args.next() {
+        if let Some(value) = arg.strip_prefix("--config=") {
+            if !value.is_empty() {
+                return Some(PathBuf::from(value));
+            }
+        } else if arg == "--config" {
+            if let Some(value) = args.next() {
+                if !value.is_empty() {
+                    return Some(PathBuf::from(value));
+                }
+            }
+        }
+    }
+    None
 }
 
 fn load_runtime_config(path: Option<&Path>) -> io::Result<RuntimeConfig> {
@@ -418,17 +457,17 @@ fn spawn_sighup_reload_task(
         {
             Ok(signal) => signal,
             Err(error) => {
-                eprintln!("failed to install SIGHUP handler: {error}");
+                error!(%error, "failed to install SIGHUP handler");
                 return;
             }
         };
         loop {
             if hangup.recv().await.is_none() {
-                eprintln!("SIGHUP signal stream closed; stopping reload task");
+                warn!("SIGHUP signal stream closed; stopping reload task");
                 return;
             }
             let Some(path) = config_path.clone() else {
-                eprintln!("SIGHUP received but no config file was loaded at startup; ignoring");
+                warn!("SIGHUP received but no config file was loaded at startup; ignoring");
                 continue;
             };
             // Config parsing, every enabled zone file's disk read/parse,
@@ -462,24 +501,21 @@ fn apply_reload_result(
             counts,
         })) => {
             resolver.publish_reload(backend_snapshot, local_entries);
-            println!(
-                "reloaded config from {} ({} upstream(s), {})",
-                path.display(),
-                config.upstreams.len(),
-                local_entry_summary(&counts),
+            info!(
+                path = %path.display(),
+                upstreams = config.upstreams.len(),
+                summary = %local_entry_summary(&counts),
+                "reloaded config"
             )
         }
         Ok(Err(error)) => {
-            eprintln!("failed to reload config from {}: {error}", path.display())
+            error!(path = %path.display(), %error, "failed to reload config")
         }
         Err(join_error) if join_error.is_cancelled() => {
-            eprintln!(
-                "reload task for {} was cancelled: {join_error}",
-                path.display()
-            )
+            warn!(path = %path.display(), %join_error, "reload task was cancelled")
         }
         Err(join_error) => {
-            eprintln!("reload task for {} panicked: {join_error}", path.display())
+            error!(path = %path.display(), %join_error, "reload task panicked")
         }
     }
 }
@@ -588,7 +624,10 @@ struct StdoutEvents;
 
 impl StdoutEvents {
     fn record_ref(&self, event: &QueryEventV1) {
-        println!("{event:?}");
+        match serde_json::to_value(event) {
+            Ok(event) => info!(%event, "query event"),
+            Err(error) => error!(%error, event = ?event, "failed to serialize query event"),
+        }
     }
 }
 
@@ -1009,6 +1048,36 @@ mod tests {
     }
 
     #[test]
+    fn parse_config_flag_supports_space_and_equals_forms() {
+        let args = ["--config", "/etc/rdns/config.toml"].map(String::from);
+        assert_eq!(
+            parse_config_flag(args.into_iter()),
+            Some(PathBuf::from("/etc/rdns/config.toml"))
+        );
+
+        let args = ["--config=/etc/rdns/other.toml"].map(String::from);
+        assert_eq!(
+            parse_config_flag(args.into_iter()),
+            Some(PathBuf::from("/etc/rdns/other.toml"))
+        );
+    }
+
+    #[test]
+    fn parse_config_flag_ignores_blank_or_missing_value() {
+        let args = ["--config", ""].map(String::from);
+        assert_eq!(parse_config_flag(args.into_iter()), None);
+
+        let args = ["--config="].map(String::from);
+        assert_eq!(parse_config_flag(args.into_iter()), None);
+
+        let args = ["--config"].map(String::from);
+        assert_eq!(parse_config_flag(args.into_iter()), None);
+
+        let args: [String; 0] = [];
+        assert_eq!(parse_config_flag(args.into_iter()), None);
+    }
+
+    #[test]
     fn load_runtime_config_falls_back_to_development_default_without_a_path() {
         let config = load_runtime_config(None).unwrap();
 
@@ -1021,7 +1090,7 @@ mod tests {
             question: Some(QuestionKey::new(name, 1, 1)),
             kind: ResolveDecisionKind::Allowed,
         };
-        QueryEventV1::from_decision(0, SystemTime::UNIX_EPOCH, &decision, None, None, None)
+        QueryEventV1::from_decision(0, None, SystemTime::UNIX_EPOCH, &decision, None, None, None)
     }
 
     #[tokio::test]
