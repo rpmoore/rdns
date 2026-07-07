@@ -830,6 +830,122 @@ pub const MAX_LOCAL_ZONE_FILE_BYTES: u64 = 10 * 1024 * 1024;
 /// contribute (SOA/NS records don't count).
 const MAX_LOCAL_ZONE_RECORDS: usize = 10_000;
 
+/// Per-name accumulator for zone-file address records, keyed by owner name
+/// while parsing. The first TTL seen for a name (across either address
+/// family) wins, since `LocalDnsEntry` has one TTL per entry, not one per
+/// family.
+struct ZoneRecordAccumulator {
+    ipv4: Vec<Ipv4Addr>,
+    ipv6: Vec<Ipv6Addr>,
+    ttl: u32,
+}
+
+/// Returns the accumulator entry for `name`, recording it in `order` on
+/// first sight so entries stay ordered by first appearance in the zone
+/// file.
+fn zone_record_group<'a>(
+    name: &DomainName,
+    ttl: u32,
+    order: &mut Vec<DomainName>,
+    by_name: &'a mut HashMap<DomainName, ZoneRecordAccumulator>,
+) -> &'a mut ZoneRecordAccumulator {
+    by_name.entry(name.clone()).or_insert_with(|| {
+        order.push(name.clone());
+        ZoneRecordAccumulator {
+            ipv4: Vec::new(),
+            ipv6: Vec::new(),
+            ttl,
+        }
+    })
+}
+
+/// Validates and accumulates a single zone-file `entry` into `order`/`by_name`,
+/// returning the updated `record_count`. `SOA`/`NS` records are recognized and
+/// skipped (not counted); any other unsupported record type, an `$INCLUDE`
+/// directive, a non-`IN` class, or a name outside `zone.root_domain` is a
+/// hard error.
+fn accumulate_zone_entry(
+    zone: &LocalZoneConfig,
+    entry: Entry,
+    record_count: usize,
+    order: &mut Vec<DomainName>,
+    by_name: &mut HashMap<DomainName, ZoneRecordAccumulator>,
+) -> Result<usize, ConfigError> {
+    let record = match entry {
+        Entry::Include { .. } => {
+            return Err(ConfigError::LocalZoneIncludeDirectiveUnsupported {
+                path: zone.path.clone(),
+            });
+        }
+        Entry::Record(record) => record,
+    };
+
+    let owner_name = record.owner().to_string();
+    let name =
+        DomainName::parse(&owner_name).map_err(|_| ConfigError::InvalidLocalDnsEntryName {
+            name: owner_name.clone(),
+        })?;
+
+    // rdns's local-entry lookup only ever answers qclass IN
+    // (`InMemoryLocalDnsEntries::lookup`), so a non-IN record loaded
+    // here would otherwise be silently served to ordinary IN clients,
+    // crossing DNS class separation. Reject it instead. (The zonefile
+    // scanner already requires one consistent class per file, but that
+    // invariant says nothing about *which* class — this checks that
+    // too.)
+    if record.class() != Class::IN {
+        return Err(ConfigError::LocalZoneUnsupportedClass {
+            path: zone.path.clone(),
+            name: name.to_string(),
+            class: format!("{:?}", record.class()),
+        });
+    }
+
+    let rtype = record.data().rtype();
+    if rtype == Rtype::SOA || rtype == Rtype::NS {
+        return Ok(record_count);
+    }
+    if !name.is_at_or_below(&zone.root_domain) {
+        return Err(ConfigError::LocalZoneRecordOutOfRoot {
+            path: zone.path.clone(),
+            name: name.to_string(),
+            root_domain: zone.root_domain.to_string(),
+        });
+    }
+
+    let record_count = record_count + 1;
+    if record_count > MAX_LOCAL_ZONE_RECORDS {
+        return Err(ConfigError::LocalZoneTooManyRecords {
+            path: zone.path.clone(),
+            count: record_count,
+            max: MAX_LOCAL_ZONE_RECORDS,
+        });
+    }
+
+    let ttl = record.ttl().as_secs();
+    match record.data() {
+        ZoneRecordData::A(a) => {
+            zone_record_group(&name, ttl, order, by_name)
+                .ipv4
+                .push(a.addr());
+        }
+        ZoneRecordData::Aaaa(aaaa) => {
+            zone_record_group(&name, ttl, order, by_name)
+                .ipv6
+                .push(aaaa.addr());
+        }
+        other => {
+            return Err(ConfigError::LocalZoneUnsupportedRecordType {
+                path: zone.path.clone(),
+                name: name.to_string(),
+                record_type: format!("{:?}", other.rtype()),
+            });
+        }
+    }
+
+    Ok(record_count)
+}
+
 /// Parses BIND-format zone file `content` (already read from disk by the
 /// caller — this function does no I/O) against an already-validated
 /// `LocalZoneConfig`, returning the `LocalDnsEntryConfig`s derived from its
@@ -866,7 +982,7 @@ pub fn parse_local_zone_file(
     // family) wins for the whole entry, since rdns's `LocalDnsEntry` model
     // has one TTL per entry, not one per family.
     let mut order: Vec<DomainName> = Vec::new();
-    let mut by_name: HashMap<DomainName, (Vec<Ipv4Addr>, Vec<Ipv6Addr>, u32)> = HashMap::new();
+    let mut by_name: HashMap<DomainName, ZoneRecordAccumulator> = HashMap::new();
     let mut record_count: usize = 0;
 
     while let Some(entry) =
@@ -877,89 +993,13 @@ pub fn parse_local_zone_file(
                 message: error.to_string(),
             })?
     {
-        let record = match entry {
-            Entry::Include { .. } => {
-                return Err(ConfigError::LocalZoneIncludeDirectiveUnsupported {
-                    path: zone.path.clone(),
-                });
-            }
-            Entry::Record(record) => record,
-        };
-
-        let owner_name = record.owner().to_string();
-        let name =
-            DomainName::parse(&owner_name).map_err(|_| ConfigError::InvalidLocalDnsEntryName {
-                name: owner_name.clone(),
-            })?;
-
-        // rdns's local-entry lookup only ever answers qclass IN
-        // (`InMemoryLocalDnsEntries::lookup`), so a non-IN record loaded
-        // here would otherwise be silently served to ordinary IN clients,
-        // crossing DNS class separation. Reject it instead. (The zonefile
-        // scanner already requires one consistent class per file, but that
-        // invariant says nothing about *which* class — this checks that
-        // too.)
-        if record.class() != Class::IN {
-            return Err(ConfigError::LocalZoneUnsupportedClass {
-                path: zone.path.clone(),
-                name: name.to_string(),
-                class: format!("{:?}", record.class()),
-            });
-        }
-
-        let rtype = record.data().rtype();
-        if rtype == Rtype::SOA || rtype == Rtype::NS {
-            continue;
-        }
-        if !name.is_at_or_below(&zone.root_domain) {
-            return Err(ConfigError::LocalZoneRecordOutOfRoot {
-                path: zone.path.clone(),
-                name: name.to_string(),
-                root_domain: zone.root_domain.to_string(),
-            });
-        }
-
-        record_count += 1;
-        if record_count > MAX_LOCAL_ZONE_RECORDS {
-            return Err(ConfigError::LocalZoneTooManyRecords {
-                path: zone.path.clone(),
-                count: record_count,
-                max: MAX_LOCAL_ZONE_RECORDS,
-            });
-        }
-
-        let ttl = record.ttl().as_secs();
-        match record.data() {
-            ZoneRecordData::A(a) => {
-                let addr = a.addr();
-                let group = by_name.entry(name.clone()).or_insert_with(|| {
-                    order.push(name.clone());
-                    (Vec::new(), Vec::new(), ttl)
-                });
-                group.0.push(addr);
-            }
-            ZoneRecordData::Aaaa(aaaa) => {
-                let addr = aaaa.addr();
-                let group = by_name.entry(name.clone()).or_insert_with(|| {
-                    order.push(name.clone());
-                    (Vec::new(), Vec::new(), ttl)
-                });
-                group.1.push(addr);
-            }
-            other => {
-                return Err(ConfigError::LocalZoneUnsupportedRecordType {
-                    path: zone.path.clone(),
-                    name: name.to_string(),
-                    record_type: format!("{:?}", other.rtype()),
-                });
-            }
-        }
+        record_count = accumulate_zone_entry(zone, entry, record_count, &mut order, &mut by_name)?;
     }
 
     Ok(order
         .into_iter()
         .map(|name| {
-            let (ipv4, ipv6, ttl) = by_name
+            let ZoneRecordAccumulator { ipv4, ipv6, ttl } = by_name
                 .remove(&name)
                 .expect("every name in `order` was inserted into `by_name` at the same time");
             LocalDnsEntryConfig {

@@ -4,7 +4,7 @@ Guidance for Codex and other coding agents working in this repository.
 
 ## Project Context
 
-`rdns` is a Rust DNS resolver/proxy. It uses Tokio for async networking, keeps DNS protocol logic in explicit domain modules, and uses traits at important boundaries so resolver behavior can be tested without real network I/O.
+`rdns` is a Rust DNS resolver/proxy. It uses Tokio for async networking, keeps DNS protocol logic in explicit domain modules, and uses traits at important boundaries so resolver behavior can be tested without real network I/O. See `RUST.md` for Rust-specific standards (formatting, linting, testing, error handling, dependencies).
 
 ## Automatic Triggers
 
@@ -27,17 +27,7 @@ These run without being asked, no explicit request needed:
 
 ## Rust Code Standards
 
-- Run `cargo fmt` before finalizing Rust changes.
-- Run `cargo test` for behavior changes. Narrow tests are fine while iterating, but prefer the full suite before finishing.
-- Prefer clear domain types over primitive-heavy APIs and loosely structured tuples.
-- Keep public APIs small and intentional. Expose only what other modules or tests need.
-- Use `Result<T, E>` with meaningful error types for recoverable failures.
-- Avoid `unwrap` and `expect` in production code unless the invariant is local and obvious.
-- Keep async I/O at the edges. Put parsing, validation, transformation, and policy decisions in synchronous helpers where practical.
-- Preserve existing copyright and license headers in Rust source files.
-- Add dependencies conservatively. A new crate should improve correctness, reduce real complexity, or match an established project pattern.
-- Prefer deterministic tests. Avoid sleeps, wall-clock dependence, and real network access unless the test is intentionally integration-level.
-- Avoid unnecessary data copying; prefer borrowing or sharing buffers when possible.
+See `RUST.md` for Rust-specific formatting, linting, testing, and code-standard rules (fmt/clippy/test gates, error handling, dependency policy, etc.). That file is the source of truth for anything toolchain- or language-level; this file stays scoped to process and workflow.
 
 ## Software Development Practices
 
@@ -66,6 +56,7 @@ These run without being asked, no explicit request needed:
 - When reviewing GitHub PR feedback, always mark the feedback as resolved when the feedback has been addressed, or state why the comment was not addressed.
 - After drafting an implementation plan (Plan mode or `/deep-plan`) and before presenting it for approval, auto-run `/codex:adversarial-review` on the plan itself. Address feedback or state why not, same as diff review.
 - After nontrivial code changes and before reporting the task done, auto-run the `verify` skill against the affected flow. Skip for test-only or doc-only diffs.
+- Before reporting any Rust change done, satisfy the fmt/clippy/test gates in `RUST.md`.
 - Before opening a PR that touches auth, parsing of untrusted input, or network-facing code, auto-run `/security-review`.
 - After changes, summarize what changed and which verification commands were run.
 

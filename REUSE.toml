@@ -17,6 +17,7 @@ path = [
     "scripts/**",
     "src/**",
     "tests/**",
+    "RUST.md",
 ]
 precedence = "override"
 SPDX-FileCopyrightText = "2023 Ryan Moore"

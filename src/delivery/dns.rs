@@ -123,27 +123,19 @@ impl UdpDnsServer {
         let semaphore = Arc::new(Semaphore::new(self.max_in_flight_requests));
         let mut tasks = JoinSet::new();
         loop {
-            if tasks.is_empty() {
-                tokio::select! {
-                    _ = &mut shutdown => break,
-                    result = self.receive_permitted_datagram(semaphore.clone()) => {
-                        if !self.spawn_received_datagram(result?, &mut tasks) {
-                            break;
-                        }
+            // The `join_next()` branch is guarded so it's never polled while
+            // `tasks` is empty; an unguarded call would resolve to `None`
+            // immediately and busy-loop the select.
+            tokio::select! {
+                _ = &mut shutdown => break,
+                result = self.receive_permitted_datagram(semaphore.clone()) => {
+                    if !self.spawn_received_datagram(result?, &mut tasks) {
+                        break;
                     }
                 }
-            } else {
-                tokio::select! {
-                    _ = &mut shutdown => break,
-                    result = self.receive_permitted_datagram(semaphore.clone()) => {
-                        if !self.spawn_received_datagram(result?, &mut tasks) {
-                            break;
-                        }
-                    }
-                    result = tasks.join_next() => {
-                        if let Some(result) = result {
-                            task_result_to_io(result)??;
-                        }
+                result = tasks.join_next(), if !tasks.is_empty() => {
+                    if let Some(result) = result {
+                        task_result_to_io(result)??;
                     }
                 }
             }

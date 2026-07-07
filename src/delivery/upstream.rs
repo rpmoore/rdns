@@ -495,36 +495,38 @@ impl RecursiveAuthorityTransportClient {
         response_bytes.truncate(response_len);
 
         if truncated_authority_response_matches_question(question, &response_bytes, authority_id)? {
-            if self.transport_allowed(RecursiveTransport::Tcp) {
-                return self
-                    .query_authority_tcp_fallback(
-                        authority,
-                        question,
-                        query,
-                        authority_id,
-                        deadline,
-                    )
-                    .await;
-            }
-            return Err(UpstreamError::MalformedResponse);
+            return self
+                .tcp_fallback_or_malformed(authority, question, query, authority_id, deadline)
+                .await;
         }
 
         let response = validate_authority_response(question, &response_bytes, authority_id)?;
         if response.header.tc() {
-            if self.transport_allowed(RecursiveTransport::Tcp) {
-                return self
-                    .query_authority_tcp_fallback(
-                        authority,
-                        question,
-                        query,
-                        authority_id,
-                        deadline,
-                    )
-                    .await;
-            }
-            return Err(UpstreamError::MalformedResponse);
+            return self
+                .tcp_fallback_or_malformed(authority, question, query, authority_id, deadline)
+                .await;
         }
         RecursiveAuthorityResponse::new(response_bytes, response)
+    }
+
+    /// Retries over TCP when it's an allowed transport, otherwise reports the
+    /// UDP response as malformed. Shared by the two UDP truncation signals: a
+    /// header/edns-derived `TC` flag mismatch caught before full parsing, and
+    /// the `TC` bit read from the parsed response header.
+    async fn tcp_fallback_or_malformed(
+        &self,
+        authority: SocketAddr,
+        question: &QuestionKey,
+        query: &[u8],
+        authority_id: u16,
+        deadline: Instant,
+    ) -> Result<RecursiveAuthorityResponse, UpstreamError> {
+        if self.transport_allowed(RecursiveTransport::Tcp) {
+            return self
+                .query_authority_tcp_fallback(authority, question, query, authority_id, deadline)
+                .await;
+        }
+        Err(UpstreamError::MalformedResponse)
     }
 
     async fn query_authority_tcp_fallback(
