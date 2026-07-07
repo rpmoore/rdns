@@ -32,6 +32,12 @@ use tokio::task::JoinSet;
 
 const DEFAULT_MAX_CONNECTIONS: usize = 32;
 const SHUTDOWN_GRACE_PERIOD: Duration = Duration::from_secs(1);
+/// Caps how long a single connection (including idle keep-alive time
+/// between requests) may hold a semaphore permit. Without this, a client
+/// that opens a connection and never sends a request — or never closes one
+/// — would starve `max_connections` scrapes indefinitely, since there's no
+/// TLS/auth in front of this endpoint to discourage that.
+const CONNECTION_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Serves a single `GET /metrics` route with the current Prometheus registry
 /// encoded as text exposition format. No TLS, no auth — the endpoint's own
@@ -134,14 +140,17 @@ impl MetricsServer {
         tasks.spawn(async move {
             let _permit = permit;
             let io = TokioIo::new(stream);
-            if let Err(error) = hyper::server::conn::http1::Builder::new()
-                .serve_connection(
-                    io,
-                    service_fn(move |req| handle_request(req, registry.clone())),
-                )
-                .await
-            {
-                tracing::warn!(%error, "metrics server connection error");
+            let serve = hyper::server::conn::http1::Builder::new().serve_connection(
+                io,
+                service_fn(move |req| handle_request(req, registry.clone())),
+            );
+            match tokio::time::timeout(CONNECTION_TIMEOUT, serve).await {
+                Ok(Ok(())) => {}
+                Ok(Err(error)) => tracing::warn!(%error, "metrics server connection error"),
+                Err(_) => tracing::warn!(
+                    timeout_secs = CONNECTION_TIMEOUT.as_secs(),
+                    "metrics server connection timed out"
+                ),
             }
         });
     }
@@ -230,8 +239,9 @@ mod tests {
         let (addr, shutdown_tx, task) = run_server(registry).await;
 
         let response = http_get(addr, "/metrics").await;
-        assert!(response.starts_with("HTTP/1.1 200"));
-        assert!(response.contains("content-type: text/plain; version=0.0.4; charset=utf-8"));
+        let lower = response.to_ascii_lowercase();
+        assert!(lower.starts_with("http/1.1 200"));
+        assert!(lower.contains("content-type: text/plain; version=0.0.4; charset=utf-8"));
         assert!(response.contains("test_counter_total 1"));
 
         shutdown_tx.send(()).unwrap();

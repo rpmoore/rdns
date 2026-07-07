@@ -1,10 +1,10 @@
 # rdns runtime configuration.
 #
 # Loaded on startup, and re-loaded on SIGHUP (resolution, upstreams, and
-# local_dns_entries — dns_listen changes require a restart). Override the
-# path with the RDNS_CONFIG environment variable; if neither RDNS_CONFIG
-# nor this file is present, rdns falls back to built-in loopback
-# development defaults.
+# local_dns_entries — dns_listen and [metrics] changes require a restart).
+# Override the path with the RDNS_CONFIG environment variable; if neither
+# RDNS_CONFIG nor this file is present, rdns falls back to built-in
+# loopback development defaults.
 
 # LAN-facing bind on the standard port. Needs root or
 # `setcap cap_net_bind_service=+ep` on the built binary (see README).

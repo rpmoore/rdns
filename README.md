@@ -310,8 +310,9 @@ kill -HUP <pid>
   between `forward` and `recursive` mode. A `[[local_zones]]` file is
   re-read from disk on every reload, so editing the zone file itself and
   sending `SIGHUP` picks up the change too, without touching `config.toml`.
-- `dns_listen` changes are **not** picked up on SIGHUP — changing listen
-  addresses/ports requires a restart.
+- `dns_listen` and `[metrics]` changes are **not** picked up on SIGHUP —
+  changing DNS listen addresses/ports, or the metrics endpoint's
+  address/enabled state, requires a restart.
 - No effect if rdns started with no config file (built-in dev defaults) —
   there's nothing to re-read.
 
@@ -340,7 +341,14 @@ max_connections = 32        # concurrent HTTP connection cap
 If `[metrics]` is omitted, these are the defaults — the endpoint is on by
 default. A bind failure (e.g. the port is already in use by something else
 on the host) is logged and does **not** prevent rdns from starting or
-serving DNS; it just runs without a metrics endpoint that run.
+serving DNS; it just runs without a metrics endpoint for that run.
+
+`[metrics]` is **restart-only** — unlike `[resolution]`/`[[upstreams]]`/
+`[[local_dns_entries]]`, changes here (including `enabled = false`) are not
+picked up on `SIGHUP`. A reload log line reporting success does not mean the
+metrics listener's address or enabled state changed; it keeps running with
+whatever `[metrics]` config was in effect at startup until the process is
+restarted.
 
 Includes request/cache counters (`query_received_total`, `cache_hit_total`,
 `cache_miss_total`, ...), latency histograms split by cache-hit vs.

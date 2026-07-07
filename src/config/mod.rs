@@ -130,6 +130,11 @@ impl RuntimeConfig {
 
         if self.metrics.enabled {
             validate_listen_address(self.metrics.listen)?;
+            if self.metrics.max_connections == 0 {
+                return Err(ConfigError::InvalidMetricsMaxConnections {
+                    value: self.metrics.max_connections,
+                });
+            }
         }
 
         let mut normalized_local_names = HashSet::with_capacity(self.local_dns_entries.len());
@@ -1144,6 +1149,9 @@ pub enum ConfigError {
     },
     InvalidTomlConfig {
         message: String,
+    },
+    InvalidMetricsMaxConnections {
+        value: usize,
     },
 }
 
@@ -2344,6 +2352,40 @@ a.root-servers.net.      3600000      Aaaa  2001:503:ba3e::2:30
         let error = RuntimeConfig::from_toml_str(&toml).unwrap_err();
 
         assert!(matches!(error, ConfigError::InvalidListenAddress { .. }));
+    }
+
+    #[test]
+    fn metrics_config_rejects_zero_max_connections_when_enabled() {
+        let mut toml = valid_toml();
+        toml.push_str(
+            r#"
+            [metrics]
+            max_connections = 0
+            "#,
+        );
+
+        let error = RuntimeConfig::from_toml_str(&toml).unwrap_err();
+
+        assert_eq!(
+            error,
+            ConfigError::InvalidMetricsMaxConnections { value: 0 }
+        );
+    }
+
+    #[test]
+    fn metrics_config_allows_zero_max_connections_when_disabled() {
+        let mut toml = valid_toml();
+        toml.push_str(
+            r#"
+            [metrics]
+            enabled = false
+            max_connections = 0
+            "#,
+        );
+
+        let config = RuntimeConfig::from_toml_str(&toml).unwrap();
+
+        assert_eq!(config.metrics.max_connections, 0);
     }
 
     #[test]

@@ -204,11 +204,15 @@ async fn serve_until_shutdown(
         let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
         info!(%address, "rdns metrics listening on http");
         let task = tokio::spawn(async move {
-            metrics_server
+            let result = metrics_server
                 .serve_until(async {
                     let _ = shutdown_rx.await;
                 })
-                .await
+                .await;
+            if let Err(error) = &result {
+                warn!(%error, "metrics listener exited with an error");
+            }
+            result
         });
         (shutdown_tx, task)
     });
@@ -239,10 +243,11 @@ async fn serve_until_shutdown(
 
     if let Some((shutdown_tx, task)) = metrics_shutdown {
         let _ = shutdown_tx.send(());
-        match task.await {
-            Ok(Ok(())) => {}
-            Ok(Err(error)) => warn!(%error, "metrics listener exited with an error"),
-            Err(join_error) => warn!(%join_error, "metrics listener task panicked"),
+        // The `io::Error` case is already logged inside the spawned task the
+        // moment `serve_until` returns (see above) — only the panic case is
+        // worth surfacing here, so we don't double-log the same failure.
+        if let Err(join_error) = task.await {
+            warn!(%join_error, "metrics listener task panicked");
         }
     }
 
