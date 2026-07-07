@@ -31,8 +31,8 @@ use rdns::delivery::metrics_http::MetricsServer;
 use rdns::delivery::upstream::{ForwardingResolutionBackend, RecursiveAuthorityTransportClient};
 use rdns::resolver::{
     BackendHealth, BackendRootHintsStatus, BackendSnapshot, BackendStatus, BasicResponseFactory,
-    CacheTtlPolicy, ChannelQueryEventSink, Clock, DnssecValidationStatus, DomainName,
-    DnsCache, InMemoryDnsCache, InMemoryLocalDnsEntries, InMemoryQueryEventStore,
+    CacheTtlPolicy, ChannelQueryEventSink, Clock, DnsCache, DnssecValidationStatus, DomainName,
+    InMemoryDnsCache, InMemoryLocalDnsEntries, InMemoryQueryEventStore,
     InMemoryQueryEventStoreConfig, InMemorySuspiciousLookupClassifier,
     InMemorySuspiciousLookupClassifierConfig, LocalDnsEntry, MetricsSink, NoopPolicyEvaluator,
     QueryEventRecordResult, QueryEventSink, QueryEventV1, RecursiveResolutionBackend,
@@ -97,21 +97,20 @@ async fn main() -> io::Result<()> {
     };
 
     let cache = Arc::new(InMemoryDnsCache::new(DEFAULT_CACHE_ENTRIES));
-    let (metrics, metrics_registry): (Arc<dyn MetricsSink>, Registry) =
-        if !config.metrics.enabled {
-            (Arc::new(NoopMetrics), Registry::new())
-        } else {
-            match OpenTelemetryMetrics::new(Arc::clone(&cache)) {
-                Ok(m) => {
-                    let registry = m.registry.clone();
-                    (Arc::new(m), registry)
-                }
-                Err(error) => {
-                    error!(%error, "failed to initialize Prometheus metrics exporter");
-                    (Arc::new(NoopMetrics), Registry::new())
-                }
+    let (metrics, metrics_registry): (Arc<dyn MetricsSink>, Registry) = if !config.metrics.enabled {
+        (Arc::new(NoopMetrics), Registry::new())
+    } else {
+        match OpenTelemetryMetrics::new(Arc::clone(&cache)) {
+            Ok(m) => {
+                let registry = m.registry.clone();
+                (Arc::new(m), registry)
             }
-        };
+            Err(error) => {
+                error!(%error, "failed to initialize Prometheus metrics exporter");
+                (Arc::new(NoopMetrics), Registry::new())
+            }
+        }
+    };
     let backend_snapshot = build_backend_snapshot(&config, Arc::clone(&metrics))?;
     let (local_entries, local_entry_counts) = build_local_entries(&config, config_path.as_deref())?;
     info!(summary = %local_entry_summary(&local_entry_counts), "loaded local dns entries");

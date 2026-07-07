@@ -3686,7 +3686,8 @@ impl ResolveQuery {
                 // Bypass/Unavailable didn't go through a normal cache lookup, and
                 // None covers protocol errors/policy blocks/local answers — none
                 // of these are cache-hit or backend-round-trip latency.
-                Some(QueryEventCacheResult::Bypass) | Some(QueryEventCacheResult::Unavailable)
+                Some(QueryEventCacheResult::Bypass)
+                | Some(QueryEventCacheResult::Unavailable)
                 | None => {}
             }
         }
@@ -13472,7 +13473,10 @@ mod tests {
         // dominated by waiting on the leader's full backend round trip — it
         // must not land in the fast-hit latency bucket alongside genuine
         // cache hits.
-        assert_eq!(metrics.duration_count(ResolverMetric::CacheHitQueryDuration), 0);
+        assert_eq!(
+            metrics.duration_count(ResolverMetric::CacheHitQueryDuration),
+            0
+        );
         assert_eq!(
             metrics.duration_count(ResolverMetric::CacheMissQueryDuration),
             2

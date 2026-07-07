@@ -135,7 +135,10 @@ impl MetricsServer {
             let _permit = permit;
             let io = TokioIo::new(stream);
             if let Err(error) = hyper::server::conn::http1::Builder::new()
-                .serve_connection(io, service_fn(move |req| handle_request(req, registry.clone())))
+                .serve_connection(
+                    io,
+                    service_fn(move |req| handle_request(req, registry.clone())),
+                )
                 .await
             {
                 tracing::warn!(%error, "metrics server connection error");
@@ -181,7 +184,13 @@ mod tests {
     use super::*;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-    async fn run_server(registry: Registry) -> (SocketAddr, tokio::sync::oneshot::Sender<()>, tokio::task::JoinHandle<io::Result<()>>) {
+    async fn run_server(
+        registry: Registry,
+    ) -> (
+        SocketAddr,
+        tokio::sync::oneshot::Sender<()>,
+        tokio::task::JoinHandle<io::Result<()>>,
+    ) {
         let server = MetricsServer::bind("127.0.0.1:0".parse().unwrap(), registry)
             .await
             .unwrap();
@@ -200,7 +209,10 @@ mod tests {
     async fn http_get(addr: SocketAddr, path: &str) -> String {
         let mut stream = TcpStream::connect(addr).await.unwrap();
         stream
-            .write_all(format!("GET {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n").as_bytes())
+            .write_all(
+                format!("GET {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+                    .as_bytes(),
+            )
             .await
             .unwrap();
         let mut response = String::new();
