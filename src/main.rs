@@ -31,9 +31,9 @@ use rdns::delivery::upstream::{ForwardingResolutionBackend, RecursiveAuthorityTr
 use rdns::resolver::{
     BackendHealth, BackendRootHintsStatus, BackendSnapshot, BackendStatus, BasicResponseFactory,
     CacheTtlPolicy, ChannelQueryEventSink, Clock, DnssecValidationStatus, DomainName,
-    InMemoryDnsCache, InMemoryLocalDnsEntries, InMemoryQueryEventStore, LocalDnsEntry,
+    InMemoryDnsCache, InMemoryLocalDnsEntries, InMemoryQueryEventStore,
     InMemoryQueryEventStoreConfig, InMemorySuspiciousLookupClassifier,
-    InMemorySuspiciousLookupClassifierConfig, MetricsSink, NoopPolicyEvaluator,
+    InMemorySuspiciousLookupClassifierConfig, LocalDnsEntry, MetricsSink, NoopPolicyEvaluator,
     QueryEventRecordResult, QueryEventSink, QueryEventV1, RecursiveResolutionBackend,
     RecursiveResolverConfig, RecursiveRootHint, ResolutionMode as ResolverResolutionMode,
     ResolveQuery, ResolverMetric, StandardProtocolCodec,
@@ -541,20 +541,18 @@ fn build_recursive_backend_snapshot(
         transport,
         metrics,
     ));
-    Ok(
-        BackendSnapshot::new(
-            backend,
-            ResolverResolutionMode::Recursive,
-            config.resolution.generation,
-            BackendHealth::Healthy,
-            Some(config.backend_cache_namespace()),
-        )
-        .with_root_hints_status(BackendRootHintsStatus::loaded(
-            root_hints_source_label(&recursive.root_hints_source),
-            recursive.root_hints_version.clone(),
-            SystemTime::now(),
-        )),
+    Ok(BackendSnapshot::new(
+        backend,
+        ResolverResolutionMode::Recursive,
+        config.resolution.generation,
+        BackendHealth::Healthy,
+        Some(config.backend_cache_namespace()),
     )
+    .with_root_hints_status(BackendRootHintsStatus::loaded(
+        root_hints_source_label(&recursive.root_hints_source),
+        recursive.root_hints_version.clone(),
+        SystemTime::now(),
+    )))
 }
 
 fn root_hints_source_label(source: &ConfigRootHintsSource) -> &'static str {

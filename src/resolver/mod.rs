@@ -5711,7 +5711,13 @@ impl RecursiveResolutionBackend {
                 };
 
                 match self
-                    .evaluate_authority_response(state, request, authority, response, query_deadline)
+                    .evaluate_authority_response(
+                        state,
+                        request,
+                        authority,
+                        response,
+                        query_deadline,
+                    )
                     .await
                 {
                     AuthorityResponseOutcome::Return(result) => {
@@ -5728,7 +5734,7 @@ impl RecursiveResolutionBackend {
         }
 
         HopOutcome::Return(Box::new(Err(
-            last_error.unwrap_or(ResolutionBackendError::NoBackendsAvailable),
+            last_error.unwrap_or(ResolutionBackendError::NoBackendsAvailable)
         )))
     }
 
@@ -6042,7 +6048,14 @@ impl RecursiveResolutionBackend {
                 }
 
                 match self
-                    .resolve_ns_hop(&question, &mut state, &authorities, qclass, deadline, depth_budget)
+                    .resolve_ns_hop(
+                        &question,
+                        &mut state,
+                        &authorities,
+                        qclass,
+                        deadline,
+                        depth_budget,
+                    )
                     .await
                 {
                     NsHopOutcome::Return(endpoints, ttl) => return (endpoints, ttl),
@@ -6097,7 +6110,14 @@ impl RecursiveResolutionBackend {
                 };
 
                 match self
-                    .evaluate_ns_response(question, state, qclass, deadline, depth_budget, &response)
+                    .evaluate_ns_response(
+                        question,
+                        state,
+                        qclass,
+                        deadline,
+                        depth_budget,
+                        &response,
+                    )
                     .await
                 {
                     NsResponseOutcome::Return(endpoints, ttl) => {

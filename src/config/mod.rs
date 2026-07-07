@@ -921,7 +921,9 @@ fn accumulate_zone_entry(
     let ttl = record.ttl().as_secs();
     match record.data() {
         ZoneRecordData::A(a) => {
-            zone_record_group(&name, ttl, order, by_name).0.push(a.addr());
+            zone_record_group(&name, ttl, order, by_name)
+                .0
+                .push(a.addr());
         }
         ZoneRecordData::Aaaa(aaaa) => {
             zone_record_group(&name, ttl, order, by_name)
