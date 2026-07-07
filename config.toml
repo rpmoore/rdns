@@ -6,34 +6,39 @@
 # nor this file is present, rdns falls back to built-in loopback
 # development defaults.
 
-# Bind loopback:5300 by default so `cargo run` works without root.
-# For real LAN use, bind :53 on a LAN-facing address (e.g. "0.0.0.0:53")
-# and run with root or `setcap cap_net_bind_service=+ep` on the built binary.
-dns_listen = ["127.0.0.1:5300"]
+# LAN-facing bind on the standard port. Needs root or
+# `setcap cap_net_bind_service=+ep` on the built binary (see README).
+dns_listen = ["0.0.0.0:53"]
 per_query_deadline_ms = 2000
 max_udp_payload_size = 1232
 
-# Upstream resolvers used for anything not answered locally, tried in
-# priority order (lower number first).
-[[upstreams]]
-name = "cloudflare"
-endpoint = "1.1.1.1:53"
-protocol = "udp"
-enabled = true
-priority = 10
-timeout_ms = 750
+# Recursive mode: rdns walks root -> TLD -> authority itself for anything
+# not answered locally. [[upstreams]] is ignored in this mode.
+[resolution]
+mode = "recursive"
 
-# Local DNS entries answer exact names for devices on your network.
-# public_address_acknowledged must be true if ipv4/ipv6 contain a
-# public/routable address (private/loopback/link-local addresses don't
-# need it).
+[resolution.recursive]
+root_hints = "bundled"
+root_hints_version = "bundled:v1"
+
+# Local DNS entries answer exact names for devices on your network,
+# suffix ".lan". public_address_acknowledged must be true if ipv4/ipv6
+# contain a public/routable address (private/loopback/link-local
+# addresses don't need it).
 #
-# Example entry — disabled by default so a fresh checkout of this file
-# doesn't answer a fake "nas.lan" record on your real network. Copy it,
-# fill in your own device's name/address, and flip enabled to true.
+# Example entries — disabled by default so a fresh checkout of this file
+# doesn't answer fake records on your real network. Copy, fill in your
+# own device names/addresses, flip enabled to true.
 [[local_dns_entries]]
 name = "nas.lan"
 ipv4 = ["192.168.1.10"]
+ttl = 300
+enabled = false
+public_address_acknowledged = false
+
+[[local_dns_entries]]
+name = "printer.lan"
+ipv4 = ["192.168.1.20"]
 ttl = 300
 enabled = false
 public_address_acknowledged = false

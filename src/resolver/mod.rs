@@ -23,6 +23,7 @@ use std::sync::{
 use std::time::{Duration, SystemTime};
 
 use bytes::Bytes;
+use serde::Serialize;
 use tokio::sync::{mpsc, Notify};
 use tokio::task::JoinSet;
 use tokio::time::{self, Instant};
@@ -62,7 +63,7 @@ pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ReceivedAt(pub SystemTime);
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize)]
 pub struct ObservedSourceEndpoint {
     pub ip: IpAddr,
     pub port: Option<u16>,
@@ -70,7 +71,7 @@ pub struct ObservedSourceEndpoint {
     pub listener: Option<SocketAddr>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
 pub enum QueryTransport {
     Udp,
 }
@@ -111,6 +112,11 @@ pub struct ResolveRequest {
     pub client_ip: IpAddr,
     pub observed_source: ObservedSourceEndpoint,
     pub received_at: ReceivedAt,
+    /// The DNS wire transaction ID, captured up front because `bytes` is
+    /// consumed (via `mem::take`) early in `ResolveQuery::resolve` — every
+    /// query-processing log statement downstream reads it from here so a
+    /// single query's log lines can be correlated.
+    pub request_id: Option<u16>,
     pub bytes: Vec<u8>,
 }
 
@@ -120,6 +126,7 @@ impl ResolveRequest {
             client_ip,
             observed_source: ObservedSourceEndpoint::ip(client_ip),
             received_at: ReceivedAt(received_at),
+            request_id: request_id_from_wire(&bytes),
             bytes,
         }
     }
@@ -134,12 +141,13 @@ impl ResolveRequest {
             client_ip: observed_source.ip,
             observed_source,
             received_at: ReceivedAt(received_at),
+            request_id: request_id_from_wire(&bytes),
             bytes,
         }
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize)]
 pub struct QuestionKey {
     pub qname: String,
     pub qtype: u16,
@@ -273,14 +281,14 @@ pub struct PolicyBlock {
     pub rule_id: Option<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub enum BlockReason {
     LocalRule,
     MaliciousDomain,
     InvalidDomain,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub enum BlockResponseMode {
     Refused,
     NxDomain,
@@ -466,7 +474,7 @@ pub enum LocalDnsEntryValidationError {
     PublicAddressRequiresAcknowledgement,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct LocalAnswerMetadata {
     pub entry_id: Option<String>,
     pub generation: u64,
@@ -485,7 +493,7 @@ impl LocalAnswerMetadata {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub enum LocalAnswerFamily {
     A,
     Aaaa,
@@ -1456,13 +1464,13 @@ pub enum ResolutionBackendError {
     Transport(String),
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
 pub enum ResolutionMode {
     Forward,
     Recursive,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub enum BackendHealth {
     Healthy,
     Degraded,
@@ -1470,7 +1478,7 @@ pub enum BackendHealth {
     Unknown,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub enum DnssecValidationStatus {
     Disabled,
 }
@@ -1878,10 +1886,14 @@ pub struct ResolveDecision {
     pub kind: ResolveDecisionKind,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct QueryEventV1 {
     pub schema_version: u8,
     pub sequence: u64,
+    /// DNS wire transaction ID for this query, threaded through from
+    /// `ResolveRequest::request_id` so this event's log line can be
+    /// correlated with anything else recorded against the same request.
+    pub request_id: Option<u16>,
     pub timestamp: SystemTime,
     pub observed_source: ObservedSourceEndpoint,
     pub original_question_name: Option<String>,
@@ -1899,10 +1911,12 @@ pub struct QueryEventV1 {
 }
 
 impl QueryEventV1 {
-    pub const SCHEMA_VERSION: u8 = 4;
+    pub const SCHEMA_VERSION: u8 = 5;
 
+    #[allow(clippy::too_many_arguments)]
     pub fn from_decision(
         sequence: u64,
+        request_id: Option<u16>,
         timestamp: SystemTime,
         decision: &ResolveDecision,
         response_code: Option<u16>,
@@ -1911,6 +1925,7 @@ impl QueryEventV1 {
     ) -> Self {
         Self::from_decision_context(
             sequence,
+            request_id,
             timestamp,
             ObservedSourceEndpoint::ip(decision.client_ip),
             None,
@@ -1924,6 +1939,7 @@ impl QueryEventV1 {
     #[allow(clippy::too_many_arguments)]
     pub fn from_decision_context(
         sequence: u64,
+        request_id: Option<u16>,
         timestamp: SystemTime,
         observed_source: ObservedSourceEndpoint,
         original_question_name: Option<String>,
@@ -1936,6 +1952,7 @@ impl QueryEventV1 {
         Self {
             schema_version: Self::SCHEMA_VERSION,
             sequence,
+            request_id,
             timestamp,
             observed_source,
             original_question_name,
@@ -1961,7 +1978,7 @@ fn local_answer_metadata(kind: &ResolveDecisionKind) -> Option<LocalAnswerMetada
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct QueryEventBackend {
     pub mode: ResolutionMode,
     pub generation: u64,
@@ -1982,7 +1999,7 @@ impl QueryEventBackend {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub enum QueryEventOutcome {
     AllowedFromBackend,
     AllowedFromLocal,
@@ -2006,7 +2023,7 @@ impl QueryEventOutcome {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub enum QueryEventCacheResult {
     Hit,
     Miss,
@@ -2015,7 +2032,7 @@ pub enum QueryEventCacheResult {
     Unavailable,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct QueryEventClassifierFinding {
     pub classifier_version: String,
     pub config_generation: u64,
@@ -2026,7 +2043,7 @@ pub struct QueryEventClassifierFinding {
     pub details: Vec<QueryEventClassifierDetail>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub enum QueryEventClassifierReason {
     NxdomainBurst,
     ServfailBurst,
@@ -2037,14 +2054,14 @@ pub enum QueryEventClassifierReason {
     SuspiciousSelector,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize)]
 pub enum QueryEventClassifierSeverity {
     Low,
     Medium,
     High,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct QueryEventClassifierWindow {
     pub started_at: SystemTime,
     pub ended_at: SystemTime,
@@ -2052,7 +2069,7 @@ pub struct QueryEventClassifierWindow {
     pub incomplete_reasons: Vec<QueryEventClassifierWindowIncompleteReason>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub enum QueryEventClassifierWindowIncompleteReason {
     ColdStart,
     RetentionEviction,
@@ -2060,7 +2077,7 @@ pub enum QueryEventClassifierWindowIncompleteReason {
     DroppedEvents,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct QueryEventClassifierDetail {
     pub key: String,
     pub value: String,
@@ -2791,7 +2808,7 @@ impl ResolveQuery {
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
             (self.backend.current(), self.local_entries.current())
         };
-        let request_id = request_id_from_wire(&request.bytes);
+        let request_id = request.request_id;
         let request_bytes = std::mem::take(&mut request.bytes);
 
         let decoded = match self
@@ -3620,6 +3637,7 @@ impl ResolveQuery {
         let latency = finished_at.duration_since(started_at).ok();
         let mut event = QueryEventV1::from_decision_context(
             self.event_sequence.fetch_add(1, Ordering::Relaxed),
+            request.request_id,
             finished_at,
             request.observed_source.clone(),
             original_question_name,
@@ -6512,7 +6530,7 @@ mod tests {
             question: Some(QuestionKey::new(name, 1, 1)),
             kind: ResolveDecisionKind::Allowed,
         };
-        QueryEventV1::from_decision(0, SystemTime::UNIX_EPOCH, &decision, None, None, None)
+        QueryEventV1::from_decision(0, None, SystemTime::UNIX_EPOCH, &decision, None, None, None)
     }
 
     fn event_with(sequence: u64, seconds: u64, source_ip: &str, name: &str) -> QueryEventV1 {
@@ -6541,6 +6559,7 @@ mod tests {
         };
         QueryEventV1::from_decision(
             sequence,
+            None,
             SystemTime::UNIX_EPOCH + Duration::from_secs(seconds),
             &decision,
             Some(response_code),
@@ -6798,6 +6817,7 @@ mod tests {
 
         let event = QueryEventV1::from_decision_context(
             1,
+            Some(0xaaaa),
             SystemTime::UNIX_EPOCH,
             source.into(),
             Some("Example.COM.".to_string()),
@@ -6807,6 +6827,7 @@ mod tests {
             Some(Duration::from_millis(1)),
         );
 
+        assert_eq!(event.request_id, Some(0xaaaa));
         assert_eq!(event.observed_source.ip, decision.client_ip);
         assert_eq!(event.observed_source.port, Some(53000));
         assert_eq!(
@@ -11221,6 +11242,7 @@ mod tests {
         let timestamp = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000);
         let event = QueryEventV1::from_decision(
             7,
+            Some(0xbeef),
             timestamp,
             &decision,
             Some(ResponseCode::NoError as u16),
@@ -11230,6 +11252,7 @@ mod tests {
 
         assert_eq!(event.schema_version, QueryEventV1::SCHEMA_VERSION);
         assert_eq!(event.sequence, 7);
+        assert_eq!(event.request_id, Some(0xbeef));
         assert_eq!(event.timestamp, timestamp);
         assert_eq!(
             event.observed_source,
