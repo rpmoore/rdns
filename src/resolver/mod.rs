@@ -2794,143 +2794,55 @@ impl ResolveQuery {
         let request_id = request_id_from_wire(&request.bytes);
         let request_bytes = std::mem::take(&mut request.bytes);
 
-        let decoded = match self.protocol.decode_query_owned(request_bytes) {
+        let decoded = match self
+            .decode_or_protocol_error(
+                started_at,
+                &request,
+                request_id,
+                &backend_snapshot,
+                request_bytes,
+            )
+            .await
+        {
             Ok(decoded) => decoded,
-            Err(error) => {
-                self.metrics.increment(ResolverMetric::ProtocolError);
-                let decision = ResolveDecision {
-                    client_ip: request.client_ip,
-                    question: None,
-                    kind: ResolveDecisionKind::ProtocolError(error.response_code()),
-                };
-                let response_bytes = self.responses.protocol_error(request_id, &error);
-                return self
-                    .finish(
-                        started_at,
-                        &request,
-                        None,
-                        decision,
-                        response_bytes,
-                        None,
-                        Some(QueryEventBackend::from_snapshot(&backend_snapshot)),
-                    )
-                    .await;
-            }
+            Err(outcome) => return outcome,
         };
 
         let question = decoded.question.clone();
-        if let PolicyDecision::Block(block) =
-            self.policy.evaluate(request.client_ip, &decoded.question)
+        if let Some(outcome) = self
+            .try_policy_block(started_at, &request, &decoded, &question, &backend_snapshot)
+            .await
         {
-            self.metrics.increment(ResolverMetric::QueryBlocked);
-            let decision = ResolveDecision {
-                client_ip: request.client_ip,
-                question: Some(question),
-                kind: ResolveDecisionKind::Blocked(block.clone()),
-            };
-            let response_bytes = self.responses.blocked(&decoded, &block);
-            return self
-                .finish(
-                    started_at,
-                    &request,
-                    decoded_original_question_name(&decoded),
-                    decision,
-                    response_bytes,
-                    None,
-                    Some(QueryEventBackend::from_snapshot(&backend_snapshot)),
-                )
-                .await;
+            return outcome;
         }
-        match local_entries.lookup(&decoded.question) {
-            LocalDnsLookup::Answer(entry) => {
-                self.metrics.increment(ResolverMetric::QueryAllowed);
-                let response_bytes = self.local_entry_response(&decoded, &entry);
-                let decision = ResolveDecision {
-                    client_ip: request.client_ip,
-                    question: Some(question),
-                    kind: ResolveDecisionKind::LocalAnswer(
-                        self.local_entry_answer_metadata(&decoded, &entry),
-                    ),
-                };
-                return self
-                    .finish(
-                        started_at,
-                        &request,
-                        decoded_original_question_name(&decoded),
-                        decision,
-                        response_bytes,
-                        None,
-                        Some(QueryEventBackend::from_snapshot(&backend_snapshot)),
-                    )
-                    .await;
-            }
-            LocalDnsLookup::NoData(_entry) => {
-                self.metrics.increment(ResolverMetric::QueryAllowed);
-                let response_bytes = build_nodata_response(&decoded.message);
-                let decision = ResolveDecision {
-                    client_ip: request.client_ip,
-                    question: Some(question),
-                    kind: ResolveDecisionKind::LocalAnswer(LocalAnswerMetadata::from_entry(
-                        &_entry,
-                        local_nodata_family(decoded.question.qtype),
-                    )),
-                };
-                return self
-                    .finish(
-                        started_at,
-                        &request,
-                        decoded_original_question_name(&decoded),
-                        decision,
-                        response_bytes,
-                        None,
-                        Some(QueryEventBackend::from_snapshot(&backend_snapshot)),
-                    )
-                    .await;
-            }
-            LocalDnsLookup::NoMatch => {}
+
+        if let Some(outcome) = self
+            .try_local_lookup(
+                started_at,
+                &request,
+                &decoded,
+                &question,
+                &local_entries,
+                &backend_snapshot,
+            )
+            .await
+        {
+            return outcome;
         }
 
         let mut cache_probe = self
             .probe_cache(&backend_snapshot, &request, &decoded)
             .await;
         if let Some(response_bytes) = cache_probe.hit {
-            if let Some(block) =
-                self.response_bytes_policy_block(request.client_ip, &response_bytes)
-            {
-                self.metrics.increment(ResolverMetric::QueryBlocked);
-                let decision = ResolveDecision {
-                    client_ip: request.client_ip,
-                    question: Some(question),
-                    kind: ResolveDecisionKind::Blocked(block.clone()),
-                };
-                let response_bytes = self.responses.blocked(&decoded, &block);
-                return self
-                    .finish(
-                        started_at,
-                        &request,
-                        decoded_original_question_name(&decoded),
-                        decision,
-                        response_bytes,
-                        cache_probe.event_cache_result,
-                        Some(QueryEventBackend::from_snapshot(&backend_snapshot)),
-                    )
-                    .await;
-            }
-            let decision = ResolveDecision {
-                client_ip: request.client_ip,
-                question: Some(question),
-                kind: ResolveDecisionKind::CacheHit,
-            };
-            self.metrics.increment(ResolverMetric::QueryAllowed);
             return self
-                .finish(
+                .finish_cache_hit(
                     started_at,
                     &request,
-                    decoded_original_question_name(&decoded),
-                    decision,
+                    &decoded,
+                    &question,
                     response_bytes,
                     cache_probe.event_cache_result,
-                    Some(QueryEventBackend::from_snapshot(&backend_snapshot)),
+                    &backend_snapshot,
                 )
                 .await;
         }
@@ -2962,6 +2874,179 @@ impl ResolveQuery {
         .await
     }
 
+    /// Decodes the raw query bytes, converting a decode failure directly
+    /// into the protocol-error `ResolveOutcome` the caller should return.
+    async fn decode_or_protocol_error(
+        &self,
+        started_at: SystemTime,
+        request: &ResolveRequest,
+        request_id: Option<u16>,
+        backend_snapshot: &BackendSnapshot,
+        request_bytes: Vec<u8>,
+    ) -> Result<DecodedQuery, ResolveOutcome> {
+        match self.protocol.decode_query_owned(request_bytes) {
+            Ok(decoded) => Ok(decoded),
+            Err(error) => {
+                self.metrics.increment(ResolverMetric::ProtocolError);
+                let decision = ResolveDecision {
+                    client_ip: request.client_ip,
+                    question: None,
+                    kind: ResolveDecisionKind::ProtocolError(error.response_code()),
+                };
+                let response_bytes = self.responses.protocol_error(request_id, &error);
+                Err(self
+                    .finish(
+                        started_at,
+                        request,
+                        None,
+                        decision,
+                        response_bytes,
+                        None,
+                        Some(QueryEventBackend::from_snapshot(backend_snapshot)),
+                    )
+                    .await)
+            }
+        }
+    }
+
+    /// Returns the blocked-response `ResolveOutcome` if policy evaluation
+    /// blocks this query, otherwise `None` so the caller keeps going.
+    async fn try_policy_block(
+        &self,
+        started_at: SystemTime,
+        request: &ResolveRequest,
+        decoded: &DecodedQuery,
+        question: &QuestionKey,
+        backend_snapshot: &BackendSnapshot,
+    ) -> Option<ResolveOutcome> {
+        let PolicyDecision::Block(block) =
+            self.policy.evaluate(request.client_ip, &decoded.question)
+        else {
+            return None;
+        };
+        self.metrics.increment(ResolverMetric::QueryBlocked);
+        let decision = ResolveDecision {
+            client_ip: request.client_ip,
+            question: Some(question.clone()),
+            kind: ResolveDecisionKind::Blocked(block.clone()),
+        };
+        let response_bytes = self.responses.blocked(decoded, &block);
+        Some(
+            self.finish(
+                started_at,
+                request,
+                decoded_original_question_name(decoded),
+                decision,
+                response_bytes,
+                None,
+                Some(QueryEventBackend::from_snapshot(backend_snapshot)),
+            )
+            .await,
+        )
+    }
+
+    /// Returns the local-DNS-answer `ResolveOutcome` if `decoded.question`
+    /// matches a configured local entry (answer or explicit NODATA),
+    /// otherwise `None` so the caller falls through to the cache/backend.
+    #[allow(clippy::too_many_arguments)]
+    async fn try_local_lookup(
+        &self,
+        started_at: SystemTime,
+        request: &ResolveRequest,
+        decoded: &DecodedQuery,
+        question: &QuestionKey,
+        local_entries: &Arc<dyn LocalDnsEntries>,
+        backend_snapshot: &BackendSnapshot,
+    ) -> Option<ResolveOutcome> {
+        let (response_bytes, kind) = match local_entries.lookup(&decoded.question) {
+            LocalDnsLookup::Answer(entry) => {
+                let response_bytes = self.local_entry_response(decoded, &entry);
+                let kind = ResolveDecisionKind::LocalAnswer(
+                    self.local_entry_answer_metadata(decoded, &entry),
+                );
+                (response_bytes, kind)
+            }
+            LocalDnsLookup::NoData(entry) => {
+                let response_bytes = build_nodata_response(&decoded.message);
+                let kind = ResolveDecisionKind::LocalAnswer(LocalAnswerMetadata::from_entry(
+                    &entry,
+                    local_nodata_family(decoded.question.qtype),
+                ));
+                (response_bytes, kind)
+            }
+            LocalDnsLookup::NoMatch => return None,
+        };
+        self.metrics.increment(ResolverMetric::QueryAllowed);
+        let decision = ResolveDecision {
+            client_ip: request.client_ip,
+            question: Some(question.clone()),
+            kind,
+        };
+        Some(
+            self.finish(
+                started_at,
+                request,
+                decoded_original_question_name(decoded),
+                decision,
+                response_bytes,
+                None,
+                Some(QueryEventBackend::from_snapshot(backend_snapshot)),
+            )
+            .await,
+        )
+    }
+
+    /// Finishes a cache-probe hit: applies the response-bytes block policy,
+    /// then serves the blocked response or the cached one.
+    #[allow(clippy::too_many_arguments)]
+    async fn finish_cache_hit(
+        &self,
+        started_at: SystemTime,
+        request: &ResolveRequest,
+        decoded: &DecodedQuery,
+        question: &QuestionKey,
+        response_bytes: Vec<u8>,
+        event_cache_result: Option<QueryEventCacheResult>,
+        backend_snapshot: &BackendSnapshot,
+    ) -> ResolveOutcome {
+        if let Some(block) = self.response_bytes_policy_block(request.client_ip, &response_bytes) {
+            self.metrics.increment(ResolverMetric::QueryBlocked);
+            let decision = ResolveDecision {
+                client_ip: request.client_ip,
+                question: Some(question.clone()),
+                kind: ResolveDecisionKind::Blocked(block.clone()),
+            };
+            let response_bytes = self.responses.blocked(decoded, &block);
+            return self
+                .finish(
+                    started_at,
+                    request,
+                    decoded_original_question_name(decoded),
+                    decision,
+                    response_bytes,
+                    event_cache_result,
+                    Some(QueryEventBackend::from_snapshot(backend_snapshot)),
+                )
+                .await;
+        }
+        let decision = ResolveDecision {
+            client_ip: request.client_ip,
+            question: Some(question.clone()),
+            kind: ResolveDecisionKind::CacheHit,
+        };
+        self.metrics.increment(ResolverMetric::QueryAllowed);
+        self.finish(
+            started_at,
+            request,
+            decoded_original_question_name(decoded),
+            decision,
+            response_bytes,
+            event_cache_result,
+            Some(QueryEventBackend::from_snapshot(backend_snapshot)),
+        )
+        .await
+    }
+
     #[allow(clippy::too_many_arguments)]
     async fn resolve_coalesced_miss(
         &self,
@@ -2975,79 +3060,100 @@ impl ResolveQuery {
     ) -> ResolveOutcome {
         match self.miss_coalescer.begin(cache_key.clone()) {
             SingleFlightTicket::Leader { key, flight } => {
-                let guard = SingleFlightLeader::new(Arc::clone(&self.miss_coalescer), key, flight);
-                let backend_result = self.resolve_backend(backend_snapshot, decoded).await;
-                let (decision, response_bytes) = self
-                    .prepare_backend_result(
-                        request,
-                        decoded,
-                        question,
-                        Some(cache_key),
-                        true,
-                        backend_snapshot.mode,
-                        backend_result.clone(),
-                    )
-                    .await;
-                guard.complete(backend_result);
-                self.finish(
+                self.resolve_coalesced_leader(
+                    backend_snapshot,
                     started_at,
                     request,
-                    decoded_original_question_name(decoded),
-                    decision,
-                    response_bytes,
+                    decoded,
+                    question,
+                    cache_key,
                     event_cache_result,
-                    Some(QueryEventBackend::from_snapshot(backend_snapshot)),
+                    key,
+                    flight,
                 )
                 .await
             }
             SingleFlightTicket::Follower { flight } => {
-                self.metrics.increment(ResolverMetric::CacheCoalescedMiss);
-                let backend_result = flight.wait().await;
-                if let Some(response_bytes) = self
-                    .cache_hit_after_coalesced_miss(request, decoded, &cache_key)
-                    .await
-                {
-                    if let Some(block) =
-                        self.response_bytes_policy_block(request.client_ip, &response_bytes)
-                    {
-                        self.metrics.increment(ResolverMetric::QueryBlocked);
-                        let decision = ResolveDecision {
-                            client_ip: request.client_ip,
-                            question: Some(question),
-                            kind: ResolveDecisionKind::Blocked(block.clone()),
-                        };
-                        let response_bytes = self.responses.blocked(decoded, &block);
-                        return self
-                            .finish(
-                                started_at,
-                                request,
-                                decoded_original_question_name(decoded),
-                                decision,
-                                response_bytes,
-                                Some(QueryEventCacheResult::Hit),
-                                Some(QueryEventBackend::from_snapshot(backend_snapshot)),
-                            )
-                            .await;
-                    }
-                    let decision = ResolveDecision {
-                        client_ip: request.client_ip,
-                        question: Some(question),
-                        kind: ResolveDecisionKind::CacheHit,
-                    };
-                    self.metrics.increment(ResolverMetric::QueryAllowed);
-                    return self
-                        .finish(
-                            started_at,
-                            request,
-                            decoded_original_question_name(decoded),
-                            decision,
-                            response_bytes,
-                            Some(QueryEventCacheResult::Hit),
-                            Some(QueryEventBackend::from_snapshot(backend_snapshot)),
-                        )
-                        .await;
-                }
-                self.finish_backend_result(
+                self.resolve_coalesced_follower(
+                    backend_snapshot,
+                    started_at,
+                    request,
+                    decoded,
+                    question,
+                    cache_key,
+                    event_cache_result,
+                    flight,
+                )
+                .await
+            }
+        }
+    }
+
+    /// Resolves the query against the backend as the single-flight leader
+    /// for `cache_key`, then releases any followers waiting on the result.
+    #[allow(clippy::too_many_arguments)]
+    async fn resolve_coalesced_leader(
+        &self,
+        backend_snapshot: &BackendSnapshot,
+        started_at: SystemTime,
+        request: &ResolveRequest,
+        decoded: &DecodedQuery,
+        question: QuestionKey,
+        cache_key: CacheKey,
+        event_cache_result: Option<QueryEventCacheResult>,
+        key: CacheKey,
+        flight: Arc<InFlightMiss>,
+    ) -> ResolveOutcome {
+        let guard = SingleFlightLeader::new(Arc::clone(&self.miss_coalescer), key, flight);
+        let backend_result = self.resolve_backend(backend_snapshot, decoded).await;
+        let (decision, response_bytes) = self
+            .prepare_backend_result(
+                request,
+                decoded,
+                question,
+                Some(cache_key),
+                true,
+                backend_snapshot.mode,
+                backend_result.clone(),
+            )
+            .await;
+        guard.complete(backend_result);
+        self.finish(
+            started_at,
+            request,
+            decoded_original_question_name(decoded),
+            decision,
+            response_bytes,
+            event_cache_result,
+            Some(QueryEventBackend::from_snapshot(backend_snapshot)),
+        )
+        .await
+    }
+
+    /// Waits for the single-flight leader resolving `cache_key` to finish,
+    /// then serves its cached result (applying the response-bytes block
+    /// policy) or falls back to the leader's raw backend result if the entry
+    /// didn't end up cacheable.
+    #[allow(clippy::too_many_arguments)]
+    async fn resolve_coalesced_follower(
+        &self,
+        backend_snapshot: &BackendSnapshot,
+        started_at: SystemTime,
+        request: &ResolveRequest,
+        decoded: &DecodedQuery,
+        question: QuestionKey,
+        cache_key: CacheKey,
+        event_cache_result: Option<QueryEventCacheResult>,
+        flight: Arc<InFlightMiss>,
+    ) -> ResolveOutcome {
+        self.metrics.increment(ResolverMetric::CacheCoalescedMiss);
+        let backend_result = flight.wait().await;
+        let Some(response_bytes) = self
+            .cache_hit_after_coalesced_miss(request, decoded, &cache_key)
+            .await
+        else {
+            return self
+                .finish_backend_result(
                     backend_snapshot,
                     started_at,
                     request,
@@ -3058,9 +3164,46 @@ impl ResolveQuery {
                     event_cache_result,
                     backend_result,
                 )
-                .await
-            }
+                .await;
+        };
+
+        if let Some(block) = self.response_bytes_policy_block(request.client_ip, &response_bytes) {
+            self.metrics.increment(ResolverMetric::QueryBlocked);
+            let decision = ResolveDecision {
+                client_ip: request.client_ip,
+                question: Some(question),
+                kind: ResolveDecisionKind::Blocked(block.clone()),
+            };
+            let response_bytes = self.responses.blocked(decoded, &block);
+            return self
+                .finish(
+                    started_at,
+                    request,
+                    decoded_original_question_name(decoded),
+                    decision,
+                    response_bytes,
+                    Some(QueryEventCacheResult::Hit),
+                    Some(QueryEventBackend::from_snapshot(backend_snapshot)),
+                )
+                .await;
         }
+
+        let decision = ResolveDecision {
+            client_ip: request.client_ip,
+            question: Some(question),
+            kind: ResolveDecisionKind::CacheHit,
+        };
+        self.metrics.increment(ResolverMetric::QueryAllowed);
+        self.finish(
+            started_at,
+            request,
+            decoded_original_question_name(decoded),
+            decision,
+            response_bytes,
+            Some(QueryEventCacheResult::Hit),
+            Some(QueryEventBackend::from_snapshot(backend_snapshot)),
+        )
+        .await
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -5377,6 +5520,57 @@ pub struct RecursiveResolutionBackend {
     delegation_cache: DelegationCache,
 }
 
+/// Mutable state threaded through one `resolve_iterative` call as it walks
+/// the delegation chain and follows CNAME restarts.
+struct IterativeQueryState {
+    question: QuestionKey,
+    current_zone: String,
+    seen_referrals: HashSet<String>,
+    seen_cnames: HashSet<String>,
+    cname_chain: Vec<Record>,
+    cname_restarts: u8,
+}
+
+/// What a single authority's response means for the in-flight iterative
+/// query: it's finished (answer or fatal error), it points to a new
+/// authority set to try next, or it just wasn't usable and other authorities
+/// in this hop should still be tried.
+enum AuthorityResponseOutcome {
+    Return(Box<Result<ResolutionResponse, ResolutionBackendError>>),
+    Advance(Vec<SocketAddr>),
+    Reject(ResolutionBackendError),
+}
+
+/// What racing every authority in one hop produced: either the query is
+/// finished, or the next authority set to try (from a referral or CNAME
+/// restart) is ready.
+enum HopOutcome {
+    Return(Box<Result<ResolutionResponse, ResolutionBackendError>>),
+    Advance(Vec<SocketAddr>),
+}
+
+/// Mutable state threaded through one `resolve_ns_addresses_for_qtype` walk.
+struct NsWalkState {
+    current_zone: String,
+    seen_referrals: HashSet<String>,
+}
+
+/// What a single authority's response means for an in-flight NS-address
+/// walk: resolved addresses (possibly empty, meaning "give up"), a referral
+/// or glueless delegation to advance to, or nothing usable (try other
+/// authorities in this hop).
+enum NsResponseOutcome {
+    Return(Vec<SocketAddr>, u32),
+    Advance(Vec<SocketAddr>),
+    Continue,
+}
+
+/// What racing every authority in one NS-address-walk hop produced.
+enum NsHopOutcome {
+    Return(Vec<SocketAddr>, u32),
+    Advance(Vec<SocketAddr>),
+}
+
 impl RecursiveResolutionBackend {
     pub fn new(
         config: RecursiveResolverConfig,
@@ -5424,13 +5618,17 @@ impl RecursiveResolutionBackend {
             return Err(ResolutionBackendError::NoBackendsAvailable);
         }
 
-        let mut question = request.query.question.clone();
-        let (mut current_zone, mut authorities) =
+        let question = request.query.question.clone();
+        let (current_zone, mut authorities) =
             self.authorities_for(&question.qname, question.qclass);
-        let mut seen_referrals = HashSet::new();
-        let mut seen_cnames = HashSet::from([question.qname.clone()]);
-        let mut cname_chain = Vec::new();
-        let mut cname_restarts = 0u8;
+        let mut state = IterativeQueryState {
+            seen_cnames: HashSet::from([question.qname.clone()]),
+            question,
+            current_zone,
+            seen_referrals: HashSet::new(),
+            cname_chain: Vec::new(),
+            cname_restarts: 0,
+        };
         let query_deadline = Instant::now() + self.config.per_query_deadline;
 
         for _ in 0..self.config.max_recursion_depth {
@@ -5438,202 +5636,277 @@ impl RecursiveResolutionBackend {
                 self.increment_metric(ResolverMetric::RecursiveLimitHit);
                 return Err(ResolutionBackendError::NoBackendsAvailable);
             }
-            let mut last_error = None;
-            let mut next_authorities = None;
 
-            let chunk_size = MAX_CONCURRENT_AUTHORITY_QUERIES;
-
-            'chunks: for authority_chunk in authorities.chunks(chunk_size) {
-                let Some(remaining) = query_deadline.checked_duration_since(Instant::now()) else {
-                    self.increment_metric(ResolverMetric::RecursiveAuthorityTimeout);
-                    return Err(ResolutionBackendError::Timeout);
-                };
-                if remaining.is_zero() {
-                    self.increment_metric(ResolverMetric::RecursiveAuthorityTimeout);
-                    return Err(ResolutionBackendError::Timeout);
-                }
-                let attempt_timeout = remaining.min(self.config.per_authority_timeout);
-
-                let mut join_set = JoinSet::new();
-                for &authority in authority_chunk {
-                    self.increment_metric(ResolverMetric::RecursiveAuthorityAttempt);
-                    let transport = Arc::clone(&self.transport);
-                    let question_for_task = question.clone();
-                    let dnssec_ok = request.query.features.dnssec_ok;
-                    join_set.spawn(async move {
-                        let outcome = time::timeout(
-                            attempt_timeout,
-                            transport.query(
-                                authority,
-                                question_for_task,
-                                dnssec_ok,
-                                attempt_timeout,
-                            ),
-                        )
-                        .await;
-                        (authority, outcome)
-                    });
-                }
-
-                while let Some(joined) = join_set.join_next().await {
-                    let Ok((authority, outcome)) = joined else {
-                        continue;
-                    };
-                    let response = match outcome {
-                        Ok(Ok(response)) => response,
-                        Ok(Err(error)) => {
-                            if error == ResolutionBackendError::Timeout {
-                                self.increment_metric(ResolverMetric::RecursiveAuthorityTimeout);
-                            } else {
-                                self.increment_metric(ResolverMetric::RecursiveAuthorityError);
-                            }
-                            last_error = Some(error);
-                            continue;
-                        }
-                        Err(_) => {
-                            self.increment_metric(ResolverMetric::RecursiveAuthorityTimeout);
-                            last_error = Some(ResolutionBackendError::Timeout);
-                            continue;
-                        }
-                    };
-                    let message = &response.message;
-                    if let Some(error) = authority_response_error(message, &question) {
-                        self.increment_metric(ResolverMetric::RecursiveAuthorityError);
-                        last_error = Some(error);
-                        continue;
-                    }
-
-                    if (message.header.aa() && has_requested_answer_for(message, &question))
-                        || is_negative_answer(message)
-                    {
-                        return ResolutionResponse::recursive_response(
-                            &request.query,
-                            response,
-                            &cname_chain,
-                            SystemTime::now(),
-                            request.backend_generation,
-                            authority,
-                        );
-                    }
-
-                    if message.header.aa() {
-                        if let Some(cname_record) = cname_record_for(message, &question) {
-                            let RecordData::CNAME(cname_target) = &cname_record.record else {
-                                unreachable!();
-                            };
-                            let target_question =
-                                QuestionKey::new(cname_target, question.qtype, question.qclass);
-                            if has_requested_answer_for(message, &target_question) {
-                                return ResolutionResponse::recursive_response(
-                                    &request.query,
-                                    response,
-                                    &cname_chain,
-                                    SystemTime::now(),
-                                    request.backend_generation,
-                                    authority,
-                                );
-                            }
-                            let next_name = normalize_question_name(cname_target);
-                            if cname_restarts >= self.config.max_cname_restarts
-                                || !seen_cnames.insert(next_name)
-                            {
-                                self.increment_metric(ResolverMetric::RecursiveLimitHit);
-                                return Err(ResolutionBackendError::NoBackendsAvailable);
-                            }
-                            cname_chain.extend(cname_chain_records(
-                                message,
-                                cname_record,
-                                request.query.features.dnssec_ok,
-                            ));
-                            cname_restarts = cname_restarts.saturating_add(1);
-                            question =
-                                QuestionKey::new(cname_target, question.qtype, question.qclass);
-                            seen_referrals.clear();
-                            let (zone, next) =
-                                self.authorities_for(&question.qname, question.qclass);
-                            current_zone = zone;
-                            next_authorities = Some(next);
-                            break 'chunks;
-                        }
-                    }
-
-                    let Some(referral) = referral_authorities(message, &question) else {
-                        // No trustable glue in this response -- if there's
-                        // still a valid NS delegation for the question, try
-                        // resolving one of its nameservers' addresses
-                        // ourselves (a "glueless" delegation) before giving
-                        // up on this response entirely.
-                        if let Some((owner, names, min_ttl)) =
-                            glueless_delegation_names(message, &question)
-                        {
-                            if is_valid_zone_progression(&current_zone, &owner) {
-                                let (resolved, resolved_ttl) = self
-                                    .resolve_glueless_endpoints(
-                                        &names,
-                                        question.qclass,
-                                        query_deadline,
-                                        MAX_GLUELESS_NS_DEPTH,
-                                    )
-                                    .await;
-                                if !resolved.is_empty() {
-                                    self.delegation_cache.insert(
-                                        owner.clone(),
-                                        question.qclass,
-                                        resolved.clone(),
-                                        min_ttl.min(resolved_ttl),
-                                    );
-                                    current_zone = owner;
-                                    next_authorities = Some(resolved);
-                                    break 'chunks;
-                                }
-                            }
-                        }
-                        if has_delegation_for_question(message, &question) {
-                            self.increment_metric(ResolverMetric::RecursiveBailiwickReject);
-                        } else {
-                            self.increment_metric(ResolverMetric::RecursiveLameDelegation);
-                        }
-                        last_error = Some(ResolutionBackendError::NoBackendsAvailable);
-                        continue;
-                    };
-                    if !is_valid_zone_progression(&current_zone, &referral.owner) {
-                        // An authority reached via `current_zone` claimed a
-                        // referral to an ancestor, sibling, or its own zone
-                        // instead of a proper child -- reject outright rather
-                        // than follow it or let it poison the shared
-                        // delegation cache for unrelated future queries.
-                        self.increment_metric(ResolverMetric::RecursiveBailiwickReject);
-                        last_error = Some(ResolutionBackendError::NoBackendsAvailable);
-                        continue;
-                    }
-                    let referral_key = referral_loop_key(&referral);
-                    if !seen_referrals.insert(referral_key) {
-                        self.increment_metric(ResolverMetric::RecursiveReferralLoop);
-                        return Err(ResolutionBackendError::NoBackendsAvailable);
-                    }
-                    self.delegation_cache.insert(
-                        referral.owner.clone(),
-                        question.qclass,
-                        referral.endpoints.clone(),
-                        referral.min_ttl,
-                    );
-                    current_zone = referral.owner.clone();
-                    next_authorities = Some(referral.endpoints);
-                    break 'chunks;
-                }
-            }
-
-            if let Some(next) = next_authorities {
-                authorities = next;
-            } else if let Some(error) = last_error {
-                return Err(error);
-            } else {
-                return Err(ResolutionBackendError::NoBackendsAvailable);
+            match self
+                .resolve_one_hop(&request, &mut state, &authorities, query_deadline)
+                .await
+            {
+                HopOutcome::Return(result) => return *result,
+                HopOutcome::Advance(next) => authorities = next,
             }
         }
 
         self.increment_metric(ResolverMetric::RecursiveLimitHit);
         Err(ResolutionBackendError::NoBackendsAvailable)
+    }
+
+    /// Races every authority in `authorities` (in bounded-size chunks,
+    /// respecting `query_deadline`) and returns either the finished query
+    /// result or the next authority set to advance to.
+    async fn resolve_one_hop(
+        &self,
+        request: &ResolutionRequest,
+        state: &mut IterativeQueryState,
+        authorities: &[SocketAddr],
+        query_deadline: Instant,
+    ) -> HopOutcome {
+        let mut last_error = None;
+
+        for authority_chunk in authorities.chunks(MAX_CONCURRENT_AUTHORITY_QUERIES) {
+            let Some(remaining) = query_deadline.checked_duration_since(Instant::now()) else {
+                self.increment_metric(ResolverMetric::RecursiveAuthorityTimeout);
+                return HopOutcome::Return(Box::new(Err(ResolutionBackendError::Timeout)));
+            };
+            if remaining.is_zero() {
+                self.increment_metric(ResolverMetric::RecursiveAuthorityTimeout);
+                return HopOutcome::Return(Box::new(Err(ResolutionBackendError::Timeout)));
+            }
+            let attempt_timeout = remaining.min(self.config.per_authority_timeout);
+
+            let mut join_set = JoinSet::new();
+            for &authority in authority_chunk {
+                self.increment_metric(ResolverMetric::RecursiveAuthorityAttempt);
+                let transport = Arc::clone(&self.transport);
+                let question_for_task = state.question.clone();
+                let dnssec_ok = request.query.features.dnssec_ok;
+                join_set.spawn(async move {
+                    let outcome = time::timeout(
+                        attempt_timeout,
+                        transport.query(authority, question_for_task, dnssec_ok, attempt_timeout),
+                    )
+                    .await;
+                    (authority, outcome)
+                });
+            }
+
+            while let Some(joined) = join_set.join_next().await {
+                let Ok((authority, outcome)) = joined else {
+                    continue;
+                };
+                let response = match self.record_transport_outcome(outcome) {
+                    Ok(response) => response,
+                    Err(error) => {
+                        last_error = Some(error);
+                        continue;
+                    }
+                };
+
+                match self
+                    .evaluate_authority_response(state, request, authority, response, query_deadline)
+                    .await
+                {
+                    AuthorityResponseOutcome::Return(result) => {
+                        return HopOutcome::Return(result);
+                    }
+                    AuthorityResponseOutcome::Advance(next) => {
+                        return HopOutcome::Advance(next);
+                    }
+                    AuthorityResponseOutcome::Reject(error) => {
+                        last_error = Some(error);
+                    }
+                }
+            }
+        }
+
+        HopOutcome::Return(Box::new(Err(
+            last_error.unwrap_or(ResolutionBackendError::NoBackendsAvailable),
+        )))
+    }
+
+    /// Maps a single authority's raced transport outcome to a response,
+    /// recording the appropriate metric for a transport-level error or
+    /// attempt timeout.
+    fn record_transport_outcome(
+        &self,
+        outcome: Result<
+            Result<RecursiveAuthorityResponse, ResolutionBackendError>,
+            time::error::Elapsed,
+        >,
+    ) -> Result<RecursiveAuthorityResponse, ResolutionBackendError> {
+        match outcome {
+            Ok(Ok(response)) => Ok(response),
+            Ok(Err(error)) => {
+                if error == ResolutionBackendError::Timeout {
+                    self.increment_metric(ResolverMetric::RecursiveAuthorityTimeout);
+                } else {
+                    self.increment_metric(ResolverMetric::RecursiveAuthorityError);
+                }
+                Err(error)
+            }
+            Err(_) => {
+                self.increment_metric(ResolverMetric::RecursiveAuthorityTimeout);
+                Err(ResolutionBackendError::Timeout)
+            }
+        }
+    }
+
+    /// Interprets one authority's response: a usable answer, a CNAME restart,
+    /// a referral to follow, or neither (in which case the caller should try
+    /// other authorities in this hop).
+    async fn evaluate_authority_response(
+        &self,
+        state: &mut IterativeQueryState,
+        request: &ResolutionRequest,
+        authority: SocketAddr,
+        response: RecursiveAuthorityResponse,
+        query_deadline: Instant,
+    ) -> AuthorityResponseOutcome {
+        let message = &response.message;
+
+        if let Some(error) = authority_response_error(message, &state.question) {
+            self.increment_metric(ResolverMetric::RecursiveAuthorityError);
+            return AuthorityResponseOutcome::Reject(error);
+        }
+
+        if (message.header.aa() && has_requested_answer_for(message, &state.question))
+            || is_negative_answer(message)
+        {
+            return AuthorityResponseOutcome::Return(Box::new(
+                ResolutionResponse::recursive_response(
+                    &request.query,
+                    response,
+                    &state.cname_chain,
+                    SystemTime::now(),
+                    request.backend_generation,
+                    authority,
+                ),
+            ));
+        }
+
+        if message.header.aa() {
+            if let Some(cname_record) = cname_record_for(message, &state.question) {
+                let RecordData::CNAME(cname_target) = &cname_record.record else {
+                    unreachable!();
+                };
+                let target_question =
+                    QuestionKey::new(cname_target, state.question.qtype, state.question.qclass);
+                if has_requested_answer_for(message, &target_question) {
+                    return AuthorityResponseOutcome::Return(Box::new(
+                        ResolutionResponse::recursive_response(
+                            &request.query,
+                            response,
+                            &state.cname_chain,
+                            SystemTime::now(),
+                            request.backend_generation,
+                            authority,
+                        ),
+                    ));
+                }
+                let next_name = normalize_question_name(cname_target);
+                if state.cname_restarts >= self.config.max_cname_restarts
+                    || !state.seen_cnames.insert(next_name)
+                {
+                    self.increment_metric(ResolverMetric::RecursiveLimitHit);
+                    return AuthorityResponseOutcome::Return(Box::new(Err(
+                        ResolutionBackendError::NoBackendsAvailable,
+                    )));
+                }
+                state.cname_chain.extend(cname_chain_records(
+                    message,
+                    cname_record,
+                    request.query.features.dnssec_ok,
+                ));
+                state.cname_restarts = state.cname_restarts.saturating_add(1);
+                state.question =
+                    QuestionKey::new(cname_target, state.question.qtype, state.question.qclass);
+                state.seen_referrals.clear();
+                let (zone, next) =
+                    self.authorities_for(&state.question.qname, state.question.qclass);
+                state.current_zone = zone;
+                return AuthorityResponseOutcome::Advance(next);
+            }
+        }
+
+        let Some(referral) = referral_authorities(message, &state.question) else {
+            return self
+                .handle_missing_referral(state, query_deadline, message)
+                .await;
+        };
+
+        self.handle_referral(state, referral)
+    }
+
+    /// Handles a response that carries no trustable referral glue: tries a
+    /// glueless-delegation resolution if one applies, otherwise records why
+    /// the response was unusable and tells the caller to try other
+    /// authorities in this hop.
+    async fn handle_missing_referral(
+        &self,
+        state: &mut IterativeQueryState,
+        query_deadline: Instant,
+        message: &Message,
+    ) -> AuthorityResponseOutcome {
+        if let Some((owner, names, min_ttl)) = glueless_delegation_names(message, &state.question) {
+            if is_valid_zone_progression(&state.current_zone, &owner) {
+                let (resolved, resolved_ttl) = self
+                    .resolve_glueless_endpoints(
+                        &names,
+                        state.question.qclass,
+                        query_deadline,
+                        MAX_GLUELESS_NS_DEPTH,
+                    )
+                    .await;
+                if !resolved.is_empty() {
+                    self.delegation_cache.insert(
+                        owner.clone(),
+                        state.question.qclass,
+                        resolved.clone(),
+                        min_ttl.min(resolved_ttl),
+                    );
+                    state.current_zone = owner;
+                    return AuthorityResponseOutcome::Advance(resolved);
+                }
+            }
+        }
+        if has_delegation_for_question(message, &state.question) {
+            self.increment_metric(ResolverMetric::RecursiveBailiwickReject);
+        } else {
+            self.increment_metric(ResolverMetric::RecursiveLameDelegation);
+        }
+        AuthorityResponseOutcome::Reject(ResolutionBackendError::NoBackendsAvailable)
+    }
+
+    /// Validates a referral against the current zone and the in-flight
+    /// referral-loop set, then advances to it, caching the delegation.
+    fn handle_referral(
+        &self,
+        state: &mut IterativeQueryState,
+        referral: ReferralAuthorities,
+    ) -> AuthorityResponseOutcome {
+        if !is_valid_zone_progression(&state.current_zone, &referral.owner) {
+            // An authority reached via `current_zone` claimed a referral to
+            // an ancestor, sibling, or its own zone instead of a proper
+            // child -- reject outright rather than follow it or let it
+            // poison the shared delegation cache for unrelated future
+            // queries.
+            self.increment_metric(ResolverMetric::RecursiveBailiwickReject);
+            return AuthorityResponseOutcome::Reject(ResolutionBackendError::NoBackendsAvailable);
+        }
+        let referral_key = referral_loop_key(&referral);
+        if !state.seen_referrals.insert(referral_key) {
+            self.increment_metric(ResolverMetric::RecursiveReferralLoop);
+            return AuthorityResponseOutcome::Return(Box::new(Err(
+                ResolutionBackendError::NoBackendsAvailable,
+            )));
+        }
+        self.delegation_cache.insert(
+            referral.owner.clone(),
+            state.question.qclass,
+            referral.endpoints.clone(),
+            referral.min_ttl,
+        );
+        state.current_zone = referral.owner.clone();
+        AuthorityResponseOutcome::Advance(referral.endpoints)
     }
 
     fn root_authorities(&self) -> Vec<SocketAddr> {
@@ -5748,125 +6021,151 @@ impl RecursiveResolutionBackend {
                 return (Vec::new(), 0);
             }
             let question = QuestionKey::new(ns_name, qtype, qclass);
-            let (mut current_zone, mut authorities) = self.authorities_for(&question.qname, qclass);
-            let mut seen_referrals = HashSet::new();
+            let (current_zone, mut authorities) = self.authorities_for(&question.qname, qclass);
+            let mut state = NsWalkState {
+                current_zone,
+                seen_referrals: HashSet::new(),
+            };
 
             for _ in 0..self.config.max_recursion_depth {
-                if authorities.is_empty() {
-                    return (Vec::new(), 0);
-                }
-                if Instant::now() >= deadline {
+                if authorities.is_empty() || Instant::now() >= deadline {
                     return (Vec::new(), 0);
                 }
 
-                let chunk_size = MAX_CONCURRENT_AUTHORITY_QUERIES;
-                let mut next_authorities = None;
-
-                'chunks: for authority_chunk in authorities.chunks(chunk_size) {
-                    let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
-                        return (Vec::new(), 0);
-                    };
-                    if remaining.is_zero() {
-                        return (Vec::new(), 0);
-                    }
-                    let attempt_timeout = remaining.min(self.config.per_authority_timeout);
-
-                    let mut join_set = JoinSet::new();
-                    for &authority in authority_chunk {
-                        self.increment_metric(ResolverMetric::RecursiveAuthorityAttempt);
-                        let transport = Arc::clone(&self.transport);
-                        let question_for_task = question.clone();
-                        join_set.spawn(async move {
-                            let outcome = time::timeout(
-                                attempt_timeout,
-                                transport.query(
-                                    authority,
-                                    question_for_task,
-                                    false,
-                                    attempt_timeout,
-                                ),
-                            )
-                            .await;
-                            outcome
-                        });
-                    }
-
-                    while let Some(joined) = join_set.join_next().await {
-                        let Ok(outcome) = joined else {
-                            continue;
-                        };
-                        let response = match outcome {
-                            Ok(Ok(response)) => response,
-                            _ => continue,
-                        };
-                        let message = &response.message;
-                        if authority_response_error(message, &question).is_some() {
-                            continue;
-                        }
-                        if is_negative_answer(message) {
-                            return (Vec::new(), 0);
-                        }
-                        if message.header.aa() && has_requested_answer_for(message, &question) {
-                            return a_record_endpoints(message, &question);
-                        }
-
-                        if let Some(referral) = referral_authorities(message, &question) {
-                            if !is_valid_zone_progression(&current_zone, &referral.owner) {
-                                continue;
-                            }
-                            let referral_key = referral_loop_key(&referral);
-                            if !seen_referrals.insert(referral_key) {
-                                return (Vec::new(), 0);
-                            }
-                            self.delegation_cache.insert(
-                                referral.owner.clone(),
-                                qclass,
-                                referral.endpoints.clone(),
-                                referral.min_ttl,
-                            );
-                            current_zone = referral.owner;
-                            next_authorities = Some(referral.endpoints);
-                            break 'chunks;
-                        }
-
-                        if let Some((owner, names, min_ttl)) =
-                            glueless_delegation_names(message, &question)
-                        {
-                            if !is_valid_zone_progression(&current_zone, &owner) {
-                                continue;
-                            }
-                            let (resolved, resolved_ttl) = self
-                                .resolve_glueless_endpoints(
-                                    &names,
-                                    qclass,
-                                    deadline,
-                                    depth_budget - 1,
-                                )
-                                .await;
-                            if resolved.is_empty() {
-                                continue;
-                            }
-                            self.delegation_cache.insert(
-                                owner.clone(),
-                                qclass,
-                                resolved.clone(),
-                                min_ttl.min(resolved_ttl),
-                            );
-                            current_zone = owner;
-                            next_authorities = Some(resolved);
-                            break 'chunks;
-                        }
-                    }
-                }
-
-                match next_authorities {
-                    Some(next) => authorities = next,
-                    None => return (Vec::new(), 0),
+                match self
+                    .resolve_ns_hop(&question, &mut state, &authorities, qclass, deadline, depth_budget)
+                    .await
+                {
+                    NsHopOutcome::Return(endpoints, ttl) => return (endpoints, ttl),
+                    NsHopOutcome::Advance(next) => authorities = next,
                 }
             }
 
             (Vec::new(), 0)
         })
+    }
+
+    /// Races every authority in `authorities` for one NS-address-walk hop.
+    async fn resolve_ns_hop(
+        &self,
+        question: &QuestionKey,
+        state: &mut NsWalkState,
+        authorities: &[SocketAddr],
+        qclass: u16,
+        deadline: Instant,
+        depth_budget: u8,
+    ) -> NsHopOutcome {
+        for authority_chunk in authorities.chunks(MAX_CONCURRENT_AUTHORITY_QUERIES) {
+            let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
+                return NsHopOutcome::Return(Vec::new(), 0);
+            };
+            if remaining.is_zero() {
+                return NsHopOutcome::Return(Vec::new(), 0);
+            }
+            let attempt_timeout = remaining.min(self.config.per_authority_timeout);
+
+            let mut join_set = JoinSet::new();
+            for &authority in authority_chunk {
+                self.increment_metric(ResolverMetric::RecursiveAuthorityAttempt);
+                let transport = Arc::clone(&self.transport);
+                let question_for_task = question.clone();
+                join_set.spawn(async move {
+                    time::timeout(
+                        attempt_timeout,
+                        transport.query(authority, question_for_task, false, attempt_timeout),
+                    )
+                    .await
+                });
+            }
+
+            while let Some(joined) = join_set.join_next().await {
+                let Ok(outcome) = joined else {
+                    continue;
+                };
+                let response = match outcome {
+                    Ok(Ok(response)) => response,
+                    _ => continue,
+                };
+
+                match self
+                    .evaluate_ns_response(question, state, qclass, deadline, depth_budget, &response)
+                    .await
+                {
+                    NsResponseOutcome::Return(endpoints, ttl) => {
+                        return NsHopOutcome::Return(endpoints, ttl);
+                    }
+                    NsResponseOutcome::Advance(next) => return NsHopOutcome::Advance(next),
+                    NsResponseOutcome::Continue => {}
+                }
+            }
+        }
+
+        NsHopOutcome::Return(Vec::new(), 0)
+    }
+
+    /// Interprets one authority's response during an NS-address walk:
+    /// resolved addresses, a referral or glueless delegation to follow, or
+    /// nothing usable.
+    async fn evaluate_ns_response(
+        &self,
+        question: &QuestionKey,
+        state: &mut NsWalkState,
+        qclass: u16,
+        deadline: Instant,
+        depth_budget: u8,
+        response: &RecursiveAuthorityResponse,
+    ) -> NsResponseOutcome {
+        let message = &response.message;
+        if authority_response_error(message, question).is_some() {
+            return NsResponseOutcome::Continue;
+        }
+        if is_negative_answer(message) {
+            return NsResponseOutcome::Return(Vec::new(), 0);
+        }
+        if message.header.aa() && has_requested_answer_for(message, question) {
+            let (endpoints, ttl) = a_record_endpoints(message, question);
+            return NsResponseOutcome::Return(endpoints, ttl);
+        }
+
+        if let Some(referral) = referral_authorities(message, question) {
+            if !is_valid_zone_progression(&state.current_zone, &referral.owner) {
+                return NsResponseOutcome::Continue;
+            }
+            let referral_key = referral_loop_key(&referral);
+            if !state.seen_referrals.insert(referral_key) {
+                return NsResponseOutcome::Return(Vec::new(), 0);
+            }
+            self.delegation_cache.insert(
+                referral.owner.clone(),
+                qclass,
+                referral.endpoints.clone(),
+                referral.min_ttl,
+            );
+            state.current_zone = referral.owner;
+            return NsResponseOutcome::Advance(referral.endpoints);
+        }
+
+        if let Some((owner, names, min_ttl)) = glueless_delegation_names(message, question) {
+            if !is_valid_zone_progression(&state.current_zone, &owner) {
+                return NsResponseOutcome::Continue;
+            }
+            let (resolved, resolved_ttl) = self
+                .resolve_glueless_endpoints(&names, qclass, deadline, depth_budget - 1)
+                .await;
+            if resolved.is_empty() {
+                return NsResponseOutcome::Continue;
+            }
+            self.delegation_cache.insert(
+                owner.clone(),
+                qclass,
+                resolved.clone(),
+                min_ttl.min(resolved_ttl),
+            );
+            state.current_zone = owner;
+            return NsResponseOutcome::Advance(resolved);
+        }
+
+        NsResponseOutcome::Continue
     }
 }
 

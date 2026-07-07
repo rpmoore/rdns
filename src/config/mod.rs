@@ -839,6 +839,22 @@ const MAX_LOCAL_ZONE_RECORDS: usize = 10_000;
 /// being silently dropped. Every record's owner name must fall at or below
 /// `zone.root_domain`. Zone files are expected to declare their own
 /// `$ORIGIN` for relative names (v1 never calls `Zonefile::set_origin`).
+/// Returns the accumulator entry for `name`, recording it in `order` on
+/// first sight so entries stay ordered by first appearance in the zone
+/// file. The first TTL seen for a name (across either address family) wins,
+/// since `LocalDnsEntry` has one TTL per entry, not one per family.
+fn zone_record_group<'a>(
+    name: &DomainName,
+    ttl: u32,
+    order: &mut Vec<DomainName>,
+    by_name: &'a mut HashMap<DomainName, (Vec<Ipv4Addr>, Vec<Ipv6Addr>, u32)>,
+) -> &'a mut (Vec<Ipv4Addr>, Vec<Ipv6Addr>, u32) {
+    by_name.entry(name.clone()).or_insert_with(|| {
+        order.push(name.clone());
+        (Vec::new(), Vec::new(), ttl)
+    })
+}
+
 pub fn parse_local_zone_file(
     zone: &LocalZoneConfig,
     content: &str,
@@ -931,20 +947,14 @@ pub fn parse_local_zone_file(
         let ttl = record.ttl().as_secs();
         match record.data() {
             ZoneRecordData::A(a) => {
-                let addr = a.addr();
-                let group = by_name.entry(name.clone()).or_insert_with(|| {
-                    order.push(name.clone());
-                    (Vec::new(), Vec::new(), ttl)
-                });
-                group.0.push(addr);
+                zone_record_group(&name, ttl, &mut order, &mut by_name)
+                    .0
+                    .push(a.addr());
             }
             ZoneRecordData::Aaaa(aaaa) => {
-                let addr = aaaa.addr();
-                let group = by_name.entry(name.clone()).or_insert_with(|| {
-                    order.push(name.clone());
-                    (Vec::new(), Vec::new(), ttl)
-                });
-                group.1.push(addr);
+                zone_record_group(&name, ttl, &mut order, &mut by_name)
+                    .1
+                    .push(aaaa.addr());
             }
             other => {
                 return Err(ConfigError::LocalZoneUnsupportedRecordType {

@@ -86,23 +86,7 @@ async fn main() -> io::Result<()> {
         });
     let backend_snapshot = build_backend_snapshot(&config, Arc::clone(&metrics))?;
     let (local_entries, local_entry_counts) = build_local_entries(&config, config_path.as_deref())?;
-    println!(
-        "loaded {} local DNS entr{} ({} inline, {} from {} zone file{})",
-        local_entry_counts.inline + local_entry_counts.zone_derived,
-        if local_entry_counts.inline + local_entry_counts.zone_derived == 1 {
-            "y"
-        } else {
-            "ies"
-        },
-        local_entry_counts.inline,
-        local_entry_counts.zone_derived,
-        local_entry_counts.zone_files,
-        if local_entry_counts.zone_files == 1 {
-            ""
-        } else {
-            "s"
-        },
-    );
+    println!("loaded {}", local_entry_summary(&local_entry_counts));
     let reload_metrics = Arc::clone(&metrics);
     let resolver = Arc::new(ResolveQuery::with_cache_policy_and_backend_snapshot(
         Arc::new(StandardProtocolCodec::new(config.max_udp_payload_size)),
@@ -128,6 +112,20 @@ async fn main() -> io::Result<()> {
         return Err(io::Error::other("no DNS listeners configured"));
     }
 
+    serve_until_shutdown(servers, resolver, sighup_task, event_drain).await
+}
+
+/// Runs the bound listeners until `ctrl_c` or a listener task exits, then
+/// tears everything down in dependency order: stop accepting new listener
+/// work, join the listener tasks, stop the SIGHUP reload task, drop the
+/// resolver (closing the query-event channel), and drain the event-recording
+/// task.
+async fn serve_until_shutdown(
+    servers: Vec<UdpDnsServer>,
+    resolver: Arc<ResolveQuery>,
+    sighup_task: tokio::task::JoinHandle<()>,
+    event_drain: tokio::task::JoinHandle<()>,
+) -> io::Result<()> {
     let mut shutdown_senders = Vec::with_capacity(servers.len());
     let mut server_tasks = JoinSet::new();
     for server in servers {
@@ -173,15 +171,11 @@ async fn main() -> io::Result<()> {
 
     drop(resolver);
     match event_drain.await {
-        Ok(()) => {}
-        Err(error) => {
-            return Err(io::Error::other(format!(
-                "query event drain task failed: {error}"
-            )));
-        }
+        Ok(()) => Ok(()),
+        Err(error) => Err(io::Error::other(format!(
+            "query event drain task failed: {error}"
+        ))),
     }
-
-    Ok(())
 }
 
 fn resolve_config_path() -> Option<PathBuf> {
@@ -218,6 +212,21 @@ struct LocalEntryCounts {
     inline: usize,
     zone_derived: usize,
     zone_files: usize,
+}
+
+/// Formats the local-DNS-entry count summary shared by the startup log line
+/// and the SIGHUP reload log line, e.g. "3 local DNS entries (2 inline, 1
+/// from 1 zone file)".
+fn local_entry_summary(counts: &LocalEntryCounts) -> String {
+    let total = counts.inline + counts.zone_derived;
+    format!(
+        "{total} local DNS entr{} ({} inline, {} from {} zone file{})",
+        if total == 1 { "y" } else { "ies" },
+        counts.inline,
+        counts.zone_derived,
+        counts.zone_files,
+        if counts.zone_files == 1 { "" } else { "s" },
+    )
 }
 
 /// Zone `path` values are resolved relative to the main config file's
@@ -407,17 +416,11 @@ fn spawn_sighup_reload_task(
             match built {
                 Ok(Ok((config, backend_snapshot, local_entries, counts))) => {
                     resolver.publish_reload(backend_snapshot, local_entries);
-                    let total = counts.inline + counts.zone_derived;
                     println!(
-                        "reloaded config from {} ({} upstream(s), {} local DNS entr{} ({} inline, {} from {} zone file{}))",
+                        "reloaded config from {} ({} upstream(s), {})",
                         path.display(),
                         config.upstreams.len(),
-                        total,
-                        if total == 1 { "y" } else { "ies" },
-                        counts.inline,
-                        counts.zone_derived,
-                        counts.zone_files,
-                        if counts.zone_files == 1 { "" } else { "s" },
+                        local_entry_summary(&counts),
                     )
                 }
                 Ok(Err(error)) => {
@@ -874,6 +877,26 @@ mod tests {
             enabled = true
             public_address_acknowledged = false
         "#
+    }
+
+    #[test]
+    fn local_entry_summary_pluralizes_entries_and_zone_files_independently() {
+        assert_eq!(
+            local_entry_summary(&LocalEntryCounts {
+                inline: 1,
+                zone_derived: 0,
+                zone_files: 0,
+            }),
+            "1 local DNS entry (1 inline, 0 from 0 zone files)"
+        );
+        assert_eq!(
+            local_entry_summary(&LocalEntryCounts {
+                inline: 2,
+                zone_derived: 3,
+                zone_files: 1,
+            }),
+            "5 local DNS entries (2 inline, 3 from 1 zone file)"
+        );
     }
 
     #[test]
