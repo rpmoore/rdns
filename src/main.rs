@@ -31,7 +31,7 @@ use rdns::delivery::upstream::{ForwardingResolutionBackend, RecursiveAuthorityTr
 use rdns::resolver::{
     BackendHealth, BackendRootHintsStatus, BackendSnapshot, BackendStatus, BasicResponseFactory,
     CacheTtlPolicy, ChannelQueryEventSink, Clock, DnssecValidationStatus, DomainName,
-    InMemoryDnsCache, InMemoryLocalDnsEntries, InMemoryQueryEventStore,
+    InMemoryDnsCache, InMemoryLocalDnsEntries, InMemoryQueryEventStore, LocalDnsEntry,
     InMemoryQueryEventStoreConfig, InMemorySuspiciousLookupClassifier,
     InMemorySuspiciousLookupClassifierConfig, MetricsSink, NoopPolicyEvaluator,
     QueryEventRecordResult, QueryEventSink, QueryEventV1, RecursiveResolutionBackend,
@@ -287,6 +287,46 @@ fn read_local_zone_file(config_path: Option<&Path>, zone: &LocalZoneConfig) -> i
     })
 }
 
+/// Reads, parses, and converts one enabled zone file's records into
+/// `entries`, checking each derived name against `seen` (which also tracks
+/// every already-accepted name, inline or zone-derived) to enforce the
+/// no-duplicate-names-across-sources invariant. Returns the number of
+/// entries this zone contributed.
+fn accumulate_zone_local_entries(
+    zone: &LocalZoneConfig,
+    config_path: Option<&Path>,
+    seen: &mut HashSet<DomainName>,
+    entries: &mut Vec<LocalDnsEntry>,
+) -> io::Result<usize> {
+    let resolved_path = resolve_zone_path(config_path, &zone.path);
+    let content = read_local_zone_file(config_path, zone)?;
+    let zone_entries = parse_local_zone_file(zone, &content).map_err(|error| {
+        io::Error::other(format!(
+            "invalid local zone {}: {error:?}",
+            resolved_path.display()
+        ))
+    })?;
+
+    let mut zone_derived_count = 0;
+    for entry_config in zone_entries {
+        let entry = entry_config.to_local_dns_entry().map_err(|error| {
+            io::Error::other(format!(
+                "invalid local zone {}: {error:?}",
+                resolved_path.display()
+            ))
+        })?;
+        if !seen.insert(entry.name.clone()) {
+            return Err(io::Error::other(format!(
+                "duplicate local DNS entry name across local_dns_entries/local_zones: {}",
+                entry.name
+            )));
+        }
+        zone_derived_count += 1;
+        entries.push(entry);
+    }
+    Ok(zone_derived_count)
+}
+
 fn build_local_entries(
     config: &RuntimeConfig,
     config_path: Option<&Path>,
@@ -321,31 +361,9 @@ fn build_local_entries(
     let mut zone_file_count = 0;
 
     for zone in config.local_zones.iter().filter(|zone| zone.enabled) {
-        let resolved_path = resolve_zone_path(config_path, &zone.path);
-        let content = read_local_zone_file(config_path, zone)?;
-        let zone_entries = parse_local_zone_file(zone, &content).map_err(|error| {
-            io::Error::other(format!(
-                "invalid local zone {}: {error:?}",
-                resolved_path.display()
-            ))
-        })?;
+        zone_derived_count +=
+            accumulate_zone_local_entries(zone, config_path, &mut seen, &mut entries)?;
         zone_file_count += 1;
-        for entry_config in zone_entries {
-            let entry = entry_config.to_local_dns_entry().map_err(|error| {
-                io::Error::other(format!(
-                    "invalid local zone {}: {error:?}",
-                    resolved_path.display()
-                ))
-            })?;
-            if !seen.insert(entry.name.clone()) {
-                return Err(io::Error::other(format!(
-                    "duplicate local DNS entry name across local_dns_entries/local_zones: {}",
-                    entry.name
-                )));
-            }
-            zone_derived_count += 1;
-            entries.push(entry);
-        }
     }
 
     Ok((
@@ -358,6 +376,16 @@ fn build_local_entries(
     ))
 }
 
+/// Everything a reload needs to publish: the parsed config (kept around for
+/// its summary fields), the new backend snapshot, the new local-entry table,
+/// and the counts behind the reload's log line.
+type ReloadMaterials = (
+    RuntimeConfig,
+    BackendSnapshot,
+    Arc<InMemoryLocalDnsEntries>,
+    LocalEntryCounts,
+);
+
 /// Loads and fully builds everything a reload needs to publish — reading
 /// the config file, reading every enabled zone file, and constructing the
 /// backend snapshot — without touching the resolver. Kept separate from
@@ -367,12 +395,7 @@ fn build_local_entries(
 fn build_reload_materials(
     config_path: &Path,
     metrics: Arc<dyn MetricsSink>,
-) -> io::Result<(
-    RuntimeConfig,
-    BackendSnapshot,
-    Arc<InMemoryLocalDnsEntries>,
-    LocalEntryCounts,
-)> {
+) -> io::Result<ReloadMaterials> {
     let config = load_runtime_config(Some(config_path))?;
     let backend_snapshot = build_backend_snapshot(&config, metrics)?;
     let (local_entries, counts) = build_local_entries(&config, Some(config_path))?;
@@ -413,31 +436,42 @@ fn spawn_sighup_reload_task(
                 build_reload_materials(&load_path, reload_metrics)
             })
             .await;
-            match built {
-                Ok(Ok((config, backend_snapshot, local_entries, counts))) => {
-                    resolver.publish_reload(backend_snapshot, local_entries);
-                    println!(
-                        "reloaded config from {} ({} upstream(s), {})",
-                        path.display(),
-                        config.upstreams.len(),
-                        local_entry_summary(&counts),
-                    )
-                }
-                Ok(Err(error)) => {
-                    eprintln!("failed to reload config from {}: {error}", path.display())
-                }
-                Err(join_error) if join_error.is_cancelled() => {
-                    eprintln!(
-                        "reload task for {} was cancelled: {join_error}",
-                        path.display()
-                    )
-                }
-                Err(join_error) => {
-                    eprintln!("reload task for {} panicked: {join_error}", path.display())
-                }
-            }
+            apply_reload_result(&resolver, &path, built);
         }
     })
+}
+
+/// Applies a completed `build_reload_materials` result: publishes the new
+/// backend/local-entry snapshot to `resolver` on success, otherwise logs why
+/// the reload didn't happen.
+fn apply_reload_result(
+    resolver: &ResolveQuery,
+    path: &Path,
+    built: Result<io::Result<ReloadMaterials>, tokio::task::JoinError>,
+) {
+    match built {
+        Ok(Ok((config, backend_snapshot, local_entries, counts))) => {
+            resolver.publish_reload(backend_snapshot, local_entries);
+            println!(
+                "reloaded config from {} ({} upstream(s), {})",
+                path.display(),
+                config.upstreams.len(),
+                local_entry_summary(&counts),
+            )
+        }
+        Ok(Err(error)) => {
+            eprintln!("failed to reload config from {}: {error}", path.display())
+        }
+        Err(join_error) if join_error.is_cancelled() => {
+            eprintln!(
+                "reload task for {} was cancelled: {join_error}",
+                path.display()
+            )
+        }
+        Err(join_error) => {
+            eprintln!("reload task for {} panicked: {join_error}", path.display())
+        }
+    }
 }
 
 #[cfg(not(unix))]
@@ -454,67 +488,73 @@ fn build_backend_snapshot(
     metrics: Arc<dyn MetricsSink>,
 ) -> io::Result<BackendSnapshot> {
     match config.resolution.mode {
-        ConfigResolutionMode::Forward => {
-            let backend = Arc::new(
-                ForwardingResolutionBackend::from_runtime_config(config).map_err(|error| {
-                    io::Error::other(format!("invalid upstream config: {error:?}"))
-                })?,
-            );
-            Ok(BackendSnapshot::new(
-                backend,
-                ResolverResolutionMode::Forward,
-                config.resolution.generation,
-                BackendHealth::Healthy,
-                Some(config.backend_cache_namespace()),
-            ))
-        }
-        ConfigResolutionMode::Recursive => {
-            let recursive = config
-                .resolution
-                .recursive
-                .as_ref()
-                .ok_or_else(|| io::Error::other("recursive resolution config is missing"))?;
-            let root_hints = recursive
-                .load_root_hints()
-                .map_err(|error| io::Error::other(format!("invalid root hints: {error:?}")))?
-                .into_iter()
-                .map(|hint| RecursiveRootHint {
-                    name: hint.name,
-                    endpoints: hint.endpoints,
-                })
-                .collect();
-            let transport = Arc::new(
-                RecursiveAuthorityTransportClient::from_runtime_config(config)
-                    .map_err(|error| {
-                        io::Error::other(format!("invalid recursive transport: {error:?}"))
-                    })?
-                    .with_metrics(Arc::clone(&metrics)),
-            );
-            let backend = Arc::new(RecursiveResolutionBackend::with_metrics(
-                RecursiveResolverConfig {
-                    root_hints,
-                    per_authority_timeout: recursive.per_authority_timeout,
-                    per_query_deadline: config.per_query_deadline,
-                    max_recursion_depth: recursive.max_recursion_depth,
-                    max_cname_restarts: recursive.max_cname_restarts,
-                },
-                transport,
-                metrics,
-            ));
-            Ok(BackendSnapshot::new(
-                backend,
-                ResolverResolutionMode::Recursive,
-                config.resolution.generation,
-                BackendHealth::Healthy,
-                Some(config.backend_cache_namespace()),
-            )
-            .with_root_hints_status(BackendRootHintsStatus::loaded(
-                root_hints_source_label(&recursive.root_hints_source),
-                recursive.root_hints_version.clone(),
-                SystemTime::now(),
-            )))
-        }
+        ConfigResolutionMode::Forward => build_forward_backend_snapshot(config),
+        ConfigResolutionMode::Recursive => build_recursive_backend_snapshot(config, metrics),
     }
+}
+
+fn build_forward_backend_snapshot(config: &RuntimeConfig) -> io::Result<BackendSnapshot> {
+    let backend = Arc::new(
+        ForwardingResolutionBackend::from_runtime_config(config)
+            .map_err(|error| io::Error::other(format!("invalid upstream config: {error:?}")))?,
+    );
+    Ok(BackendSnapshot::new(
+        backend,
+        ResolverResolutionMode::Forward,
+        config.resolution.generation,
+        BackendHealth::Healthy,
+        Some(config.backend_cache_namespace()),
+    ))
+}
+
+fn build_recursive_backend_snapshot(
+    config: &RuntimeConfig,
+    metrics: Arc<dyn MetricsSink>,
+) -> io::Result<BackendSnapshot> {
+    let recursive = config
+        .resolution
+        .recursive
+        .as_ref()
+        .ok_or_else(|| io::Error::other("recursive resolution config is missing"))?;
+    let root_hints = recursive
+        .load_root_hints()
+        .map_err(|error| io::Error::other(format!("invalid root hints: {error:?}")))?
+        .into_iter()
+        .map(|hint| RecursiveRootHint {
+            name: hint.name,
+            endpoints: hint.endpoints,
+        })
+        .collect();
+    let transport = Arc::new(
+        RecursiveAuthorityTransportClient::from_runtime_config(config)
+            .map_err(|error| io::Error::other(format!("invalid recursive transport: {error:?}")))?
+            .with_metrics(Arc::clone(&metrics)),
+    );
+    let backend = Arc::new(RecursiveResolutionBackend::with_metrics(
+        RecursiveResolverConfig {
+            root_hints,
+            per_authority_timeout: recursive.per_authority_timeout,
+            per_query_deadline: config.per_query_deadline,
+            max_recursion_depth: recursive.max_recursion_depth,
+            max_cname_restarts: recursive.max_cname_restarts,
+        },
+        transport,
+        metrics,
+    ));
+    Ok(
+        BackendSnapshot::new(
+            backend,
+            ResolverResolutionMode::Recursive,
+            config.resolution.generation,
+            BackendHealth::Healthy,
+            Some(config.backend_cache_namespace()),
+        )
+        .with_root_hints_status(BackendRootHintsStatus::loaded(
+            root_hints_source_label(&recursive.root_hints_source),
+            recursive.root_hints_version.clone(),
+            SystemTime::now(),
+        )),
+    )
 }
 
 fn root_hints_source_label(source: &ConfigRootHintsSource) -> &'static str {

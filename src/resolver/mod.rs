@@ -3310,47 +3310,56 @@ impl ResolveQuery {
                 received_at: request.received_at.0,
             })
             .await;
-        let mut probe = CacheProbe {
-            key: Some(key),
-            hit: None,
-            store_allowed: matches!(lookup, CacheLookup::Miss | CacheLookup::Expired),
-            event_cache_result: Some(QueryEventCacheResult::Miss),
-        };
+        let (store_allowed, hit, event_cache_result) =
+            self.evaluate_cache_lookup(lookup, decoded, request);
 
+        CacheProbe {
+            key: Some(key),
+            hit,
+            store_allowed,
+            event_cache_result: Some(event_cache_result),
+        }
+    }
+
+    /// Maps a cache lookup outcome to whether the eventual backend result may
+    /// be stored, the serialized hit response (if any), and the outcome to
+    /// report on the query event. A `Hit` whose cached response fails to
+    /// re-serialize is treated as a miss that's still allowed to store a
+    /// fresh result.
+    fn evaluate_cache_lookup(
+        &self,
+        lookup: CacheLookup,
+        decoded: &DecodedQuery,
+        request: &ResolveRequest,
+    ) -> (bool, Option<Vec<u8>>, QueryEventCacheResult) {
         match lookup {
             CacheLookup::Hit(cached) => match self.serialize_cache_hit(decoded, &cached, request) {
-                Ok(response_bytes) => {
-                    probe.event_cache_result = Some(QueryEventCacheResult::Hit);
-                    probe.hit = Some(response_bytes);
-                }
+                Ok(response_bytes) => (false, Some(response_bytes), QueryEventCacheResult::Hit),
                 Err(_) => {
                     self.metrics.increment(ResolverMetric::CacheMiss);
-                    probe.store_allowed = true;
-                    probe.event_cache_result = Some(QueryEventCacheResult::Miss);
+                    (true, None, QueryEventCacheResult::Miss)
                 }
             },
             CacheLookup::Miss => {
                 self.metrics.increment(ResolverMetric::CacheMiss);
-                probe.event_cache_result = Some(QueryEventCacheResult::Miss);
+                (true, None, QueryEventCacheResult::Miss)
             }
             CacheLookup::Expired => {
                 self.metrics.increment(ResolverMetric::CacheExpired);
                 self.metrics.increment(ResolverMetric::CacheMiss);
-                probe.event_cache_result = Some(QueryEventCacheResult::Expired);
+                (true, None, QueryEventCacheResult::Expired)
             }
             CacheLookup::Bypass(_) => {
                 self.metrics.increment(ResolverMetric::CacheBypass);
                 self.metrics.increment(ResolverMetric::CacheMiss);
-                probe.event_cache_result = Some(QueryEventCacheResult::Bypass);
+                (false, None, QueryEventCacheResult::Bypass)
             }
             CacheLookup::Unavailable => {
                 self.metrics.increment(ResolverMetric::CacheUnavailable);
                 self.metrics.increment(ResolverMetric::CacheMiss);
-                probe.event_cache_result = Some(QueryEventCacheResult::Unavailable);
+                (false, None, QueryEventCacheResult::Unavailable)
             }
         }
-
-        probe
     }
 
     async fn cache_hit_after_coalesced_miss(

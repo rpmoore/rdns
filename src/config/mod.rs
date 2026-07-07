@@ -855,6 +855,91 @@ fn zone_record_group<'a>(
     })
 }
 
+/// Validates and accumulates a single zone-file `entry` into `order`/`by_name`,
+/// returning the updated `record_count`. `SOA`/`NS` records are recognized and
+/// skipped (not counted); any other unsupported record type, an `$INCLUDE`
+/// directive, a non-`IN` class, or a name outside `zone.root_domain` is a
+/// hard error.
+fn accumulate_zone_entry(
+    zone: &LocalZoneConfig,
+    entry: Entry,
+    record_count: usize,
+    order: &mut Vec<DomainName>,
+    by_name: &mut HashMap<DomainName, (Vec<Ipv4Addr>, Vec<Ipv6Addr>, u32)>,
+) -> Result<usize, ConfigError> {
+    let record = match entry {
+        Entry::Include { .. } => {
+            return Err(ConfigError::LocalZoneIncludeDirectiveUnsupported {
+                path: zone.path.clone(),
+            });
+        }
+        Entry::Record(record) => record,
+    };
+
+    let owner_name = record.owner().to_string();
+    let name =
+        DomainName::parse(&owner_name).map_err(|_| ConfigError::InvalidLocalDnsEntryName {
+            name: owner_name.clone(),
+        })?;
+
+    // rdns's local-entry lookup only ever answers qclass IN
+    // (`InMemoryLocalDnsEntries::lookup`), so a non-IN record loaded
+    // here would otherwise be silently served to ordinary IN clients,
+    // crossing DNS class separation. Reject it instead. (The zonefile
+    // scanner already requires one consistent class per file, but that
+    // invariant says nothing about *which* class — this checks that
+    // too.)
+    if record.class() != Class::IN {
+        return Err(ConfigError::LocalZoneUnsupportedClass {
+            path: zone.path.clone(),
+            name: name.to_string(),
+            class: format!("{:?}", record.class()),
+        });
+    }
+
+    let rtype = record.data().rtype();
+    if rtype == Rtype::SOA || rtype == Rtype::NS {
+        return Ok(record_count);
+    }
+    if !name.is_at_or_below(&zone.root_domain) {
+        return Err(ConfigError::LocalZoneRecordOutOfRoot {
+            path: zone.path.clone(),
+            name: name.to_string(),
+            root_domain: zone.root_domain.to_string(),
+        });
+    }
+
+    let record_count = record_count + 1;
+    if record_count > MAX_LOCAL_ZONE_RECORDS {
+        return Err(ConfigError::LocalZoneTooManyRecords {
+            path: zone.path.clone(),
+            count: record_count,
+            max: MAX_LOCAL_ZONE_RECORDS,
+        });
+    }
+
+    let ttl = record.ttl().as_secs();
+    match record.data() {
+        ZoneRecordData::A(a) => {
+            zone_record_group(&name, ttl, order, by_name).0.push(a.addr());
+        }
+        ZoneRecordData::Aaaa(aaaa) => {
+            zone_record_group(&name, ttl, order, by_name)
+                .1
+                .push(aaaa.addr());
+        }
+        other => {
+            return Err(ConfigError::LocalZoneUnsupportedRecordType {
+                path: zone.path.clone(),
+                name: name.to_string(),
+                record_type: format!("{:?}", other.rtype()),
+            });
+        }
+    }
+
+    Ok(record_count)
+}
+
 pub fn parse_local_zone_file(
     zone: &LocalZoneConfig,
     content: &str,
@@ -893,77 +978,7 @@ pub fn parse_local_zone_file(
                 message: error.to_string(),
             })?
     {
-        let record = match entry {
-            Entry::Include { .. } => {
-                return Err(ConfigError::LocalZoneIncludeDirectiveUnsupported {
-                    path: zone.path.clone(),
-                });
-            }
-            Entry::Record(record) => record,
-        };
-
-        let owner_name = record.owner().to_string();
-        let name =
-            DomainName::parse(&owner_name).map_err(|_| ConfigError::InvalidLocalDnsEntryName {
-                name: owner_name.clone(),
-            })?;
-
-        // rdns's local-entry lookup only ever answers qclass IN
-        // (`InMemoryLocalDnsEntries::lookup`), so a non-IN record loaded
-        // here would otherwise be silently served to ordinary IN clients,
-        // crossing DNS class separation. Reject it instead. (The zonefile
-        // scanner already requires one consistent class per file, but that
-        // invariant says nothing about *which* class — this checks that
-        // too.)
-        if record.class() != Class::IN {
-            return Err(ConfigError::LocalZoneUnsupportedClass {
-                path: zone.path.clone(),
-                name: name.to_string(),
-                class: format!("{:?}", record.class()),
-            });
-        }
-
-        let rtype = record.data().rtype();
-        if rtype == Rtype::SOA || rtype == Rtype::NS {
-            continue;
-        }
-        if !name.is_at_or_below(&zone.root_domain) {
-            return Err(ConfigError::LocalZoneRecordOutOfRoot {
-                path: zone.path.clone(),
-                name: name.to_string(),
-                root_domain: zone.root_domain.to_string(),
-            });
-        }
-
-        record_count += 1;
-        if record_count > MAX_LOCAL_ZONE_RECORDS {
-            return Err(ConfigError::LocalZoneTooManyRecords {
-                path: zone.path.clone(),
-                count: record_count,
-                max: MAX_LOCAL_ZONE_RECORDS,
-            });
-        }
-
-        let ttl = record.ttl().as_secs();
-        match record.data() {
-            ZoneRecordData::A(a) => {
-                zone_record_group(&name, ttl, &mut order, &mut by_name)
-                    .0
-                    .push(a.addr());
-            }
-            ZoneRecordData::Aaaa(aaaa) => {
-                zone_record_group(&name, ttl, &mut order, &mut by_name)
-                    .1
-                    .push(aaaa.addr());
-            }
-            other => {
-                return Err(ConfigError::LocalZoneUnsupportedRecordType {
-                    path: zone.path.clone(),
-                    name: name.to_string(),
-                    record_type: format!("{:?}", other.rtype()),
-                });
-            }
-        }
+        record_count = accumulate_zone_entry(zone, entry, record_count, &mut order, &mut by_name)?;
     }
 
     Ok(order
