@@ -18,20 +18,21 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
-use opentelemetry::metrics::{Counter, Gauge, Histogram, MeterProvider};
+use opentelemetry::metrics::{Counter, Gauge, Histogram, MeterProvider, ObservableGauge};
 use opentelemetry::KeyValue;
-use opentelemetry_otlp::MetricExporter;
-use opentelemetry_sdk::metrics::{PeriodicReader, SdkMeterProvider};
+use opentelemetry_sdk::metrics::SdkMeterProvider;
+use prometheus::Registry;
 use rdns::config::{
     parse_local_zone_file, LocalZoneConfig, ResolutionMode as ConfigResolutionMode,
     RootHintsSource as ConfigRootHintsSource, RuntimeConfig, MAX_LOCAL_ZONE_FILE_BYTES,
 };
 use rdns::delivery::dns::UdpDnsServer;
+use rdns::delivery::metrics_http::MetricsServer;
 use rdns::delivery::upstream::{ForwardingResolutionBackend, RecursiveAuthorityTransportClient};
 use rdns::resolver::{
     BackendHealth, BackendRootHintsStatus, BackendSnapshot, BackendStatus, BasicResponseFactory,
     CacheTtlPolicy, ChannelQueryEventSink, Clock, DnssecValidationStatus, DomainName,
-    InMemoryDnsCache, InMemoryLocalDnsEntries, InMemoryQueryEventStore,
+    DnsCache, InMemoryDnsCache, InMemoryLocalDnsEntries, InMemoryQueryEventStore,
     InMemoryQueryEventStoreConfig, InMemorySuspiciousLookupClassifier,
     InMemorySuspiciousLookupClassifierConfig, LocalDnsEntry, MetricsSink, NoopPolicyEvaluator,
     QueryEventRecordResult, QueryEventSink, QueryEventV1, RecursiveResolutionBackend,
@@ -95,19 +96,29 @@ async fn main() -> io::Result<()> {
         })
     };
 
-    let metrics = OpenTelemetryMetrics::new()
-        .map(|metrics| Arc::new(metrics) as Arc<dyn MetricsSink>)
-        .unwrap_or_else(|error| {
-            error!(%error, "failed to initialize OpenTelemetry metrics exporter");
-            Arc::new(NoopMetrics)
-        });
+    let cache = Arc::new(InMemoryDnsCache::new(DEFAULT_CACHE_ENTRIES));
+    let (metrics, metrics_registry): (Arc<dyn MetricsSink>, Registry) =
+        if !config.metrics.enabled {
+            (Arc::new(NoopMetrics), Registry::new())
+        } else {
+            match OpenTelemetryMetrics::new(Arc::clone(&cache)) {
+                Ok(m) => {
+                    let registry = m.registry.clone();
+                    (Arc::new(m), registry)
+                }
+                Err(error) => {
+                    error!(%error, "failed to initialize Prometheus metrics exporter");
+                    (Arc::new(NoopMetrics), Registry::new())
+                }
+            }
+        };
     let backend_snapshot = build_backend_snapshot(&config, Arc::clone(&metrics))?;
     let (local_entries, local_entry_counts) = build_local_entries(&config, config_path.as_deref())?;
     info!(summary = %local_entry_summary(&local_entry_counts), "loaded local dns entries");
     let reload_metrics = Arc::clone(&metrics);
     let resolver = Arc::new(ResolveQuery::with_cache_policy_and_backend_snapshot(
         Arc::new(StandardProtocolCodec::new(config.max_udp_payload_size)),
-        Arc::new(InMemoryDnsCache::new(DEFAULT_CACHE_ENTRIES)),
+        Arc::clone(&cache) as Arc<dyn DnsCache>,
         Arc::new(NoopPolicyEvaluator),
         local_entries,
         CacheTtlPolicy::default(),
@@ -128,8 +139,33 @@ async fn main() -> io::Result<()> {
     if servers.is_empty() {
         return Err(io::Error::other("no DNS listeners configured"));
     }
+    // A metrics-listener bind failure (e.g. the configured port is already in
+    // use by something else on the host) must not prevent the DNS resolver
+    // itself from starting — metrics are optional observability, not a core
+    // dependency. Log and continue without the endpoint instead of `?`.
+    let metrics_server = if config.metrics.enabled {
+        match MetricsServer::bind_with_max_connections(
+            config.metrics.listen,
+            metrics_registry,
+            config.metrics.max_connections,
+        )
+        .await
+        {
+            Ok(server) => Some(server),
+            Err(error) => {
+                error!(
+                    %error,
+                    address = %config.metrics.listen,
+                    "failed to bind metrics listener; continuing without it"
+                );
+                None
+            }
+        }
+    } else {
+        None
+    };
 
-    serve_until_shutdown(servers, resolver, sighup_task, event_drain).await
+    serve_until_shutdown(servers, metrics_server, resolver, sighup_task, event_drain).await
 }
 
 /// Runs the bound listeners until `ctrl_c` or a listener task exits, then
@@ -139,6 +175,7 @@ async fn main() -> io::Result<()> {
 /// task.
 async fn serve_until_shutdown(
     servers: Vec<UdpDnsServer>,
+    metrics_server: Option<MetricsServer>,
     resolver: Arc<ResolveQuery>,
     sighup_task: tokio::task::JoinHandle<()>,
     event_drain: tokio::task::JoinHandle<()>,
@@ -159,6 +196,24 @@ async fn serve_until_shutdown(
         });
     }
 
+    // The metrics listener is optional observability, not part of the DNS
+    // service's fault domain: it gets its own shutdown signal and task
+    // handle, kept out of `server_tasks` so a metrics-listener error can
+    // never trigger (or block) DNS shutdown — it's only ever logged.
+    let metrics_shutdown = metrics_server.map(|metrics_server| {
+        let address = metrics_server.local_addr();
+        let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
+        info!(%address, "rdns metrics listening on http");
+        let task = tokio::spawn(async move {
+            metrics_server
+                .serve_until(async {
+                    let _ = shutdown_rx.await;
+                })
+                .await
+        });
+        (shutdown_tx, task)
+    });
+
     tokio::select! {
         signal = tokio::signal::ctrl_c() => {
             signal?;
@@ -168,7 +223,7 @@ async fn serve_until_shutdown(
             match result {
                 Some(result) => {
                     listener_task_result_to_io(result)?;
-                    warn!("DNS listener stopped");
+                    warn!("listener stopped");
                 }
                 None => return Ok(()),
             }
@@ -181,6 +236,15 @@ async fn serve_until_shutdown(
 
     while let Some(result) = server_tasks.join_next().await {
         listener_task_result_to_io(result)?;
+    }
+
+    if let Some((shutdown_tx, task)) = metrics_shutdown {
+        let _ = shutdown_tx.send(());
+        match task.await {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => warn!(%error, "metrics listener exited with an error"),
+            Err(join_error) => warn!(%join_error, "metrics listener task panicked"),
+        }
     }
 
     sighup_task.abort();
@@ -611,7 +675,7 @@ fn root_hints_source_label(source: &ConfigRootHintsSource) -> &'static str {
 }
 
 fn listener_task_result_to_io(result: Result<io::Result<()>, JoinError>) -> io::Result<()> {
-    result.map_err(|error| io::Error::other(format!("DNS listener task failed: {error}")))?
+    result.map_err(|error| io::Error::other(format!("listener task failed: {error}")))?
 }
 
 struct SystemClock;
@@ -671,6 +735,7 @@ impl MetricsSink for NoopMetrics {
 
 struct OpenTelemetryMetrics {
     _provider: SdkMeterProvider,
+    registry: Registry,
     query_received_total: Counter<u64>,
     query_allowed_total: Counter<u64>,
     query_blocked_total: Counter<u64>,
@@ -710,20 +775,39 @@ struct OpenTelemetryMetrics {
     protocol_error_total: Counter<u64>,
     query_duration_seconds: Histogram<f64>,
     recursive_query_duration_seconds: Histogram<f64>,
+    cache_hit_query_duration_seconds: Histogram<f64>,
+    cache_miss_query_duration_seconds: Histogram<f64>,
+    _cache_size_gauge: ObservableGauge<u64>,
+    _cache_capacity_gauge: ObservableGauge<u64>,
 }
 
 impl OpenTelemetryMetrics {
-    fn new() -> Result<Self, String> {
-        let exporter = MetricExporter::builder()
-            .with_tonic()
+    fn new(cache: Arc<InMemoryDnsCache>) -> Result<Self, String> {
+        let registry = Registry::new();
+        // Our counter instrument names already end in `_total` (chosen to read
+        // correctly as Prometheus metric names directly); without this, the
+        // exporter appends its own `_total` on top, producing `..._total_total`.
+        let exporter = opentelemetry_prometheus::exporter()
+            .with_registry(registry.clone())
+            .without_counter_suffixes()
             .build()
-            .map_err(|error| format!("failed to build OTLP metrics exporter: {error}"))?;
-        let reader = PeriodicReader::builder(exporter).build();
-        let provider = SdkMeterProvider::builder().with_reader(reader).build();
+            .map_err(|error| format!("failed to build Prometheus metrics exporter: {error}"))?;
+        let provider = SdkMeterProvider::builder().with_reader(exporter).build();
         let meter = provider.meter("rdns.resolver");
+
+        let cache_for_size = Arc::clone(&cache);
+        let cache_size_gauge = meter
+            .u64_observable_gauge("cache_size")
+            .with_callback(move |observer| observer.observe(cache_for_size.len() as u64, &[]))
+            .build();
+        let cache_capacity_gauge = meter
+            .u64_observable_gauge("cache_capacity")
+            .with_callback(move |observer| observer.observe(cache.capacity() as u64, &[]))
+            .build();
 
         Ok(Self {
             _provider: provider,
+            registry,
             query_received_total: meter.u64_counter("query_received_total").build(),
             query_allowed_total: meter.u64_counter("query_allowed_total").build(),
             query_blocked_total: meter.u64_counter("query_blocked_total").build(),
@@ -791,6 +875,14 @@ impl OpenTelemetryMetrics {
             recursive_query_duration_seconds: meter
                 .f64_histogram("recursive_query_duration_seconds")
                 .build(),
+            cache_hit_query_duration_seconds: meter
+                .f64_histogram("cache_hit_query_duration_seconds")
+                .build(),
+            cache_miss_query_duration_seconds: meter
+                .f64_histogram("cache_miss_query_duration_seconds")
+                .build(),
+            _cache_size_gauge: cache_size_gauge,
+            _cache_capacity_gauge: cache_capacity_gauge,
         })
     }
 }
@@ -856,7 +948,10 @@ impl MetricsSink for OpenTelemetryMetrics {
                 self.recursive_tcp_fallback_timeout_total.add(1, &[])
             }
             ResolverMetric::ProtocolError => self.protocol_error_total.add(1, &[]),
-            ResolverMetric::QueryDuration | ResolverMetric::RecursiveQueryDuration => {}
+            ResolverMetric::QueryDuration
+            | ResolverMetric::RecursiveQueryDuration
+            | ResolverMetric::CacheHitQueryDuration
+            | ResolverMetric::CacheMissQueryDuration => {}
         }
     }
 
@@ -868,6 +963,14 @@ impl MetricsSink for OpenTelemetryMetrics {
             }
             ResolverMetric::RecursiveQueryDuration => {
                 self.recursive_query_duration_seconds
+                    .record(duration.as_secs_f64(), &[]);
+            }
+            ResolverMetric::CacheHitQueryDuration => {
+                self.cache_hit_query_duration_seconds
+                    .record(duration.as_secs_f64(), &[]);
+            }
+            ResolverMetric::CacheMissQueryDuration => {
+                self.cache_miss_query_duration_seconds
                     .record(duration.as_secs_f64(), &[]);
             }
             _ => {}

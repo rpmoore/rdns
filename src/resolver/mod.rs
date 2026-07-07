@@ -2912,7 +2912,7 @@ impl ResolveQuery {
                 };
                 let response_bytes = self.responses.protocol_error(request_id, &error);
                 Err(self
-                    .finish(
+                    .finish_uniform(
                         started_at,
                         request,
                         None,
@@ -2949,7 +2949,7 @@ impl ResolveQuery {
         };
         let response_bytes = self.responses.blocked(decoded, &block);
         Some(
-            self.finish(
+            self.finish_uniform(
                 started_at,
                 request,
                 decoded_original_question_name(decoded),
@@ -3000,7 +3000,7 @@ impl ResolveQuery {
             kind,
         };
         Some(
-            self.finish(
+            self.finish_uniform(
                 started_at,
                 request,
                 decoded_original_question_name(decoded),
@@ -3035,7 +3035,7 @@ impl ResolveQuery {
             };
             let response_bytes = self.responses.blocked(decoded, &block);
             return self
-                .finish(
+                .finish_uniform(
                     started_at,
                     request,
                     decoded_original_question_name(decoded),
@@ -3052,7 +3052,7 @@ impl ResolveQuery {
             kind: ResolveDecisionKind::CacheHit,
         };
         self.metrics.increment(ResolverMetric::QueryAllowed);
-        self.finish(
+        self.finish_uniform(
             started_at,
             request,
             decoded_original_question_name(decoded),
@@ -3135,7 +3135,7 @@ impl ResolveQuery {
             )
             .await;
         guard.complete(backend_result);
-        self.finish(
+        self.finish_uniform(
             started_at,
             request,
             decoded_original_question_name(decoded),
@@ -3200,6 +3200,11 @@ impl ResolveQuery {
                     decision,
                     response_bytes,
                     Some(QueryEventCacheResult::Hit),
+                    // Audit event says Hit (correctly — this was served from the
+                    // cache entry the leader just populated), but latency here
+                    // is dominated by `flight.wait().await` above, not a fast
+                    // cache lookup, so bucket it by the pre-coalescing result.
+                    event_cache_result,
                     Some(QueryEventBackend::from_snapshot(backend_snapshot)),
                 )
                 .await;
@@ -3218,6 +3223,9 @@ impl ResolveQuery {
             decision,
             response_bytes,
             Some(QueryEventCacheResult::Hit),
+            // Same reasoning as above: this follower waited on the leader's
+            // full backend round trip, so its latency isn't cache-hit latency.
+            event_cache_result,
             Some(QueryEventBackend::from_snapshot(backend_snapshot)),
         )
         .await
@@ -3445,7 +3453,7 @@ impl ResolveQuery {
                 backend_result,
             )
             .await;
-        self.finish(
+        self.finish_uniform(
             started_at,
             request,
             decoded_original_question_name(decoded),
@@ -3622,6 +3630,15 @@ impl ResolveQuery {
         })
     }
 
+    /// `cache_result` drives the `QueryEventV1` audit event (what was
+    /// actually served). `latency_cache_result` drives which latency
+    /// histogram this query's duration lands in, and is usually identical to
+    /// `cache_result` — the one exception is a single-flight coalesced
+    /// follower, which is correctly labeled `Hit` for the audit event (it was
+    /// served from the cache entry the leader just populated) but whose
+    /// *latency* is dominated by waiting on the leader's full backend round
+    /// trip, not a fast cache lookup. Callers on that path pass the original
+    /// pre-coalescing classification for `latency_cache_result` instead.
     #[allow(clippy::too_many_arguments)]
     async fn finish(
         &self,
@@ -3631,6 +3648,7 @@ impl ResolveQuery {
         decision: ResolveDecision,
         response_bytes: Vec<u8>,
         cache_result: Option<QueryEventCacheResult>,
+        latency_cache_result: Option<QueryEventCacheResult>,
         backend: Option<QueryEventBackend>,
     ) -> ResolveOutcome {
         let finished_at = self.clock.now();
@@ -3656,11 +3674,54 @@ impl ResolveQuery {
         if let Some(duration) = latency {
             self.metrics
                 .observe_duration(ResolverMetric::QueryDuration, duration);
+            match latency_cache_result {
+                Some(QueryEventCacheResult::Hit) => {
+                    self.metrics
+                        .observe_duration(ResolverMetric::CacheHitQueryDuration, duration);
+                }
+                Some(QueryEventCacheResult::Miss) | Some(QueryEventCacheResult::Expired) => {
+                    self.metrics
+                        .observe_duration(ResolverMetric::CacheMissQueryDuration, duration);
+                }
+                // Bypass/Unavailable didn't go through a normal cache lookup, and
+                // None covers protocol errors/policy blocks/local answers — none
+                // of these are cache-hit or backend-round-trip latency.
+                Some(QueryEventCacheResult::Bypass) | Some(QueryEventCacheResult::Unavailable)
+                | None => {}
+            }
         }
         ResolveOutcome {
             response_bytes,
             decision,
         }
+    }
+
+    /// Calls `finish` with the same value for both `cache_result` and
+    /// `latency_cache_result` — the common case everywhere except the
+    /// single-flight coalesced-follower paths, which call `finish` directly
+    /// so the two can deliberately diverge (see `finish`'s doc comment).
+    #[allow(clippy::too_many_arguments)]
+    async fn finish_uniform(
+        &self,
+        started_at: SystemTime,
+        request: &ResolveRequest,
+        original_question_name: Option<String>,
+        decision: ResolveDecision,
+        response_bytes: Vec<u8>,
+        cache_result: Option<QueryEventCacheResult>,
+        backend: Option<QueryEventBackend>,
+    ) -> ResolveOutcome {
+        self.finish(
+            started_at,
+            request,
+            original_question_name,
+            decision,
+            response_bytes,
+            cache_result,
+            cache_result,
+            backend,
+        )
+        .await
     }
 
     fn record_query_event(&self, event: QueryEventV1) {
@@ -5196,6 +5257,10 @@ impl InMemoryDnsCache {
         self.len() == 0
     }
 
+    pub fn capacity(&self) -> usize {
+        self.max_entries
+    }
+
     pub fn remove_expired(&self, now: SystemTime) {
         let mut state = self.state.lock().unwrap();
         state.remove_expired(now);
@@ -6366,6 +6431,8 @@ pub enum ResolverMetric {
     RecursiveTcpFallbackTimeout,
     QueryDuration,
     RecursiveQueryDuration,
+    CacheHitQueryDuration,
+    CacheMissQueryDuration,
     ProtocolError,
 }
 
@@ -7936,6 +8003,15 @@ mod tests {
                 .unwrap()
                 .iter()
                 .filter(|increment| **increment == metric)
+                .count()
+        }
+
+        fn duration_count(&self, metric: ResolverMetric) -> usize {
+            self.durations
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|(observed, _)| *observed == metric)
                 .count()
         }
     }
@@ -11440,6 +11516,13 @@ mod tests {
     }
 
     #[test]
+    fn cache_capacity_returns_configured_max_entries() {
+        let cache = InMemoryDnsCache::new(42);
+
+        assert_eq!(cache.capacity(), 42);
+    }
+
+    #[test]
     fn in_memory_cache_returns_unexpired_entry() {
         let cache = InMemoryDnsCache::new(16);
         let now = SystemTime::UNIX_EPOCH + Duration::from_secs(10);
@@ -13384,6 +13467,16 @@ mod tests {
         assert_eq!(metrics.count(ResolverMetric::CacheCoalescedMiss), 1);
         assert_eq!(metrics.count(ResolverMetric::CacheHit), 1);
         assert_eq!(metrics.count(ResolverMetric::CacheMiss), 2);
+        // The follower's QueryEventV1 is legitimately labeled `Hit` (served
+        // from the cache entry the leader just populated), but its latency is
+        // dominated by waiting on the leader's full backend round trip — it
+        // must not land in the fast-hit latency bucket alongside genuine
+        // cache hits.
+        assert_eq!(metrics.duration_count(ResolverMetric::CacheHitQueryDuration), 0);
+        assert_eq!(
+            metrics.duration_count(ResolverMetric::CacheMissQueryDuration),
+            2
+        );
     }
 
     #[tokio::test]

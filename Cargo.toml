@@ -9,10 +9,14 @@ license = "Apache-2.0"
 [dependencies]
 bytes = "1"
 domain = { version = "0.12.1", default-features = false, features = ["zonefile", "bytes", "std"] }
+http-body-util = "0.1"
+hyper = { version = "1", features = ["server", "http1"] }
+hyper-util = { version = "0.1", features = ["tokio"] }
 idna = "1"
 opentelemetry = { version = "0.32.0", default-features = false, features = ["metrics"] }
-opentelemetry-otlp = { version = "0.32.0", default-features = false, features = ["grpc-tonic", "metrics"] }
-opentelemetry_sdk = { version = "0.32.1", default-features = false, features = ["metrics", "rt-tokio"] }
+opentelemetry-prometheus = "0.32"
+opentelemetry_sdk = { version = "0.32.1", default-features = false, features = ["metrics"] }
+prometheus = "0.14"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1.0.150"
 socket2 = "0.6"

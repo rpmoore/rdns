@@ -315,9 +315,35 @@ kill -HUP <pid>
 - No effect if rdns started with no config file (built-in dev defaults) —
   there's nothing to re-read.
 
-## Metrics export note
+## Metrics (Prometheus)
 
-The current OpenTelemetry OTLP metrics exporter configuration supports plaintext gRPC endpoints.
-Use an `http://` endpoint in `OTEL_EXPORTER_OTLP_ENDPOINT`.
+> **Breaking change:** rdns used to push metrics via OpenTelemetry OTLP/gRPC
+> (`OTEL_EXPORTER_OTLP_ENDPOINT`). That exporter has been removed entirely and
+> replaced with a Prometheus pull endpoint. If you were scraping metrics via
+> an OTLP collector, that pipeline stops receiving data after upgrading —
+> point your Prometheus server at the new `/metrics` endpoint instead (there
+> is no OTLP compatibility mode).
 
-HTTPS OTLP endpoints (`https://`) are not currently supported in this configuration.
+rdns exposes `GET /metrics` in Prometheus text exposition format — no TLS,
+no auth. The endpoint's own reachability doubles as a liveness check: if
+`/metrics` responds, the process is up.
+
+```toml
+[metrics]
+enabled = true              # set false to disable the endpoint entirely
+listen = "127.0.0.1:9090"   # loopback by default since there's no TLS/auth;
+                             # override to e.g. "0.0.0.0:9090" for an
+                             # external Prometheus server to reach it
+max_connections = 32        # concurrent HTTP connection cap
+```
+
+If `[metrics]` is omitted, these are the defaults — the endpoint is on by
+default. A bind failure (e.g. the port is already in use by something else
+on the host) is logged and does **not** prevent rdns from starting or
+serving DNS; it just runs without a metrics endpoint that run.
+
+Includes request/cache counters (`query_received_total`, `cache_hit_total`,
+`cache_miss_total`, ...), latency histograms split by cache-hit vs.
+cache-miss/backend path (`cache_hit_query_duration_seconds`,
+`cache_miss_query_duration_seconds`), and cache size/capacity gauges
+(`cache_size`, `cache_capacity`).
