@@ -6,6 +6,25 @@ Guidance for Codex and other coding agents working in this repository.
 
 `rdns` is a Rust DNS resolver/proxy. It uses Tokio for async networking, keeps DNS protocol logic in explicit domain modules, and uses traits at important boundaries so resolver behavior can be tested without real network I/O.
 
+## Automatic Triggers
+
+These run without being asked, no explicit request needed:
+
+- Plan drafted → adversarial-review the plan before presenting it (Change Workflow).
+- Diff ready to commit → adversarial-review the diff before committing (Change Workflow).
+- Nontrivial code change done → run `verify` skill before reporting done (Change Workflow).
+- PR touches auth/untrusted-input/network code → run `/security-review` before opening PR (Change Workflow).
+- PR feedback reviewed → mark resolved or state why not (Change Workflow).
+- Code change complete → log entry to Obsidian daily note, if available (Change Logging).
+
+## Caveman Tooling
+
+- For read-only code location ("where is X defined", "map this directory"), delegate to `cavecrew-investigator` instead of exploring inline — output is context-compressed.
+- For bounded 1–2 file mechanical edits (typo fixes, renames, format-preserving tweaks), delegate to `cavecrew-builder`. Do not route new features, new files, or cross-file refactors through it.
+- For diff/PR review output, use `cavecrew-reviewer` or `/caveman-review` for compressed, severity-tagged one-line findings instead of prose review.
+- For commit messages, use `/caveman-commit` to keep them terse and Conventional-Commits formatted.
+- Keep cavecrew delegation scoped to narrow, mechanical work only — multi-file refactors, new features, and architecture decisions stay in the main agent.
+
 ## Rust Code Standards
 
 - Run `cargo fmt` before finalizing Rust changes.
@@ -44,6 +63,10 @@ Guidance for Codex and other coding agents working in this repository.
 - When fixing a bug, include a regression test whenever practical.
 - Before committing substantive code or documentation changes, run `/codex:adversarial-review` on the intended diff to challenge the implementation approach, design choices, and assumptions. Address actionable feedback before committing, or document why feedback is not being acted on. If feedback fixes materially change the diff, run one follow-up adversarial review on the updated diff before committing.
 - When working on a step in `docs/steps.md` that links to a GitHub issue, update that issue's status as work progresses. Leave a concise progress comment when starting or materially changing scope, and close the issue only after the step's acceptance criteria and verification are complete.
+- When reviewing GitHub PR feedback, always mark the feedback as resolved when the feedback has been addressed, or state why the comment was not addressed.
+- After drafting an implementation plan (Plan mode or `/deep-plan`) and before presenting it for approval, auto-run `/codex:adversarial-review` on the plan itself. Address feedback or state why not, same as diff review.
+- After nontrivial code changes and before reporting the task done, auto-run the `verify` skill against the affected flow. Skip for test-only or doc-only diffs.
+- Before opening a PR that touches auth, parsing of untrusted input, or network-facing code, auto-run `/security-review`.
 - After changes, summarize what changed and which verification commands were run.
 
 ## Change Logging
