@@ -379,12 +379,12 @@ fn build_local_entries(
 /// Everything a reload needs to publish: the parsed config (kept around for
 /// its summary fields), the new backend snapshot, the new local-entry table,
 /// and the counts behind the reload's log line.
-type ReloadMaterials = (
-    RuntimeConfig,
-    BackendSnapshot,
-    Arc<InMemoryLocalDnsEntries>,
-    LocalEntryCounts,
-);
+struct ReloadMaterials {
+    config: RuntimeConfig,
+    backend_snapshot: BackendSnapshot,
+    local_entries: Arc<InMemoryLocalDnsEntries>,
+    counts: LocalEntryCounts,
+}
 
 /// Loads and fully builds everything a reload needs to publish — reading
 /// the config file, reading every enabled zone file, and constructing the
@@ -399,7 +399,12 @@ fn build_reload_materials(
     let config = load_runtime_config(Some(config_path))?;
     let backend_snapshot = build_backend_snapshot(&config, metrics)?;
     let (local_entries, counts) = build_local_entries(&config, Some(config_path))?;
-    Ok((config, backend_snapshot, local_entries, counts))
+    Ok(ReloadMaterials {
+        config,
+        backend_snapshot,
+        local_entries,
+        counts,
+    })
 }
 
 #[cfg(unix)]
@@ -450,7 +455,12 @@ fn apply_reload_result(
     built: Result<io::Result<ReloadMaterials>, tokio::task::JoinError>,
 ) {
     match built {
-        Ok(Ok((config, backend_snapshot, local_entries, counts))) => {
+        Ok(Ok(ReloadMaterials {
+            config,
+            backend_snapshot,
+            local_entries,
+            counts,
+        })) => {
             resolver.publish_reload(backend_snapshot, local_entries);
             println!(
                 "reloaded config from {} ({} upstream(s), {})",

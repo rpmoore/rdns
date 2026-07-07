@@ -830,28 +830,32 @@ pub const MAX_LOCAL_ZONE_FILE_BYTES: u64 = 10 * 1024 * 1024;
 /// contribute (SOA/NS records don't count).
 const MAX_LOCAL_ZONE_RECORDS: usize = 10_000;
 
-/// Parses BIND-format zone file `content` (already read from disk by the
-/// caller — this function does no I/O) against an already-validated
-/// `LocalZoneConfig`, returning the `LocalDnsEntryConfig`s derived from its
-/// `A`/`AAAA` records. `SOA`/`NS` records are recognized and ignored (they're
-/// zone-management boilerplate, not answerable local records); any other
-/// record type, or a `$INCLUDE` directive, is a hard error rather than
-/// being silently dropped. Every record's owner name must fall at or below
-/// `zone.root_domain`. Zone files are expected to declare their own
-/// `$ORIGIN` for relative names (v1 never calls `Zonefile::set_origin`).
+/// Per-name accumulator for zone-file address records, keyed by owner name
+/// while parsing. The first TTL seen for a name (across either address
+/// family) wins, since `LocalDnsEntry` has one TTL per entry, not one per
+/// family.
+struct ZoneRecordAccumulator {
+    ipv4: Vec<Ipv4Addr>,
+    ipv6: Vec<Ipv6Addr>,
+    ttl: u32,
+}
+
 /// Returns the accumulator entry for `name`, recording it in `order` on
 /// first sight so entries stay ordered by first appearance in the zone
-/// file. The first TTL seen for a name (across either address family) wins,
-/// since `LocalDnsEntry` has one TTL per entry, not one per family.
+/// file.
 fn zone_record_group<'a>(
     name: &DomainName,
     ttl: u32,
     order: &mut Vec<DomainName>,
-    by_name: &'a mut HashMap<DomainName, (Vec<Ipv4Addr>, Vec<Ipv6Addr>, u32)>,
-) -> &'a mut (Vec<Ipv4Addr>, Vec<Ipv6Addr>, u32) {
+    by_name: &'a mut HashMap<DomainName, ZoneRecordAccumulator>,
+) -> &'a mut ZoneRecordAccumulator {
     by_name.entry(name.clone()).or_insert_with(|| {
         order.push(name.clone());
-        (Vec::new(), Vec::new(), ttl)
+        ZoneRecordAccumulator {
+            ipv4: Vec::new(),
+            ipv6: Vec::new(),
+            ttl,
+        }
     })
 }
 
@@ -865,7 +869,7 @@ fn accumulate_zone_entry(
     entry: Entry,
     record_count: usize,
     order: &mut Vec<DomainName>,
-    by_name: &mut HashMap<DomainName, (Vec<Ipv4Addr>, Vec<Ipv6Addr>, u32)>,
+    by_name: &mut HashMap<DomainName, ZoneRecordAccumulator>,
 ) -> Result<usize, ConfigError> {
     let record = match entry {
         Entry::Include { .. } => {
@@ -922,12 +926,12 @@ fn accumulate_zone_entry(
     match record.data() {
         ZoneRecordData::A(a) => {
             zone_record_group(&name, ttl, order, by_name)
-                .0
+                .ipv4
                 .push(a.addr());
         }
         ZoneRecordData::Aaaa(aaaa) => {
             zone_record_group(&name, ttl, order, by_name)
-                .1
+                .ipv6
                 .push(aaaa.addr());
         }
         other => {
@@ -942,6 +946,15 @@ fn accumulate_zone_entry(
     Ok(record_count)
 }
 
+/// Parses BIND-format zone file `content` (already read from disk by the
+/// caller — this function does no I/O) against an already-validated
+/// `LocalZoneConfig`, returning the `LocalDnsEntryConfig`s derived from its
+/// `A`/`AAAA` records. `SOA`/`NS` records are recognized and ignored (they're
+/// zone-management boilerplate, not answerable local records); any other
+/// record type, or a `$INCLUDE` directive, is a hard error rather than
+/// being silently dropped. Every record's owner name must fall at or below
+/// `zone.root_domain`. Zone files are expected to declare their own
+/// `$ORIGIN` for relative names (v1 never calls `Zonefile::set_origin`).
 pub fn parse_local_zone_file(
     zone: &LocalZoneConfig,
     content: &str,
@@ -969,7 +982,7 @@ pub fn parse_local_zone_file(
     // family) wins for the whole entry, since rdns's `LocalDnsEntry` model
     // has one TTL per entry, not one per family.
     let mut order: Vec<DomainName> = Vec::new();
-    let mut by_name: HashMap<DomainName, (Vec<Ipv4Addr>, Vec<Ipv6Addr>, u32)> = HashMap::new();
+    let mut by_name: HashMap<DomainName, ZoneRecordAccumulator> = HashMap::new();
     let mut record_count: usize = 0;
 
     while let Some(entry) =
@@ -986,7 +999,7 @@ pub fn parse_local_zone_file(
     Ok(order
         .into_iter()
         .map(|name| {
-            let (ipv4, ipv6, ttl) = by_name
+            let ZoneRecordAccumulator { ipv4, ipv6, ttl } = by_name
                 .remove(&name)
                 .expect("every name in `order` was inserted into `by_name` at the same time");
             LocalDnsEntryConfig {
