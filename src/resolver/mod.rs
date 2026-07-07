@@ -5689,8 +5689,44 @@ impl RecursiveResolutionBackend {
         (Vec::new(), 0)
     }
 
-    /// Resolves a bare hostname (an NS target with no glue) to its A/AAAA
-    /// addresses via its own independent iterative walk -- the same
+    /// Resolves a bare hostname (an NS target with no glue) to its A and
+    /// AAAA addresses, querying both qtypes independently and merging the
+    /// results -- an IPv6-only glueless nameserver would otherwise never
+    /// produce endpoints since only A was queried. Returns the union of
+    /// both address families, bounded by the minimum TTL across whichever
+    /// queries actually returned addresses.
+    async fn resolve_ns_addresses(
+        &self,
+        ns_name: &str,
+        qclass: u16,
+        deadline: Instant,
+        depth_budget: u8,
+    ) -> (Vec<SocketAddr>, u32) {
+        let (mut a_endpoints, a_ttl) = self
+            .resolve_ns_addresses_for_qtype(ns_name, A_RECORD_TYPE, qclass, deadline, depth_budget)
+            .await;
+        let (aaaa_endpoints, aaaa_ttl) = self
+            .resolve_ns_addresses_for_qtype(
+                ns_name,
+                AAAA_RECORD_TYPE,
+                qclass,
+                deadline,
+                depth_budget,
+            )
+            .await;
+
+        let ttl = match (a_endpoints.is_empty(), aaaa_endpoints.is_empty()) {
+            (true, true) => 0,
+            (false, true) => a_ttl,
+            (true, false) => aaaa_ttl,
+            (false, false) => a_ttl.min(aaaa_ttl),
+        };
+        a_endpoints.extend(aaaa_endpoints);
+        (a_endpoints, ttl)
+    }
+
+    /// Resolves a bare hostname (an NS target with no glue) to its addresses
+    /// for a single qtype via its own independent iterative walk -- the same
     /// referral-following, bailiwick validation, and delegation caching as
     /// the main query path, just returning raw addresses instead of a
     /// client-facing response. `depth_budget` bounds nested glueless
@@ -5699,9 +5735,10 @@ impl RecursiveResolutionBackend {
     /// keep requiring each other's glueless resolution can't recurse
     /// forever. NS records must not point to CNAMEs (RFC 2181), so unlike
     /// the main path this walk does not need to follow CNAME chains.
-    fn resolve_ns_addresses<'a>(
+    fn resolve_ns_addresses_for_qtype<'a>(
         &'a self,
         ns_name: &'a str,
+        qtype: u16,
         qclass: u16,
         deadline: Instant,
         depth_budget: u8,
@@ -5710,7 +5747,7 @@ impl RecursiveResolutionBackend {
             if depth_budget == 0 {
                 return (Vec::new(), 0);
             }
-            let question = QuestionKey::new(ns_name, 1, qclass);
+            let question = QuestionKey::new(ns_name, qtype, qclass);
             let (mut current_zone, mut authorities) = self.authorities_for(&question.qname, qclass);
             let mut seen_referrals = HashSet::new();
 
@@ -8395,6 +8432,7 @@ mod tests {
         // of giving up.
         let question = QuestionKey::new("example.io", 1, 1);
         let ns_question = QuestionKey::new("ns1.example.net", 1, 1);
+        let ns_aaaa_question = QuestionKey::new("ns1.example.net", AAAA_RECORD_TYPE, 1);
         let resolved_ns_addr: SocketAddr = "192.0.2.10:53".parse().unwrap();
 
         let transport = Arc::new(ScriptedAuthorityTransport::new([
@@ -8411,6 +8449,14 @@ mod tests {
                 ResponseCode::NoError,
                 vec![a_record("ns1.example.net", 60)],
                 Vec::new(),
+                Vec::new(),
+                true,
+            )),
+            Ok(response_message_for_question(
+                ns_aaaa_question,
+                ResponseCode::NxDomain,
+                Vec::new(),
+                vec![soa_record("example.net", 300, 60)],
                 Vec::new(),
                 true,
             )),
@@ -8433,10 +8479,10 @@ mod tests {
         assert_eq!(response.answers().len(), 1);
         {
             let requests = transport.requests.lock().unwrap();
-            assert_eq!(requests.len(), 3);
+            assert_eq!(requests.len(), 4);
             // The final answer was fetched from the address resolved for
             // the glueless NS name, not straight from the root.
-            assert_eq!(requests[2].0, resolved_ns_addr);
+            assert_eq!(requests[3].0, resolved_ns_addr);
         }
 
         // The glueless delegation gets cached like a normal referral, so a
@@ -8453,6 +8499,7 @@ mod tests {
         // address long after that address record itself expired.
         let question = QuestionKey::new("example.io", 1, 1);
         let ns_question = QuestionKey::new("ns1.example.net", 1, 1);
+        let ns_aaaa_question = QuestionKey::new("ns1.example.net", AAAA_RECORD_TYPE, 1);
 
         let transport = Arc::new(ScriptedAuthorityTransport::new([
             Ok(response_message_for_question(
@@ -8468,6 +8515,14 @@ mod tests {
                 ResponseCode::NoError,
                 vec![a_record("ns1.example.net", 5)],
                 Vec::new(),
+                Vec::new(),
+                true,
+            )),
+            Ok(response_message_for_question(
+                ns_aaaa_question,
+                ResponseCode::NxDomain,
+                Vec::new(),
+                vec![soa_record("example.net", 300, 60)],
                 Vec::new(),
                 true,
             )),
@@ -8506,7 +8561,9 @@ mod tests {
         // from run to run.
         let question = QuestionKey::new("example.io", 1, 1);
         let a_question = QuestionKey::new("a.example.net", 1, 1);
+        let a_aaaa_question = QuestionKey::new("a.example.net", AAAA_RECORD_TYPE, 1);
         let b_question = QuestionKey::new("b.example.net", 1, 1);
+        let b_aaaa_question = QuestionKey::new("b.example.net", AAAA_RECORD_TYPE, 1);
 
         let transport = Arc::new(ScriptedAuthorityTransport::new([
             Ok(response_message_for_question(
@@ -8530,7 +8587,23 @@ mod tests {
                 true,
             )),
             Ok(response_message_for_question(
+                a_aaaa_question,
+                ResponseCode::NxDomain,
+                Vec::new(),
+                vec![soa_record("example.net", 300, 60)],
+                Vec::new(),
+                true,
+            )),
+            Ok(response_message_for_question(
                 b_question,
+                ResponseCode::NxDomain,
+                Vec::new(),
+                vec![soa_record("example.net", 300, 60)],
+                Vec::new(),
+                true,
+            )),
+            Ok(response_message_for_question(
+                b_aaaa_question,
                 ResponseCode::NxDomain,
                 Vec::new(),
                 vec![soa_record("example.net", 300, 60)],
@@ -8552,9 +8625,73 @@ mod tests {
             .collect();
         assert_eq!(
             queried_names,
-            vec!["example.io", "a.example.net", "b.example.net"],
-            "expected the two lexicographically-first NS names to be tried, never c.example.net"
+            vec![
+                "example.io",
+                "a.example.net",
+                "a.example.net",
+                "b.example.net",
+                "b.example.net",
+            ],
+            "expected the two lexicographically-first NS names to be tried (each queried for A and AAAA), never c.example.net"
         );
+    }
+
+    #[tokio::test]
+    async fn recursive_backend_resolves_glueless_delegation_via_aaaa_only_nameserver() {
+        // The glueless NS hostname has no A record at all, only AAAA -- the
+        // resolver must still find it by querying both qtypes rather than
+        // giving up after an empty/negative A answer.
+        let question = QuestionKey::new("example.io", 1, 1);
+        let ns_a_question = QuestionKey::new("ns1.example.net", 1, 1);
+        let ns_aaaa_question = QuestionKey::new("ns1.example.net", AAAA_RECORD_TYPE, 1);
+        let resolved_ns_addr: SocketAddr =
+            "[2001:db8::1]:53".parse().expect("valid IPv6 socket addr");
+
+        let transport = Arc::new(ScriptedAuthorityTransport::new([
+            Ok(response_message_for_question(
+                question.clone(),
+                ResponseCode::NoError,
+                Vec::new(),
+                vec![ns_record("example.io", 300, "ns1.example.net")],
+                Vec::new(),
+                false,
+            )),
+            Ok(response_message_for_question(
+                ns_a_question,
+                ResponseCode::NxDomain,
+                Vec::new(),
+                vec![soa_record("example.net", 300, 60)],
+                Vec::new(),
+                true,
+            )),
+            Ok(response_message_for_question(
+                ns_aaaa_question,
+                ResponseCode::NoError,
+                vec![aaaa_record("ns1.example.net", 60)],
+                Vec::new(),
+                Vec::new(),
+                true,
+            )),
+            Ok(response_message_for_question(
+                question.clone(),
+                ResponseCode::NoError,
+                vec![a_record("example.io", 60)],
+                Vec::new(),
+                Vec::new(),
+                true,
+            )),
+        ]));
+        let backend = recursive_backend(transport.clone());
+
+        let response = backend
+            .resolve(recursive_request("example.io"))
+            .await
+            .unwrap();
+
+        assert_eq!(response.answers().len(), 1);
+        let requests = transport.requests.lock().unwrap();
+        assert_eq!(requests.len(), 4);
+        assert_eq!(requests[3].0, resolved_ns_addr);
     }
 
     #[tokio::test]
@@ -10170,6 +10307,16 @@ mod tests {
             rclass: 1,
             ttl,
             record: RecordData::A("192.0.2.10".parse().unwrap()),
+        }
+    }
+
+    fn aaaa_record(name: &str, ttl: u32) -> Record {
+        Record {
+            name: name.to_string(),
+            rtype: AAAA_RECORD_TYPE,
+            rclass: 1,
+            ttl,
+            record: RecordData::AAAA(Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1)),
         }
     }
 
