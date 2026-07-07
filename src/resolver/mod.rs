@@ -5668,7 +5668,14 @@ impl RecursiveResolutionBackend {
         deadline: Instant,
         depth_budget: u8,
     ) -> (Vec<SocketAddr>, u32) {
-        for name in names.iter().take(MAX_GLUELESS_NS_NAMES) {
+        // HashSet iteration order is arbitrary, so sort first -- otherwise
+        // which NS names get tried (and thus whether resolution succeeds)
+        // when there are more candidates than MAX_GLUELESS_NS_NAMES would be
+        // nondeterministic from one run to the next.
+        let mut candidates: Vec<&String> = names.iter().collect();
+        candidates.sort();
+
+        for name in candidates.into_iter().take(MAX_GLUELESS_NS_NAMES) {
             if Instant::now() >= deadline {
                 break;
             }
@@ -8487,6 +8494,66 @@ mod tests {
         assert!(
             remaining <= 5,
             "expected delegation TTL bounded by the resolved address's 5s TTL, got {remaining}s"
+        );
+    }
+
+    #[tokio::test]
+    async fn recursive_backend_tries_glueless_ns_names_in_sorted_order() {
+        // More NS names than MAX_GLUELESS_NS_NAMES (2): the candidates must
+        // be tried in a deterministic (sorted) order rather than whatever
+        // order a HashSet happens to iterate in, so which names get
+        // attempted -- and thus whether resolution succeeds -- doesn't vary
+        // from run to run.
+        let question = QuestionKey::new("example.io", 1, 1);
+        let a_question = QuestionKey::new("a.example.net", 1, 1);
+        let b_question = QuestionKey::new("b.example.net", 1, 1);
+
+        let transport = Arc::new(ScriptedAuthorityTransport::new([
+            Ok(response_message_for_question(
+                question.clone(),
+                ResponseCode::NoError,
+                Vec::new(),
+                vec![
+                    ns_record("example.io", 300, "c.example.net"),
+                    ns_record("example.io", 300, "a.example.net"),
+                    ns_record("example.io", 300, "b.example.net"),
+                ],
+                Vec::new(),
+                false,
+            )),
+            Ok(response_message_for_question(
+                a_question,
+                ResponseCode::NxDomain,
+                Vec::new(),
+                vec![soa_record("example.net", 300, 60)],
+                Vec::new(),
+                true,
+            )),
+            Ok(response_message_for_question(
+                b_question,
+                ResponseCode::NxDomain,
+                Vec::new(),
+                vec![soa_record("example.net", 300, 60)],
+                Vec::new(),
+                true,
+            )),
+        ]));
+        let backend = recursive_backend(transport.clone());
+
+        assert_eq!(
+            backend.resolve(recursive_request("example.io")).await,
+            Err(ResolutionBackendError::NoBackendsAvailable)
+        );
+
+        let requests = transport.requests.lock().unwrap();
+        let queried_names: Vec<&str> = requests
+            .iter()
+            .map(|(_, question, _)| question.qname.as_str())
+            .collect();
+        assert_eq!(
+            queried_names,
+            vec!["example.io", "a.example.net", "b.example.net"],
+            "expected the two lexicographically-first NS names to be tried, never c.example.net"
         );
     }
 
