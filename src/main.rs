@@ -626,8 +626,8 @@ struct StdoutEvents;
 
 impl StdoutEvents {
     fn record_ref(&self, event: &QueryEventV1) {
-        match serde_json::to_value(event) {
-            Ok(event) => info!(%event, "query event"),
+        match serde_json::to_string(event) {
+            Ok(json) => println!("{json}"),
             Err(error) => error!(%error, event = ?event, "failed to serialize query event"),
         }
     }
