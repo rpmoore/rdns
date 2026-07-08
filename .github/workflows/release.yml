@@ -24,6 +24,15 @@ jobs:
       - name: Cache Cargo
         uses: Swatinem/rust-cache@v2
 
+      - name: Verify release tag matches Cargo.toml version
+        run: |
+          tag="${{ github.event.release.tag_name }}"
+          cargo_version="$(cargo metadata --no-deps --format-version=1 | jq -r '.packages[0].version')"
+          if [ "$tag" != "v$cargo_version" ]; then
+            echo "::error::release tag '$tag' does not match Cargo.toml version 'v$cargo_version' — bump Cargo.toml and merge before tagging"
+            exit 1
+          fi
+
       - name: Build release binary
         run: cargo build --release --locked
 
