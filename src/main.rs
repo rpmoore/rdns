@@ -49,6 +49,8 @@ const QUERY_EVENT_QUEUE_CAPACITY: usize = 1024;
 const CONFIG_PATH_ENV_VAR: &str = "RDNS_CONFIG";
 const DEFAULT_CONFIG_PATH: &str = "config.toml";
 
+const VERSION: &str = env!("CARGO_PKG_VERSION");
+
 /// Installs the global `tracing` subscriber: JSON-formatted events on
 /// stdout, level controlled by `RUST_LOG` (defaults to `info`).
 fn init_logging() {
@@ -64,6 +66,10 @@ fn init_logging() {
 
 #[tokio::main]
 async fn main() -> io::Result<()> {
+    if handle_version_command(std::env::args().skip(1)) {
+        return Ok(());
+    }
+
     init_logging();
 
     let config_path = resolve_config_path();
@@ -275,6 +281,18 @@ fn resolve_config_path() -> Option<PathBuf> {
     }
     let default_path = PathBuf::from(DEFAULT_CONFIG_PATH);
     default_path.exists().then_some(default_path)
+}
+
+/// Handles `rdns version`: prints the compiled-in version to stdout and
+/// returns `true` if the first argument (excluding argv[0]) is `version`, so
+/// installers and users can query the binary's version without starting the
+/// resolver.
+fn handle_version_command<I: Iterator<Item = String>>(mut args: I) -> bool {
+    if args.next().as_deref() != Some("version") {
+        return false;
+    }
+    println!("rdns {VERSION}");
+    true
 }
 
 /// Parses a `--config <path>` or `--config=<path>` flag out of an argv
@@ -1154,6 +1172,18 @@ mod tests {
         let actual = resolve_config_path();
 
         assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn handle_version_command_matches_only_the_version_subcommand() {
+        let args = ["version"].map(String::from);
+        assert!(handle_version_command(args.into_iter()));
+
+        let args = ["--config", "/etc/rdns/config.toml"].map(String::from);
+        assert!(!handle_version_command(args.into_iter()));
+
+        let args: [String; 0] = [];
+        assert!(!handle_version_command(args.into_iter()));
     }
 
     #[test]

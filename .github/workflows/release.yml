@@ -1,0 +1,49 @@
+name: Release
+
+on:
+  release:
+    types: [published]
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build-linux:
+    name: Build Linux binary
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Verify release tag matches Cargo.toml version
+        run: |
+          tag="${{ github.event.release.tag_name }}"
+          cargo_version="$(cargo metadata --no-deps --format-version=1 | python3 -c 'import json, sys; print(json.load(sys.stdin)["packages"][0]["version"])')"
+          if [ "$tag" != "v$cargo_version" ]; then
+            echo "::error::release tag '$tag' does not match Cargo.toml version 'v$cargo_version' — bump Cargo.toml and merge before tagging"
+            exit 1
+          fi
+
+      - name: Build release binary
+        run: cargo build --release --locked
+
+      - name: Package binary
+        run: tar czf rdns-${{ github.event.release.tag_name }}-linux-x86_64.tar.gz -C target/release rdns
+
+      - name: Upload release asset and generate changelog
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.event.release.tag_name }}
+          files: rdns-*-linux-x86_64.tar.gz
+          generate_release_notes: true
