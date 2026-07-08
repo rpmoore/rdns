@@ -345,8 +345,7 @@ impl TcpDnsServer {
         let listener = self.local_addr;
         tasks.spawn(async move {
             let _permit = permit;
-            if let Err(error) = serve_tcp_connection(stream, peer_addr, listener, resolver).await
-            {
+            if let Err(error) = serve_tcp_connection(stream, peer_addr, listener, resolver).await {
                 tracing::debug!(%error, %peer_addr, "tcp dns connection closed with error");
             }
         });
@@ -384,12 +383,9 @@ async fn serve_tcp_connection(
 
         let message_len = u16::from_be_bytes(length_prefix) as usize;
         let mut message = vec![0u8; message_len];
-        time::timeout(
-            TCP_CONNECTION_IDLE_TIMEOUT,
-            stream.read_exact(&mut message),
-        )
-        .await
-        .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "tcp dns read timed out"))??;
+        time::timeout(TCP_CONNECTION_IDLE_TIMEOUT, stream.read_exact(&mut message))
+            .await
+            .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "tcp dns read timed out"))??;
 
         let outcome = resolver
             .resolve(ResolveRequest::new_with_observed_source(
@@ -748,7 +744,8 @@ mod tests {
     #[tokio::test]
     async fn tcp_server_answers_pipelined_queries_on_one_connection() {
         let upstream = Arc::new(StaticUpstream::new(Ok(upstream_response(a_response(
-            0, "example.com",
+            0,
+            "example.com",
         )))));
         let resolver = resolve_service(upstream, Arc::new(RecordingEvents::default()));
         let server = TcpDnsServer::bind("127.0.0.1:0".parse().unwrap(), resolver)
