@@ -69,7 +69,7 @@ case "$arch" in
   *) die "rdns installer currently supports Linux x86_64 only (detected arch: $arch)" ;;
 esac
 
-for tool in curl tar sha256sum; do
+for tool in curl tar sha256sum grep sed head install; do
   command -v "$tool" >/dev/null 2>&1 || die "required tool '$tool' not found; install it and re-run"
 done
 
@@ -118,12 +118,15 @@ log "Downloading ${ASSET}..."
 curl -fsSL --retry 3 -o "$TMPDIR/$ASSET" "$DOWNLOAD_URL" \
   || die "failed to download $DOWNLOAD_URL (check that this release/asset exists)"
 
-log "Verifying checksum..."
+log "Verifying download integrity..."
 curl -fsSL --retry 3 -o "$TMPDIR/$ASSET.sha256" "$CHECKSUM_URL" \
-  || die "failed to download checksum file $CHECKSUM_URL — refusing to install an unverified binary"
+  || die "failed to download checksum file $CHECKSUM_URL — refusing to install without an integrity check"
 
+# Note: this only proves the tarball matches what release.yml published — the
+# checksum comes from the same GitHub origin as the binary, so it guards
+# against a corrupted/incomplete download, not against a compromised release.
 ( cd "$TMPDIR" && sha256sum -c "$ASSET.sha256" ) \
-  || die "checksum verification failed for $ASSET — the download may be corrupted or tampered with"
+  || die "checksum mismatch for $ASSET — the download is corrupted or was tampered with in transit"
 
 # --- Extract & install binary ------------------------------------------------
 
@@ -135,8 +138,12 @@ tar -xzf "$TMPDIR/$ASSET" -C "$TMPDIR"
 [ -f "$TMPDIR/$BIN_NAME" ] || die "extracted archive did not contain a '$BIN_NAME' binary"
 
 service_was_active=0
+service_was_enabled=0
 if systemctl is-active --quiet rdns.service 2>/dev/null; then
   service_was_active=1
+fi
+if systemctl is-enabled --quiet rdns.service 2>/dev/null; then
+  service_was_enabled=1
 fi
 
 install -d -m 0755 -o root -g root "$INSTALL_DIR"
@@ -321,12 +328,23 @@ RDNS_SERVICE_UNIT_EOF
   install -m 0644 -o root -g root "$UNIT_TMP" "$UNIT_PATH"
 
   systemctl daemon-reload
-  systemctl enable rdns.service >/dev/null
 
-  if [ "$service_was_active" -eq 1 ]; then
-    log "Restarting rdns.service (binary updated)..."
-    systemctl restart rdns.service
+  if [ "$already_has_unit" -eq 1 ]; then
+    # Upgrade: respect whatever enabled/active state the operator already
+    # chose — don't re-enable or (re)start a service they deliberately
+    # disabled or stopped.
+    if [ "$service_was_enabled" -eq 1 ]; then
+      systemctl enable rdns.service >/dev/null
+    fi
+    if [ "$service_was_active" -eq 1 ]; then
+      log "Restarting rdns.service (binary updated)..."
+      systemctl restart rdns.service
+    else
+      log "rdns.service was not running before this upgrade; leaving it stopped."
+      echo "    Start it with: systemctl start rdns.service"
+    fi
   else
+    systemctl enable rdns.service >/dev/null
     log "Starting rdns.service..."
     systemctl start rdns.service
   fi
