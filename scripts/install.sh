@@ -90,7 +90,8 @@ if [ -n "$VERSION_OVERRIDE" ]; then
 else
   log "Looking up latest release for ${REPO}..."
   http_code="$(curl -sSL -o "$TMPDIR/latest.json" -w '%{http_code}' \
-    "https://api.github.com/repos/${REPO}/releases/latest" || echo "000")"
+    "https://api.github.com/repos/${REPO}/releases/latest" || true)"
+  [ -n "$http_code" ] || http_code="000"
   case "$http_code" in
     200) ;;
     404) die "no published release found for ${REPO} yet" ;;
@@ -139,11 +140,13 @@ tar -xzf "$TMPDIR/$ASSET" -C "$TMPDIR"
 
 service_was_active=0
 service_was_enabled=0
-if systemctl is-active --quiet rdns.service 2>/dev/null; then
-  service_was_active=1
-fi
-if systemctl is-enabled --quiet rdns.service 2>/dev/null; then
-  service_was_enabled=1
+if command -v systemctl >/dev/null 2>&1; then
+  if systemctl is-active --quiet rdns.service 2>/dev/null; then
+    service_was_active=1
+  fi
+  if systemctl is-enabled --quiet rdns.service 2>/dev/null; then
+    service_was_enabled=1
+  fi
 fi
 
 install -d -m 0755 -o root -g root "$INSTALL_DIR"
@@ -180,8 +183,10 @@ config_freshly_installed=0
 unit_backup=""
 
 if [ "$setup_service" -eq 1 ]; then
-  command -v systemctl >/dev/null 2>&1 \
-    || die "systemctl not found — this system does not appear to use systemd; re-run with --no-service"
+  for tool in systemctl getent useradd groupadd cmp cp date; do
+    command -v "$tool" >/dev/null 2>&1 \
+      || die "required tool '$tool' not found for systemd service setup (this system may not use systemd); re-run with --no-service to skip it"
+  done
 
   if ! getent group "$SVC_USER" >/dev/null; then
     groupadd --system "$SVC_USER"
