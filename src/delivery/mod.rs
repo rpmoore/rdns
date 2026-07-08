@@ -13,4 +13,5 @@
 // limitations under the License.
 
 pub mod dns;
+pub mod metrics_http;
 pub mod upstream;

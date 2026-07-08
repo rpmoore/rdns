@@ -1,16 +1,26 @@
 # rdns runtime configuration.
 #
 # Loaded on startup, and re-loaded on SIGHUP (resolution, upstreams, and
-# local_dns_entries — dns_listen changes require a restart). Override the
-# path with the RDNS_CONFIG environment variable; if neither RDNS_CONFIG
-# nor this file is present, rdns falls back to built-in loopback
-# development defaults.
+# local_dns_entries — dns_listen and [metrics] changes require a restart).
+# Override the path with the RDNS_CONFIG environment variable; if neither
+# RDNS_CONFIG nor this file is present, rdns falls back to built-in
+# loopback development defaults.
 
 # LAN-facing bind on the standard port. Needs root or
 # `setcap cap_net_bind_service=+ep` on the built binary (see README).
 dns_listen = ["0.0.0.0:53"]
 per_query_deadline_ms = 2000
 max_udp_payload_size = 1232
+
+# Prometheus metrics on GET /metrics — no TLS/auth, so this defaults to
+# loopback-only. Override `listen` (e.g. "0.0.0.0:9090") to make it
+# reachable from an external Prometheus server, or set enabled = false
+# to turn it off entirely. A bind failure here (e.g. port already in use)
+# is logged and does not prevent rdns from serving DNS.
+[metrics]
+enabled = true
+listen = "127.0.0.1:9090"
+max_connections = 32
 
 # Recursive mode: rdns walks root -> TLD -> authority itself for anything
 # not answered locally. [[upstreams]] is ignored in this mode.

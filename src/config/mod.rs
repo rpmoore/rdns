@@ -35,6 +35,7 @@ pub struct RuntimeConfig {
     pub max_udp_payload_size: usize,
     pub local_dns_entries: Vec<LocalDnsEntryConfig>,
     pub local_zones: Vec<LocalZoneConfig>,
+    pub metrics: MetricsConfig,
 }
 
 impl RuntimeConfig {
@@ -68,6 +69,7 @@ impl RuntimeConfig {
             max_udp_payload_size,
             local_dns_entries: Vec::new(),
             local_zones: Vec::new(),
+            metrics: MetricsConfig::default_enabled(),
         };
         config.validate()?;
         Ok(config)
@@ -92,6 +94,7 @@ impl RuntimeConfig {
             max_udp_payload_size: 1232,
             local_dns_entries: Vec::new(),
             local_zones: Vec::new(),
+            metrics: MetricsConfig::default_enabled(),
         }
     }
 
@@ -123,6 +126,15 @@ impl RuntimeConfig {
         }
         for upstream in &self.upstreams {
             upstream.validate()?;
+        }
+
+        if self.metrics.enabled {
+            validate_listen_address(self.metrics.listen)?;
+            if self.metrics.max_connections == 0 {
+                return Err(ConfigError::InvalidMetricsMaxConnections {
+                    value: self.metrics.max_connections,
+                });
+            }
         }
 
         let mut normalized_local_names = HashSet::with_capacity(self.local_dns_entries.len());
@@ -234,6 +246,29 @@ impl RuntimeConfig {
         }
         hash
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MetricsConfig {
+    pub enabled: bool,
+    pub listen: SocketAddr,
+    pub max_connections: usize,
+}
+
+impl MetricsConfig {
+    pub fn default_enabled() -> Self {
+        Self {
+            enabled: true,
+            listen: default_metrics_listen_addr(),
+            max_connections: DEFAULT_METRICS_MAX_CONNECTIONS,
+        }
+    }
+}
+
+const DEFAULT_METRICS_MAX_CONNECTIONS: usize = 32;
+
+fn default_metrics_listen_addr() -> SocketAddr {
+    SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 9090)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1115,6 +1150,9 @@ pub enum ConfigError {
     InvalidTomlConfig {
         message: String,
     },
+    InvalidMetricsMaxConnections {
+        value: usize,
+    },
 }
 
 #[derive(Debug, Deserialize)]
@@ -1131,6 +1169,37 @@ struct RawRuntimeConfig {
     local_dns_entries: Vec<RawLocalDnsEntryConfig>,
     #[serde(default)]
     local_zones: Vec<RawLocalZoneConfig>,
+    #[serde(default)]
+    metrics: Option<RawMetricsConfig>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawMetricsConfig {
+    #[serde(default = "default_true")]
+    enabled: bool,
+    #[serde(default = "default_metrics_listen")]
+    listen: String,
+    #[serde(default = "default_metrics_max_connections")]
+    max_connections: usize,
+}
+
+fn default_metrics_listen() -> String {
+    default_metrics_listen_addr().to_string()
+}
+
+fn default_metrics_max_connections() -> usize {
+    DEFAULT_METRICS_MAX_CONNECTIONS
+}
+
+impl RawMetricsConfig {
+    fn try_into_metrics_config(self) -> Result<MetricsConfig, ConfigError> {
+        Ok(MetricsConfig {
+            enabled: self.enabled,
+            listen: parse_socket_addr(&self.listen)?,
+            max_connections: self.max_connections,
+        })
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -1418,6 +1487,11 @@ impl TryFrom<RawRuntimeConfig> for RuntimeConfig {
             .into_iter()
             .map(RawLocalZoneConfig::try_into_local_zone_config)
             .collect::<Result<Vec<_>, _>>()?;
+        let metrics = raw
+            .metrics
+            .map(RawMetricsConfig::try_into_metrics_config)
+            .transpose()?
+            .unwrap_or_else(MetricsConfig::default_enabled);
 
         let config = RuntimeConfig {
             dns_listen,
@@ -1427,6 +1501,7 @@ impl TryFrom<RawRuntimeConfig> for RuntimeConfig {
             max_udp_payload_size: raw.max_udp_payload_size,
             local_dns_entries,
             local_zones,
+            metrics,
         };
         config.validate()?;
         Ok(config)
@@ -2198,6 +2273,135 @@ a.root-servers.net.      3600000      Aaaa  2001:503:ba3e::2:30
         let entry = config.local_dns_entries[0].to_local_dns_entry().unwrap();
         assert_eq!(entry.name, DomainName::parse("nas.lan").unwrap());
         assert_eq!(entry.ipv4, vec![Ipv4Addr::new(192, 168, 1, 10)]);
+    }
+
+    #[test]
+    fn metrics_config_defaults_when_absent() {
+        let config = RuntimeConfig::from_toml_str(&valid_toml()).unwrap();
+
+        assert_eq!(
+            config.metrics,
+            MetricsConfig {
+                enabled: true,
+                listen: SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 9090),
+                max_connections: 32,
+            }
+        );
+    }
+
+    #[test]
+    fn metrics_config_explicit_override() {
+        let mut toml = valid_toml();
+        toml.push_str(
+            r#"
+            [metrics]
+            listen = "0.0.0.0:9090"
+            "#,
+        );
+
+        let config = RuntimeConfig::from_toml_str(&toml).unwrap();
+
+        assert!(config.metrics.enabled);
+        assert_eq!(
+            config.metrics.listen,
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 9090)
+        );
+    }
+
+    #[test]
+    fn metrics_config_max_connections_defaults_and_can_be_overridden() {
+        let config = RuntimeConfig::from_toml_str(&valid_toml()).unwrap();
+        assert_eq!(config.metrics.max_connections, 32);
+
+        let mut toml = valid_toml();
+        toml.push_str(
+            r#"
+            [metrics]
+            max_connections = 8
+            "#,
+        );
+        let config = RuntimeConfig::from_toml_str(&toml).unwrap();
+        assert_eq!(config.metrics.max_connections, 8);
+    }
+
+    #[test]
+    fn metrics_config_can_be_disabled() {
+        let mut toml = valid_toml();
+        toml.push_str(
+            r#"
+            [metrics]
+            enabled = false
+            "#,
+        );
+
+        let config = RuntimeConfig::from_toml_str(&toml).unwrap();
+
+        assert!(!config.metrics.enabled);
+    }
+
+    #[test]
+    fn metrics_config_rejects_invalid_listen_address_when_enabled() {
+        let mut toml = valid_toml();
+        toml.push_str(
+            r#"
+            [metrics]
+            listen = "127.0.0.1:0"
+            "#,
+        );
+
+        let error = RuntimeConfig::from_toml_str(&toml).unwrap_err();
+
+        assert!(matches!(error, ConfigError::InvalidListenAddress { .. }));
+    }
+
+    #[test]
+    fn metrics_config_rejects_zero_max_connections_when_enabled() {
+        let mut toml = valid_toml();
+        toml.push_str(
+            r#"
+            [metrics]
+            max_connections = 0
+            "#,
+        );
+
+        let error = RuntimeConfig::from_toml_str(&toml).unwrap_err();
+
+        assert_eq!(
+            error,
+            ConfigError::InvalidMetricsMaxConnections { value: 0 }
+        );
+    }
+
+    #[test]
+    fn metrics_config_allows_zero_max_connections_when_disabled() {
+        let mut toml = valid_toml();
+        toml.push_str(
+            r#"
+            [metrics]
+            enabled = false
+            max_connections = 0
+            "#,
+        );
+
+        let config = RuntimeConfig::from_toml_str(&toml).unwrap();
+
+        assert_eq!(config.metrics.max_connections, 0);
+    }
+
+    #[test]
+    fn metrics_config_allows_port_zero_listen_address_when_disabled() {
+        let mut toml = valid_toml();
+        toml.push_str(
+            r#"
+            [metrics]
+            enabled = false
+            listen = "127.0.0.1:0"
+            "#,
+        );
+
+        let config = RuntimeConfig::from_toml_str(&toml).unwrap();
+
+        assert!(!config.metrics.enabled);
     }
 
     #[test]
