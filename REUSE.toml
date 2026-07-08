@@ -21,5 +21,5 @@ path = [
     "RUST.md",
 ]
 precedence = "override"
-SPDX-FileCopyrightText = "2023 Ryan Moore"
+SPDX-FileCopyrightText = "2026 Ryan Moore"
 SPDX-License-Identifier = "Apache-2.0"

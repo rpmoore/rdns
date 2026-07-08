@@ -1,4 +1,4 @@
-// Copyright 2023 Ryan Moore
+// Copyright 2026 Ryan Moore
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -26,7 +26,7 @@ use tokio::net::UdpSocket;
 use tokio::time::{self, Instant};
 
 use crate::config::{RecursiveTransport, RuntimeConfig, UpstreamConfig, UpstreamProtocol};
-use crate::protocol::{encode_tcp_frame, first_question, rewrite_response_id, Message};
+use crate::protocol::{Message, encode_tcp_frame, first_question, rewrite_response_id};
 use crate::resolver::{
     MetricsSink, NoopMetricsSink, QuestionKey, RecursiveAuthorityResponse,
     RecursiveAuthorityTransport, ResolutionBackend, ResolverMetric, UpstreamError, UpstreamRequest,
@@ -1394,12 +1394,14 @@ mod tests {
             let tcp_query = read_tcp_query(&mut stream).await;
             assert_eq!(&tcp_query[0..2], &[0xbe, 0xef]);
             write_tcp_response(&mut stream, &a_response(0xbeef, "example.com")).await;
-            assert!(time::timeout(Duration::from_millis(50), async {
-                let mut request = [0u8; 512];
-                udp_socket.recv_from(&mut request).await.unwrap();
-            })
-            .await
-            .is_err());
+            assert!(
+                time::timeout(Duration::from_millis(50), async {
+                    let mut request = [0u8; 512];
+                    udp_socket.recv_from(&mut request).await.unwrap();
+                })
+                .await
+                .is_err()
+            );
         });
         let transport = recursive_transport_with(
             vec![RecursiveTransport::Tcp],

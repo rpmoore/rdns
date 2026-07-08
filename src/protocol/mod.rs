@@ -1,4 +1,4 @@
-// Copyright 2023 Ryan Moore
+// Copyright 2026 Ryan Moore
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -1449,10 +1449,10 @@ fn decode_compression_pointer(
     if pointer_offset >= cursor || pointer_offset >= dns_message.len() {
         return Err(DnsParseError::InvalidNamePointer);
     }
-    if let Some(context) = context {
-        if !context.valid_name_offsets.contains(&pointer_offset) {
-            return Err(DnsParseError::InvalidNamePointer);
-        }
+    if let Some(context) = context
+        && !context.valid_name_offsets.contains(&pointer_offset)
+    {
+        return Err(DnsParseError::InvalidNamePointer);
     }
     Ok(pointer_offset)
 }

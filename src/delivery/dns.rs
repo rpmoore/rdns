@@ -1,4 +1,4 @@
-// Copyright 2023 Ryan Moore
+// Copyright 2026 Ryan Moore
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -553,9 +553,11 @@ mod tests {
         first_started.await;
         shutdown_tx.send(()).unwrap();
 
-        assert!(time::timeout(Duration::from_millis(50), &mut server_task)
-            .await
-            .is_err());
+        assert!(
+            time::timeout(Duration::from_millis(50), &mut server_task)
+                .await
+                .is_err()
+        );
         upstream.first_release.notify_waiters();
         server_task.await.unwrap().unwrap();
     }
