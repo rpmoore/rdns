@@ -26,7 +26,7 @@ use tokio::task::JoinSet;
 use tokio::time;
 
 use crate::config::{DEFAULT_MAX_TCP_CONNECTIONS, RuntimeConfig};
-use crate::protocol::build_servfail_response;
+use crate::protocol::{DNS_HEADER_LEN, build_servfail_response};
 use crate::resolver::{ObservedSourceEndpoint, ResolveQuery, ResolveRequest};
 
 const DEFAULT_MAX_IN_FLIGHT_REQUESTS: usize = 1024;
@@ -83,6 +83,34 @@ async fn bind_listener_socket(address: SocketAddr) -> io::Result<UdpSocket> {
 #[cfg(not(target_os = "linux"))]
 async fn bind_listener_socket(address: SocketAddr) -> io::Result<UdpSocket> {
     UdpSocket::bind(address).await
+}
+
+/// Bind a TCP listener socket for the DNS listener.
+///
+/// Mirrors `bind_listener_socket`'s `SO_REUSEPORT` handling for UDP. Without
+/// it, a `dns_listen` config that binds both a wildcard and a more specific
+/// address on the same port (e.g. `0.0.0.0:53` and `127.0.0.1:53`) can start
+/// fine on the UDP side but fail the plain TCP bind with `EADDRINUSE`,
+/// aborting startup on a config that otherwise works.
+#[cfg(target_os = "linux")]
+async fn bind_tcp_listener_socket(address: SocketAddr) -> io::Result<TcpListener> {
+    use socket2::{Domain, Protocol, Socket, Type};
+    let socket = Socket::new(
+        Domain::for_address(address),
+        Type::STREAM,
+        Some(Protocol::TCP),
+    )?;
+    socket.set_reuse_port(true)?;
+    socket.set_nonblocking(true)?;
+    socket.bind(&address.into())?;
+    socket.listen(1024)?;
+    let std_listener: std::net::TcpListener = socket.into();
+    TcpListener::from_std(std_listener)
+}
+
+#[cfg(not(target_os = "linux"))]
+async fn bind_tcp_listener_socket(address: SocketAddr) -> io::Result<TcpListener> {
+    TcpListener::bind(address).await
 }
 
 pub struct UdpDnsServer {
@@ -289,7 +317,19 @@ impl TcpDnsServer {
         max_connections_per_ip: usize,
         shutdown_grace_period: Duration,
     ) -> io::Result<Self> {
-        let listener = TcpListener::bind(address).await?;
+        // `Semaphore::new(0)` never issues a permit, so every accepted
+        // connection would stall forever waiting for one — a self-inflicted
+        // DoS that's very hard to debug from the outside. Reject it here so
+        // every construction path (including direct callers of `bind`/
+        // `bind_with_max_connections`, not just `bind_configured`) is
+        // covered.
+        if max_connections == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "tcp dns server: max_connections must be greater than zero",
+            ));
+        }
+        let listener = bind_tcp_listener_socket(address).await?;
         let local_addr = listener.local_addr()?;
         Ok(Self {
             listener,
@@ -339,44 +379,43 @@ impl TcpDnsServer {
         let per_ip_counts: Arc<Mutex<HashMap<IpAddr, usize>>> =
             Arc::new(Mutex::new(HashMap::new()));
         let mut tasks: JoinSet<()> = JoinSet::new();
-        // A connection that passed the per-IP check but hasn't yet secured a
-        // global `max_connections` permit. This lives across loop
-        // iterations (unlike the futures inside `select!`, which are
-        // recreated every iteration and dropped if a different branch
-        // wins): if the accepted `TcpStream` itself lived inside one of
-        // those per-iteration futures, a `tasks.join_next()` completion
-        // (freeing the very permit this connection is waiting for) would
-        // cause `select!` to discard the still-pending accept future on the
-        // next loop iteration — dropping the live, already-accepted socket
-        // and resetting the connection out from under a client that did
-        // nothing wrong. Keeping it here means only the permit-acquisition
-        // attempt is retried each iteration (safe: `Semaphore::acquire_owned`
-        // is cancel-safe), never the connection itself.
-        let mut pending: Option<(TcpStream, SocketAddr, PerIpConnectionGuard)> = None;
+        // A global connection permit secured *before* calling `accept()`.
+        // This lives across loop iterations (unlike the futures inside
+        // `select!`, which are recreated every iteration and dropped if a
+        // different branch wins): acquiring the permit first means a
+        // cancelled iteration only abandons a semaphore wait — cancel-safe,
+        // and invisible to any client, since the connection simply stays in
+        // the kernel's accept backlog — instead of risking an already-
+        // `accept()`-ed `TcpStream` being dropped (and the connection reset)
+        // out from under a client that did nothing wrong. It also keeps
+        // `max_connections` strict: nothing is pulled out of the kernel
+        // backlog into a live, resource-holding socket until a permit is
+        // actually available.
+        let mut pending_permit: Option<OwnedSemaphorePermit> = None;
         loop {
             tokio::select! {
                 _ = &mut shutdown => break,
-                accepted = self.listener.accept(), if pending.is_none() => {
+                permit = Arc::clone(&semaphore).acquire_owned(), if pending_permit.is_none() => {
+                    match permit {
+                        Ok(permit) => pending_permit = Some(permit),
+                        Err(_) => break,
+                    }
+                }
+                accepted = self.listener.accept(), if pending_permit.is_some() => {
+                    let permit = pending_permit.take().unwrap();
                     let (stream, peer_addr) = accepted?;
                     match PerIpConnectionGuard::try_acquire(
                         per_ip_counts.clone(),
                         peer_addr.ip(),
                         self.max_connections_per_ip,
                     ) {
-                        Some(per_ip_guard) => pending = Some((stream, peer_addr, per_ip_guard)),
+                        Some(per_ip_guard) => {
+                            self.spawn_connection(stream, peer_addr, permit, per_ip_guard, &mut tasks);
+                        }
                         None => tracing::debug!(
                             %peer_addr,
                             "tcp dns: dropping connection, per-source-ip limit reached"
                         ),
-                    }
-                }
-                permit = Arc::clone(&semaphore).acquire_owned(), if pending.is_some() => {
-                    let (stream, peer_addr, per_ip_guard) = pending.take().unwrap();
-                    match permit {
-                        Ok(permit) => {
-                            self.spawn_connection(stream, peer_addr, permit, per_ip_guard, &mut tasks);
-                        }
-                        Err(_) => break,
                     }
                 }
                 result = tasks.join_next(), if !tasks.is_empty() => {
@@ -488,6 +527,18 @@ async fn serve_tcp_connection(
         }
 
         let message_len = u16::from_be_bytes(length_prefix) as usize;
+        // Anything shorter than a DNS header can't be a real query; the
+        // resolver's own decode step would reject it anyway, but bailing out
+        // here avoids driving a read/resolve round-trip for a client sending
+        // deliberately malformed length prefixes.
+        if message_len < DNS_HEADER_LEN {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "tcp dns message length {message_len} is shorter than the {DNS_HEADER_LEN}-byte dns header"
+                ),
+            ));
+        }
         let mut message = vec![0u8; message_len];
         time::timeout(TCP_CONNECTION_IDLE_TIMEOUT, stream.read_exact(&mut message))
             .await
@@ -1110,6 +1161,75 @@ mod tests {
         let parsed = Message::parse(&second_response).unwrap();
         assert_eq!(parsed.header.id, 0xbbbb);
         assert_eq!(parsed.header.r_code(), ResponseCode::ServFail as u8);
+
+        drop(client);
+        shutdown_tx.send(()).unwrap();
+        server_task.await.unwrap().unwrap();
+    }
+
+    /// `Semaphore::new(0)` never issues a permit, so a server built with
+    /// `max_connections = 0` would accept TCP connections that then stall
+    /// forever. Regression test for the P1 finding in PR #117's review that
+    /// this wasn't rejected.
+    #[tokio::test]
+    async fn tcp_bind_rejects_zero_max_connections() {
+        let upstream = Arc::new(StaticUpstream::new(Ok(upstream_response(a_response(
+            0,
+            "example.com",
+        )))));
+        let resolver = resolve_service(upstream, Arc::new(RecordingEvents::default()));
+        let result =
+            TcpDnsServer::bind_with_max_connections("127.0.0.1:0".parse().unwrap(), resolver, 0)
+                .await;
+        match result {
+            Ok(_) => panic!("expected max_connections = 0 to be rejected"),
+            Err(error) => assert_eq!(error.kind(), io::ErrorKind::InvalidInput),
+        }
+    }
+
+    /// A TCP length prefix smaller than the 12-byte DNS header can't frame a
+    /// real query. Regression test for the P2 finding in PR #117's review
+    /// that undersized lengths were passed straight through to the resolver
+    /// instead of being rejected at the framing layer.
+    #[tokio::test]
+    async fn tcp_server_rejects_message_shorter_than_dns_header() {
+        let upstream = Arc::new(StaticUpstream::new(Ok(upstream_response(a_response(
+            0,
+            "example.com",
+        )))));
+        let resolver = resolve_service(upstream, Arc::new(RecordingEvents::default()));
+        let server = TcpDnsServer::bind("127.0.0.1:0".parse().unwrap(), resolver)
+            .await
+            .unwrap();
+        let server_addr = server.local_addr().unwrap();
+        let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
+        let server_task = tokio::spawn(async move {
+            server
+                .serve_until(async {
+                    let _ = shutdown_rx.await;
+                })
+                .await
+        });
+
+        let mut client = TcpStream::connect(server_addr).await.unwrap();
+        // A length prefix of 4 claims a message far shorter than the 12-byte
+        // DNS header.
+        tcp_send_query(&mut client, &[0u8; 4]).await;
+        let mut probe = [0u8; 1];
+        let read_result = time::timeout(Duration::from_secs(2), client.read(&mut probe))
+            .await
+            .expect("server should close the connection promptly");
+        // The server closes without reading the (unread, still-buffered)
+        // 4 bytes of declared-but-rejected message payload, so the kernel
+        // may report this as a clean EOF or as `ConnectionReset` depending
+        // on timing — either is an acceptable "connection closed" outcome,
+        // as long as the malformed message was never resolved.
+        match read_result {
+            Ok(0) => {}
+            Ok(n) => panic!("expected connection close, got {n} bytes"),
+            Err(error) if error.kind() == io::ErrorKind::ConnectionReset => {}
+            Err(error) => panic!("expected EOF or connection reset, got {error:?}"),
+        }
 
         drop(client);
         shutdown_tx.send(()).unwrap();

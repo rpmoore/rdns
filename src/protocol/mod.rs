@@ -21,7 +21,7 @@ use std::time::Duration;
 use bytes::Bytes;
 use serde::Serialize;
 
-const DNS_HEADER_LEN: usize = 12;
+pub(crate) const DNS_HEADER_LEN: usize = 12;
 pub const DNS_DEFAULT_UDP_PAYLOAD_SIZE: usize = 512;
 const MAX_LABEL_LEN: usize = 63;
 const MAX_NAME_LEN: usize = 255;
