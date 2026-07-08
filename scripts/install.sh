@@ -102,6 +102,10 @@ else
   [ -n "$TAG" ] || die "could not parse a release tag from the GitHub API response"
 fi
 
+case "$TAG" in
+  *[!A-Za-z0-9._-]*|"") die "invalid release tag: '$TAG'" ;;
+esac
+
 log "Installing rdns ${TAG} (linux-x86_64)"
 
 ASSET="rdns-${TAG}-linux-x86_64.tar.gz"
@@ -135,6 +139,7 @@ if systemctl is-active --quiet rdns.service 2>/dev/null; then
   service_was_active=1
 fi
 
+install -d -m 0755 -o root -g root "$INSTALL_DIR"
 install -m 0755 -o root -g root "$TMPDIR/$BIN_NAME" "$INSTALL_DIR/$BIN_NAME"
 
 # --- Decide whether to set up systemd ---------------------------------------
@@ -175,8 +180,13 @@ if [ "$setup_service" -eq 1 ]; then
     groupadd --system "$SVC_USER"
   fi
   if ! getent passwd "$SVC_USER" >/dev/null; then
+    nologin_shell="/usr/sbin/nologin"
+    [ -x "$nologin_shell" ] || nologin_shell="/sbin/nologin"
+    [ -x "$nologin_shell" ] || nologin_shell="$(command -v nologin || true)"
+    [ -n "$nologin_shell" ] || nologin_shell="/bin/false"
+
     log "Creating system user '$SVC_USER'..."
-    useradd --system --no-create-home --shell /usr/sbin/nologin \
+    useradd --system --no-create-home --shell "$nologin_shell" \
       --gid "$SVC_USER" --comment "rdns DNS resolver daemon" "$SVC_USER"
   fi
 
