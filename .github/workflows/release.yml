@@ -13,6 +13,8 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: write
+    env:
+      RELEASE_TAG: ${{ github.event.release.tag_name }}
 
     steps:
       - name: Checkout
@@ -28,10 +30,9 @@ jobs:
 
       - name: Verify release tag matches Cargo.toml version
         run: |
-          tag="${{ github.event.release.tag_name }}"
           cargo_version="$(cargo metadata --no-deps --format-version=1 | python3 -c 'import json, sys; print(json.load(sys.stdin)["packages"][0]["version"])')"
-          if [ "$tag" != "v$cargo_version" ]; then
-            echo "::error::release tag '$tag' does not match Cargo.toml version 'v$cargo_version' — bump Cargo.toml and merge before tagging"
+          if [ "$RELEASE_TAG" != "v$cargo_version" ]; then
+            echo "::error::release tag '$RELEASE_TAG' does not match Cargo.toml version 'v$cargo_version' — bump Cargo.toml and merge before tagging"
             exit 1
           fi
 
@@ -39,11 +40,14 @@ jobs:
         run: cargo build --release --locked
 
       - name: Package binary
-        run: tar czf rdns-${{ github.event.release.tag_name }}-linux-x86_64.tar.gz -C target/release rdns
+        run: tar czf "rdns-${RELEASE_TAG}-linux-x86_64.tar.gz" -C target/release rdns
+
+      - name: Checksum tarball
+        run: sha256sum "rdns-${RELEASE_TAG}-linux-x86_64.tar.gz" > "rdns-${RELEASE_TAG}-linux-x86_64.tar.gz.sha256"
 
       - name: Upload release asset and generate changelog
-        uses: softprops/action-gh-release@v2
-        with:
-          tag_name: ${{ github.event.release.tag_name }}
-          files: rdns-*-linux-x86_64.tar.gz
-          generate_release_notes: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release upload "$RELEASE_TAG" "rdns-${RELEASE_TAG}-linux-x86_64.tar.gz" "rdns-${RELEASE_TAG}-linux-x86_64.tar.gz.sha256" --clobber
+          gh release edit "$RELEASE_TAG" --generate-notes
