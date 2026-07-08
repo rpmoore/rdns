@@ -14,7 +14,7 @@ curl -fsSL https://raw.githubusercontent.com/rpmoore/rdns/main/scripts/install.s
 
 Pass `--yes` to install and start the service without prompting, `--no-service`
 to install only the binary, or `--version <tag>` to pin a specific release.
-See `scripts/install.sh --help` for details.
+See `./scripts/install.sh --help` for details (from a repo checkout).
 
 ## Run it
 

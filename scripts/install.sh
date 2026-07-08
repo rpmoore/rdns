@@ -136,7 +136,6 @@ if systemctl is-active --quiet rdns.service 2>/dev/null; then
 fi
 
 install -m 0755 -o root -g root "$TMPDIR/$BIN_NAME" "$INSTALL_DIR/$BIN_NAME"
-log "Installed: $("$INSTALL_DIR/$BIN_NAME" version)"
 
 # --- Decide whether to set up systemd ---------------------------------------
 
