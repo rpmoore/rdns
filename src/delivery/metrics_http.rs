@@ -122,12 +122,11 @@ impl MetricsServer {
         &self,
         semaphore: Arc<Semaphore>,
     ) -> io::Result<Option<(TcpStream, OwnedSemaphorePermit)>> {
-        let permit = match semaphore.acquire_owned().await {
-            Ok(permit) => permit,
-            Err(_) => return Ok(None),
-        };
         let (stream, _peer_addr) = self.listener.accept().await?;
-        Ok(Some((stream, permit)))
+        match semaphore.acquire_owned().await {
+            Ok(permit) => Ok(Some((stream, permit))),
+            Err(_) => Ok(None),
+        }
     }
 
     fn spawn_connection(

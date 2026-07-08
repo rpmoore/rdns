@@ -226,7 +226,7 @@ async fn serve_until_shutdown(
             match result {
                 Some(result) => {
                     listener_task_result_to_io(result)?;
-                    warn!("listener stopped");
+                    warn!("dns listener stopped");
                 }
                 None => return Ok(()),
             }
@@ -679,7 +679,7 @@ fn root_hints_source_label(source: &ConfigRootHintsSource) -> &'static str {
 }
 
 fn listener_task_result_to_io(result: Result<io::Result<()>, JoinError>) -> io::Result<()> {
-    result.map_err(|error| io::Error::other(format!("listener task failed: {error}")))?
+    result.map_err(|error| io::Error::other(format!("dns listener task failed: {error}")))?
 }
 
 struct SystemClock;
