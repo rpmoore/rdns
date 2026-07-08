@@ -293,6 +293,15 @@ ExecReload=/bin/kill -HUP $MAINPID
 Restart=on-failure
 RestartSec=2s
 
+# Log level defaults to "info" (startup/shutdown/errors only — no
+# per-query lines). To temporarily see the per-query audit trail:
+#   sudo systemctl edit rdns
+# and add:
+#   [Service]
+#   Environment=RUST_LOG=debug
+# then `systemctl restart rdns`. Revert by removing the override.
+#Environment=RUST_LOG=info
+
 User=rdns
 Group=rdns
 
