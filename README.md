@@ -3,6 +3,25 @@
 Small DNS server. Answers configured local names for your LAN, forwards
 everything else upstream (e.g. Cloudflare) or resolves it recursively itself.
 
+## Install
+
+Installs the latest release binary to `/usr/local/bin/rdns` and, if you opt
+in, sets up a systemd service running as a recursive resolver. **Linux
+x86_64 only** — no macOS or ARM builds are published yet, so the script
+exits with an error on other platforms. The release binary is built on
+`ubuntu-latest` and is **glibc-linked**; it will not run on musl-based
+distros (e.g. Alpine) even though they report `x86_64` — the installer
+detects musl-only systems (no glibc present) and exits with a clear error
+rather than installing a binary that can't execute.
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/rpmoore/rdns/main/scripts/install.sh | sudo bash
+```
+
+Pass `--yes` to install and start the service without prompting, `--no-service`
+to install only the binary, or `--version <tag>` to pin a specific release.
+See `./scripts/install.sh --help` for details (from a repo checkout).
+
 ## Run it
 
 ```bash
@@ -11,9 +30,13 @@ cargo run
 
 Startup config resolution order:
 
-1. `RDNS_CONFIG` env var, if set — path to a TOML config file.
-2. `./config.toml`, if present in the working directory.
-3. Otherwise, built-in loopback dev defaults (listens on `127.0.0.1:5300`,
+1. `--config <path>` CLI flag, if given — takes precedence over everything
+   else. This is how the installer's systemd unit starts rdns
+   (`--config /etc/rdns/config.toml`), so on an installed/service setup
+   this is the config in effect regardless of `RDNS_CONFIG`.
+2. `RDNS_CONFIG` env var, if set — path to a TOML config file.
+3. `./config.toml`, if present in the working directory.
+4. Otherwise, built-in loopback dev defaults (listens on `127.0.0.1:5300`,
    forwards to `1.1.1.1:53`, no local entries).
 
 A sample `config.toml` ships at the repo root and loads automatically. Its
@@ -49,6 +72,11 @@ grant the built binary the capability:
 ```bash
 sudo setcap cap_net_bind_service=+ep target/release/rdns
 ```
+
+(This only matters if you build/run the binary manually. `scripts/install.sh`'s
+systemd unit grants the capability via `AmbientCapabilities` instead, so its
+service doesn't need `setcap` and won't lose the capability across binary
+upgrades.)
 
 Unknown fields in the file are rejected at load time (fails closed rather
 than silently ignoring a typo'd or unsupported setting).

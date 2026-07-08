@@ -1,0 +1,49 @@
+# Keep this file in sync with the embedded copy in scripts/install.sh.
+[Unit]
+Description=rdns - Rust DNS resolver daemon
+Documentation=https://github.com/rpmoore/rdns
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/rdns --config /etc/rdns/config.toml
+ExecReload=/bin/kill -HUP $MAINPID
+Restart=on-failure
+RestartSec=2s
+
+User=rdns
+Group=rdns
+
+# Tags journald/syslog-forwarded lines as "rdns" (journalctl -t rdns),
+# instead of the default derived-from-binary-path identifier.
+SyslogIdentifier=rdns
+
+# Bind port 53 without root. Ambient (process) capability, not `setcap`
+# (a file xattr an upgrade's `install`/`cp` of a new binary would wipe).
+AmbientCapabilities=CAP_NET_BIND_SERVICE
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE
+NoNewPrivileges=yes
+
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+ProtectClock=true
+ProtectHostname=true
+RestrictSUIDSGID=true
+RestrictRealtime=true
+RestrictNamespaces=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+RemoveIPC=true
+UMask=0077
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+
+[Install]
+WantedBy=multi-user.target
