@@ -8,7 +8,11 @@ everything else upstream (e.g. Cloudflare) or resolves it recursively itself.
 Installs the latest release binary to `/usr/local/bin/rdns` and, if you opt
 in, sets up a systemd service running as a recursive resolver. **Linux
 x86_64 only** — no macOS or ARM builds are published yet, so the script
-exits with an error on other platforms.
+exits with an error on other platforms. The release binary is built on
+`ubuntu-latest` and is **glibc-linked**; it will not run on musl-based
+distros (e.g. Alpine) even though they report `x86_64` — the installer
+detects musl-only systems (no glibc present) and exits with a clear error
+rather than installing a binary that can't execute.
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/rpmoore/rdns/main/scripts/install.sh | sudo bash
@@ -26,9 +30,13 @@ cargo run
 
 Startup config resolution order:
 
-1. `RDNS_CONFIG` env var, if set — path to a TOML config file.
-2. `./config.toml`, if present in the working directory.
-3. Otherwise, built-in loopback dev defaults (listens on `127.0.0.1:5300`,
+1. `--config <path>` CLI flag, if given — takes precedence over everything
+   else. This is how the installer's systemd unit starts rdns
+   (`--config /etc/rdns/config.toml`), so on an installed/service setup
+   this is the config in effect regardless of `RDNS_CONFIG`.
+2. `RDNS_CONFIG` env var, if set — path to a TOML config file.
+3. `./config.toml`, if present in the working directory.
+4. Otherwise, built-in loopback dev defaults (listens on `127.0.0.1:5300`,
    forwards to `1.1.1.1:53`, no local entries).
 
 A sample `config.toml` ships at the repo root and loads automatically. Its

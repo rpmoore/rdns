@@ -69,7 +69,14 @@ case "$arch" in
   *) die "rdns installer currently supports Linux x86_64 only (detected arch: $arch)" ;;
 esac
 
-for tool in curl tar sha256sum grep sed head install; do
+# Release binaries are built on ubuntu-latest and are glibc-linked. A
+# musl-only system (e.g. Alpine) reports x86_64 too, but the binary won't
+# run there — ldd itself is the musl libc on those systems and says so.
+if command -v ldd >/dev/null 2>&1 && ldd --version 2>&1 | grep -qi musl; then
+  die "rdns installer's release binary is glibc-linked and will not run on musl-based systems (e.g. Alpine); detected musl libc"
+fi
+
+for tool in curl tar sha256sum grep sed head install mktemp; do
   command -v "$tool" >/dev/null 2>&1 || die "required tool '$tool' not found; install it and re-run"
 done
 
