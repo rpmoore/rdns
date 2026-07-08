@@ -6,7 +6,9 @@ everything else upstream (e.g. Cloudflare) or resolves it recursively itself.
 ## Install
 
 Installs the latest release binary to `/usr/local/bin/rdns` and, if you opt
-in, sets up a systemd service running as a recursive resolver:
+in, sets up a systemd service running as a recursive resolver. **Linux
+x86_64 only** — no macOS or ARM builds are published yet, so the script
+exits with an error on other platforms.
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/rpmoore/rdns/main/scripts/install.sh | sudo bash
