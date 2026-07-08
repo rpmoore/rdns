@@ -50,4 +50,5 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           gh release upload "$RELEASE_TAG" "rdns-${RELEASE_TAG}-linux-x86_64.tar.gz" "rdns-${RELEASE_TAG}-linux-x86_64.tar.gz.sha256" --clobber
-          gh release edit "$RELEASE_TAG" --generate-notes
+          notes="$(gh api repos/${{ github.repository }}/releases/generate-notes -f tag_name="$RELEASE_TAG" --jq .body)"
+          gh release edit "$RELEASE_TAG" --notes "$notes"
