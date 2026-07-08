@@ -166,6 +166,7 @@ else
 fi
 
 config_freshly_installed=0
+unit_backup=""
 
 if [ "$setup_service" -eq 1 ]; then
   command -v systemctl >/dev/null 2>&1 \
@@ -248,8 +249,8 @@ RDNS_DEFAULT_CONFIG_EOF
     log "Existing config at $CONFIG_FILE left untouched"
   fi
 
-  log "Installing systemd unit to $UNIT_PATH"
-  cat > "$UNIT_PATH" <<'RDNS_SERVICE_UNIT_EOF'
+  UNIT_TMP="$TMPDIR/rdns.service"
+  cat > "$UNIT_TMP" <<'RDNS_SERVICE_UNIT_EOF'
 # Keep this file in sync with the embedded copy in scripts/install.sh.
 [Unit]
 Description=rdns - Rust DNS resolver daemon
@@ -300,7 +301,15 @@ SystemCallErrorNumber=EPERM
 [Install]
 WantedBy=multi-user.target
 RDNS_SERVICE_UNIT_EOF
-  chmod 0644 "$UNIT_PATH"
+
+  if [ -f "$UNIT_PATH" ] && ! cmp -s "$UNIT_TMP" "$UNIT_PATH"; then
+    unit_backup="${UNIT_PATH}.bak.$(date +%Y%m%d%H%M%S)"
+    log "Existing $UNIT_PATH differs from the installer-managed unit; backing up to $unit_backup"
+    cp -p "$UNIT_PATH" "$unit_backup"
+  fi
+
+  log "Installing systemd unit to $UNIT_PATH"
+  install -m 0644 -o root -g root "$UNIT_TMP" "$UNIT_PATH"
 
   systemctl daemon-reload
   systemctl enable rdns.service >/dev/null
@@ -325,6 +334,12 @@ if [ "$setup_service" -eq 1 ]; then
   echo "    journalctl -u rdns -f       # follow logs"
   echo "    systemctl reload rdns       # hot-reload resolution/upstreams/local_dns_entries"
   echo "    systemctl restart rdns      # apply dns_listen/[metrics] changes"
+  if [ -n "$unit_backup" ]; then
+    echo
+    log "Your previous $UNIT_PATH had customizations; backed up to $unit_backup"
+    echo "    before installing the installer-managed unit. Diff and re-apply any"
+    echo "    overrides you want to keep (e.g. via a systemd drop-in)."
+  fi
   if [ "$config_freshly_installed" -eq 1 ]; then
     echo
     log "$CONFIG_FILE ships with no local DNS entries configured."
