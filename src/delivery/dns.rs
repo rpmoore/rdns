@@ -12,10 +12,11 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use std::collections::HashMap;
 use std::future::Future;
 use std::io;
-use std::net::SocketAddr;
-use std::sync::Arc;
+use std::net::{IpAddr, SocketAddr};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime};
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -24,11 +25,16 @@ use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tokio::task::JoinSet;
 use tokio::time;
 
-use crate::config::RuntimeConfig;
+use crate::config::{DEFAULT_MAX_TCP_CONNECTIONS, RuntimeConfig};
+use crate::protocol::build_servfail_response;
 use crate::resolver::{ObservedSourceEndpoint, ResolveQuery, ResolveRequest};
 
 const DEFAULT_MAX_IN_FLIGHT_REQUESTS: usize = 1024;
-const DEFAULT_MAX_TCP_CONNECTIONS: usize = 128;
+/// Caps how many concurrent connections a single source IP may hold against
+/// one listener. Without this, one client opening `max_connections`
+/// connections and idling them (see `TCP_CONNECTION_IDLE_TIMEOUT`) starves
+/// every other resolver of a slot on that listener.
+const DEFAULT_MAX_TCP_CONNECTIONS_PER_IP: usize = 32;
 /// RFC 1035 §4.2.2 length-prefixes TCP DNS messages with a 16-bit length —
 /// this is the hard ceiling regardless of any EDNS/config UDP payload size.
 const MAX_TCP_MESSAGE_SIZE: usize = u16::MAX as usize;
@@ -37,7 +43,18 @@ const MAX_TCP_MESSAGE_SIZE: usize = u16::MAX as usize;
 /// read/write may take. Without this, a client that opens a connection and
 /// never sends/finishes a query would hold a `max_connections` slot forever.
 const TCP_CONNECTION_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
+/// Fallback shutdown grace period for servers bound without a `RuntimeConfig`
+/// (e.g. `bind`/`bind_with_max_connections`, used directly by tests).
+/// `bind_configured` derives a config-aware value instead — see
+/// `TCP_SHUTDOWN_GRACE_BUFFER`.
 const TCP_SHUTDOWN_GRACE_PERIOD: Duration = Duration::from_secs(1);
+/// Added on top of `RuntimeConfig::per_query_deadline` to get the real
+/// shutdown grace period: a connection's in-flight resolve is allowed to
+/// take up to that deadline, so the grace period must cover it plus a little
+/// slack for framing/writing the response, or a slow-but-healthy resolve
+/// gets its task hard-aborted (client sees a reset, not an answer) during a
+/// routine shutdown/reload.
+const TCP_SHUTDOWN_GRACE_BUFFER: Duration = Duration::from_millis(250);
 
 /// Bind a UDP socket for the DNS listener.
 ///
@@ -241,6 +258,8 @@ pub struct TcpDnsServer {
     resolver: Arc<ResolveQuery>,
     local_addr: SocketAddr,
     max_connections: usize,
+    max_connections_per_ip: usize,
+    shutdown_grace_period: Duration,
 }
 
 impl TcpDnsServer {
@@ -253,6 +272,23 @@ impl TcpDnsServer {
         resolver: Arc<ResolveQuery>,
         max_connections: usize,
     ) -> io::Result<Self> {
+        Self::bind_with_options(
+            address,
+            resolver,
+            max_connections,
+            DEFAULT_MAX_TCP_CONNECTIONS_PER_IP,
+            TCP_SHUTDOWN_GRACE_PERIOD,
+        )
+        .await
+    }
+
+    async fn bind_with_options(
+        address: SocketAddr,
+        resolver: Arc<ResolveQuery>,
+        max_connections: usize,
+        max_connections_per_ip: usize,
+        shutdown_grace_period: Duration,
+    ) -> io::Result<Self> {
         let listener = TcpListener::bind(address).await?;
         let local_addr = listener.local_addr()?;
         Ok(Self {
@@ -260,6 +296,8 @@ impl TcpDnsServer {
             resolver,
             local_addr,
             max_connections,
+            max_connections_per_ip,
+            shutdown_grace_period,
         })
     }
 
@@ -268,8 +306,18 @@ impl TcpDnsServer {
         resolver: Arc<ResolveQuery>,
     ) -> io::Result<Vec<Self>> {
         let mut servers = Vec::with_capacity(config.dns_listen.len());
+        let shutdown_grace_period = config.per_query_deadline + TCP_SHUTDOWN_GRACE_BUFFER;
         for address in &config.dns_listen {
-            servers.push(Self::bind(*address, resolver.clone()).await?);
+            servers.push(
+                Self::bind_with_options(
+                    *address,
+                    resolver.clone(),
+                    config.max_tcp_connections,
+                    DEFAULT_MAX_TCP_CONNECTIONS_PER_IP,
+                    shutdown_grace_period,
+                )
+                .await?,
+            );
         }
         Ok(servers)
     }
@@ -288,17 +336,47 @@ impl TcpDnsServer {
     {
         tokio::pin!(shutdown);
         let semaphore = Arc::new(Semaphore::new(self.max_connections));
+        let per_ip_counts: Arc<Mutex<HashMap<IpAddr, usize>>> =
+            Arc::new(Mutex::new(HashMap::new()));
         let mut tasks: JoinSet<()> = JoinSet::new();
+        // A connection that passed the per-IP check but hasn't yet secured a
+        // global `max_connections` permit. This lives across loop
+        // iterations (unlike the futures inside `select!`, which are
+        // recreated every iteration and dropped if a different branch
+        // wins): if the accepted `TcpStream` itself lived inside one of
+        // those per-iteration futures, a `tasks.join_next()` completion
+        // (freeing the very permit this connection is waiting for) would
+        // cause `select!` to discard the still-pending accept future on the
+        // next loop iteration — dropping the live, already-accepted socket
+        // and resetting the connection out from under a client that did
+        // nothing wrong. Keeping it here means only the permit-acquisition
+        // attempt is retried each iteration (safe: `Semaphore::acquire_owned`
+        // is cancel-safe), never the connection itself.
+        let mut pending: Option<(TcpStream, SocketAddr, PerIpConnectionGuard)> = None;
         loop {
             tokio::select! {
                 _ = &mut shutdown => break,
-                accepted = self.accept_permitted(semaphore.clone()) => {
-                    match accepted {
-                        Ok(Some((stream, peer_addr, permit))) => {
-                            self.spawn_connection(stream, peer_addr, permit, &mut tasks);
+                accepted = self.listener.accept(), if pending.is_none() => {
+                    let (stream, peer_addr) = accepted?;
+                    match PerIpConnectionGuard::try_acquire(
+                        per_ip_counts.clone(),
+                        peer_addr.ip(),
+                        self.max_connections_per_ip,
+                    ) {
+                        Some(per_ip_guard) => pending = Some((stream, peer_addr, per_ip_guard)),
+                        None => tracing::debug!(
+                            %peer_addr,
+                            "tcp dns: dropping connection, per-source-ip limit reached"
+                        ),
+                    }
+                }
+                permit = Arc::clone(&semaphore).acquire_owned(), if pending.is_some() => {
+                    let (stream, peer_addr, per_ip_guard) = pending.take().unwrap();
+                    match permit {
+                        Ok(permit) => {
+                            self.spawn_connection(stream, peer_addr, permit, per_ip_guard, &mut tasks);
                         }
-                        Ok(None) => break,
-                        Err(error) => return Err(error),
+                        Err(_) => break,
                     }
                 }
                 result = tasks.join_next(), if !tasks.is_empty() => {
@@ -309,7 +387,7 @@ impl TcpDnsServer {
             }
         }
 
-        if time::timeout(TCP_SHUTDOWN_GRACE_PERIOD, drain_tasks(&mut tasks))
+        if time::timeout(self.shutdown_grace_period, drain_tasks(&mut tasks))
             .await
             .is_err()
         {
@@ -323,32 +401,60 @@ impl TcpDnsServer {
         Ok(())
     }
 
-    async fn accept_permitted(
-        &self,
-        semaphore: Arc<Semaphore>,
-    ) -> io::Result<Option<(TcpStream, SocketAddr, OwnedSemaphorePermit)>> {
-        let (stream, peer_addr) = self.listener.accept().await?;
-        match semaphore.acquire_owned().await {
-            Ok(permit) => Ok(Some((stream, peer_addr, permit))),
-            Err(_) => Ok(None),
-        }
-    }
-
     fn spawn_connection(
         &self,
         stream: TcpStream,
         peer_addr: SocketAddr,
         permit: OwnedSemaphorePermit,
+        per_ip_guard: PerIpConnectionGuard,
         tasks: &mut JoinSet<()>,
     ) {
         let resolver = Arc::clone(&self.resolver);
         let listener = self.local_addr;
         tasks.spawn(async move {
             let _permit = permit;
+            let _per_ip_guard = per_ip_guard;
             if let Err(error) = serve_tcp_connection(stream, peer_addr, listener, resolver).await {
                 tracing::debug!(%error, %peer_addr, "tcp dns connection closed with error");
             }
         });
+    }
+}
+
+/// RAII slot for `TcpDnsServer`'s per-source-IP connection cap: increments
+/// the source's count on acquire, decrements (and prunes the map entry) on
+/// drop, so the count self-corrects however the connection's task ends.
+struct PerIpConnectionGuard {
+    counts: Arc<Mutex<HashMap<IpAddr, usize>>>,
+    ip: IpAddr,
+}
+
+impl PerIpConnectionGuard {
+    fn try_acquire(
+        counts: Arc<Mutex<HashMap<IpAddr, usize>>>,
+        ip: IpAddr,
+        max_connections_per_ip: usize,
+    ) -> Option<Self> {
+        let mut guard = counts.lock().unwrap();
+        let count = guard.entry(ip).or_insert(0);
+        if *count >= max_connections_per_ip {
+            return None;
+        }
+        *count += 1;
+        drop(guard);
+        Some(Self { counts, ip })
+    }
+}
+
+impl Drop for PerIpConnectionGuard {
+    fn drop(&mut self) {
+        let mut guard = self.counts.lock().unwrap();
+        if let Some(count) = guard.get_mut(&self.ip) {
+            *count -= 1;
+            if *count == 0 {
+                guard.remove(&self.ip);
+            }
+        }
     }
 }
 
@@ -387,6 +493,13 @@ async fn serve_tcp_connection(
             .await
             .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "tcp dns read timed out"))??;
 
+        // Captured before `message` moves into the request below: needed to
+        // build a same-transaction SERVFAIL if the resolved response can't
+        // fit a TCP frame (see below).
+        let request_id = message
+            .get(0..2)
+            .map(|bytes| u16::from_be_bytes([bytes[0], bytes[1]]));
+
         let outcome = resolver
             .resolve(ResolveRequest::new_with_observed_source(
                 ObservedSourceEndpoint::tcp(peer_addr, Some(listener)),
@@ -395,17 +508,21 @@ async fn serve_tcp_connection(
             ))
             .await;
 
-        // The resolver never truncates a TCP-sourced response (it can only
-        // grow past `u16::MAX` if a backend itself violates the RFC 1035
-        // length-prefix ceiling), so this is a defensive bound, not a path
-        // truncation ever takes in practice.
-        let response = outcome.response_bytes;
-        if response.len() > MAX_TCP_MESSAGE_SIZE {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "resolved response exceeds the TCP message size limit",
-            ));
-        }
+        // The resolver never truncates a TCP-sourced response in practice
+        // (it can only grow past `u16::MAX` if a backend itself violates
+        // the RFC 1035 length-prefix ceiling). That's a misbehaving
+        // backend, not a reason to drop the whole pipelined connection —
+        // answer just this query with SERVFAIL and keep serving the rest.
+        let response = if outcome.response_bytes.len() > MAX_TCP_MESSAGE_SIZE {
+            tracing::warn!(
+                %peer_addr,
+                response_len = outcome.response_bytes.len(),
+                "resolved response exceeds the tcp message size limit; answering servfail"
+            );
+            build_servfail_response(None, request_id)
+        } else {
+            outcome.response_bytes
+        };
 
         let mut framed = Vec::with_capacity(2 + response.len());
         framed.extend_from_slice(&(response.len() as u16).to_be_bytes());
@@ -420,12 +537,12 @@ async fn serve_tcp_connection(
 mod tests {
     use super::*;
     use std::pin::Pin;
-    use std::sync::Mutex;
     use std::time::Duration;
 
     use tokio::sync::Notify;
     use tokio::time;
 
+    use crate::protocol::{Message, ResponseCode};
     use crate::resolver::{
         BasicResponseFactory, Clock, MetricsSink, QueryEventRecordResult, QueryEventSink,
         QueryEventV1, QueryTransport, ResolutionBackend, ResolverMetric, StandardProtocolCodec,
@@ -807,6 +924,196 @@ mod tests {
         assert_eq!(servers.len(), 2);
         assert_eq!(servers[0].local_addr().unwrap(), first_address);
         assert_eq!(servers[1].local_addr().unwrap(), second_address);
+    }
+
+    fn build_config_with_max_tcp_connections(
+        address: SocketAddr,
+        max_tcp_connections: usize,
+    ) -> RuntimeConfig {
+        let mut config = RuntimeConfig::new(
+            vec![address],
+            vec![crate::config::UpstreamConfig {
+                name: "primary".to_string(),
+                endpoint: "192.0.2.53:53".parse().unwrap(),
+                protocol: crate::config::UpstreamProtocol::Udp,
+                enabled: true,
+                priority: 10,
+                timeout: Duration::from_millis(500),
+            }],
+            Duration::from_secs(2),
+            1232,
+        )
+        .unwrap();
+        config.max_tcp_connections = max_tcp_connections;
+        config
+    }
+
+    /// A single source IP opening more than `max_connections_per_ip`
+    /// connections must have the excess ones closed by the server rather
+    /// than accepted and left to consume the (much larger) global
+    /// `max_connections` pool — otherwise one client can starve every other
+    /// resolver of a connection slot. Regression test for the P1 finding in
+    /// PR #117's review: no per-source-IP cap existed on `TcpDnsServer`.
+    #[tokio::test]
+    async fn tcp_server_enforces_per_source_ip_connection_limit() {
+        let upstream = Arc::new(StaticUpstream::new(Ok(upstream_response(a_response(
+            0,
+            "example.com",
+        )))));
+        let resolver = resolve_service(upstream, Arc::new(RecordingEvents::default()));
+        let server = TcpDnsServer::bind_with_options(
+            "127.0.0.1:0".parse().unwrap(),
+            resolver,
+            10,
+            2,
+            Duration::from_secs(1),
+        )
+        .await
+        .unwrap();
+        let server_addr = server.local_addr().unwrap();
+        let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
+        let server_task = tokio::spawn(async move {
+            server
+                .serve_until(async {
+                    let _ = shutdown_rx.await;
+                })
+                .await
+        });
+
+        // First two connections from the same source IP are within the cap
+        // and are served normally.
+        let mut first = TcpStream::connect(server_addr).await.unwrap();
+        tcp_send_query(&mut first, &a_query(1, "example.com")).await;
+        assert_eq!(
+            tcp_recv_response(&mut first).await,
+            a_response(1, "example.com")
+        );
+
+        let mut second = TcpStream::connect(server_addr).await.unwrap();
+        tcp_send_query(&mut second, &a_query(2, "example.com")).await;
+        assert_eq!(
+            tcp_recv_response(&mut second).await,
+            a_response(2, "example.com")
+        );
+
+        // Third connection from the same IP exceeds the per-IP cap and is
+        // closed by the server before it ever gets a chance to send a query.
+        let mut third = TcpStream::connect(server_addr).await.unwrap();
+        let mut probe = [0u8; 1];
+        let read_result = time::timeout(Duration::from_secs(2), third.read(&mut probe)).await;
+        assert_eq!(
+            read_result.unwrap().unwrap(),
+            0,
+            "expected the server to close the over-cap connection (EOF)"
+        );
+
+        drop(first);
+        drop(second);
+        drop(third);
+        shutdown_tx.send(()).unwrap();
+        server_task.await.unwrap().unwrap();
+    }
+
+    /// `bind_configured` must actually use `RuntimeConfig::max_tcp_connections`
+    /// rather than a hardcoded default — regression test for the P2 finding
+    /// in PR #117's review that the ceiling wasn't wired through config.
+    #[tokio::test]
+    async fn tcp_bind_configured_uses_configured_max_connections() {
+        let address = unused_high_local_address().await;
+        let config = build_config_with_max_tcp_connections(address, 1);
+        let upstream = Arc::new(StaticUpstream::new(Ok(upstream_response(a_response(
+            0,
+            "example.com",
+        )))));
+        let resolver = resolve_service(upstream, Arc::new(RecordingEvents::default()));
+
+        let server = TcpDnsServer::bind_configured(&config, resolver)
+            .await
+            .unwrap()
+            .into_iter()
+            .next()
+            .unwrap();
+        let server_addr = server.local_addr().unwrap();
+        let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
+        let server_task = tokio::spawn(async move {
+            server
+                .serve_until(async {
+                    let _ = shutdown_rx.await;
+                })
+                .await
+        });
+
+        // Holds the single configured connection slot open without sending
+        // a query, so it never completes and frees the slot on its own.
+        let first = TcpStream::connect(server_addr).await.unwrap();
+
+        // A second connection is accepted at the TCP level but must not be
+        // serviced while the one configured slot is held by `first`.
+        let mut second = TcpStream::connect(server_addr).await.unwrap();
+        tcp_send_query(&mut second, &a_query(7, "example.com")).await;
+        let premature =
+            time::timeout(Duration::from_millis(200), tcp_recv_response(&mut second)).await;
+        assert!(
+            premature.is_err(),
+            "second connection must not be served while max_tcp_connections=1 is exhausted"
+        );
+
+        // Freeing the first connection's slot lets the second be serviced.
+        drop(first);
+        let response = time::timeout(Duration::from_secs(2), tcp_recv_response(&mut second))
+            .await
+            .expect("second connection should be served once a slot frees up");
+        assert_eq!(response, a_response(7, "example.com"));
+
+        drop(second);
+        shutdown_tx.send(()).unwrap();
+        server_task.await.unwrap().unwrap();
+    }
+
+    /// A resolved response too large to fit the RFC 1035 16-bit TCP length
+    /// prefix must not kill the whole connection: the misbehaving backend
+    /// affects only that one query, which gets answered SERVFAIL, and later
+    /// pipelined queries on the same connection are still served. Regression
+    /// test for the P3 finding in PR #117's review, where this previously
+    /// closed the connection with an I/O error.
+    #[tokio::test]
+    async fn tcp_server_answers_servfail_for_oversized_response_and_keeps_connection_open() {
+        let oversized_backend_response = vec![0xabu8; MAX_TCP_MESSAGE_SIZE + 1];
+        let upstream = Arc::new(StaticUpstream::new(Ok(upstream_response(
+            oversized_backend_response,
+        ))));
+        let resolver = resolve_service(upstream, Arc::new(RecordingEvents::default()));
+        let server = TcpDnsServer::bind("127.0.0.1:0".parse().unwrap(), resolver)
+            .await
+            .unwrap();
+        let server_addr = server.local_addr().unwrap();
+        let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
+        let server_task = tokio::spawn(async move {
+            server
+                .serve_until(async {
+                    let _ = shutdown_rx.await;
+                })
+                .await
+        });
+
+        let mut client = TcpStream::connect(server_addr).await.unwrap();
+        tcp_send_query(&mut client, &a_query(0xaaaa, "example.com")).await;
+        let first_response = tcp_recv_response(&mut client).await;
+        let parsed = Message::parse(&first_response).unwrap();
+        assert_eq!(parsed.header.id, 0xaaaa);
+        assert_eq!(parsed.header.r_code(), ResponseCode::ServFail as u8);
+
+        // The connection must still be usable for a subsequent pipelined
+        // query rather than having been closed after the first.
+        tcp_send_query(&mut client, &a_query(0xbbbb, "example.com")).await;
+        let second_response = tcp_recv_response(&mut client).await;
+        let parsed = Message::parse(&second_response).unwrap();
+        assert_eq!(parsed.header.id, 0xbbbb);
+        assert_eq!(parsed.header.r_code(), ResponseCode::ServFail as u8);
+
+        drop(client);
+        shutdown_tx.send(()).unwrap();
+        server_task.await.unwrap().unwrap();
     }
 
     #[tokio::test]
