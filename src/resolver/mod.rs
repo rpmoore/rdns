@@ -5882,8 +5882,8 @@ impl RecursiveResolutionBackend {
             ));
         }
 
-        if message.header.aa() {
-            if let Some(cname_record) = cname_record_for(message, &state.question) {
+        if message.header.aa()
+            && let Some(cname_record) = cname_record_for(message, &state.question) {
                 let RecordData::CNAME(cname_target) = &cname_record.record else {
                     unreachable!();
                 };
@@ -5924,7 +5924,6 @@ impl RecursiveResolutionBackend {
                 state.current_zone = zone;
                 return AuthorityResponseOutcome::Advance(next);
             }
-        }
 
         let Some(referral) = referral_authorities(message, &state.question) else {
             return self
@@ -5945,8 +5944,8 @@ impl RecursiveResolutionBackend {
         query_deadline: Instant,
         message: &Message,
     ) -> AuthorityResponseOutcome {
-        if let Some((owner, names, min_ttl)) = glueless_delegation_names(message, &state.question) {
-            if is_valid_zone_progression(&state.current_zone, &owner) {
+        if let Some((owner, names, min_ttl)) = glueless_delegation_names(message, &state.question)
+            && is_valid_zone_progression(&state.current_zone, &owner) {
                 let (resolved, resolved_ttl) = self
                     .resolve_glueless_endpoints(
                         &names,
@@ -5966,7 +5965,6 @@ impl RecursiveResolutionBackend {
                     return AuthorityResponseOutcome::Advance(resolved);
                 }
             }
-        }
         if has_delegation_for_question(message, &state.question) {
             self.increment_metric(ResolverMetric::RecursiveBailiwickReject);
         } else {

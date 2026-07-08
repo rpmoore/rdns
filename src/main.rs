@@ -305,13 +305,11 @@ fn parse_config_flag<I: Iterator<Item = String>>(mut args: I) -> Option<PathBuf>
             if !value.is_empty() {
                 return Some(PathBuf::from(value));
             }
-        } else if arg == "--config" {
-            if let Some(value) = args.next() {
-                if !value.is_empty() {
+        } else if arg == "--config"
+            && let Some(value) = args.next()
+                && !value.is_empty() {
                     return Some(PathBuf::from(value));
                 }
-            }
-        }
     }
     None
 }
@@ -1007,12 +1005,11 @@ impl MetricsSink for OpenTelemetryMetrics {
             u64::from(status.dnssec_validation == DnssecValidationStatus::Disabled),
             &attributes,
         );
-        if let Some(root_hints) = &status.root_hints {
-            if let Some(age) = root_hints.age_at(SystemTime::now()) {
+        if let Some(root_hints) = &status.root_hints
+            && let Some(age) = root_hints.age_at(SystemTime::now()) {
                 self.root_hints_age_seconds
                     .record(age.as_secs_f64(), &attributes);
             }
-        }
     }
 }
 

@@ -1449,11 +1449,10 @@ fn decode_compression_pointer(
     if pointer_offset >= cursor || pointer_offset >= dns_message.len() {
         return Err(DnsParseError::InvalidNamePointer);
     }
-    if let Some(context) = context {
-        if !context.valid_name_offsets.contains(&pointer_offset) {
+    if let Some(context) = context
+        && !context.valid_name_offsets.contains(&pointer_offset) {
             return Err(DnsParseError::InvalidNamePointer);
         }
-    }
     Ok(pointer_offset)
 }
 
