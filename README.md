@@ -3,6 +3,19 @@
 Small DNS server. Answers configured local names for your LAN, forwards
 everything else upstream (e.g. Cloudflare) or resolves it recursively itself.
 
+## Install
+
+Installs the latest release binary to `/usr/local/bin/rdns` and, if you opt
+in, sets up a systemd service running as a recursive resolver:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/rpmoore/rdns/main/scripts/install.sh | sudo bash
+```
+
+Pass `--yes` to install and start the service without prompting, `--no-service`
+to install only the binary, or `--version <tag>` to pin a specific release.
+See `scripts/install.sh --help` for details.
+
 ## Run it
 
 ```bash
@@ -49,6 +62,11 @@ grant the built binary the capability:
 ```bash
 sudo setcap cap_net_bind_service=+ep target/release/rdns
 ```
+
+(This only matters if you build/run the binary manually. `scripts/install.sh`'s
+systemd unit grants the capability via `AmbientCapabilities` instead, so its
+service doesn't need `setcap` and won't lose the capability across binary
+upgrades.)
 
 Unknown fields in the file are rejected at load time (fails closed rather
 than silently ignoring a typo'd or unsupported setting).

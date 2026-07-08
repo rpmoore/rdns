@@ -1,0 +1,48 @@
+# rdns runtime configuration — installed default.
+#
+# Loaded on startup, and re-loaded on SIGHUP (resolution, upstreams, and
+# local_dns_entries hot-reload — dns_listen and [metrics] changes require
+# `systemctl restart rdns`). Override the path with the RDNS_CONFIG
+# environment variable.
+#
+# Installed once; re-running the installer never overwrites this file.
+
+# LAN-facing bind on the standard port. The installer grants the rdns
+# service account CAP_NET_BIND_SERVICE via systemd AmbientCapabilities,
+# so no setcap/root is needed at runtime.
+dns_listen = ["0.0.0.0:53"]
+per_query_deadline_ms = 2000
+max_udp_payload_size = 1232
+
+# Prometheus metrics on GET /metrics — no TLS/auth, loopback-only by
+# default. Only change `listen` to a routable address if you understand
+# the exposure (e.g. put it behind a firewall/reverse proxy first).
+[metrics]
+enabled = true
+listen = "127.0.0.1:9053"
+max_connections = 32
+
+# Recursive mode: rdns walks root -> TLD -> authority itself for anything
+# not answered locally. Switch to mode = "forward" and add [[upstreams]]
+# entries instead if you'd rather forward to an upstream resolver.
+[resolution]
+mode = "recursive"
+
+[resolution.recursive]
+root_hints = "bundled"
+root_hints_version = "bundled:v1"
+
+# No local DNS entries by default. To answer exact names for devices on
+# your network (suffix ".lan"), add a [[local_dns_entries]] block below,
+# e.g.:
+#
+# [[local_dns_entries]]
+# name = "nas.lan"
+# ipv4 = ["192.168.1.10"]
+# ttl = 300
+# enabled = true
+# public_address_acknowledged = false   # must be true if ipv4/ipv6 is a
+#                                        # public/routable address
+#
+# Changes to local_dns_entries hot-reload on `systemctl reload rdns` —
+# no restart needed.
