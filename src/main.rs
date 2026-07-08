@@ -710,7 +710,16 @@ impl Clock for SystemClock {
 struct StdoutEvents;
 
 impl StdoutEvents {
+    /// Per-query audit line, printed as its own top-level JSON object (its
+    /// `schema_version` is a stable, documented schema — it deliberately
+    /// bypasses the `tracing` JSON formatter so it isn't nested inside a
+    /// `message` string). Gated on the `debug` level so it follows `RUST_LOG`
+    /// like every other log line: silent by default, `RUST_LOG=debug` (or
+    /// higher) turns the per-query trail back on for troubleshooting.
     fn record_ref(&self, event: &QueryEventV1) {
+        if !tracing::enabled!(tracing::Level::DEBUG) {
+            return;
+        }
         match serde_json::to_string(event) {
             Ok(json) => println!("{json}"),
             Err(error) => error!(%error, event = ?event, "failed to serialize query event"),
