@@ -14,7 +14,7 @@ jobs:
     permissions:
       contents: write
     env:
-      TAG: ${{ github.event.release.tag_name }}
+      RELEASE_TAG: ${{ github.event.release.tag_name }}
 
     steps:
       - name: Checkout
@@ -31,8 +31,8 @@ jobs:
       - name: Verify release tag matches Cargo.toml version
         run: |
           cargo_version="$(cargo metadata --no-deps --format-version=1 | python3 -c 'import json, sys; print(json.load(sys.stdin)["packages"][0]["version"])')"
-          if [ "$TAG" != "v$cargo_version" ]; then
-            echo "::error::release tag '$TAG' does not match Cargo.toml version 'v$cargo_version' — bump Cargo.toml and merge before tagging"
+          if [ "$RELEASE_TAG" != "v$cargo_version" ]; then
+            echo "::error::release tag '$RELEASE_TAG' does not match Cargo.toml version 'v$cargo_version' — bump Cargo.toml and merge before tagging"
             exit 1
           fi
 
@@ -40,14 +40,14 @@ jobs:
         run: cargo build --release --locked
 
       - name: Package binary
-        run: tar czf "rdns-${TAG}-linux-x86_64.tar.gz" -C target/release rdns
+        run: tar czf "rdns-${RELEASE_TAG}-linux-x86_64.tar.gz" -C target/release rdns
 
       - name: Checksum tarball
-        run: sha256sum "rdns-${TAG}-linux-x86_64.tar.gz" > "rdns-${TAG}-linux-x86_64.tar.gz.sha256"
+        run: sha256sum "rdns-${RELEASE_TAG}-linux-x86_64.tar.gz" > "rdns-${RELEASE_TAG}-linux-x86_64.tar.gz.sha256"
 
       - name: Upload release asset and generate changelog
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          gh release upload "$TAG" rdns-*-linux-x86_64.tar.gz rdns-*-linux-x86_64.tar.gz.sha256 --clobber
-          gh release edit "$TAG" --generate-notes
+          gh release upload "$RELEASE_TAG" "rdns-${RELEASE_TAG}-linux-x86_64.tar.gz" "rdns-${RELEASE_TAG}-linux-x86_64.tar.gz.sha256" --clobber
+          gh release edit "$RELEASE_TAG" --generate-notes
