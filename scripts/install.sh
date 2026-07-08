@@ -89,7 +89,7 @@ if [ -n "$VERSION_OVERRIDE" ]; then
   TAG="$VERSION_OVERRIDE"
 else
   log "Looking up latest release for ${REPO}..."
-  http_code="$(curl -fsSL -o "$TMPDIR/latest.json" -w '%{http_code}' \
+  http_code="$(curl -sSL -o "$TMPDIR/latest.json" -w '%{http_code}' \
     "https://api.github.com/repos/${REPO}/releases/latest" || echo "000")"
   case "$http_code" in
     200) ;;
@@ -123,6 +123,10 @@ curl -fsSL --retry 3 -o "$TMPDIR/$ASSET.sha256" "$CHECKSUM_URL" \
 
 # --- Extract & install binary ------------------------------------------------
 
+archive_members="$(tar -tzf "$TMPDIR/$ASSET")"
+[ "$archive_members" = "$BIN_NAME" ] \
+  || die "unexpected archive contents (expected only '$BIN_NAME', got: $archive_members)"
+
 tar -xzf "$TMPDIR/$ASSET" -C "$TMPDIR"
 [ -f "$TMPDIR/$BIN_NAME" ] || die "extracted archive did not contain a '$BIN_NAME' binary"
 
@@ -140,14 +144,14 @@ already_has_unit=0
 [ -f "$UNIT_PATH" ] && already_has_unit=1
 
 setup_service=0
-if [ "$already_has_unit" -eq 1 ]; then
+if [ "$NO_SERVICE" -eq 1 ]; then
+  setup_service=0
+elif [ "$already_has_unit" -eq 1 ]; then
   # Upgrading an existing install: keep the service configured, don't re-prompt.
   setup_service=1
 elif [ "$AUTO_YES" -eq 1 ]; then
   setup_service=1
-elif [ "$NO_SERVICE" -eq 1 ]; then
-  setup_service=0
-elif [ -r /dev/tty ] && exec 3<>/dev/tty 2>/dev/null; then
+elif [ -r /dev/tty ] && { exec 3<>/dev/tty; } 2>/dev/null; then
   printf 'Install and start rdns as a systemd service (recommended)? [Y/n] ' >&3
   read -r reply <&3
   exec 3<&-
@@ -164,10 +168,16 @@ fi
 config_freshly_installed=0
 
 if [ "$setup_service" -eq 1 ]; then
+  command -v systemctl >/dev/null 2>&1 \
+    || die "systemctl not found — this system does not appear to use systemd; re-run with --no-service"
+
+  if ! getent group "$SVC_USER" >/dev/null; then
+    groupadd --system "$SVC_USER"
+  fi
   if ! getent passwd "$SVC_USER" >/dev/null; then
     log "Creating system user '$SVC_USER'..."
     useradd --system --no-create-home --shell /usr/sbin/nologin \
-      --comment "rdns DNS resolver daemon" "$SVC_USER"
+      --gid "$SVC_USER" --comment "rdns DNS resolver daemon" "$SVC_USER"
   fi
 
   install -d -m 0755 -o root -g root "$CONFIG_DIR"
@@ -183,10 +193,18 @@ if [ "$setup_service" -eq 1 ]; then
 # environment variable.
 #
 # Installed once; re-running the installer never overwrites this file.
+#
+# Keep this file in sync with the embedded copy in scripts/install.sh.
 
 # LAN-facing bind on the standard port. The installer grants the rdns
 # service account CAP_NET_BIND_SERVICE via systemd AmbientCapabilities,
 # so no setcap/root is needed at runtime.
+#
+# WARNING: 0.0.0.0 listens on every interface, including any public one
+# this host may have. An open recursive resolver reachable from the
+# internet is a well-known DDoS amplification vector — if this host has
+# a public IP, firewall UDP/TCP 53 to your LAN/trusted subnet only, or
+# change this to a specific LAN address (e.g. "192.168.1.1:53").
 dns_listen = ["0.0.0.0:53"]
 per_query_deadline_ms = 2000
 max_udp_payload_size = 1232
@@ -232,6 +250,7 @@ RDNS_DEFAULT_CONFIG_EOF
 
   log "Installing systemd unit to $UNIT_PATH"
   cat > "$UNIT_PATH" <<'RDNS_SERVICE_UNIT_EOF'
+# Keep this file in sync with the embedded copy in scripts/install.sh.
 [Unit]
 Description=rdns - Rust DNS resolver daemon
 Documentation=https://github.com/rpmoore/rdns
@@ -312,6 +331,11 @@ if [ "$setup_service" -eq 1 ]; then
     echo "    To answer names for devices on your network, edit $CONFIG_FILE and add a"
     echo "    [[local_dns_entries]] block (a commented example is already in the file),"
     echo "    then run: systemctl reload rdns"
+    echo
+    log "Security: dns_listen defaults to 0.0.0.0:53 (all interfaces)."
+    echo "    If this host has a public IP, firewall port 53 to trusted networks only —"
+    echo "    an open recursive resolver reachable from the internet can be abused for"
+    echo "    DNS amplification attacks."
   fi
 else
   log "Systemd service was not installed."

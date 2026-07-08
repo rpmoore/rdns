@@ -1,3 +1,4 @@
+# Keep this file in sync with the embedded copy in scripts/install.sh.
 [Unit]
 Description=rdns - Rust DNS resolver daemon
 Documentation=https://github.com/rpmoore/rdns
