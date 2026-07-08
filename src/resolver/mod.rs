@@ -74,6 +74,7 @@ pub struct ObservedSourceEndpoint {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
 pub enum QueryTransport {
     Udp,
+    Tcp,
 }
 
 impl ObservedSourceEndpoint {
@@ -93,6 +94,22 @@ impl ObservedSourceEndpoint {
             transport: Some(QueryTransport::Udp),
             listener,
         }
+    }
+
+    pub fn tcp(source: SocketAddr, listener: Option<SocketAddr>) -> Self {
+        Self {
+            ip: source.ip(),
+            port: Some(source.port()),
+            transport: Some(QueryTransport::Tcp),
+            listener,
+        }
+    }
+
+    /// EDNS UDP payload-size limits (and the 512-byte pre-EDNS default) are
+    /// meaningless over TCP (RFC 6891 §6.2.3) — a TCP-sourced query's
+    /// response must never be truncated on that basis.
+    pub fn is_tcp(&self) -> bool {
+        matches!(self.transport, Some(QueryTransport::Tcp))
     }
 }
 
@@ -2977,7 +2994,7 @@ impl ResolveQuery {
     ) -> Option<ResolveOutcome> {
         let (response_bytes, kind) = match local_entries.lookup(&decoded.question) {
             LocalDnsLookup::Answer(entry) => {
-                let response_bytes = self.local_entry_response(decoded, &entry);
+                let response_bytes = self.local_entry_response(request, decoded, &entry);
                 let kind = ResolveDecisionKind::LocalAnswer(
                     self.local_entry_answer_metadata(decoded, &entry),
                 );
@@ -3280,7 +3297,12 @@ impl ResolveQuery {
             .await
     }
 
-    fn local_entry_response(&self, decoded: &DecodedQuery, entry: &LocalDnsEntry) -> Vec<u8> {
+    fn local_entry_response(
+        &self,
+        request: &ResolveRequest,
+        decoded: &DecodedQuery,
+        entry: &LocalDnsEntry,
+    ) -> Vec<u8> {
         let response = match decoded.question.qtype {
             A_RECORD_TYPE => build_a_answers_response(&decoded.message, &entry.ipv4, entry.ttl),
             AAAA_RECORD_TYPE => {
@@ -3288,10 +3310,12 @@ impl ResolveQuery {
             }
             _ => build_nodata_response(&decoded.message),
         };
-        if decoded.message.response_exceeds_udp_payload(
-            response.len(),
-            self.protocol.configured_max_udp_payload_size(),
-        ) {
+        if !request.observed_source.is_tcp()
+            && decoded.message.response_exceeds_udp_payload(
+                response.len(),
+                self.protocol.configured_max_udp_payload_size(),
+            )
+        {
             build_truncated_response(&decoded.message)
         } else {
             response
@@ -3323,10 +3347,22 @@ impl ResolveQuery {
             };
         }
 
-        let key = CacheKey::from_query(
-            decoded,
+        // TCP has no UDP-style payload ceiling, so a TCP query gets its own
+        // namespace (keyed on usize::MAX) instead of the EDNS/512-byte-floor
+        // size class UDP queries use — see `ObservedSourceEndpoint::is_tcp`.
+        let effective_payload_size = if request.observed_source.is_tcp() {
+            usize::MAX
+        } else {
+            decoded
+                .message
+                .effective_udp_payload_size(self.protocol.configured_max_udp_payload_size())
+        };
+        let key = CacheKey::new(
+            decoded.question.clone(),
+            decoded.question_wire.to_vec(),
+            decoded.features.clone(),
             backend_snapshot.cache_namespace.clone(),
-            self.protocol.configured_max_udp_payload_size(),
+            effective_payload_size,
         );
         let lookup = self
             .cache
@@ -3415,9 +3451,12 @@ impl ResolveQuery {
         if cached.expires_at <= request.received_at.0 {
             self.metrics.increment(ResolverMetric::CacheExpired);
         }
-        let response_bytes =
-            self.protocol
-                .serialize_cached_response(decoded, cached, request.received_at.0)?;
+        let response_bytes = self.protocol.serialize_cached_response(
+            decoded,
+            cached,
+            request.received_at.0,
+            !request.observed_source.is_tcp(),
+        )?;
         self.metrics.increment(ResolverMetric::CacheHit);
         if cached.negative_cache.is_some() {
             self.metrics.increment(ResolverMetric::CacheNegativeHit);
@@ -3521,6 +3560,7 @@ impl ResolveQuery {
         }
 
         if backend_mode == ResolutionMode::Recursive
+            && !request.observed_source.is_tcp()
             && decoded.message.response_exceeds_udp_payload(
                 response_bytes.len(),
                 self.protocol.configured_max_udp_payload_size(),
@@ -4144,6 +4184,7 @@ impl ProtocolCodec for StandardProtocolCodec {
         query: &DecodedQuery,
         cached: &CachedResponse,
         now: SystemTime,
+        allow_udp_truncation: bool,
     ) -> crate::protocol::Result<Vec<u8>> {
         let mut response = cached.response_template.clone();
         if cached.expires_at <= now {
@@ -4158,9 +4199,10 @@ impl ProtocolCodec for StandardProtocolCodec {
             .duration_since(now)
             .map_err(|_| crate::protocol::DnsParseError::MalformedRecord)?;
         cap_response_ttls(&mut response, remaining_ttl)?;
-        if query
-            .message
-            .response_exceeds_udp_payload(response.len(), self.configured_max_udp_payload_size)
+        if allow_udp_truncation
+            && query
+                .message
+                .response_exceeds_udp_payload(response.len(), self.configured_max_udp_payload_size)
         {
             return Ok(crate::protocol::build_truncated_response(&query.message));
         }
@@ -4292,11 +4334,16 @@ pub trait ProtocolCodec: Send + Sync {
         request_id: u16,
     ) -> crate::protocol::Result<()>;
 
+    /// `allow_udp_truncation` must be `false` for TCP-sourced queries: the
+    /// UDP payload-size ceiling (and the pre-EDNS 512-byte floor) has no
+    /// meaning over TCP (RFC 6891 §6.2.3), so the cached template must be
+    /// replayed in full rather than truncated to the UDP limit.
     fn serialize_cached_response(
         &self,
         query: &DecodedQuery,
         cached: &CachedResponse,
         now: SystemTime,
+        allow_udp_truncation: bool,
     ) -> crate::protocol::Result<Vec<u8>>;
 }
 
@@ -4881,6 +4928,7 @@ fn transport_rank(transport: Option<QueryTransport>) -> u8 {
     match transport {
         None => 0,
         Some(QueryTransport::Udp) => 1,
+        Some(QueryTransport::Tcp) => 2,
     }
 }
 
@@ -8108,8 +8156,14 @@ mod tests {
             query: &DecodedQuery,
             cached: &CachedResponse,
             now: SystemTime,
+            allow_udp_truncation: bool,
         ) -> crate::protocol::Result<Vec<u8>> {
-            StandardProtocolCodec::new(1232).serialize_cached_response(query, cached, now)
+            StandardProtocolCodec::new(1232).serialize_cached_response(
+                query,
+                cached,
+                now,
+                allow_udp_truncation,
+            )
         }
     }
 
@@ -10347,6 +10401,140 @@ mod tests {
         let response = Message::parse(&outcome.response_bytes).unwrap();
         assert!(response.header.tc());
         assert!(response.answers.is_empty());
+    }
+
+    /// dig against a live rdns instance found this: a query with no EDNS OPT
+    /// (so the pre-EDNS 512-byte UDP ceiling applies — see
+    /// `resolve_truncates_fresh_recursive_response_to_default_udp_limit`
+    /// above) sent over TCP must NOT be truncated. RFC 6891 §6.2.3: the UDP
+    /// payload size has no meaning over TCP. Before the transport-aware fix,
+    /// this test failed identically to the UDP test above (`tc()` set,
+    /// answers dropped) because truncation was decided purely from the
+    /// query's own EDNS/512-byte floor, never from which socket it arrived on.
+    #[tokio::test]
+    async fn resolve_does_not_truncate_tcp_sourced_response_at_default_udp_limit() {
+        let question = QuestionKey::new("example.com", 1, 1);
+        let answers = (0..40)
+            .map(|_| a_record("example.com", 60))
+            .collect::<Vec<_>>();
+        let transport = Arc::new(ScriptedAuthorityTransport::new([Ok(
+            response_message_for_question_with_id(
+                0xbeef,
+                question,
+                ResponseCode::NoError,
+                answers,
+                Vec::new(),
+                Vec::new(),
+                true,
+            ),
+        )]));
+        let backend = Arc::new(recursive_backend(transport));
+        let service = ResolveQuery::with_cache_and_backend_snapshot(
+            Arc::new(StandardProtocolCodec::new(1232)),
+            Arc::new(NoopDnsCache),
+            CacheTtlPolicy::default(),
+            BackendSnapshot::new(
+                backend,
+                ResolutionMode::Recursive,
+                7,
+                BackendHealth::Healthy,
+                Some("mode:recursive;generation:7".to_string()),
+            ),
+            Arc::new(BasicResponseFactory),
+            Arc::new(FixedClock(SystemTime::UNIX_EPOCH)),
+            Arc::new(RecordingEvents::default()),
+            Arc::new(RecordingMetrics::default()),
+        );
+
+        let outcome = service
+            .resolve(ResolveRequest::new_with_observed_source(
+                ObservedSourceEndpoint::tcp(
+                    "192.0.2.10:5555".parse().unwrap(),
+                    Some("127.0.0.1:53".parse().unwrap()),
+                ),
+                SystemTime::UNIX_EPOCH,
+                a_query(0x1234, "example.com"),
+            ))
+            .await;
+
+        assert_eq!(outcome.decision.kind, ResolveDecisionKind::Allowed);
+        let response = Message::parse(&outcome.response_bytes).unwrap();
+        assert!(!response.header.tc());
+        assert_eq!(response.answers.len(), 40);
+    }
+
+    /// Same scenario as `resolve_does_not_truncate_tcp_sourced_response_at_default_udp_limit`,
+    /// but for a cache HIT rather than a fresh backend response — this
+    /// exercises `serialize_cached_response`'s own truncation check, a
+    /// separate code path from the fresh-response one above. TCP queries get
+    /// their own cache namespace (see `probe_cache`'s `is_tcp()` branch), so
+    /// two TCP-sourced queries for the same question are used here: the
+    /// first is a miss that populates that namespace, the second a hit.
+    #[tokio::test]
+    async fn resolve_does_not_truncate_tcp_sourced_cache_hit() {
+        let question = QuestionKey::new("example.com", 1, 1);
+        let answers = (0..40)
+            .map(|_| a_record("example.com", 60))
+            .collect::<Vec<_>>();
+        let transport = Arc::new(ScriptedAuthorityTransport::new([Ok(
+            response_message_for_question_with_id(
+                0xbeef,
+                question,
+                ResponseCode::NoError,
+                answers,
+                Vec::new(),
+                Vec::new(),
+                true,
+            ),
+        )]));
+        let backend = Arc::new(recursive_backend(transport));
+        let service = ResolveQuery::with_cache_and_backend_snapshot(
+            Arc::new(StandardProtocolCodec::new(1232)),
+            Arc::new(InMemoryDnsCache::new(10)),
+            CacheTtlPolicy::default(),
+            BackendSnapshot::new(
+                backend,
+                ResolutionMode::Recursive,
+                7,
+                BackendHealth::Healthy,
+                Some("mode:recursive;generation:7".to_string()),
+            ),
+            Arc::new(BasicResponseFactory),
+            Arc::new(FixedClock(SystemTime::UNIX_EPOCH)),
+            Arc::new(RecordingEvents::default()),
+            Arc::new(RecordingMetrics::default()),
+        );
+        let tcp_source = || {
+            ObservedSourceEndpoint::tcp(
+                "192.0.2.11:5555".parse().unwrap(),
+                Some("127.0.0.1:53".parse().unwrap()),
+            )
+        };
+
+        // First TCP query: cache miss, resolves fresh and populates the
+        // TCP-namespaced cache entry.
+        let first = service
+            .resolve(ResolveRequest::new_with_observed_source(
+                tcp_source(),
+                SystemTime::UNIX_EPOCH,
+                a_query(0x1234, "example.com"),
+            ))
+            .await;
+        let first_response = Message::parse(&first.response_bytes).unwrap();
+        assert!(!first_response.header.tc());
+        assert_eq!(first_response.answers.len(), 40);
+
+        // Second TCP query: cache hit, served through `serialize_cached_response`.
+        let second = service
+            .resolve(ResolveRequest::new_with_observed_source(
+                tcp_source(),
+                SystemTime::UNIX_EPOCH,
+                a_query(0x4321, "example.com"),
+            ))
+            .await;
+        let second_response = Message::parse(&second.response_bytes).unwrap();
+        assert!(!second_response.header.tc());
+        assert_eq!(second_response.answers.len(), 40);
     }
 
     #[tokio::test]

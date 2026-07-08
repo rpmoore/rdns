@@ -16,16 +16,28 @@ use std::future::Future;
 use std::io;
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::time::SystemTime;
+use std::time::{Duration, SystemTime};
 
-use tokio::net::UdpSocket;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::{TcpListener, TcpStream, UdpSocket};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tokio::task::JoinSet;
+use tokio::time;
 
 use crate::config::RuntimeConfig;
 use crate::resolver::{ObservedSourceEndpoint, ResolveQuery, ResolveRequest};
 
 const DEFAULT_MAX_IN_FLIGHT_REQUESTS: usize = 1024;
+const DEFAULT_MAX_TCP_CONNECTIONS: usize = 128;
+/// RFC 1035 §4.2.2 length-prefixes TCP DNS messages with a 16-bit length —
+/// this is the hard ceiling regardless of any EDNS/config UDP payload size.
+const MAX_TCP_MESSAGE_SIZE: usize = u16::MAX as usize;
+/// Caps how long a connection may sit idle between pipelined queries (RFC
+/// 7766 §6.2 recommends servers support pipelining) and how long a single
+/// read/write may take. Without this, a client that opens a connection and
+/// never sends/finishes a query would hold a `max_connections` slot forever.
+const TCP_CONNECTION_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
+const TCP_SHUTDOWN_GRACE_PERIOD: Duration = Duration::from_secs(1);
 
 /// Bind a UDP socket for the DNS listener.
 ///
@@ -215,6 +227,197 @@ fn task_result_to_io(
     result: Result<io::Result<()>, tokio::task::JoinError>,
 ) -> io::Result<io::Result<()>> {
     result.map_err(|error| io::Error::other(format!("DNS request task failed: {error}")))
+}
+
+/// TCP counterpart to `UdpDnsServer`. RFC 1035 §4.2 and RFC 7766 both make
+/// TCP support mandatory for a conformant DNS server (not just a large-UDP-
+/// response fallback): clients may connect over TCP directly, and a UDP
+/// response we truncate (`TC=1`) is a promise that the same query answered
+/// over TCP will fit. Every response emitted here is exempt from the
+/// UDP-payload-size truncation, since it went through `ObservedSourceEndpoint::tcp`,
+/// which `ResolveQuery::resolve` checks (see `ObservedSourceEndpoint::is_tcp`).
+pub struct TcpDnsServer {
+    listener: TcpListener,
+    resolver: Arc<ResolveQuery>,
+    local_addr: SocketAddr,
+    max_connections: usize,
+}
+
+impl TcpDnsServer {
+    pub async fn bind(address: SocketAddr, resolver: Arc<ResolveQuery>) -> io::Result<Self> {
+        Self::bind_with_max_connections(address, resolver, DEFAULT_MAX_TCP_CONNECTIONS).await
+    }
+
+    pub async fn bind_with_max_connections(
+        address: SocketAddr,
+        resolver: Arc<ResolveQuery>,
+        max_connections: usize,
+    ) -> io::Result<Self> {
+        let listener = TcpListener::bind(address).await?;
+        let local_addr = listener.local_addr()?;
+        Ok(Self {
+            listener,
+            resolver,
+            local_addr,
+            max_connections,
+        })
+    }
+
+    pub async fn bind_configured(
+        config: &RuntimeConfig,
+        resolver: Arc<ResolveQuery>,
+    ) -> io::Result<Vec<Self>> {
+        let mut servers = Vec::with_capacity(config.dns_listen.len());
+        for address in &config.dns_listen {
+            servers.push(Self::bind(*address, resolver.clone()).await?);
+        }
+        Ok(servers)
+    }
+
+    pub fn local_addr(&self) -> io::Result<SocketAddr> {
+        Ok(self.local_addr)
+    }
+
+    /// Mirrors `UdpDnsServer::serve_until`'s accept/drain loop, but — like
+    /// `MetricsServer` — bounds the post-shutdown drain: a TCP connection
+    /// isn't guaranteed to close on its own the way a UDP datagram-handling
+    /// task finishes, so an idle or stalled client can't hang shutdown.
+    pub async fn serve_until<S>(&self, shutdown: S) -> io::Result<()>
+    where
+        S: Future<Output = ()>,
+    {
+        tokio::pin!(shutdown);
+        let semaphore = Arc::new(Semaphore::new(self.max_connections));
+        let mut tasks: JoinSet<()> = JoinSet::new();
+        loop {
+            tokio::select! {
+                _ = &mut shutdown => break,
+                accepted = self.accept_permitted(semaphore.clone()) => {
+                    match accepted {
+                        Ok(Some((stream, peer_addr, permit))) => {
+                            self.spawn_connection(stream, peer_addr, permit, &mut tasks);
+                        }
+                        Ok(None) => break,
+                        Err(error) => return Err(error),
+                    }
+                }
+                result = tasks.join_next(), if !tasks.is_empty() => {
+                    if let Some(Err(join_error)) = result {
+                        tracing::warn!(%join_error, "tcp dns connection task panicked");
+                    }
+                }
+            }
+        }
+
+        if time::timeout(TCP_SHUTDOWN_GRACE_PERIOD, drain_tasks(&mut tasks))
+            .await
+            .is_err()
+        {
+            tracing::warn!(
+                outstanding = tasks.len(),
+                "tcp dns server: connections still open after shutdown grace period, aborting"
+            );
+            tasks.abort_all();
+            drain_tasks(&mut tasks).await;
+        }
+        Ok(())
+    }
+
+    async fn accept_permitted(
+        &self,
+        semaphore: Arc<Semaphore>,
+    ) -> io::Result<Option<(TcpStream, SocketAddr, OwnedSemaphorePermit)>> {
+        let (stream, peer_addr) = self.listener.accept().await?;
+        match semaphore.acquire_owned().await {
+            Ok(permit) => Ok(Some((stream, peer_addr, permit))),
+            Err(_) => Ok(None),
+        }
+    }
+
+    fn spawn_connection(
+        &self,
+        stream: TcpStream,
+        peer_addr: SocketAddr,
+        permit: OwnedSemaphorePermit,
+        tasks: &mut JoinSet<()>,
+    ) {
+        let resolver = Arc::clone(&self.resolver);
+        let listener = self.local_addr;
+        tasks.spawn(async move {
+            let _permit = permit;
+            if let Err(error) = serve_tcp_connection(stream, peer_addr, listener, resolver).await
+            {
+                tracing::debug!(%error, %peer_addr, "tcp dns connection closed with error");
+            }
+        });
+    }
+}
+
+async fn drain_tasks(tasks: &mut JoinSet<()>) {
+    while tasks.join_next().await.is_some() {}
+}
+
+/// Serves one TCP connection: reads pipelined, length-prefixed queries
+/// until the client closes the connection or goes idle past
+/// `TCP_CONNECTION_IDLE_TIMEOUT`, resolving and answering each in turn.
+async fn serve_tcp_connection(
+    mut stream: TcpStream,
+    peer_addr: SocketAddr,
+    listener: SocketAddr,
+    resolver: Arc<ResolveQuery>,
+) -> io::Result<()> {
+    loop {
+        let mut length_prefix = [0u8; 2];
+        match time::timeout(
+            TCP_CONNECTION_IDLE_TIMEOUT,
+            stream.read_exact(&mut length_prefix),
+        )
+        .await
+        {
+            Ok(Ok(_)) => {}
+            // A clean close between queries (including the very first one)
+            // ends the connection normally, not as an error.
+            Ok(Err(error)) if error.kind() == io::ErrorKind::UnexpectedEof => return Ok(()),
+            Ok(Err(error)) => return Err(error),
+            Err(_) => return Ok(()),
+        }
+
+        let message_len = u16::from_be_bytes(length_prefix) as usize;
+        let mut message = vec![0u8; message_len];
+        time::timeout(
+            TCP_CONNECTION_IDLE_TIMEOUT,
+            stream.read_exact(&mut message),
+        )
+        .await
+        .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "tcp dns read timed out"))??;
+
+        let outcome = resolver
+            .resolve(ResolveRequest::new_with_observed_source(
+                ObservedSourceEndpoint::tcp(peer_addr, Some(listener)),
+                SystemTime::now(),
+                message,
+            ))
+            .await;
+
+        // The resolver never truncates a TCP-sourced response (it can only
+        // grow past `u16::MAX` if a backend itself violates the RFC 1035
+        // length-prefix ceiling), so this is a defensive bound, not a path
+        // truncation ever takes in practice.
+        let response = outcome.response_bytes;
+        if response.len() > MAX_TCP_MESSAGE_SIZE {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "resolved response exceeds the TCP message size limit",
+            ));
+        }
+
+        let mut framed = Vec::with_capacity(2 + response.len());
+        framed.extend_from_slice(&(response.len() as u16).to_be_bytes());
+        framed.extend_from_slice(&response);
+        time::timeout(TCP_CONNECTION_IDLE_TIMEOUT, stream.write_all(&framed))
+            .await
+            .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "tcp dns write timed out"))??;
+    }
 }
 
 #[cfg(test)]
@@ -465,6 +668,142 @@ mod tests {
         let resolver = resolve_service(upstream, Arc::new(RecordingEvents::default()));
 
         let servers = UdpDnsServer::bind_configured(&config, resolver)
+            .await
+            .unwrap();
+
+        assert_eq!(servers.len(), 2);
+        assert_eq!(servers[0].local_addr().unwrap(), first_address);
+        assert_eq!(servers[1].local_addr().unwrap(), second_address);
+    }
+
+    async fn tcp_send_query(stream: &mut TcpStream, query: &[u8]) {
+        let mut framed = Vec::with_capacity(2 + query.len());
+        framed.extend_from_slice(&(query.len() as u16).to_be_bytes());
+        framed.extend_from_slice(query);
+        stream.write_all(&framed).await.unwrap();
+    }
+
+    async fn tcp_recv_response(stream: &mut TcpStream) -> Vec<u8> {
+        let mut length_prefix = [0u8; 2];
+        stream.read_exact(&mut length_prefix).await.unwrap();
+        let mut response = vec![0u8; u16::from_be_bytes(length_prefix) as usize];
+        stream.read_exact(&mut response).await.unwrap();
+        response
+    }
+
+    /// Reproduces the "connection refused" a real `dig ANY` query hit against
+    /// a UDP-only rdns build: before `TcpDnsServer` existed, nothing was
+    /// listening on TCP at all, so any client (dig defaults to TCP for ANY
+    /// queries, and any UDP truncation fallback) got ECONNREFUSED.
+    #[tokio::test]
+    async fn tcp_server_answers_a_length_prefixed_query() {
+        let backend_bytes = a_response(0xabcd, "example.com");
+        let upstream = Arc::new(StaticUpstream::new(Ok(upstream_response(backend_bytes))));
+        let events = Arc::new(RecordingEvents::default());
+        let resolver = resolve_service(upstream.clone(), events.clone());
+        let server = TcpDnsServer::bind("127.0.0.1:0".parse().unwrap(), resolver)
+            .await
+            .unwrap();
+        let server_addr = server.local_addr().unwrap();
+        let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
+        let server_task = tokio::spawn(async move {
+            server
+                .serve_until(async {
+                    let _ = shutdown_rx.await;
+                })
+                .await
+        });
+
+        let mut client = TcpStream::connect(server_addr).await.unwrap();
+        let client_addr = client.local_addr().unwrap();
+        tcp_send_query(&mut client, &a_query(0x1234, "example.com")).await;
+        let response = tcp_recv_response(&mut client).await;
+
+        assert_eq!(response, a_response(0x1234, "example.com"));
+        {
+            let recorded_events = events.events.lock().unwrap();
+            assert_eq!(recorded_events.len(), 1);
+            assert_eq!(recorded_events[0].observed_source.ip, client_addr.ip());
+            assert_eq!(
+                recorded_events[0].observed_source.port,
+                Some(client_addr.port())
+            );
+            assert_eq!(
+                recorded_events[0].observed_source.transport,
+                Some(QueryTransport::Tcp)
+            );
+            assert_eq!(
+                recorded_events[0].observed_source.listener,
+                Some(server_addr)
+            );
+        }
+
+        drop(client);
+        shutdown_tx.send(()).unwrap();
+        server_task.await.unwrap().unwrap();
+    }
+
+    /// RFC 7766 §6.2.1: a server should support multiple outstanding queries
+    /// pipelined on a single TCP connection, not require one-query-per-connection.
+    #[tokio::test]
+    async fn tcp_server_answers_pipelined_queries_on_one_connection() {
+        let upstream = Arc::new(StaticUpstream::new(Ok(upstream_response(a_response(
+            0, "example.com",
+        )))));
+        let resolver = resolve_service(upstream, Arc::new(RecordingEvents::default()));
+        let server = TcpDnsServer::bind("127.0.0.1:0".parse().unwrap(), resolver)
+            .await
+            .unwrap();
+        let server_addr = server.local_addr().unwrap();
+        let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
+        let server_task = tokio::spawn(async move {
+            server
+                .serve_until(async {
+                    let _ = shutdown_rx.await;
+                })
+                .await
+        });
+
+        let mut client = TcpStream::connect(server_addr).await.unwrap();
+        tcp_send_query(&mut client, &a_query(0x1111, "example.com")).await;
+        tcp_send_query(&mut client, &a_query(0x2222, "example.com")).await;
+
+        assert_eq!(
+            tcp_recv_response(&mut client).await,
+            a_response(0x1111, "example.com")
+        );
+        assert_eq!(
+            tcp_recv_response(&mut client).await,
+            a_response(0x2222, "example.com")
+        );
+
+        drop(client);
+        shutdown_tx.send(()).unwrap();
+        server_task.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn tcp_bind_configured_creates_one_server_per_dns_listener() {
+        let first_address = unused_high_local_address().await;
+        let second_address = unused_high_local_address().await;
+        let config = RuntimeConfig::new(
+            vec![first_address, second_address],
+            vec![crate::config::UpstreamConfig {
+                name: "primary".to_string(),
+                endpoint: "192.0.2.53:53".parse().unwrap(),
+                protocol: crate::config::UpstreamProtocol::Udp,
+                enabled: true,
+                priority: 10,
+                timeout: Duration::from_millis(500),
+            }],
+            Duration::from_secs(2),
+            1232,
+        )
+        .unwrap();
+        let upstream = Arc::new(StaticUpstream::new(Err(UpstreamError::Timeout)));
+        let resolver = resolve_service(upstream, Arc::new(RecordingEvents::default()));
+
+        let servers = TcpDnsServer::bind_configured(&config, resolver)
             .await
             .unwrap();
 
