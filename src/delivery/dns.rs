@@ -553,9 +553,11 @@ mod tests {
         first_started.await;
         shutdown_tx.send(()).unwrap();
 
-        assert!(time::timeout(Duration::from_millis(50), &mut server_task)
-            .await
-            .is_err());
+        assert!(
+            time::timeout(Duration::from_millis(50), &mut server_task)
+                .await
+                .is_err()
+        );
         upstream.first_release.notify_waiters();
         server_task.await.unwrap().unwrap();
     }

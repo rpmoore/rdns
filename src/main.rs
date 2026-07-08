@@ -18,13 +18,13 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
-use opentelemetry::metrics::{Counter, Gauge, Histogram, MeterProvider, ObservableGauge};
 use opentelemetry::KeyValue;
+use opentelemetry::metrics::{Counter, Gauge, Histogram, MeterProvider, ObservableGauge};
 use opentelemetry_sdk::metrics::SdkMeterProvider;
 use prometheus::Registry;
 use rdns::config::{
-    parse_local_zone_file, LocalZoneConfig, ResolutionMode as ConfigResolutionMode,
-    RootHintsSource as ConfigRootHintsSource, RuntimeConfig, MAX_LOCAL_ZONE_FILE_BYTES,
+    LocalZoneConfig, MAX_LOCAL_ZONE_FILE_BYTES, ResolutionMode as ConfigResolutionMode,
+    RootHintsSource as ConfigRootHintsSource, RuntimeConfig, parse_local_zone_file,
 };
 use rdns::delivery::dns::UdpDnsServer;
 use rdns::delivery::metrics_http::MetricsServer;
@@ -307,9 +307,10 @@ fn parse_config_flag<I: Iterator<Item = String>>(mut args: I) -> Option<PathBuf>
             }
         } else if arg == "--config"
             && let Some(value) = args.next()
-                && !value.is_empty() {
-                    return Some(PathBuf::from(value));
-                }
+            && !value.is_empty()
+        {
+            return Some(PathBuf::from(value));
+        }
     }
     None
 }
@@ -1006,10 +1007,11 @@ impl MetricsSink for OpenTelemetryMetrics {
             &attributes,
         );
         if let Some(root_hints) = &status.root_hints
-            && let Some(age) = root_hints.age_at(SystemTime::now()) {
-                self.root_hints_age_seconds
-                    .record(age.as_secs_f64(), &attributes);
-            }
+            && let Some(age) = root_hints.age_at(SystemTime::now())
+        {
+            self.root_hints_age_seconds
+                .record(age.as_secs_f64(), &attributes);
+        }
     }
 }
 

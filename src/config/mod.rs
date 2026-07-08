@@ -18,8 +18,8 @@ use std::path::PathBuf;
 use std::sync::OnceLock;
 use std::time::Duration;
 
-use domain::base::iana::{Class, Rtype};
 use domain::base::RecordData;
+use domain::base::iana::{Class, Rtype};
 use domain::rdata::ZoneRecordData;
 use domain::zonefile::inplace::{Entry, Zonefile};
 use serde::Deserialize;
@@ -1280,7 +1280,7 @@ impl RawRecursiveResolutionConfig {
             Some(other) => {
                 return Err(ConfigError::InvalidTomlConfig {
                     message: format!("unknown dnssec_validation mode: {other}"),
-                })
+                });
             }
         };
         let dname_handling = match self.dname_handling.as_deref() {
@@ -1288,7 +1288,7 @@ impl RawRecursiveResolutionConfig {
             Some(other) => {
                 return Err(ConfigError::InvalidTomlConfig {
                     message: format!("unknown dname_handling policy: {other}"),
-                })
+                });
             }
         };
         let allowed_transports = self
@@ -1316,7 +1316,7 @@ impl RawRecursiveResolutionConfig {
             other => {
                 return Err(ConfigError::InvalidTomlConfig {
                     message: format!("unknown root_hints source: {other}"),
-                })
+                });
             }
         };
         config.dnssec_validation = dnssec_validation;
@@ -1367,7 +1367,7 @@ impl RawUpstreamConfig {
             other => {
                 return Err(ConfigError::InvalidTomlConfig {
                     message: format!("unknown upstream protocol: {other}"),
-                })
+                });
             }
         };
         Ok(UpstreamConfig {
@@ -1842,9 +1842,10 @@ mod tests {
         )
         .unwrap();
 
-        assert!(base
-            .backend_cache_namespace()
-            .starts_with("mode:forward;generation:0;upstreams:"));
+        assert!(
+            base.backend_cache_namespace()
+                .starts_with("mode:forward;generation:0;upstreams:")
+        );
         assert_eq!(
             base.backend_cache_namespace(),
             same_active_set.backend_cache_namespace()
@@ -2898,8 +2899,8 @@ a.root-servers.net.      3600000      Aaaa  2001:503:ba3e::2:30
     }
 
     #[test]
-    fn runtime_config_validate_rejects_local_zone_with_registered_tld_root_without_reading_any_file(
-    ) {
+    fn runtime_config_validate_rejects_local_zone_with_registered_tld_root_without_reading_any_file()
+     {
         let mut config = RuntimeConfig::development_default();
         config.local_zones.push(local_zone("com"));
 

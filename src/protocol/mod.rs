@@ -1450,9 +1450,10 @@ fn decode_compression_pointer(
         return Err(DnsParseError::InvalidNamePointer);
     }
     if let Some(context) = context
-        && !context.valid_name_offsets.contains(&pointer_offset) {
-            return Err(DnsParseError::InvalidNamePointer);
-        }
+        && !context.valid_name_offsets.contains(&pointer_offset)
+    {
+        return Err(DnsParseError::InvalidNamePointer);
+    }
     Ok(pointer_offset)
 }
 

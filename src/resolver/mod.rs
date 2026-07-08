@@ -17,24 +17,24 @@ use std::future::Future;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::pin::Pin;
 use std::sync::{
-    atomic::{AtomicU64, Ordering},
     Arc, Mutex, RwLock,
+    atomic::{AtomicU64, Ordering},
 };
 use std::time::{Duration, SystemTime};
 
 use bytes::Bytes;
 use serde::Serialize;
-use tokio::sync::{mpsc, Notify};
+use tokio::sync::{Notify, mpsc};
 use tokio::task::JoinSet;
 use tokio::time::{self, Instant};
 
 use crate::protocol::{
-    age_response_ttls, build_a_answers_response, build_a_block_response,
-    build_aaaa_answers_response, build_aaaa_block_response, build_formerr_response,
-    build_nodata_response, build_nxdomain_response, build_refused_response,
-    build_servfail_response, build_truncated_response, cap_response_ttls, message_question_wire,
-    rewrite_response_id, rewrite_response_request_fields, EdnsInfo, Message, QueryValidationError,
-    Record, RecordData, ResponseCode,
+    EdnsInfo, Message, QueryValidationError, Record, RecordData, ResponseCode, age_response_ttls,
+    build_a_answers_response, build_a_block_response, build_aaaa_answers_response,
+    build_aaaa_block_response, build_formerr_response, build_nodata_response,
+    build_nxdomain_response, build_refused_response, build_servfail_response,
+    build_truncated_response, cap_response_ttls, message_question_wire, rewrite_response_id,
+    rewrite_response_request_fields,
 };
 
 pub mod policy;
@@ -5883,47 +5883,47 @@ impl RecursiveResolutionBackend {
         }
 
         if message.header.aa()
-            && let Some(cname_record) = cname_record_for(message, &state.question) {
-                let RecordData::CNAME(cname_target) = &cname_record.record else {
-                    unreachable!();
-                };
-                let target_question =
-                    QuestionKey::new(cname_target, state.question.qtype, state.question.qclass);
-                if has_requested_answer_for(message, &target_question) {
-                    return AuthorityResponseOutcome::Return(Box::new(
-                        ResolutionResponse::recursive_response(
-                            &request.query,
-                            response,
-                            &state.cname_chain,
-                            SystemTime::now(),
-                            request.backend_generation,
-                            authority,
-                        ),
-                    ));
-                }
-                let next_name = normalize_question_name(cname_target);
-                if state.cname_restarts >= self.config.max_cname_restarts
-                    || !state.seen_cnames.insert(next_name)
-                {
-                    self.increment_metric(ResolverMetric::RecursiveLimitHit);
-                    return AuthorityResponseOutcome::Return(Box::new(Err(
-                        ResolutionBackendError::NoBackendsAvailable,
-                    )));
-                }
-                state.cname_chain.extend(cname_chain_records(
-                    message,
-                    cname_record,
-                    request.query.features.dnssec_ok,
+            && let Some(cname_record) = cname_record_for(message, &state.question)
+        {
+            let RecordData::CNAME(cname_target) = &cname_record.record else {
+                unreachable!();
+            };
+            let target_question =
+                QuestionKey::new(cname_target, state.question.qtype, state.question.qclass);
+            if has_requested_answer_for(message, &target_question) {
+                return AuthorityResponseOutcome::Return(Box::new(
+                    ResolutionResponse::recursive_response(
+                        &request.query,
+                        response,
+                        &state.cname_chain,
+                        SystemTime::now(),
+                        request.backend_generation,
+                        authority,
+                    ),
                 ));
-                state.cname_restarts = state.cname_restarts.saturating_add(1);
-                state.question =
-                    QuestionKey::new(cname_target, state.question.qtype, state.question.qclass);
-                state.seen_referrals.clear();
-                let (zone, next) =
-                    self.authorities_for(&state.question.qname, state.question.qclass);
-                state.current_zone = zone;
-                return AuthorityResponseOutcome::Advance(next);
             }
+            let next_name = normalize_question_name(cname_target);
+            if state.cname_restarts >= self.config.max_cname_restarts
+                || !state.seen_cnames.insert(next_name)
+            {
+                self.increment_metric(ResolverMetric::RecursiveLimitHit);
+                return AuthorityResponseOutcome::Return(Box::new(Err(
+                    ResolutionBackendError::NoBackendsAvailable,
+                )));
+            }
+            state.cname_chain.extend(cname_chain_records(
+                message,
+                cname_record,
+                request.query.features.dnssec_ok,
+            ));
+            state.cname_restarts = state.cname_restarts.saturating_add(1);
+            state.question =
+                QuestionKey::new(cname_target, state.question.qtype, state.question.qclass);
+            state.seen_referrals.clear();
+            let (zone, next) = self.authorities_for(&state.question.qname, state.question.qclass);
+            state.current_zone = zone;
+            return AuthorityResponseOutcome::Advance(next);
+        }
 
         let Some(referral) = referral_authorities(message, &state.question) else {
             return self
@@ -5945,26 +5945,27 @@ impl RecursiveResolutionBackend {
         message: &Message,
     ) -> AuthorityResponseOutcome {
         if let Some((owner, names, min_ttl)) = glueless_delegation_names(message, &state.question)
-            && is_valid_zone_progression(&state.current_zone, &owner) {
-                let (resolved, resolved_ttl) = self
-                    .resolve_glueless_endpoints(
-                        &names,
-                        state.question.qclass,
-                        query_deadline,
-                        MAX_GLUELESS_NS_DEPTH,
-                    )
-                    .await;
-                if !resolved.is_empty() {
-                    self.delegation_cache.insert(
-                        owner.clone(),
-                        state.question.qclass,
-                        resolved.clone(),
-                        min_ttl.min(resolved_ttl),
-                    );
-                    state.current_zone = owner;
-                    return AuthorityResponseOutcome::Advance(resolved);
-                }
+            && is_valid_zone_progression(&state.current_zone, &owner)
+        {
+            let (resolved, resolved_ttl) = self
+                .resolve_glueless_endpoints(
+                    &names,
+                    state.question.qclass,
+                    query_deadline,
+                    MAX_GLUELESS_NS_DEPTH,
+                )
+                .await;
+            if !resolved.is_empty() {
+                self.delegation_cache.insert(
+                    owner.clone(),
+                    state.question.qclass,
+                    resolved.clone(),
+                    min_ttl.min(resolved_ttl),
+                );
+                state.current_zone = owner;
+                return AuthorityResponseOutcome::Advance(resolved);
             }
+        }
         if has_delegation_for_question(message, &state.question) {
             self.increment_metric(ResolverMetric::RecursiveBailiwickReject);
         } else {
@@ -6438,12 +6439,12 @@ pub enum ResolverMetric {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::mpsc as std_mpsc;
     use std::sync::Mutex;
+    use std::sync::mpsc as std_mpsc;
     use std::thread;
 
     use crate::protocol::{
-        build_a_block_response, question_wire, EdnsInfo, Header, Question, Record,
+        EdnsInfo, Header, Question, Record, build_a_block_response, question_wire,
     };
 
     fn a_query(id: u16, name: &str) -> Vec<u8> {
@@ -7276,8 +7277,10 @@ mod tests {
             !finding_reasons(&classifier, &below_nxdomain[1], &below_nxdomain)
                 .contains(&QueryEventClassifierReason::NxdomainBurst)
         );
-        assert!(finding_reasons(&classifier, &at_nxdomain[2], &at_nxdomain)
-            .contains(&QueryEventClassifierReason::NxdomainBurst));
+        assert!(
+            finding_reasons(&classifier, &at_nxdomain[2], &at_nxdomain)
+                .contains(&QueryEventClassifierReason::NxdomainBurst)
+        );
 
         let below_servfail = vec![event_with_response(
             4,
@@ -7303,8 +7306,10 @@ mod tests {
             !finding_reasons(&classifier, &below_servfail[0], &below_servfail)
                 .contains(&QueryEventClassifierReason::ServfailBurst)
         );
-        assert!(finding_reasons(&classifier, &at_servfail[1], &at_servfail)
-            .contains(&QueryEventClassifierReason::ServfailBurst));
+        assert!(
+            finding_reasons(&classifier, &at_servfail[1], &at_servfail)
+                .contains(&QueryEventClassifierReason::ServfailBurst)
+        );
 
         let below_txt = vec![
             event_with_response(
@@ -7337,10 +7342,14 @@ mod tests {
             ),
         ];
 
-        assert!(!finding_reasons(&classifier, &below_txt[1], &below_txt)
-            .contains(&QueryEventClassifierReason::RepeatedTxtLookup));
-        assert!(finding_reasons(&classifier, &at_txt[2], &at_txt)
-            .contains(&QueryEventClassifierReason::RepeatedTxtLookup));
+        assert!(
+            !finding_reasons(&classifier, &below_txt[1], &below_txt)
+                .contains(&QueryEventClassifierReason::RepeatedTxtLookup)
+        );
+        assert!(
+            finding_reasons(&classifier, &at_txt[2], &at_txt)
+                .contains(&QueryEventClassifierReason::RepeatedTxtLookup)
+        );
 
         let short_entropy = vec![event_with(9, 9, "192.0.2.1", "a9x4qz7.example")];
         let long_entropy = vec![event_with(10, 10, "192.0.2.1", "a9x4qz7m.example")];
@@ -7649,10 +7658,12 @@ mod tests {
             .iter()
             .find(|finding| finding.reason == QueryEventClassifierReason::RepeatedTxtLookup)
             .unwrap();
-        assert!(txt_finding
-            .evaluated_window
-            .incomplete_reasons
-            .contains(&QueryEventClassifierWindowIncompleteReason::ColdStart));
+        assert!(
+            txt_finding
+                .evaluated_window
+                .incomplete_reasons
+                .contains(&QueryEventClassifierWindowIncompleteReason::ColdStart)
+        );
         assert!(txt_finding.details.iter().any(|detail| {
             detail.key == "window_incomplete_reason" && detail.value == "cold_start"
         }));
@@ -7711,10 +7722,12 @@ mod tests {
             .iter()
             .find(|finding| finding.reason == QueryEventClassifierReason::RepeatedTxtLookup)
             .unwrap();
-        assert!(txt_finding
-            .evaluated_window
-            .incomplete_reasons
-            .contains(&QueryEventClassifierWindowIncompleteReason::RetentionEviction));
+        assert!(
+            txt_finding
+                .evaluated_window
+                .incomplete_reasons
+                .contains(&QueryEventClassifierWindowIncompleteReason::RetentionEviction)
+        );
     }
 
     #[test]
@@ -7907,10 +7920,12 @@ mod tests {
 
         let _first_event = first.join().unwrap();
         let second_event = second.join().unwrap();
-        assert!(second_event
-            .advisory_findings
-            .iter()
-            .any(|finding| finding.reason == QueryEventClassifierReason::RepeatedTxtLookup));
+        assert!(
+            second_event
+                .advisory_findings
+                .iter()
+                .any(|finding| finding.reason == QueryEventClassifierReason::RepeatedTxtLookup)
+        );
     }
 
     #[test]
@@ -7928,14 +7943,18 @@ mod tests {
         let event =
             store.record_classified(event_with(1, 10, "192.0.2.1", "same.example"), &classifier);
 
-        assert!(event
-            .advisory_findings
-            .iter()
-            .any(|finding| finding.reason == QueryEventClassifierReason::NewDomain));
-        assert!(!event
-            .advisory_findings
-            .iter()
-            .any(|finding| finding.reason == QueryEventClassifierReason::RareDomain));
+        assert!(
+            event
+                .advisory_findings
+                .iter()
+                .any(|finding| finding.reason == QueryEventClassifierReason::NewDomain)
+        );
+        assert!(
+            !event
+                .advisory_findings
+                .iter()
+                .any(|finding| finding.reason == QueryEventClassifierReason::RareDomain)
+        );
     }
 
     #[test]
@@ -7965,10 +7984,12 @@ mod tests {
             .iter()
             .find(|finding| finding.reason == QueryEventClassifierReason::HighEntropyName)
             .unwrap();
-        assert!(finding
-            .evaluated_window
-            .incomplete_reasons
-            .contains(&QueryEventClassifierWindowIncompleteReason::RetentionEviction));
+        assert!(
+            finding
+                .evaluated_window
+                .incomplete_reasons
+                .contains(&QueryEventClassifierWindowIncompleteReason::RetentionEviction)
+        );
         let retained = store.recent_events();
         assert_eq!(retained.len(), 1);
         assert_eq!(retained[0].sequence, 2);
@@ -9692,12 +9713,14 @@ mod tests {
         assert_eq!(metrics.count(ResolverMetric::RecursiveQuery), 1);
         assert_eq!(metrics.count(ResolverMetric::RecursiveAuthorityAttempt), 2);
         assert_eq!(metrics.count(ResolverMetric::RecursiveReferralLoop), 1);
-        assert!(metrics
-            .durations
-            .lock()
-            .unwrap()
-            .iter()
-            .any(|(metric, _)| *metric == ResolverMetric::RecursiveQueryDuration));
+        assert!(
+            metrics
+                .durations
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|(metric, _)| *metric == ResolverMetric::RecursiveQueryDuration)
+        );
     }
 
     #[tokio::test]
@@ -10380,11 +10403,13 @@ mod tests {
             .await;
 
         assert_eq!(events.events.lock().unwrap().len(), 1);
-        assert!(metrics
-            .increments
-            .lock()
-            .unwrap()
-            .contains(&ResolverMetric::QueryEventAccepted));
+        assert!(
+            metrics
+                .increments
+                .lock()
+                .unwrap()
+                .contains(&ResolverMetric::QueryEventAccepted)
+        );
     }
 
     #[tokio::test]
@@ -11838,26 +11863,30 @@ mod tests {
             ),
             Err(BlockResponseConfigError::MissingSinkholeAddress)
         );
-        assert!(BlockResponseConfig::new(
-            BlockResponseMode::Sinkhole,
-            BlockResponseMode::Sinkhole,
-            BlockResponseMode::Sinkhole,
-            60,
-            true,
-            Some(Ipv4Addr::new(192, 0, 2, 1)),
-            None,
-        )
-        .is_ok());
-        assert!(BlockResponseConfig::new(
-            BlockResponseMode::Sinkhole,
-            BlockResponseMode::Sinkhole,
-            BlockResponseMode::Sinkhole,
-            60,
-            true,
-            None,
-            Some(Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1)),
-        )
-        .is_ok());
+        assert!(
+            BlockResponseConfig::new(
+                BlockResponseMode::Sinkhole,
+                BlockResponseMode::Sinkhole,
+                BlockResponseMode::Sinkhole,
+                60,
+                true,
+                Some(Ipv4Addr::new(192, 0, 2, 1)),
+                None,
+            )
+            .is_ok()
+        );
+        assert!(
+            BlockResponseConfig::new(
+                BlockResponseMode::Sinkhole,
+                BlockResponseMode::Sinkhole,
+                BlockResponseMode::Sinkhole,
+                60,
+                true,
+                None,
+                Some(Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1)),
+            )
+            .is_ok()
+        );
     }
 
     #[test]
@@ -11874,30 +11903,34 @@ mod tests {
             ),
             Err(BlockResponseConfigError::ClientCachingUnsupportedForNonSinkhole)
         );
-        assert!(BlockResponseConfig::new(
-            BlockResponseMode::Sinkhole,
-            BlockResponseMode::Sinkhole,
-            BlockResponseMode::Sinkhole,
-            60,
-            true,
-            Some(Ipv4Addr::new(192, 0, 2, 1)),
-            Some(Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1)),
-        )
-        .is_ok());
+        assert!(
+            BlockResponseConfig::new(
+                BlockResponseMode::Sinkhole,
+                BlockResponseMode::Sinkhole,
+                BlockResponseMode::Sinkhole,
+                60,
+                true,
+                Some(Ipv4Addr::new(192, 0, 2, 1)),
+                Some(Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1)),
+            )
+            .is_ok()
+        );
     }
 
     #[test]
     fn block_response_config_allows_internal_ttl_for_uncacheable_negative_modes() {
-        assert!(BlockResponseConfig::new(
-            BlockResponseMode::NxDomain,
-            BlockResponseMode::Refused,
-            BlockResponseMode::Refused,
-            60,
-            false,
-            None,
-            None,
-        )
-        .is_ok());
+        assert!(
+            BlockResponseConfig::new(
+                BlockResponseMode::NxDomain,
+                BlockResponseMode::Refused,
+                BlockResponseMode::Refused,
+                60,
+                false,
+                None,
+                None,
+            )
+            .is_ok()
+        );
     }
 
     #[test]
@@ -12072,11 +12105,13 @@ mod tests {
                 Some(QueryEventCacheResult::Miss)
             );
         }
-        assert!(metrics
-            .increments
-            .lock()
-            .unwrap()
-            .contains(&ResolverMetric::UpstreamSuccess));
+        assert!(
+            metrics
+                .increments
+                .lock()
+                .unwrap()
+                .contains(&ResolverMetric::UpstreamSuccess)
+        );
     }
 
     #[tokio::test]
@@ -12142,11 +12177,13 @@ mod tests {
                 Some("Blocked.Example")
             );
         }
-        assert!(!metrics
-            .increments
-            .lock()
-            .unwrap()
-            .contains(&ResolverMetric::QueryAllowed));
+        assert!(
+            !metrics
+                .increments
+                .lock()
+                .unwrap()
+                .contains(&ResolverMetric::QueryAllowed)
+        );
         assert_eq!(metrics.count(ResolverMetric::QueryBlocked), 1);
     }
 
@@ -12402,14 +12439,16 @@ mod tests {
         ))));
         let cache = Arc::new(RecordingCache::with_lookup(CacheLookup::Miss));
         let events = Arc::new(RecordingEvents::default());
-        let local_entries = Arc::new(InMemoryLocalDnsEntries::new(vec![LocalDnsEntry::new(
-            DomainName::parse("host.example").unwrap(),
-            vec![Ipv4Addr::new(192, 0, 2, 44), Ipv4Addr::new(192, 0, 2, 45)],
-            vec![Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 44)],
-            120,
-            true,
-        )
-        .with_metadata("entry-1", 7)]));
+        let local_entries = Arc::new(InMemoryLocalDnsEntries::new(vec![
+            LocalDnsEntry::new(
+                DomainName::parse("host.example").unwrap(),
+                vec![Ipv4Addr::new(192, 0, 2, 44), Ipv4Addr::new(192, 0, 2, 45)],
+                vec![Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 44)],
+                120,
+                true,
+            )
+            .with_metadata("entry-1", 7),
+        ]));
         let service = ResolveQuery::with_cache_and_policy(
             Arc::new(StandardProtocolCodec::new(1232)),
             cache.clone(),
@@ -12702,14 +12741,16 @@ mod tests {
             a_response_with_answer(0xabcd, "host.example", 60),
         ))));
         let cache = Arc::new(RecordingCache::with_lookup(CacheLookup::Miss));
-        let local_entries = Arc::new(InMemoryLocalDnsEntries::new(vec![LocalDnsEntry::new(
-            DomainName::parse("host.example").unwrap(),
-            vec![Ipv4Addr::new(192, 0, 2, 44)],
-            Vec::new(),
-            120,
-            true,
-        )
-        .with_metadata("entry-2", 8)]));
+        let local_entries = Arc::new(InMemoryLocalDnsEntries::new(vec![
+            LocalDnsEntry::new(
+                DomainName::parse("host.example").unwrap(),
+                vec![Ipv4Addr::new(192, 0, 2, 44)],
+                Vec::new(),
+                120,
+                true,
+            )
+            .with_metadata("entry-2", 8),
+        ]));
         let service = ResolveQuery::with_cache_and_policy(
             Arc::new(StandardProtocolCodec::new(1232)),
             cache.clone(),
@@ -14057,11 +14098,13 @@ mod tests {
             );
             assert_eq!(recorded_events[0].cache_result, None);
         }
-        assert!(metrics
-            .increments
-            .lock()
-            .unwrap()
-            .contains(&ResolverMetric::ProtocolError));
+        assert!(
+            metrics
+                .increments
+                .lock()
+                .unwrap()
+                .contains(&ResolverMetric::ProtocolError)
+        );
     }
 
     #[tokio::test]
@@ -14100,11 +14143,13 @@ mod tests {
                 Some(QueryEventCacheResult::Miss)
             );
         }
-        assert!(metrics
-            .increments
-            .lock()
-            .unwrap()
-            .contains(&ResolverMetric::UpstreamFailure));
+        assert!(
+            metrics
+                .increments
+                .lock()
+                .unwrap()
+                .contains(&ResolverMetric::UpstreamFailure)
+        );
     }
 
     #[tokio::test]
@@ -14127,11 +14172,13 @@ mod tests {
             ResponseCode::ServFail as u8
         );
         assert_eq!(outcome.decision.kind, ResolveDecisionKind::BackendFailure);
-        assert!(metrics
-            .increments
-            .lock()
-            .unwrap()
-            .contains(&ResolverMetric::UpstreamFailure));
+        assert!(
+            metrics
+                .increments
+                .lock()
+                .unwrap()
+                .contains(&ResolverMetric::UpstreamFailure)
+        );
     }
 
     #[test]
