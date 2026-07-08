@@ -17,6 +17,8 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          persist-credentials: false
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
@@ -27,7 +29,7 @@ jobs:
       - name: Verify release tag matches Cargo.toml version
         run: |
           tag="${{ github.event.release.tag_name }}"
-          cargo_version="$(cargo metadata --no-deps --format-version=1 | jq -r '.packages[0].version')"
+          cargo_version="$(cargo metadata --no-deps --format-version=1 | python3 -c 'import json, sys; print(json.load(sys.stdin)["packages"][0]["version"])')"
           if [ "$tag" != "v$cargo_version" ]; then
             echo "::error::release tag '$tag' does not match Cargo.toml version 'v$cargo_version' — bump Cargo.toml and merge before tagging"
             exit 1
