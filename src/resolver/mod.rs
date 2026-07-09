@@ -1319,7 +1319,8 @@ fn write_dns_record(
             next_domain,
             type_bit_maps,
         } => {
-            compressor.write_name(bytes, next_domain);
+            // RFC 4034 §4.1.1: MUST NOT compress the Next Domain Name field.
+            write_dns_name(bytes, next_domain);
             bytes.extend_from_slice(type_bit_maps);
         }
         RecordData::NSEC3 {
@@ -1359,8 +1360,10 @@ fn write_dns_record(
             mboxdname,
             txtdname,
         } => {
-            compressor.write_name(bytes, mboxdname);
-            compressor.write_name(bytes, txtdname);
+            // RFC 3597 §4: RP isn't an RFC 1035 well-known type, so its
+            // embedded names must not be compressed when writing.
+            write_dns_name(bytes, mboxdname);
+            write_dns_name(bytes, txtdname);
         }
         RecordData::SOA {
             ttl: _,
@@ -1389,7 +1392,8 @@ fn write_dns_record(
             write_dns_u16(bytes, *priority);
             write_dns_u16(bytes, *weight);
             write_dns_u16(bytes, *port);
-            compressor.write_name(bytes, target);
+            // RFC 2782: "name compression is not to be used for this field."
+            write_dns_name(bytes, target);
         }
         RecordData::TXT(text) => {
             for chunk in text.as_bytes().chunks(255) {
@@ -1415,7 +1419,8 @@ fn write_dns_record(
             write_dns_u32(bytes, *signature_expiration);
             write_dns_u32(bytes, *signature_inception);
             write_dns_u16(bytes, *key_tag);
-            compressor.write_name(bytes, signer_name);
+            // RFC 4034 §3.1.7: MUST NOT compress the Signer's Name field.
+            write_dns_name(bytes, signer_name);
             bytes.extend_from_slice(signature);
         }
         RecordData::OPT(info) => {
@@ -1434,7 +1439,6 @@ fn write_dns_record(
     Ok(())
 }
 
-#[cfg(test)]
 fn write_dns_name(bytes: &mut Vec<u8>, name: &str) {
     let name = name.trim_end_matches('.');
     if name.is_empty() {
@@ -11273,6 +11277,90 @@ mod tests {
             round_tripped.answers[1].record,
             RecordData::A("192.0.2.10".parse().unwrap())
         );
+    }
+
+    #[test]
+    fn serialize_recursive_response_never_compresses_rfc_forbidden_rdata_names() {
+        // RFC 4034 §3.1.7/§4.1.1 forbid compressing RRSIG's signer name and
+        // NSEC's next domain name; RFC 2782 forbids it for SRV's target;
+        // RFC 3597 §4 forbids it for RP (not an RFC 1035 well-known type).
+        // Every name below deliberately shares the "example.com" suffix
+        // already written for the question, so an implementation that
+        // (wrongly) compresses these fields would elide it as a 2-byte
+        // pointer instead of writing it out in full.
+        let question = QuestionKey::new("alpha.example.com", 1, 1);
+        let original_query = Message::parse_owned(query(
+            0xbeef,
+            &question.qname,
+            question.qtype,
+            question.qclass,
+        ))
+        .unwrap();
+
+        // rrsig_record's signer_name defaults to "example.com".
+        let rrsig = rrsig_record("alpha.example.com", 3600, 1);
+        let nsec = Record {
+            name: "alpha.example.com".to_string(),
+            rtype: NSEC_RECORD_TYPE,
+            rclass: 1,
+            ttl: 3600,
+            record: RecordData::NSEC {
+                next_domain: "beta.example.com".to_string(),
+                type_bit_maps: vec![0, 1, 0x40],
+            },
+        };
+        let srv = Record {
+            name: "_sip._tcp.example.com".to_string(),
+            rtype: 33,
+            rclass: 1,
+            ttl: 3600,
+            record: RecordData::SRV {
+                priority: 10,
+                weight: 20,
+                port: 5060,
+                target: "host.example.com".to_string(),
+            },
+        };
+        let rp = Record {
+            name: "alpha.example.com".to_string(),
+            rtype: 17,
+            rclass: 1,
+            ttl: 3600,
+            record: RecordData::RP {
+                mboxdname: "admin.example.com".to_string(),
+                txtdname: "info.example.com".to_string(),
+            },
+        };
+        let answers = vec![rrsig, nsec, srv, rp];
+
+        let bytes = serialize_recursive_response(
+            &original_query,
+            ResponseCode::NoError,
+            false,
+            &answers,
+            &[],
+            &[],
+        )
+        .unwrap();
+
+        // "example.com" written out in full (7'example'3'com'0) should
+        // appear once for the question and once more for each of the 5
+        // RFC-forbidden fields above (signer_name, next_domain, target,
+        // mboxdname, txtdname) — 6 total. A regression that compresses any
+        // of them would drop this count.
+        let uncompressed_example_com: &[u8] = b"\x07example\x03com\x00";
+        let literal_count = bytes
+            .windows(uncompressed_example_com.len())
+            .filter(|w| *w == uncompressed_example_com)
+            .count();
+        assert_eq!(
+            literal_count, 6,
+            "expected 6 literal writes of \"example.com\" (question + 5 \
+             forbidden rdata fields), found {literal_count} in {bytes:?}"
+        );
+
+        let round_tripped = Message::parse_owned(bytes).unwrap();
+        assert_eq!(round_tripped.answers.len(), 4);
     }
 
     fn opt_record(udp_payload_size: u16) -> Record {
