@@ -2398,6 +2398,20 @@ a.root-servers.net.      3600000      Aaaa  2001:503:ba3e::2:30
     }
 
     #[test]
+    fn config_rejects_zero_max_tcp_connections() {
+        let mut toml = valid_toml();
+        toml = toml.replacen(
+            "per_query_deadline_ms = 2000",
+            "per_query_deadline_ms = 2000\n            max_tcp_connections = 0",
+            1,
+        );
+
+        let error = RuntimeConfig::from_toml_str(&toml).unwrap_err();
+
+        assert_eq!(error, ConfigError::InvalidMaxTcpConnections { value: 0 });
+    }
+
+    #[test]
     fn metrics_config_allows_zero_max_connections_when_disabled() {
         let mut toml = valid_toml();
         toml.push_str(

@@ -221,7 +221,6 @@ pub struct CacheKey {
     pub question_wire: Vec<u8>,
     pub features: QueryFeatures,
     pub cache_namespace: Option<String>,
-    pub effective_udp_payload_size: usize,
 }
 
 impl CacheKey {
@@ -230,30 +229,21 @@ impl CacheKey {
         question_wire: Vec<u8>,
         features: QueryFeatures,
         cache_namespace: Option<String>,
-        effective_udp_payload_size: usize,
     ) -> Self {
         Self {
             question,
             question_wire,
             features,
             cache_namespace,
-            effective_udp_payload_size,
         }
     }
 
-    pub fn from_query(
-        query: &DecodedQuery,
-        cache_namespace: Option<String>,
-        configured_max_udp_payload_size: usize,
-    ) -> Self {
+    pub fn from_query(query: &DecodedQuery, cache_namespace: Option<String>) -> Self {
         Self::new(
             query.question.clone(),
             query.question_wire.to_vec(),
             query.features.clone(),
             cache_namespace,
-            query
-                .message
-                .effective_udp_payload_size(configured_max_udp_payload_size),
         )
     }
 }
@@ -3347,22 +3337,18 @@ impl ResolveQuery {
             };
         }
 
-        // TCP has no UDP-style payload ceiling, so a TCP query gets its own
-        // namespace (keyed on usize::MAX) instead of the EDNS/512-byte-floor
-        // size class UDP queries use — see `ObservedSourceEndpoint::is_tcp`.
-        let effective_payload_size = if request.observed_source.is_tcp() {
-            usize::MAX
-        } else {
-            decoded
-                .message
-                .effective_udp_payload_size(self.protocol.configured_max_udp_payload_size())
-        };
+        // No payload-size class here: UDP and TCP queries (and UDP queries
+        // advertising different EDNS bufsizes) for the same question share
+        // one cache entry — see docs/plans/cache_key.md. Every entry stores
+        // the full, untruncated response regardless of who populated it;
+        // `allow_udp_truncation`/`is_tcp()` checks at serve time (not the
+        // cache key) are what keep each response correct for the current
+        // request's transport.
         let key = CacheKey::new(
             decoded.question.clone(),
             decoded.question_wire.to_vec(),
             decoded.features.clone(),
             backend_snapshot.cache_namespace.clone(),
-            effective_payload_size,
         );
         let lookup = self
             .cache
@@ -10537,6 +10523,126 @@ mod tests {
         assert_eq!(second_response.answers.len(), 40);
     }
 
+    /// `CacheKey` no longer partitions on payload size (see
+    /// docs/plans/cache_key.md): a UDP query and a TCP query for the same
+    /// question must land on the same cache entry, in either order. Proven
+    /// here by scripting exactly one backend response per question — if a
+    /// second query for the same question ever missed the cache, the
+    /// backend transport would be asked for a response it doesn't have and
+    /// the resolve would fail closed instead of serving the cached answer.
+    #[tokio::test]
+    async fn resolve_shares_cache_entry_between_udp_and_tcp_queries() {
+        let udp_first_question = QuestionKey::new("udp-then-tcp.example.com", 1, 1);
+        let tcp_first_question = QuestionKey::new("tcp-then-udp.example.com", 1, 1);
+        let transport = Arc::new(ScriptedAuthorityTransport::new([
+            Ok(response_message_for_question_with_id(
+                0xbeef,
+                udp_first_question,
+                ResponseCode::NoError,
+                vec![a_record("udp-then-tcp.example.com", 60)],
+                Vec::new(),
+                Vec::new(),
+                true,
+            )),
+            Ok(response_message_for_question_with_id(
+                0xbeef,
+                tcp_first_question,
+                ResponseCode::NoError,
+                vec![a_record("tcp-then-udp.example.com", 60)],
+                Vec::new(),
+                Vec::new(),
+                true,
+            )),
+        ]));
+        let backend = Arc::new(recursive_backend(transport.clone()));
+        let service = ResolveQuery::with_cache_and_backend_snapshot(
+            Arc::new(StandardProtocolCodec::new(1232)),
+            Arc::new(InMemoryDnsCache::new(10)),
+            CacheTtlPolicy::default(),
+            BackendSnapshot::new(
+                backend,
+                ResolutionMode::Recursive,
+                7,
+                BackendHealth::Healthy,
+                Some("mode:recursive;generation:7".to_string()),
+            ),
+            Arc::new(BasicResponseFactory),
+            Arc::new(FixedClock(SystemTime::UNIX_EPOCH)),
+            Arc::new(RecordingEvents::default()),
+            Arc::new(RecordingMetrics::default()),
+        );
+        let udp_source = || ObservedSourceEndpoint::udp("192.0.2.11:5555".parse().unwrap(), None);
+        let tcp_source = || {
+            ObservedSourceEndpoint::tcp(
+                "192.0.2.11:5555".parse().unwrap(),
+                Some("127.0.0.1:53".parse().unwrap()),
+            )
+        };
+
+        // UDP populates the entry; a same-question TCP query must hit it
+        // rather than issue a second backend query.
+        let udp_first = service
+            .resolve(ResolveRequest::new_with_observed_source(
+                udp_source(),
+                SystemTime::UNIX_EPOCH,
+                a_query(0x1111, "udp-then-tcp.example.com"),
+            ))
+            .await;
+        assert_eq!(
+            Message::parse(&udp_first.response_bytes)
+                .unwrap()
+                .answers
+                .len(),
+            1
+        );
+        let tcp_hit = service
+            .resolve(ResolveRequest::new_with_observed_source(
+                tcp_source(),
+                SystemTime::UNIX_EPOCH,
+                a_query(0x2222, "udp-then-tcp.example.com"),
+            ))
+            .await;
+        assert_eq!(
+            Message::parse(&tcp_hit.response_bytes)
+                .unwrap()
+                .answers
+                .len(),
+            1
+        );
+        assert_eq!(transport.requests.lock().unwrap().len(), 1);
+
+        // And the reverse: TCP populates the entry, UDP hits it.
+        let tcp_first = service
+            .resolve(ResolveRequest::new_with_observed_source(
+                tcp_source(),
+                SystemTime::UNIX_EPOCH,
+                a_query(0x3333, "tcp-then-udp.example.com"),
+            ))
+            .await;
+        assert_eq!(
+            Message::parse(&tcp_first.response_bytes)
+                .unwrap()
+                .answers
+                .len(),
+            1
+        );
+        let udp_hit = service
+            .resolve(ResolveRequest::new_with_observed_source(
+                udp_source(),
+                SystemTime::UNIX_EPOCH,
+                a_query(0x4444, "tcp-then-udp.example.com"),
+            ))
+            .await;
+        assert_eq!(
+            Message::parse(&udp_hit.response_bytes)
+                .unwrap()
+                .answers
+                .len(),
+            1
+        );
+        assert_eq!(transport.requests.lock().unwrap().len(), 2);
+    }
+
     #[tokio::test]
     async fn resolve_decodes_owned_request_bytes() {
         let request_bytes = a_query(0x1234, "example.com");
@@ -10796,7 +10902,6 @@ mod tests {
                     edns_udp_payload_size: None,
                 },
                 Some("primary".to_string()),
-                512,
             ),
             response_template: vec![1, 2, 3],
             response_code: ResponseCode::NoError,
@@ -10808,7 +10913,6 @@ mod tests {
 
         assert_eq!(entry.key.question.qname, "example.com");
         assert_eq!(entry.key.cache_namespace.as_deref(), Some("primary"));
-        assert_eq!(entry.key.effective_udp_payload_size, 512);
         assert_eq!(entry.response_template, vec![1, 2, 3]);
         assert_eq!(entry.response_code, ResponseCode::NoError);
         assert_eq!(entry.minimum_ttl, Duration::from_secs(30));
@@ -10828,7 +10932,6 @@ mod tests {
                 edns_udp_payload_size: None,
             },
             Some("primary".to_string()),
-            512,
         )
     }
 
@@ -11910,7 +12013,7 @@ mod tests {
             .decode_query(&a_query_with_edns(0x1234, "Example.COM", 4096, true))
             .unwrap();
 
-        let key = CacheKey::from_query(&query, Some("primary".to_string()), 1232);
+        let key = CacheKey::from_query(&query, Some("primary".to_string()));
 
         assert_eq!(key.question, QuestionKey::new("example.com", 1, 1));
         assert_eq!(
@@ -11924,11 +12027,10 @@ mod tests {
             }
         );
         assert_eq!(key.cache_namespace.as_deref(), Some("primary"));
-        assert_eq!(key.effective_udp_payload_size, 1232);
     }
 
     #[test]
-    fn cache_key_separates_question_type_class_policy_and_udp_size() {
+    fn cache_key_separates_question_type_class_and_policy() {
         let codec = StandardProtocolCodec::new(4096);
         let a_in = codec
             .decode_query(&a_query_with_edns(0x1000, "example.com", 512, false))
@@ -11939,27 +12041,20 @@ mod tests {
         let a_ch = codec
             .decode_query(&chaos_a_query(0x1000, "example.com"))
             .unwrap();
-        let a_in_larger_udp = codec
-            .decode_query(&a_query_with_edns(0x1000, "example.com", 1232, false))
-            .unwrap();
 
-        let base = CacheKey::from_query(&a_in, Some("primary".to_string()), 4096);
+        let base = CacheKey::from_query(&a_in, Some("primary".to_string()));
 
         assert_ne!(
             base,
-            CacheKey::from_query(&aaaa_in, Some("primary".to_string()), 4096)
+            CacheKey::from_query(&aaaa_in, Some("primary".to_string()))
         );
         assert_ne!(
             base,
-            CacheKey::from_query(&a_ch, Some("primary".to_string()), 4096)
+            CacheKey::from_query(&a_ch, Some("primary".to_string()))
         );
         assert_ne!(
             base,
-            CacheKey::from_query(&a_in, Some("secondary".to_string()), 4096)
-        );
-        assert_ne!(
-            base,
-            CacheKey::from_query(&a_in_larger_udp, Some("primary".to_string()), 4096)
+            CacheKey::from_query(&a_in, Some("secondary".to_string()))
         );
     }
 
@@ -11971,8 +12066,8 @@ mod tests {
 
         assert_eq!(lower.question, mixed.question);
         assert_ne!(
-            CacheKey::from_query(&lower, None, 1232),
-            CacheKey::from_query(&mixed, None, 1232)
+            CacheKey::from_query(&lower, None),
+            CacheKey::from_query(&mixed, None)
         );
     }
 
@@ -11985,8 +12080,8 @@ mod tests {
             .unwrap();
 
         assert_ne!(
-            CacheKey::from_query(&recursive, None, 1232),
-            CacheKey::from_query(&non_recursive, None, 1232)
+            CacheKey::from_query(&recursive, None),
+            CacheKey::from_query(&non_recursive, None)
         );
     }
 
@@ -12004,25 +12099,13 @@ mod tests {
             .decode_query(&a_query_with_edns(0x1000, "example.com", 1232, true))
             .unwrap();
 
-        let base_key = CacheKey::from_query(&base, None, 1232);
-        assert_ne!(base_key, CacheKey::from_query(&ad, None, 1232));
-        assert_ne!(base_key, CacheKey::from_query(&cd, None, 1232));
-        assert_ne!(base_key, CacheKey::from_query(&do_query, None, 1232));
-        assert!(
-            CacheKey::from_query(&ad, None, 1232)
-                .features
-                .authenticated_data
-        );
-        assert!(
-            CacheKey::from_query(&cd, None, 1232)
-                .features
-                .checking_disabled
-        );
-        assert!(
-            CacheKey::from_query(&do_query, None, 1232)
-                .features
-                .dnssec_ok
-        );
+        let base_key = CacheKey::from_query(&base, None);
+        assert_ne!(base_key, CacheKey::from_query(&ad, None));
+        assert_ne!(base_key, CacheKey::from_query(&cd, None));
+        assert_ne!(base_key, CacheKey::from_query(&do_query, None));
+        assert!(CacheKey::from_query(&ad, None).features.authenticated_data);
+        assert!(CacheKey::from_query(&cd, None).features.checking_disabled);
+        assert!(CacheKey::from_query(&do_query, None).features.dnssec_ok);
     }
 
     #[test]
@@ -13133,7 +13216,6 @@ mod tests {
             key: CacheKey::from_query(
                 &cached_query,
                 backend_cache_namespace(ResolutionMode::Forward, 0),
-                1232,
             ),
             response_template: response_message.original_bytes.to_vec(),
             response_code: ResponseCode::NoError,
@@ -13394,7 +13476,6 @@ mod tests {
             key: CacheKey::from_query(
                 &cached_query,
                 backend_cache_namespace(ResolutionMode::Forward, 0),
-                1232,
             ),
             response_template: a_response_with_answer(0, "example.com", 60),
             response_code: ResponseCode::NoError,
@@ -13463,7 +13544,6 @@ mod tests {
             key: CacheKey::from_query(
                 &cached_query,
                 backend_cache_namespace(ResolutionMode::Forward, 0),
-                1232,
             ),
             response_template: a_response_with_answer(0, "example.com", 60),
             response_code: ResponseCode::NoError,
@@ -13500,7 +13580,6 @@ mod tests {
             key: CacheKey::from_query(
                 &cached_query,
                 backend_cache_namespace(ResolutionMode::Forward, 0),
-                1232,
             ),
             response_template: a_response_with_answer(0, "example.com", 60),
             response_code: ResponseCode::NoError,
@@ -13537,7 +13616,6 @@ mod tests {
             key: CacheKey::from_query(
                 &cached_query,
                 backend_cache_namespace(ResolutionMode::Forward, 0),
-                1232,
             ),
             response_template: a_response_with_answer(0, "example.com", 3600),
             response_code: ResponseCode::NoError,

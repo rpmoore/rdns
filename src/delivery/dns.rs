@@ -329,6 +329,18 @@ impl TcpDnsServer {
                 "tcp dns server: max_connections must be greater than zero",
             ));
         }
+        // `PerIpConnectionGuard::try_acquire` inserts a source IP's `0`-count
+        // entry into the map *before* checking it against the cap, so a cap
+        // of zero would insert (and never remove, since `try_acquire` only
+        // returns a cleanup-on-drop guard on success) a permanent entry for
+        // every distinct source IP that ever attempts a connection —
+        // unbounded memory growth on top of refusing every connection.
+        if max_connections_per_ip == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "tcp dns server: max_connections_per_ip must be greater than zero",
+            ));
+        }
         let listener = bind_tcp_listener_socket(address).await?;
         let local_addr = listener.local_addr()?;
         Ok(Self {
@@ -474,7 +486,9 @@ impl PerIpConnectionGuard {
         ip: IpAddr,
         max_connections_per_ip: usize,
     ) -> Option<Self> {
-        let mut guard = counts.lock().unwrap();
+        let mut guard = counts
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let count = guard.entry(ip).or_insert(0);
         if *count >= max_connections_per_ip {
             return None;
@@ -487,7 +501,14 @@ impl PerIpConnectionGuard {
 
 impl Drop for PerIpConnectionGuard {
     fn drop(&mut self) {
-        let mut guard = self.counts.lock().unwrap();
+        // Best-effort cleanup: a panic elsewhere while holding this lock
+        // shouldn't cascade into every subsequent accept/drop on this
+        // listener also panicking, so recover from poison rather than
+        // propagating it.
+        let mut guard = self
+            .counts
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         if let Some(count) = guard.get_mut(&self.ip) {
             *count -= 1;
             if *count == 0 {
@@ -1183,6 +1204,32 @@ mod tests {
                 .await;
         match result {
             Ok(_) => panic!("expected max_connections = 0 to be rejected"),
+            Err(error) => assert_eq!(error.kind(), io::ErrorKind::InvalidInput),
+        }
+    }
+
+    /// `PerIpConnectionGuard::try_acquire` inserts a source IP's entry
+    /// before checking it against the cap, so a `max_connections_per_ip` of
+    /// zero would leak an unremovable map entry per distinct source IP.
+    /// Regression test for the P1 finding in PR #117's review that this
+    /// wasn't rejected.
+    #[tokio::test]
+    async fn tcp_bind_rejects_zero_max_connections_per_ip() {
+        let upstream = Arc::new(StaticUpstream::new(Ok(upstream_response(a_response(
+            0,
+            "example.com",
+        )))));
+        let resolver = resolve_service(upstream, Arc::new(RecordingEvents::default()));
+        let result = TcpDnsServer::bind_with_options(
+            "127.0.0.1:0".parse().unwrap(),
+            resolver,
+            10,
+            0,
+            Duration::from_secs(1),
+        )
+        .await;
+        match result {
+            Ok(_) => panic!("expected max_connections_per_ip = 0 to be rejected"),
             Err(error) => assert_eq!(error.kind(), io::ErrorKind::InvalidInput),
         }
     }
