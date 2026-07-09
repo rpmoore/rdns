@@ -33,10 +33,16 @@ pub struct RuntimeConfig {
     pub upstreams: Vec<UpstreamConfig>,
     pub per_query_deadline: Duration,
     pub max_udp_payload_size: usize,
+    pub max_tcp_connections: usize,
     pub local_dns_entries: Vec<LocalDnsEntryConfig>,
     pub local_zones: Vec<LocalZoneConfig>,
     pub metrics: MetricsConfig,
 }
+
+/// Default ceiling on concurrent TCP DNS connections per listener. Shared
+/// with `delivery::dns::TcpDnsServer` so the unconfigured convenience
+/// constructor and the config-file default never drift apart.
+pub const DEFAULT_MAX_TCP_CONNECTIONS: usize = 128;
 
 impl RuntimeConfig {
     pub fn new(
@@ -67,6 +73,7 @@ impl RuntimeConfig {
             upstreams,
             per_query_deadline,
             max_udp_payload_size,
+            max_tcp_connections: DEFAULT_MAX_TCP_CONNECTIONS,
             local_dns_entries: Vec::new(),
             local_zones: Vec::new(),
             metrics: MetricsConfig::default_enabled(),
@@ -92,6 +99,7 @@ impl RuntimeConfig {
             }],
             per_query_deadline: Duration::from_secs(2),
             max_udp_payload_size: 1232,
+            max_tcp_connections: DEFAULT_MAX_TCP_CONNECTIONS,
             local_dns_entries: Vec::new(),
             local_zones: Vec::new(),
             metrics: MetricsConfig::default_enabled(),
@@ -170,6 +178,12 @@ impl RuntimeConfig {
                 value: self.max_udp_payload_size,
                 min: MIN_UDP_PAYLOAD_SIZE,
                 max: MAX_UDP_PAYLOAD_SIZE,
+            });
+        }
+
+        if self.max_tcp_connections == 0 {
+            return Err(ConfigError::InvalidMaxTcpConnections {
+                value: self.max_tcp_connections,
             });
         }
 
@@ -1153,6 +1167,9 @@ pub enum ConfigError {
     InvalidMetricsMaxConnections {
         value: usize,
     },
+    InvalidMaxTcpConnections {
+        value: usize,
+    },
 }
 
 #[derive(Debug, Deserialize)]
@@ -1161,6 +1178,8 @@ struct RawRuntimeConfig {
     dns_listen: Vec<String>,
     per_query_deadline_ms: u64,
     max_udp_payload_size: usize,
+    #[serde(default = "default_max_tcp_connections")]
+    max_tcp_connections: usize,
     #[serde(default)]
     resolution: Option<RawResolutionConfig>,
     #[serde(default)]
@@ -1190,6 +1209,10 @@ fn default_metrics_listen() -> String {
 
 fn default_metrics_max_connections() -> usize {
     DEFAULT_METRICS_MAX_CONNECTIONS
+}
+
+fn default_max_tcp_connections() -> usize {
+    DEFAULT_MAX_TCP_CONNECTIONS
 }
 
 impl RawMetricsConfig {
@@ -1499,6 +1522,7 @@ impl TryFrom<RawRuntimeConfig> for RuntimeConfig {
             upstreams,
             per_query_deadline: Duration::from_millis(raw.per_query_deadline_ms),
             max_udp_payload_size: raw.max_udp_payload_size,
+            max_tcp_connections: raw.max_tcp_connections,
             local_dns_entries,
             local_zones,
             metrics,
@@ -2371,6 +2395,20 @@ a.root-servers.net.      3600000      Aaaa  2001:503:ba3e::2:30
             error,
             ConfigError::InvalidMetricsMaxConnections { value: 0 }
         );
+    }
+
+    #[test]
+    fn config_rejects_zero_max_tcp_connections() {
+        let mut toml = valid_toml();
+        toml = toml.replacen(
+            "per_query_deadline_ms = 2000",
+            "per_query_deadline_ms = 2000\n            max_tcp_connections = 0",
+            1,
+        );
+
+        let error = RuntimeConfig::from_toml_str(&toml).unwrap_err();
+
+        assert_eq!(error, ConfigError::InvalidMaxTcpConnections { value: 0 });
     }
 
     #[test]

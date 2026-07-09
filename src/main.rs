@@ -26,7 +26,7 @@ use rdns::config::{
     LocalZoneConfig, MAX_LOCAL_ZONE_FILE_BYTES, ResolutionMode as ConfigResolutionMode,
     RootHintsSource as ConfigRootHintsSource, RuntimeConfig, parse_local_zone_file,
 };
-use rdns::delivery::dns::UdpDnsServer;
+use rdns::delivery::dns::{TcpDnsServer, UdpDnsServer};
 use rdns::delivery::metrics_http::MetricsServer;
 use rdns::delivery::upstream::{ForwardingResolutionBackend, RecursiveAuthorityTransportClient};
 use rdns::resolver::{
@@ -144,6 +144,11 @@ async fn main() -> io::Result<()> {
     if servers.is_empty() {
         return Err(io::Error::other("no DNS listeners configured"));
     }
+    // TCP is not an optional fallback transport (RFC 1035 §4.2, RFC 7766):
+    // clients may connect over TCP directly, and a UDP response we truncate
+    // (`TC=1`) is a promise that the same query will succeed over TCP, so a
+    // bind failure here is as fatal as a UDP bind failure.
+    let tcp_servers = TcpDnsServer::bind_configured(&config, Arc::clone(&resolver)).await?;
     // A metrics-listener bind failure (e.g. the configured port is already in
     // use by something else on the host) must not prevent the DNS resolver
     // itself from starting — metrics are optional observability, not a core
@@ -170,7 +175,15 @@ async fn main() -> io::Result<()> {
         None
     };
 
-    serve_until_shutdown(servers, metrics_server, resolver, sighup_task, event_drain).await
+    serve_until_shutdown(
+        servers,
+        tcp_servers,
+        metrics_server,
+        resolver,
+        sighup_task,
+        event_drain,
+    )
+    .await
 }
 
 /// Runs the bound listeners until `ctrl_c` or a listener task exits, then
@@ -180,18 +193,32 @@ async fn main() -> io::Result<()> {
 /// task.
 async fn serve_until_shutdown(
     servers: Vec<UdpDnsServer>,
+    tcp_servers: Vec<TcpDnsServer>,
     metrics_server: Option<MetricsServer>,
     resolver: Arc<ResolveQuery>,
     sighup_task: tokio::task::JoinHandle<()>,
     event_drain: tokio::task::JoinHandle<()>,
 ) -> io::Result<()> {
-    let mut shutdown_senders = Vec::with_capacity(servers.len());
+    let mut shutdown_senders = Vec::with_capacity(servers.len() + tcp_servers.len());
     let mut server_tasks = JoinSet::new();
     for server in servers {
         let address = server.local_addr()?;
         let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
         shutdown_senders.push(shutdown_tx);
         info!(%address, "rdns listening on udp");
+        server_tasks.spawn(async move {
+            server
+                .serve_until(async {
+                    let _ = shutdown_rx.await;
+                })
+                .await
+        });
+    }
+    for server in tcp_servers {
+        let address = server.local_addr()?;
+        let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
+        shutdown_senders.push(shutdown_tx);
+        info!(%address, "rdns listening on tcp");
         server_tasks.spawn(async move {
             server
                 .serve_until(async {

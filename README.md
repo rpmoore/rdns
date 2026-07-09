@@ -60,9 +60,10 @@ dig @127.0.0.1 -p 5300 example.com A    # forwarded upstream
 TOML. Top-level:
 
 ```toml
-dns_listen = ["127.0.0.1:5300"]   # one or more "host:port" UDP listeners
+dns_listen = ["127.0.0.1:5300"]   # one or more "host:port" UDP+TCP listeners
 per_query_deadline_ms = 2000       # per-query timeout budget
 max_udp_payload_size = 1232        # EDNS UDP payload size advertised/accepted
+max_tcp_connections = 128          # concurrent TCP connections per listener
 ```
 
 `dns_listen` binding to port 53 (or any port `<= 1024`) is allowed by config

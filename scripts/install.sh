@@ -237,6 +237,7 @@ if [ "$setup_service" -eq 1 ]; then
 dns_listen = ["0.0.0.0:53"]
 per_query_deadline_ms = 2000
 max_udp_payload_size = 1232
+max_tcp_connections = 128
 
 # Prometheus metrics on GET /metrics — no TLS/auth, loopback-only by
 # default. Only change `listen` to a routable address if you understand
