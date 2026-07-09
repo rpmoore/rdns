@@ -1144,7 +1144,10 @@ fn recursive_response_authority_supported(
         | RecordData::NSEC3 { .. }
         | RecordData::NSEC3PARAM { .. }
         | RecordData::RRSIG { .. } => dnssec_ok || record_matches_any_question(record, questions),
-        RecordData::Unknown { rtype, .. } => dnssec_ok || !is_dnssec_record_type(rtype),
+        RecordData::Unknown { rtype, .. } => {
+            is_dnssec_record_type(rtype)
+                && (dnssec_ok || record_matches_any_question(record, questions))
+        }
         _ => false,
     }
 }
