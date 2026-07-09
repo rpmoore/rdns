@@ -1420,6 +1420,13 @@ fn write_dns_record(
             write_dns_u32(bytes, *signature_inception);
             write_dns_u16(bytes, *key_tag);
             // RFC 4034 §3.1.7: MUST NOT compress the Signer's Name field.
+            // Confirmed against Cloudflare's production authoritative
+            // servers: a raw DO-bit query for the DNSSEC-signed
+            // cloudflare.com zone (sent directly to ns3.cloudflare.com)
+            // shows every RRSIG's owner name compressed back to the
+            // question (0xC00C), but the Signer's Name field spelled out
+            // in full even though it repeats that same "cloudflare.com"
+            // suffix already written earlier in the message.
             write_dns_name(bytes, signer_name);
             bytes.extend_from_slice(signature);
         }
