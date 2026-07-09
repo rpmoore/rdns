@@ -1061,7 +1061,7 @@ fn synthesize_recursive_cname_response(
         .authorities
         .iter()
         .filter(|record| {
-            recursive_response_record_supported(
+            recursive_response_authority_supported(
                 record,
                 dnssec_ok,
                 &[&original_question, &final_question],
@@ -1113,6 +1113,31 @@ fn recursive_response_record_supported(
         | RecordData::SOA { .. }
         | RecordData::SRV { .. }
         | RecordData::TXT(_) => true,
+        RecordData::DNSKEY { .. }
+        | RecordData::DS { .. }
+        | RecordData::NSEC { .. }
+        | RecordData::NSEC3 { .. }
+        | RecordData::NSEC3PARAM { .. }
+        | RecordData::RRSIG { .. } => dnssec_ok || record_matches_any_question(record, questions),
+        RecordData::Unknown { rtype, .. } => dnssec_ok || !is_dnssec_record_type(rtype),
+        _ => false,
+    }
+}
+
+/// Filters records copied into the AUTHORITY section of the client-facing
+/// response. Unlike `recursive_response_record_supported` (used for answers
+/// and additionals), this excludes `NS` and other non-SOA types: an
+/// authoritative server may echo the zone's NS set in its AUTHORITY section
+/// alongside a satisfying answer, but that's not useful to a stub client and
+/// other recursors (e.g. Cloudflare) omit it. Only SOA (needed for negative
+/// caching) and DNSSEC signing records survive.
+fn recursive_response_authority_supported(
+    record: &Record,
+    dnssec_ok: bool,
+    questions: &[&QuestionKey],
+) -> bool {
+    match record.record {
+        RecordData::SOA { .. } => true,
         RecordData::DNSKEY { .. }
         | RecordData::DS { .. }
         | RecordData::NSEC { .. }
@@ -8791,6 +8816,34 @@ mod tests {
         let authorities = response.authorities();
         assert_eq!(authorities.len(), 2);
         assert!(matches!(authorities[1].record, RecordData::NSEC3 { .. }));
+    }
+
+    #[tokio::test]
+    async fn recursive_backend_strips_echoed_ns_from_authority_on_positive_answer() {
+        // Some authoritative servers (e.g. NS1/AWS DNS) echo the zone's NS
+        // set in the AUTHORITY section even when the ANSWER section already
+        // satisfies the question. That's not useful to a stub client and
+        // other recursors (e.g. Cloudflare) omit it from the final response.
+        let question = QuestionKey::new("example.com", 1, 1);
+        let transport = Arc::new(ScriptedAuthorityTransport::new([Ok(
+            response_message_for_question(
+                question,
+                ResponseCode::NoError,
+                vec![a_record("example.com", 60)],
+                vec![ns_record("example.com", 300, "ns1.example.com")],
+                Vec::new(),
+                true,
+            ),
+        )]));
+        let backend = recursive_backend(transport);
+
+        let response = backend
+            .resolve(recursive_request("example.com"))
+            .await
+            .unwrap();
+
+        assert_eq!(response.answers().len(), 1);
+        assert!(response.authorities().is_empty());
     }
 
     #[tokio::test]
