@@ -3337,13 +3337,16 @@ impl ResolveQuery {
             };
         }
 
-        // No payload-size class here: UDP and TCP queries (and UDP queries
-        // advertising different EDNS bufsizes) for the same question share
-        // one cache entry — see docs/plans/cache_key.md. Every entry stores
-        // the full, untruncated response regardless of who populated it;
-        // `allow_udp_truncation`/`is_tcp()` checks at serve time (not the
-        // cache key) are what keep each response correct for the current
-        // request's transport.
+        // No effective-payload-size class here: a UDP query and a TCP query
+        // for the same question now share one cache entry — see
+        // docs/plans/cache_key.md. (Two UDP queries advertising different
+        // *raw* EDNS bufsizes still get separate entries: the raw value
+        // lives in `decoded.features.edns_udp_payload_size`, part of the key
+        // below — this change only drops the redundant *clamped* size that
+        // used to also be there.) Every entry stores the full, untruncated
+        // response regardless of who populated it; `allow_udp_truncation`/
+        // `is_tcp()` checks at serve time (not the cache key) are what keep
+        // each response correct for the current request's transport.
         let key = CacheKey::new(
             decoded.question.clone(),
             decoded.question_wire.to_vec(),
@@ -10452,10 +10455,9 @@ mod tests {
     /// Same scenario as `resolve_does_not_truncate_tcp_sourced_response_at_default_udp_limit`,
     /// but for a cache HIT rather than a fresh backend response — this
     /// exercises `serialize_cached_response`'s own truncation check, a
-    /// separate code path from the fresh-response one above. TCP queries get
-    /// their own cache namespace (see `probe_cache`'s `is_tcp()` branch), so
-    /// two TCP-sourced queries for the same question are used here: the
-    /// first is a miss that populates that namespace, the second a hit.
+    /// separate code path from the fresh-response one above. Two TCP-sourced
+    /// queries for the same question are used here: the first is a cache
+    /// miss that populates the entry, the second a hit.
     #[tokio::test]
     async fn resolve_does_not_truncate_tcp_sourced_cache_hit() {
         let question = QuestionKey::new("example.com", 1, 1);

@@ -7,8 +7,14 @@ removes it. The concrete motivation: right now a UDP query and a TCP query
 for the identical question never land in the same cache entry, because the
 TCP-sourced fix (see `ObservedSourceEndpoint::is_tcp`) gives TCP queries a
 dedicated `usize::MAX` size class in `probe_cache`. Removing the field lets
-UDP and TCP share cache entries for the same question, and also collapses
-existing UDP-vs-UDP fragmentation across different EDNS bufsize values.
+UDP and TCP share cache entries for the same question. It does *not* collapse
+UDP-vs-UDP fragmentation across different EDNS bufsize values — the *raw*
+advertised bufsize stays in the key via `QueryFeatures.edns_udp_payload_size`
+(see "Out of scope" below), so two UDP queries with different raw bufsizes
+still get different keys regardless of this change. As section 1 of "Why
+remove it" explains, `effective_udp_payload_size` never affected UDP-vs-UDP
+collisions in the first place — it only ever duplicated a partition `features`
+already enforced.
 
 ## Current state
 
