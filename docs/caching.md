@@ -195,14 +195,30 @@ never left hanging if the leader task panics or is cancelled
 (`single_flight_leader_drop_wakes_followers_and_clears_key`, `mod.rs:14140`).
 
 Request handling itself is one task per datagram/connection
-(`UdpDnsServer::serve_until`, `src/delivery/dns.rs:175-205`; `TcpDnsServer`
-mirrors it): `recv_from` happens under a bounded `Semaphore` (default 1024
-in-flight, `DEFAULT_MAX_IN_FLIGHT_REQUESTS`, `dns.rs:32`), then each
-datagram is handed to a freshly spawned task tracked in a `JoinSet` — the
-receive loop does not await resolution before reading the next packet.
-Tokio runs multi-threaded (`#[tokio::main]`, default flavor = one worker
-per core, `main.rs:67`), so genuinely parallel requests do hit the cache
-mutex from multiple OS threads simultaneously.
+(`UdpDnsServer::serve_until`, `src/delivery/dns.rs:175-205`): `recv_from`
+happens under a bounded `Semaphore` (default 1024 in-flight,
+`DEFAULT_MAX_IN_FLIGHT_REQUESTS`, `dns.rs:32`), then each datagram is
+handed to a freshly spawned task tracked in a `JoinSet` — the receive loop
+does not await resolution before reading the next packet. Tokio runs
+multi-threaded (`#[tokio::main]`, default flavor = one worker per core,
+`main.rs:67`), so genuinely parallel requests do hit the cache mutex from
+multiple OS threads simultaneously.
+
+`TcpDnsServer` spawns one task per *accepted connection* the same way
+(its own `Semaphore`/`JoinSet`, plus a per-source-IP cap,
+`max_connections`/`max_connections_per_ip`) — so many concurrent TCP
+clients do get real parallelism, same as UDP. But **within one TCP
+connection, pipelined queries are not concurrent**:
+`serve_tcp_connection` (`dns.rs:528-606`) is a single `loop` that reads one
+length-prefixed query, `.await`s the full `resolver.resolve(...)`
+(`dns.rs:575-581`), writes the response, and only then reads the next
+query off the same socket. RFC 7766 §6.2 permits a client to pipeline
+several queries back-to-back on one connection without waiting for each
+answer; this server accepts that framing but still answers them one at a
+time in submission order. A slow query (cache miss, single-flight wait, or
+a lock-contended cache op per §8) head-of-line-blocks every later query
+pipelined on that same connection, even though it doesn't block other
+connections or UDP traffic.
 
 ## 7. Eviction / capacity behavior as the cache grows
 
@@ -237,9 +253,15 @@ fn store_now(&self, entry) {
 ```
 
 This replaced an earlier version that ran the O(n) scans on *every* lookup
-and store (`docs/review/perf-01.md` Finding 2); `lookup_now` is now genuinely
-O(1) average case. **`store_now` is not** — see §8, finding G1, this is
-the single biggest bottleneck this document identifies.
+and store (`docs/review/perf-01.md` Finding 2); both `lookup_now` and
+`store_now` are *amortized* O(1) — but neither is unconditionally O(1).
+`store_now` has a capacity-gated full scan that, at steady state, isn't
+rare at all (§8 G1, the single biggest bottleneck this document
+identifies). `lookup_now` calls the same `maybe_compact_lru` as `store_now`
+(`mod.rs:5393`) — a sustained run of cache *hits* also pushes one LRU
+token per hit and eventually crosses the `4×max_entries` threshold,
+triggering the same O(n) `VecDeque::retain` under the lock on a hit path,
+not just a miss/store path (§8 G6).
 
 The LRU itself is an approximation, not an exact structure: every touch
 (hit or store) appends a `(key, sequence)` token to a `VecDeque` rather
@@ -255,7 +277,7 @@ means eviction order is "approximately least-recently-used within the last
 ## 8. Performance under concurrent/parallel load — bottleneck analysis
 
 This is code-inspection analysis (there is no in-repo benchmark exercising
-the cache under real concurrent load — see gap G6 below), but it follows
+the cache under real concurrent load — see gap G8 below), but it follows
 directly from the mechanisms in §6-7.
 
 **G1 — Steady-state-full cache: every `store()` does an O(n) scan, not just some.**
@@ -323,7 +345,35 @@ out via `evict_to_bound`, or until they expire and get swept by the next
 `remove_expired` triggered under G1. Effective usable capacity is reduced
 for a while after every reload.
 
-**G6 — No test or benchmark exercises the cache under real concurrent
+**G6 — Hits aren't exempt either: lock-held cloning and hit-triggered
+compaction.** `lookup_now` (`mod.rs:5370-5395`) clones the entire
+`CachedResponse` — including the full `response_template` byte buffer —
+**while holding the cache mutex** (`mod.rs:5387`). Every hit's critical
+section is therefore proportional to that response's size, not O(1)
+regardless of size; a cache full of large RRsets (wide `TXT`/`MX` sets,
+many-address answers, see G11) makes every hit hold the single global lock
+longer, compounding G2's contention for all other concurrent requests
+regardless of key. Separately, every hit also calls `maybe_compact_lru`
+(`mod.rs:5393`), which pushes one LRU token per hit and, once the ghost
+queue crosses `4×max_entries` outstanding tokens, runs the same O(n)
+`VecDeque::retain` compaction under the lock (`mod.rs:5446,5460`) that
+G1 describes for stores. A sustained high-hit-rate workload — the case
+the cache exists to serve well — periodically pays this scan too, it's
+just less frequent than the at-capacity store case in G1 because the
+threshold is `4×max_entries` touches rather than every single store.
+
+**G7 — TCP pipelining serializes on the resolver, including cache ops,
+within one connection.** As noted in §6, `serve_tcp_connection`
+(`dns.rs:528-606`) fully awaits `resolve()` — cache lookup, single-flight
+wait, and cache store all included — before reading the next pipelined
+query on that socket. A client that pipelines several queries (RFC 7766
+§6.2) gets them answered strictly in order at the speed of the slowest one
+in the batch; a single cache miss or lock-contended cache op (G1, G6) in
+the middle of a pipelined batch delays every query queued behind it on
+that connection, even though the cache and every other connection are
+otherwise healthy.
+
+**G8 — No test or benchmark exercises the cache under real concurrent
 load.** `tests/recursive_perf.rs`'s cache-related benchmarks
 (`recursive_resolver_perf_with_cache`, `:480`) issue queries in a
 sequential loop against one resolver and are `#[ignore]`d (require live
@@ -333,30 +383,31 @@ cache at all. The only concurrency test in the whole delivery/resolver
 path is `udp_server_handles_next_datagram_while_first_request_is_in_flight`
 (`src/delivery/dns.rs:1286`), which proves two requests don't serialize on
 each other's *upstream I/O*, not that the cache holds up under many
-parallel hits/misses/evictions. None of G1-G5 above are backed by a
-regression test; they're derived from reading the store/lookup code paths.
+parallel hits/misses/evictions, and nothing exercises TCP pipelining
+concurrency (G7) either. None of G1-G7 above are backed by a regression
+test; they're derived from reading the store/lookup/connection code paths.
 
 ## 9. Other gaps
 
-- **G7 — No periodic/background eviction.** `InMemoryDnsCache::remove_expired`
+- **G9 — No periodic/background eviction.** `InMemoryDnsCache::remove_expired`
   (the public maintenance method, `mod.rs:5359-5363`) is never called from
   `main.rs` — there's no sweep task. Expired-but-unbounded-by-capacity
   entries (cache below `max_entries`, long TTLs still technically "not
   expired but stale in practice") linger until touched by a lookup or
   until the cache fills enough to trigger the capacity-based scan in G1.
-- **G8 — Capacity is not configurable.** `DEFAULT_CACHE_ENTRIES = 10_000`
+- **G10 — Capacity is not configurable.** `DEFAULT_CACHE_ENTRIES = 10_000`
   is a `main.rs` constant, not wired to `src/config`. Operators can't tune
   this without a code change/rebuild.
-- **G9 — No memory/byte-size bound**, only an entry-count bound — a
+- **G11 — No memory/byte-size bound**, only an entry-count bound — a
   working set with large RRsets (e.g. wide `TXT`, `MX` sets, or many
   addresses per name) has no ceiling on cache memory beyond
   `max_entries × (average response size)`.
-- **G10 — No observability into the store-time O(n) scan.** Existing cache
-  metrics (`CacheHit`, `CacheMiss`, `CacheStore`, etc., `main.rs:799-883`)
-  and the `cache_size`/`cache_capacity` gauges don't expose scan
-  frequency/duration, so G1's cost is invisible in production telemetry
-  today. There's no lock-wait-time or store-latency histogram to catch a
-  regression here.
+- **G12 — No observability into the store-time or hit-time O(n) scans.**
+  Existing cache metrics (`CacheHit`, `CacheMiss`, `CacheStore`, etc.,
+  `main.rs:799-883`) and the `cache_size`/`cache_capacity` gauges don't
+  expose scan frequency/duration, so G1's and G6's cost is invisible in
+  production telemetry today. There's no lock-wait-time or
+  lookup/store-latency histogram to catch a regression here.
 - **Approximate LRU (§7)** means eviction order is "recent within roughly
   the last `4×max_entries` touches," not exact recency — acceptable for a
   cache, but worth knowing if debugging why a hot entry got evicted.
