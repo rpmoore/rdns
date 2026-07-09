@@ -29,12 +29,12 @@ use tokio::task::JoinSet;
 use tokio::time::{self, Instant};
 
 use crate::protocol::{
-    EdnsInfo, Message, QueryValidationError, Record, RecordData, ResponseCode, age_response_ttls,
-    build_a_answers_response, build_a_block_response, build_aaaa_answers_response,
-    build_aaaa_block_response, build_formerr_response, build_nodata_response,
-    build_nxdomain_response, build_refused_response, build_servfail_response,
-    build_truncated_response, cap_response_ttls, message_question_wire, rewrite_response_id,
-    rewrite_response_request_fields,
+    EdnsInfo, Message, NameCompressor, QueryValidationError, Record, RecordData, ResponseCode,
+    age_response_ttls, build_a_answers_response, build_a_block_response,
+    build_aaaa_answers_response, build_aaaa_block_response, build_formerr_response,
+    build_nodata_response, build_nxdomain_response, build_refused_response,
+    build_servfail_response, build_truncated_response, cap_response_ttls, message_question_wire,
+    rewrite_response_id, rewrite_response_request_fields,
 };
 
 pub mod policy;
@@ -1218,27 +1218,44 @@ fn serialize_recursive_response(
     write_dns_u16(&mut bytes, answers.len() as u16);
     write_dns_u16(&mut bytes, authorities.len() as u16);
     write_dns_u16(&mut bytes, additionals.len() as u16);
-    write_dns_question(&mut bytes, &question.qname, question.qtype, question.qclass);
+    let mut compressor = NameCompressor::new();
+    write_dns_question(
+        &mut bytes,
+        &mut compressor,
+        &question.qname,
+        question.qtype,
+        question.qclass,
+    );
     for record in answers {
-        write_dns_record(&mut bytes, record)?;
+        write_dns_record(&mut bytes, &mut compressor, record)?;
     }
     for record in authorities {
-        write_dns_record(&mut bytes, record)?;
+        write_dns_record(&mut bytes, &mut compressor, record)?;
     }
     for record in additionals {
-        write_dns_record(&mut bytes, record)?;
+        write_dns_record(&mut bytes, &mut compressor, record)?;
     }
     Ok(bytes)
 }
 
-fn write_dns_question(bytes: &mut Vec<u8>, name: &str, qtype: u16, qclass: u16) {
-    write_dns_name(bytes, name);
+fn write_dns_question(
+    bytes: &mut Vec<u8>,
+    compressor: &mut NameCompressor,
+    name: &str,
+    qtype: u16,
+    qclass: u16,
+) {
+    compressor.write_name(bytes, name);
     write_dns_u16(bytes, qtype);
     write_dns_u16(bytes, qclass);
 }
 
-fn write_dns_record(bytes: &mut Vec<u8>, record: &Record) -> Result<(), ResolutionBackendError> {
-    write_dns_name(bytes, &record.name);
+fn write_dns_record(
+    bytes: &mut Vec<u8>,
+    compressor: &mut NameCompressor,
+    record: &Record,
+) -> Result<(), ResolutionBackendError> {
+    compressor.write_name(bytes, &record.name);
     write_dns_u16(bytes, record.rtype);
     write_dns_u16(bytes, record.rclass);
     write_dns_u32(bytes, record.ttl);
@@ -1268,13 +1285,13 @@ fn write_dns_record(bytes: &mut Vec<u8>, record: &Record) -> Result<(), Resoluti
             bytes.push(*algorithm);
             bytes.extend_from_slice(cert);
         }
-        RecordData::CNAME(name) | RecordData::NS(name) => write_dns_name(bytes, name),
+        RecordData::CNAME(name) | RecordData::NS(name) => compressor.write_name(bytes, name),
         RecordData::MX {
             preference,
             exchange,
         } => {
             write_dns_u16(bytes, *preference);
-            write_dns_name(bytes, exchange);
+            compressor.write_name(bytes, exchange);
         }
         RecordData::DNSKEY {
             flags,
@@ -1302,7 +1319,7 @@ fn write_dns_record(bytes: &mut Vec<u8>, record: &Record) -> Result<(), Resoluti
             next_domain,
             type_bit_maps,
         } => {
-            write_dns_name(bytes, next_domain);
+            compressor.write_name(bytes, next_domain);
             bytes.extend_from_slice(type_bit_maps);
         }
         RecordData::NSEC3 {
@@ -1337,13 +1354,13 @@ fn write_dns_record(bytes: &mut Vec<u8>, record: &Record) -> Result<(), Resoluti
             bytes.push(*salt_length);
             bytes.extend_from_slice(salt);
         }
-        RecordData::PTR(name) => write_dns_name(bytes, name),
+        RecordData::PTR(name) => compressor.write_name(bytes, name),
         RecordData::RP {
             mboxdname,
             txtdname,
         } => {
-            write_dns_name(bytes, mboxdname);
-            write_dns_name(bytes, txtdname);
+            compressor.write_name(bytes, mboxdname);
+            compressor.write_name(bytes, txtdname);
         }
         RecordData::SOA {
             ttl: _,
@@ -1355,8 +1372,8 @@ fn write_dns_record(bytes: &mut Vec<u8>, record: &Record) -> Result<(), Resoluti
             expire,
             minimum,
         } => {
-            write_dns_name(bytes, mname);
-            write_dns_name(bytes, rname);
+            compressor.write_name(bytes, mname);
+            compressor.write_name(bytes, rname);
             write_dns_u32(bytes, *serial);
             write_dns_u32(bytes, *refresh);
             write_dns_u32(bytes, *retry);
@@ -1372,7 +1389,7 @@ fn write_dns_record(bytes: &mut Vec<u8>, record: &Record) -> Result<(), Resoluti
             write_dns_u16(bytes, *priority);
             write_dns_u16(bytes, *weight);
             write_dns_u16(bytes, *port);
-            write_dns_name(bytes, target);
+            compressor.write_name(bytes, target);
         }
         RecordData::TXT(text) => {
             for chunk in text.as_bytes().chunks(255) {
@@ -1398,7 +1415,7 @@ fn write_dns_record(bytes: &mut Vec<u8>, record: &Record) -> Result<(), Resoluti
             write_dns_u32(bytes, *signature_expiration);
             write_dns_u32(bytes, *signature_inception);
             write_dns_u16(bytes, *key_tag);
-            write_dns_name(bytes, signer_name);
+            compressor.write_name(bytes, signer_name);
             bytes.extend_from_slice(signature);
         }
         RecordData::OPT(info) => {
@@ -1417,6 +1434,7 @@ fn write_dns_record(bytes: &mut Vec<u8>, record: &Record) -> Result<(), Resoluti
     Ok(())
 }
 
+#[cfg(test)]
 fn write_dns_name(bytes: &mut Vec<u8>, name: &str) {
     let name = name.trim_end_matches('.');
     if name.is_empty() {
@@ -10302,7 +10320,10 @@ mod tests {
     #[tokio::test]
     async fn resolve_truncates_fresh_recursive_response_to_configured_udp_limit() {
         let question = QuestionKey::new("example.com", 1, 1);
-        let answers = (0..40)
+        // Name compression shrinks each repeated "example.com" owner name to
+        // a 2-byte pointer, so this needs far more records than an
+        // uncompressed encoder would to still exceed the configured limit.
+        let answers = (0..200)
             .map(|_| a_record("example.com", 60))
             .collect::<Vec<_>>();
         let transport = Arc::new(ScriptedAuthorityTransport::new([Ok(
@@ -11196,6 +11217,62 @@ mod tests {
             ttl,
             record: RecordData::Unknown { rtype: 39, bytes },
         }
+    }
+
+    #[test]
+    fn serialize_recursive_response_compresses_repeated_names() {
+        let question = QuestionKey::new("collector.github.com", 1, 1);
+        let original_query = Message::parse_owned(query(
+            0xbeef,
+            &question.qname,
+            question.qtype,
+            question.qclass,
+        ))
+        .unwrap();
+        let answers = vec![
+            cname_record(
+                "collector.github.com",
+                3600,
+                "glb-db52c2cf8be544.github.com",
+            ),
+            a_record("glb-db52c2cf8be544.github.com", 60),
+        ];
+
+        let bytes = serialize_recursive_response(
+            &original_query,
+            ResponseCode::NoError,
+            false,
+            &answers,
+            &[],
+            &[],
+        )
+        .unwrap();
+
+        // The CNAME's owner name repeats the question name, and the A
+        // record's owner name repeats the CNAME's target: both should
+        // collapse to 2-byte compression pointers (0xC0 high bits) instead
+        // of being spelled out again.
+        let pointer_count = bytes.windows(2).filter(|w| w[0] & 0xC0 == 0xC0).count();
+        assert!(
+            pointer_count >= 2,
+            "expected at least 2 compression pointers, found {pointer_count} in {bytes:?}"
+        );
+
+        let round_tripped = Message::parse_owned(bytes).unwrap();
+        assert_eq!(round_tripped.answers.len(), 2);
+        assert_eq!(round_tripped.answers[0].name, "collector.github.com");
+        assert_eq!(
+            round_tripped.answers[0].record,
+            RecordData::CNAME("glb-db52c2cf8be544.github.com".to_string())
+        );
+        assert_eq!(
+            round_tripped.answers[1].name,
+            "glb-db52c2cf8be544.github.com"
+        );
+        assert_eq!(
+            round_tripped.answers[1].record,
+            RecordData::A("192.0.2.10".parse().unwrap())
+        );
     }
 
     fn opt_record(udp_payload_size: u16) -> Record {
