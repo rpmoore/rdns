@@ -38,7 +38,7 @@ cache at all:
 Only queries that reach the backend (forward or recursive resolution) are
 candidates for caching, and only if the resulting response is *cacheable*
 (§4) and the query itself didn't ask for something the cache layer doesn't
-understand (§6).
+understand (§5).
 
 ## 2. What's used to index into the cache
 
