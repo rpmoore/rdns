@@ -1,6 +1,6 @@
 # DNS Resolver Caching — Current Implementation
 
-Describes caching as actually implemented today (branch `dns_gaps_plan`,
+Describes caching as actually implemented today (snapshot as of
 2026-07-09). This is a snapshot of the code, not a design proposal — see
 `docs/plan/02-resolver-cache.md` (original design intent) and
 `docs/plans/cache_key.md` (a landed key-simplification change) for history.
@@ -148,9 +148,9 @@ re-derivation happens on every hit, not just once.
 | `failure_ttl` (SERVFAIL) | `None` — SERVFAIL is not cached unless explicitly configured, and even then capped at 5 minutes (`MAX_FAILURE_CACHE_TTL`, `mod.rs:50`) |
 
 Positive TTL = minimum TTL across all answer records, then
-`min(cap).max(floor).min(cap)` (`apply_ttl_bounds`, `mod.rs:1492-1498` — the
-trailing `.min(cap)` guarantees a configured floor can't push the effective
-value back over the ceiling).
+`ttl.min(cap).max(floor).min(cap)` (`apply_ttl_bounds`, `mod.rs:1492-1498` —
+the trailing `.min(cap)` guarantees a configured floor can't push the
+effective value back over the ceiling).
 
 Negative TTL (NXDOMAIN / NODATA) is derived per RFC 2308 from the SOA
 record in the response's authority section: `min(SOA TTL, SOA MINIMUM)`
