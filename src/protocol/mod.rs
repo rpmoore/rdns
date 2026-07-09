@@ -715,18 +715,28 @@ impl NameCompressor {
             out.push(0);
             return;
         }
-        let labels: Vec<&str> = name.split('.').collect();
-        for i in 0..labels.len() {
-            let suffix = labels[i..].join(".").to_ascii_lowercase();
-            if let Some(&ptr) = self.offsets.get(&suffix) {
+        // Lowercase once and slice suffixes out of it by byte offset, rather
+        // than rejoining + relowercasing the remaining labels on every
+        // iteration (which was O(n^2) in label count).
+        let lower = name.to_ascii_lowercase();
+        let mut offset = 0usize;
+        while offset < name.len() {
+            let label_end = name[offset..]
+                .find('.')
+                .map(|i| offset + i)
+                .unwrap_or(name.len());
+            let label = &name[offset..label_end];
+            let suffix = &lower[offset..];
+            if let Some(&ptr) = self.offsets.get(suffix) {
                 out.extend_from_slice(&(0xC000u16 | ptr).to_be_bytes());
                 return;
             }
             if out.len() <= 0x3FFF {
-                self.offsets.insert(suffix, out.len() as u16);
+                self.offsets.insert(suffix.to_string(), out.len() as u16);
             }
-            out.push(labels[i].len() as u8);
-            out.extend_from_slice(labels[i].as_bytes());
+            out.push(label.len() as u8);
+            out.extend_from_slice(label.as_bytes());
+            offset = label_end + 1;
         }
         out.push(0);
     }

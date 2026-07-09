@@ -11255,8 +11255,21 @@ mod tests {
         // The CNAME's owner name repeats the question name, and the A
         // record's owner name repeats the CNAME's target: both should
         // collapse to 2-byte compression pointers (0xC0 high bits) instead
-        // of being spelled out again.
-        let pointer_count = bytes.windows(2).filter(|w| w[0] & 0xC0 == 0xC0).count();
+        // of being spelled out again. Matching on the high bits alone is
+        // ambiguous with arbitrary payload bytes (e.g. the A record's first
+        // octet, 192, is 0xC0), so also decode the pointer's 14-bit offset
+        // and require it to point backward at an earlier, past-header byte
+        // in the message — that's the only way a real compression pointer
+        // can decode.
+        let pointer_count = (0..bytes.len().saturating_sub(1))
+            .filter(|&i| {
+                if bytes[i] & 0xC0 != 0xC0 {
+                    return false;
+                }
+                let offset = (((bytes[i] as u16) & 0x3F) << 8) | bytes[i + 1] as u16;
+                offset >= 12 && (offset as usize) < i
+            })
+            .count();
         assert!(
             pointer_count >= 2,
             "expected at least 2 compression pointers, found {pointer_count} in {bytes:?}"
