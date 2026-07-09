@@ -74,12 +74,13 @@ Notable properties:
   still fragments the key — that part was explicitly kept (see "Out of
   scope" in `cache_key.md`), so `dig` from two stub resolvers advertising
   different EDNS bufsizes for the same name still get separate entries.
-- **`cache_namespace` is the invalidation lever.** It's an opaque string
-  folded into every key so that changing what the backend *would* answer
-  invalidates the whole cache without an explicit sweep — a different
-  namespace is a different key, so old entries simply become
-  unreachable (they still occupy a slot until evicted/expired, see §7).
-  Computed by `Config::backend_cache_namespace` (`src/config/mod.rs:218-242`):
+- **`cache_namespace` is the invalidation lever — but it doesn't cover
+  every backend-affecting setting.** It's an opaque string folded into
+  every key so that changing what the backend *would* answer invalidates
+  the whole cache without an explicit sweep — a different namespace is a
+  different key, so old entries simply become unreachable (they still
+  occupy a slot until evicted/expired, see §7). Computed by
+  `Config::backend_cache_namespace` (`src/config/mod.rs:218-242`):
   - Forward mode: `mode:forward;generation:{n};upstreams:{hash}` — the hash
     (`forwarding_upstream_set_hash`, `config/mod.rs:244-262`) covers
     name/endpoint/protocol/priority/timeout of every enabled UDP upstream,
@@ -91,9 +92,26 @@ Notable properties:
     manual "flush everything" lever.
   - Recomputed only when a new `BackendSnapshot` is published, i.e. on
     SIGHUP reload (`main.rs:597-635` → `resolver.publish_reload(...)`).
+  - **Exception:** `RuntimeConfig::per_query_deadline` is *not* part of the
+    hash (`config/mod.rs:218-262` — only the upstream set's own per-upstream
+    `timeout` is hashed, not the global deadline). A SIGHUP that only
+    tightens or loosens `per_query_deadline` changes how long resolution is
+    allowed to run — and therefore can change whether a given query now
+    times out to SERVFAIL — without changing `cache_namespace`, so answers
+    cached under the old deadline stay addressable under the same key. The
+    cached *content* isn't wrong, but "changing what the backend would
+    answer invalidates the whole cache" isn't quite true for this one
+    setting.
   - Local DNS entry changes do **not** touch `cache_namespace` — they don't
-    need to, since local entries are checked before `probe_cache` ever runs
-    and are never stored in this cache.
+    need to for correctness of the local answers themselves, since local
+    entries are checked before `probe_cache` ever runs and are never stored
+    in this cache. But this can still surface stale *backend* answers: if a
+    name was resolved and cached before a local entry for it existed, then
+    the local entry is later removed (e.g. on reload), `try_local_lookup`
+    stops shadowing that name and the next query falls through to
+    `probe_cache` — which may still hold the old, unexpired backend-cache
+    entry from before the override existed. Removing a local entry can
+    un-shadow an old cached answer rather than guarantee a fresh lookup.
 
 ## 3. What's stored per entry
 
@@ -175,10 +193,16 @@ One `std::sync::Mutex` guards the entire cache — every lookup and every
 store for every key funnels through this single lock. It's never held
 across an `.await` (`lookup`/`store` on the `DnsCache` trait wrap the sync
 `lookup_now`/`store_now` in `Box::pin(async move {...})` with no await
-inside, `mod.rs:5489-5499`), so it's a pure CPU-bound critical section, not
-a source of async task starvation. But it is still a single serialization
-point across every concurrent request regardless of which key they touch
-(see §8).
+inside, `mod.rs:5489-5499`), so it can't deadlock or get cancelled mid-hold
+the way an `.await`-spanning lock could. That does **not** make it free of
+async task starvation, though: `Mutex::lock()` blocks the calling OS
+thread, and that thread is a Tokio worker running other tasks' futures.
+While one task holds this lock through the O(n) scan in G1 (§8), the
+worker thread it's running on can't poll any other task, so unrelated
+async work scheduled on that thread stalls until the scan finishes — a
+real (if bounded, single-worker-at-a-time) starvation effect, not just
+lock-wait latency. It is still a single serialization point across every
+concurrent request regardless of which key they touch (see §8).
 
 Separately, **request coalescing** (`SingleFlightMisses`, `mod.rs:3826-3931`)
 uses its own global `std::sync::Mutex<HashMap<CacheKey, Arc<InFlightMiss>>>`,
