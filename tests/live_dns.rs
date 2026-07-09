@@ -16,13 +16,16 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
-use rdns::config::{RuntimeConfig, UpstreamConfig, UpstreamProtocol};
+use rdns::config::{
+    RecursiveResolutionConfig, ResolutionConfig, RuntimeConfig, UpstreamConfig, UpstreamProtocol,
+};
 use rdns::delivery::dns::UdpDnsServer;
-use rdns::delivery::upstream::ForwardingResolutionBackend;
-use rdns::protocol::Message;
+use rdns::delivery::upstream::{ForwardingResolutionBackend, RecursiveAuthorityTransportClient};
+use rdns::protocol::{Message, RecordData};
 use rdns::resolver::{
     BasicResponseFactory, Clock, MetricsSink, QueryEventRecordResult, QueryEventSink, QueryEventV1,
-    ResolveQuery, ResolverMetric, StandardProtocolCodec,
+    RecursiveResolutionBackend, RecursiveResolverConfig, RecursiveRootHint, ResolveQuery,
+    ResolverMetric, StandardProtocolCodec,
 };
 use tokio::net::UdpSocket;
 use tokio::time;
@@ -116,6 +119,64 @@ async fn run_live_server(
     (server_addr, shutdown_tx, server_task)
 }
 
+async fn run_live_recursive_server() -> (
+    SocketAddr,
+    tokio::sync::oneshot::Sender<()>,
+    tokio::task::JoinHandle<std::io::Result<()>>,
+) {
+    let recursive = RecursiveResolutionConfig::bundled("live-test");
+    let config = RuntimeConfig::new_with_resolution(
+        vec!["127.0.0.1:5300".parse().unwrap()],
+        ResolutionConfig::recursive(0, recursive),
+        Vec::new(),
+        Duration::from_secs(5),
+        1232,
+    )
+    .unwrap();
+    let recursive = config.resolution.recursive.as_ref().unwrap();
+    let root_hints = recursive
+        .load_root_hints()
+        .unwrap()
+        .into_iter()
+        .map(|hint| RecursiveRootHint {
+            name: hint.name,
+            endpoints: hint.endpoints,
+        })
+        .collect();
+    let transport =
+        Arc::new(RecursiveAuthorityTransportClient::from_runtime_config(&config).unwrap());
+    let backend = Arc::new(RecursiveResolutionBackend::new(
+        RecursiveResolverConfig {
+            root_hints,
+            per_authority_timeout: recursive.per_authority_timeout,
+            per_query_deadline: config.per_query_deadline,
+            max_recursion_depth: recursive.max_recursion_depth,
+            max_cname_restarts: recursive.max_cname_restarts,
+        },
+        transport,
+    ));
+    let resolver = Arc::new(ResolveQuery::new(
+        Arc::new(StandardProtocolCodec::new(config.max_udp_payload_size)),
+        backend,
+        Arc::new(BasicResponseFactory),
+        Arc::new(SystemClock),
+        Arc::new(NoopEvents),
+        Arc::new(NoopMetrics),
+    ));
+    let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let server = UdpDnsServer::new(socket, resolver, config.max_udp_payload_size);
+    let server_addr = server.local_addr().unwrap();
+    let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
+    let server_task = tokio::spawn(async move {
+        server
+            .serve_until(async {
+                let _ = shutdown_rx.await;
+            })
+            .await
+    });
+    (server_addr, shutdown_tx, server_task)
+}
+
 async fn resolve_via_server(server_addr: SocketAddr, request: &[u8]) -> Vec<u8> {
     let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
     client.send_to(request, server_addr).await.unwrap();
@@ -163,4 +224,38 @@ async fn live_dns_resolves_example_a_through_google_dns() {
         0x5678,
     )
     .await;
+}
+
+// Regression test for github.com's authoritative servers (NS1/AWS DNS)
+// echoing the zone's NS set in the AUTHORITY section alongside the A answer
+// -- confirmed via `dig github.com` against those authorities directly.
+// rdns's recursive backend used to forward that AUTHORITY section verbatim
+// to the client; it should now be stripped, matching what Cloudflare (dig
+// github.com @1.1.1.1) returns.
+#[tokio::test]
+#[ignore = "requires outbound UDP/TCP DNS access to public root/TLD servers"]
+async fn live_dns_recursive_github_a_excludes_echoed_ns_authority() {
+    let (server_addr, shutdown_tx, server_task) = run_live_recursive_server().await;
+
+    let response = resolve_via_server(server_addr, &query(0x1234, "github.com", 1)).await;
+    let message = Message::parse(&response).unwrap();
+
+    assert_eq!(message.header.id, 0x1234);
+    assert!(message.header.qr());
+    assert_eq!(message.header.r_code(), 0);
+    assert!(
+        !message.answers.is_empty(),
+        "expected at least one A answer for github.com"
+    );
+    assert!(
+        message
+            .authorities
+            .iter()
+            .all(|record| !matches!(record.record, RecordData::NS(_))),
+        "expected no NS records in the AUTHORITY section, got {:?}",
+        message.authorities
+    );
+
+    shutdown_tx.send(()).unwrap();
+    server_task.await.unwrap().unwrap();
 }
