@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::net::{Ipv4Addr, Ipv6Addr};
 use std::ops::Range;
 use std::str;
@@ -627,9 +627,10 @@ fn build_question_response(
     );
 
     if let Some(question) = request.questions.first() {
-        write_question(&mut response, question);
+        let mut compressor = NameCompressor::new();
+        write_question(&mut response, &mut compressor, question);
         for answer in answers {
-            write_sinkhole_answer(&mut response, question, answer);
+            write_sinkhole_answer(&mut response, &mut compressor, question, answer);
         }
     }
 
@@ -662,16 +663,21 @@ fn write_response_header(
     write_u16(out, 0);
 }
 
-fn write_question(out: &mut Vec<u8>, question: &Question) {
-    write_name(out, &question.qname);
+fn write_question(out: &mut Vec<u8>, compressor: &mut NameCompressor, question: &Question) {
+    compressor.write_name(out, &question.qname);
     write_u16(out, question.qtype);
     write_u16(out, question.qclass);
 }
 
-fn write_sinkhole_answer(out: &mut Vec<u8>, question: &Question, answer: &AddressAnswer) {
+fn write_sinkhole_answer(
+    out: &mut Vec<u8>,
+    compressor: &mut NameCompressor,
+    question: &Question,
+    answer: &AddressAnswer,
+) {
     match answer {
         AddressAnswer::A { address, ttl } => {
-            write_name(out, &question.qname);
+            compressor.write_name(out, &question.qname);
             write_u16(out, 1);
             write_u16(out, question.qclass);
             write_u32(out, *ttl);
@@ -679,7 +685,7 @@ fn write_sinkhole_answer(out: &mut Vec<u8>, question: &Question, answer: &Addres
             out.extend_from_slice(&address.octets());
         }
         AddressAnswer::Aaaa { address, ttl } => {
-            write_name(out, &question.qname);
+            compressor.write_name(out, &question.qname);
             write_u16(out, 28);
             write_u16(out, question.qclass);
             write_u32(out, *ttl);
@@ -689,16 +695,51 @@ fn write_sinkhole_answer(out: &mut Vec<u8>, question: &Question, answer: &Addres
     }
 }
 
-fn write_name(out: &mut Vec<u8>, name: &str) {
-    if name.is_empty() {
+/// Writes DNS domain names using compression pointers (RFC 1035 §4.1.4):
+/// a name that repeats a suffix already written earlier in the same message
+/// is replaced with a 2-byte pointer back to that earlier occurrence.
+pub(crate) struct NameCompressor {
+    offsets: HashMap<String, u16>,
+}
+
+impl NameCompressor {
+    pub(crate) fn new() -> Self {
+        Self {
+            offsets: HashMap::new(),
+        }
+    }
+
+    pub(crate) fn write_name(&mut self, out: &mut Vec<u8>, name: &str) {
+        let name = name.trim_end_matches('.');
+        if name.is_empty() {
+            out.push(0);
+            return;
+        }
+        // Lowercase once and slice suffixes out of it by byte offset, rather
+        // than rejoining + relowercasing the remaining labels on every
+        // iteration (which was O(n^2) in label count).
+        let lower = name.to_ascii_lowercase();
+        let mut offset = 0usize;
+        while offset < name.len() {
+            let label_end = name[offset..]
+                .find('.')
+                .map(|i| offset + i)
+                .unwrap_or(name.len());
+            let label = &name[offset..label_end];
+            let suffix = &lower[offset..];
+            if let Some(&ptr) = self.offsets.get(suffix) {
+                out.extend_from_slice(&(0xC000u16 | ptr).to_be_bytes());
+                return;
+            }
+            if out.len() <= 0x3FFF {
+                self.offsets.insert(suffix.to_string(), out.len() as u16);
+            }
+            out.push(label.len() as u8);
+            out.extend_from_slice(label.as_bytes());
+            offset = label_end + 1;
+        }
         out.push(0);
-        return;
     }
-    for label in name.split('.') {
-        out.push(label.len() as u8);
-        out.extend_from_slice(label.as_bytes());
-    }
-    out.push(0);
 }
 
 fn write_u16(out: &mut Vec<u8>, value: u16) {
@@ -1908,6 +1949,28 @@ mod tests {
             response.answers[0].record,
             RecordData::A(Ipv4Addr::new(10, 0, 0, 1))
         );
+    }
+
+    #[test]
+    fn build_sinkhole_a_response_compresses_repeated_question_name() {
+        let mut request = Vec::new();
+        push_header(&mut request, 1, 0, 0, 0);
+        push_question(&mut request, "blocked.example", 1, 1);
+        let request = Message::parse_standard_query(&request).unwrap();
+
+        let bytes = build_a_block_response(&request, Ipv4Addr::new(10, 0, 0, 1), 60);
+
+        // The answer's owner name repeats the question name verbatim, so it
+        // should be a 2-byte compression pointer rather than the full label
+        // sequence written out again.
+        let pointer_count = bytes.windows(2).filter(|w| w[0] & 0xC0 == 0xC0).count();
+        assert_eq!(
+            pointer_count, 1,
+            "expected one compression pointer in {bytes:?}"
+        );
+
+        let response = Message::parse(&bytes).unwrap();
+        assert_eq!(response.answers[0].name, "blocked.example");
     }
 
     #[test]

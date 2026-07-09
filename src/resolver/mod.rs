@@ -29,12 +29,12 @@ use tokio::task::JoinSet;
 use tokio::time::{self, Instant};
 
 use crate::protocol::{
-    EdnsInfo, Message, QueryValidationError, Record, RecordData, ResponseCode, age_response_ttls,
-    build_a_answers_response, build_a_block_response, build_aaaa_answers_response,
-    build_aaaa_block_response, build_formerr_response, build_nodata_response,
-    build_nxdomain_response, build_refused_response, build_servfail_response,
-    build_truncated_response, cap_response_ttls, message_question_wire, rewrite_response_id,
-    rewrite_response_request_fields,
+    EdnsInfo, Message, NameCompressor, QueryValidationError, Record, RecordData, ResponseCode,
+    age_response_ttls, build_a_answers_response, build_a_block_response,
+    build_aaaa_answers_response, build_aaaa_block_response, build_formerr_response,
+    build_nodata_response, build_nxdomain_response, build_refused_response,
+    build_servfail_response, build_truncated_response, cap_response_ttls, message_question_wire,
+    rewrite_response_id, rewrite_response_request_fields,
 };
 
 pub mod policy;
@@ -1218,27 +1218,44 @@ fn serialize_recursive_response(
     write_dns_u16(&mut bytes, answers.len() as u16);
     write_dns_u16(&mut bytes, authorities.len() as u16);
     write_dns_u16(&mut bytes, additionals.len() as u16);
-    write_dns_question(&mut bytes, &question.qname, question.qtype, question.qclass);
+    let mut compressor = NameCompressor::new();
+    write_dns_question(
+        &mut bytes,
+        &mut compressor,
+        &question.qname,
+        question.qtype,
+        question.qclass,
+    );
     for record in answers {
-        write_dns_record(&mut bytes, record)?;
+        write_dns_record(&mut bytes, &mut compressor, record)?;
     }
     for record in authorities {
-        write_dns_record(&mut bytes, record)?;
+        write_dns_record(&mut bytes, &mut compressor, record)?;
     }
     for record in additionals {
-        write_dns_record(&mut bytes, record)?;
+        write_dns_record(&mut bytes, &mut compressor, record)?;
     }
     Ok(bytes)
 }
 
-fn write_dns_question(bytes: &mut Vec<u8>, name: &str, qtype: u16, qclass: u16) {
-    write_dns_name(bytes, name);
+fn write_dns_question(
+    bytes: &mut Vec<u8>,
+    compressor: &mut NameCompressor,
+    name: &str,
+    qtype: u16,
+    qclass: u16,
+) {
+    compressor.write_name(bytes, name);
     write_dns_u16(bytes, qtype);
     write_dns_u16(bytes, qclass);
 }
 
-fn write_dns_record(bytes: &mut Vec<u8>, record: &Record) -> Result<(), ResolutionBackendError> {
-    write_dns_name(bytes, &record.name);
+fn write_dns_record(
+    bytes: &mut Vec<u8>,
+    compressor: &mut NameCompressor,
+    record: &Record,
+) -> Result<(), ResolutionBackendError> {
+    compressor.write_name(bytes, &record.name);
     write_dns_u16(bytes, record.rtype);
     write_dns_u16(bytes, record.rclass);
     write_dns_u32(bytes, record.ttl);
@@ -1268,13 +1285,13 @@ fn write_dns_record(bytes: &mut Vec<u8>, record: &Record) -> Result<(), Resoluti
             bytes.push(*algorithm);
             bytes.extend_from_slice(cert);
         }
-        RecordData::CNAME(name) | RecordData::NS(name) => write_dns_name(bytes, name),
+        RecordData::CNAME(name) | RecordData::NS(name) => compressor.write_name(bytes, name),
         RecordData::MX {
             preference,
             exchange,
         } => {
             write_dns_u16(bytes, *preference);
-            write_dns_name(bytes, exchange);
+            compressor.write_name(bytes, exchange);
         }
         RecordData::DNSKEY {
             flags,
@@ -1302,6 +1319,7 @@ fn write_dns_record(bytes: &mut Vec<u8>, record: &Record) -> Result<(), Resoluti
             next_domain,
             type_bit_maps,
         } => {
+            // RFC 4034 §4.1.1: MUST NOT compress the Next Domain Name field.
             write_dns_name(bytes, next_domain);
             bytes.extend_from_slice(type_bit_maps);
         }
@@ -1337,11 +1355,13 @@ fn write_dns_record(bytes: &mut Vec<u8>, record: &Record) -> Result<(), Resoluti
             bytes.push(*salt_length);
             bytes.extend_from_slice(salt);
         }
-        RecordData::PTR(name) => write_dns_name(bytes, name),
+        RecordData::PTR(name) => compressor.write_name(bytes, name),
         RecordData::RP {
             mboxdname,
             txtdname,
         } => {
+            // RFC 3597 §4: RP isn't an RFC 1035 well-known type, so its
+            // embedded names must not be compressed when writing.
             write_dns_name(bytes, mboxdname);
             write_dns_name(bytes, txtdname);
         }
@@ -1355,8 +1375,8 @@ fn write_dns_record(bytes: &mut Vec<u8>, record: &Record) -> Result<(), Resoluti
             expire,
             minimum,
         } => {
-            write_dns_name(bytes, mname);
-            write_dns_name(bytes, rname);
+            compressor.write_name(bytes, mname);
+            compressor.write_name(bytes, rname);
             write_dns_u32(bytes, *serial);
             write_dns_u32(bytes, *refresh);
             write_dns_u32(bytes, *retry);
@@ -1372,6 +1392,7 @@ fn write_dns_record(bytes: &mut Vec<u8>, record: &Record) -> Result<(), Resoluti
             write_dns_u16(bytes, *priority);
             write_dns_u16(bytes, *weight);
             write_dns_u16(bytes, *port);
+            // RFC 2782: "name compression is not to be used for this field."
             write_dns_name(bytes, target);
         }
         RecordData::TXT(text) => {
@@ -1398,6 +1419,14 @@ fn write_dns_record(bytes: &mut Vec<u8>, record: &Record) -> Result<(), Resoluti
             write_dns_u32(bytes, *signature_expiration);
             write_dns_u32(bytes, *signature_inception);
             write_dns_u16(bytes, *key_tag);
+            // RFC 4034 §3.1.7: MUST NOT compress the Signer's Name field.
+            // Confirmed against Cloudflare's production authoritative
+            // servers: a raw DO-bit query for the DNSSEC-signed
+            // cloudflare.com zone (sent directly to ns3.cloudflare.com)
+            // shows every RRSIG's owner name compressed back to the
+            // question (0xC00C), but the Signer's Name field spelled out
+            // in full even though it repeats that same "cloudflare.com"
+            // suffix already written earlier in the message.
             write_dns_name(bytes, signer_name);
             bytes.extend_from_slice(signature);
         }
@@ -10302,7 +10331,10 @@ mod tests {
     #[tokio::test]
     async fn resolve_truncates_fresh_recursive_response_to_configured_udp_limit() {
         let question = QuestionKey::new("example.com", 1, 1);
-        let answers = (0..40)
+        // Name compression shrinks each repeated "example.com" owner name to
+        // a 2-byte pointer, so this needs far more records than an
+        // uncompressed encoder would to still exceed the configured limit.
+        let answers = (0..200)
             .map(|_| a_record("example.com", 60))
             .collect::<Vec<_>>();
         let transport = Arc::new(ScriptedAuthorityTransport::new([Ok(
@@ -11196,6 +11228,159 @@ mod tests {
             ttl,
             record: RecordData::Unknown { rtype: 39, bytes },
         }
+    }
+
+    #[test]
+    fn serialize_recursive_response_compresses_repeated_names() {
+        let question = QuestionKey::new("collector.github.com", 1, 1);
+        let original_query = Message::parse_owned(query(
+            0xbeef,
+            &question.qname,
+            question.qtype,
+            question.qclass,
+        ))
+        .unwrap();
+        let answers = vec![
+            cname_record(
+                "collector.github.com",
+                3600,
+                "glb-db52c2cf8be544.github.com",
+            ),
+            a_record("glb-db52c2cf8be544.github.com", 60),
+        ];
+
+        let bytes = serialize_recursive_response(
+            &original_query,
+            ResponseCode::NoError,
+            false,
+            &answers,
+            &[],
+            &[],
+        )
+        .unwrap();
+
+        // The CNAME's owner name repeats the question name, and the A
+        // record's owner name repeats the CNAME's target: both should
+        // collapse to 2-byte compression pointers (0xC0 high bits) instead
+        // of being spelled out again. Matching on the high bits alone is
+        // ambiguous with arbitrary payload bytes (e.g. the A record's first
+        // octet, 192, is 0xC0), so also decode the pointer's 14-bit offset
+        // and require it to point backward at an earlier, past-header byte
+        // in the message — that's the only way a real compression pointer
+        // can decode.
+        let pointer_count = (0..bytes.len().saturating_sub(1))
+            .filter(|&i| {
+                if bytes[i] & 0xC0 != 0xC0 {
+                    return false;
+                }
+                let offset = (((bytes[i] as u16) & 0x3F) << 8) | bytes[i + 1] as u16;
+                offset >= 12 && (offset as usize) < i
+            })
+            .count();
+        assert!(
+            pointer_count >= 2,
+            "expected at least 2 compression pointers, found {pointer_count} in {bytes:?}"
+        );
+
+        let round_tripped = Message::parse_owned(bytes).unwrap();
+        assert_eq!(round_tripped.answers.len(), 2);
+        assert_eq!(round_tripped.answers[0].name, "collector.github.com");
+        assert_eq!(
+            round_tripped.answers[0].record,
+            RecordData::CNAME("glb-db52c2cf8be544.github.com".to_string())
+        );
+        assert_eq!(
+            round_tripped.answers[1].name,
+            "glb-db52c2cf8be544.github.com"
+        );
+        assert_eq!(
+            round_tripped.answers[1].record,
+            RecordData::A("192.0.2.10".parse().unwrap())
+        );
+    }
+
+    #[test]
+    fn serialize_recursive_response_never_compresses_rfc_forbidden_rdata_names() {
+        // RFC 4034 §3.1.7/§4.1.1 forbid compressing RRSIG's signer name and
+        // NSEC's next domain name; RFC 2782 forbids it for SRV's target;
+        // RFC 3597 §4 forbids it for RP (not an RFC 1035 well-known type).
+        // Every name below deliberately shares the "example.com" suffix
+        // already written for the question, so an implementation that
+        // (wrongly) compresses these fields would elide it as a 2-byte
+        // pointer instead of writing it out in full.
+        let question = QuestionKey::new("alpha.example.com", 1, 1);
+        let original_query = Message::parse_owned(query(
+            0xbeef,
+            &question.qname,
+            question.qtype,
+            question.qclass,
+        ))
+        .unwrap();
+
+        // rrsig_record's signer_name defaults to "example.com".
+        let rrsig = rrsig_record("alpha.example.com", 3600, 1);
+        let nsec = Record {
+            name: "alpha.example.com".to_string(),
+            rtype: NSEC_RECORD_TYPE,
+            rclass: 1,
+            ttl: 3600,
+            record: RecordData::NSEC {
+                next_domain: "beta.example.com".to_string(),
+                type_bit_maps: vec![0, 1, 0x40],
+            },
+        };
+        let srv = Record {
+            name: "_sip._tcp.example.com".to_string(),
+            rtype: 33,
+            rclass: 1,
+            ttl: 3600,
+            record: RecordData::SRV {
+                priority: 10,
+                weight: 20,
+                port: 5060,
+                target: "host.example.com".to_string(),
+            },
+        };
+        let rp = Record {
+            name: "alpha.example.com".to_string(),
+            rtype: 17,
+            rclass: 1,
+            ttl: 3600,
+            record: RecordData::RP {
+                mboxdname: "admin.example.com".to_string(),
+                txtdname: "info.example.com".to_string(),
+            },
+        };
+        let answers = vec![rrsig, nsec, srv, rp];
+
+        let bytes = serialize_recursive_response(
+            &original_query,
+            ResponseCode::NoError,
+            false,
+            &answers,
+            &[],
+            &[],
+        )
+        .unwrap();
+
+        // "example.com" written out in full (7'example'3'com'0) should
+        // appear once for the question and once more for each of the 5
+        // RFC-forbidden fields above (signer_name, next_domain, target,
+        // mboxdname, txtdname) — 6 total. A regression that compresses any
+        // of them would drop this count.
+        let uncompressed_example_com: &[u8] = b"\x07example\x03com\x00";
+        let literal_count = bytes
+            .windows(uncompressed_example_com.len())
+            .filter(|w| *w == uncompressed_example_com)
+            .count();
+        assert_eq!(
+            literal_count, 6,
+            "expected 6 literal writes of \"example.com\" (question + 5 \
+             forbidden rdata fields), found {literal_count} in {bytes:?}"
+        );
+
+        let round_tripped = Message::parse_owned(bytes).unwrap();
+        assert_eq!(round_tripped.answers.len(), 4);
     }
 
     fn opt_record(udp_payload_size: u16) -> Record {
