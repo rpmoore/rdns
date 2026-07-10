@@ -40,7 +40,7 @@ pub(crate) struct DomainRecordSets {
 /// flags are no longer key dimensions — see the wider rework's serve-time
 /// assembly design, implemented in section-06, not this section).
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct RRsetEntry {
+pub struct RRsetEntry {
     pub(crate) records: Vec<StoredRecord>,
     pub(crate) rrsigs: Vec<StoredRecord>, // empty if none were fetched/cached
     // Almost always NoError; kept for parity with today's CachedResponse shape.
@@ -59,7 +59,7 @@ pub(crate) struct RRsetEntry {
 /// time by section-06's assembly logic, not stored here). Reuses the
 /// existing `RecordData` type from `src/protocol`.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct StoredRecord {
+pub struct StoredRecord {
     pub(crate) rtype: u16,
     pub(crate) rclass: u16,
     pub(crate) ttl_at_store: u32,
@@ -99,7 +99,7 @@ pub(crate) struct DomainNegativeEntries {
 /// itself doesn't exist, independent of any specific qtype. `qtype:
 /// Some(t)` represents NODATA for that specific type at an existing name.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub(crate) struct NegativeKey {
+pub struct NegativeKey {
     pub(crate) qtype: Option<u16>,
     pub(crate) qclass: u16,
 }
@@ -109,7 +109,7 @@ pub(crate) struct NegativeKey {
 /// `NegativeCacheMetadata`, this stores the full covering SOA record so a
 /// servable authority section can be rebuilt from `soa_record` alone.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct NegativeEntry {
+pub struct NegativeEntry {
     pub(crate) kind: NegativeCacheKind, // reuse existing enum: NxDomain | NoData
     /// The covering SOA record itself (owner, RDATA, TTL) — needed to
     /// rebuild the authority section of a servable negative response, not

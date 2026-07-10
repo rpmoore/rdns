@@ -37,6 +37,7 @@ pub struct RuntimeConfig {
     pub local_dns_entries: Vec<LocalDnsEntryConfig>,
     pub local_zones: Vec<LocalZoneConfig>,
     pub metrics: MetricsConfig,
+    pub cache: CacheConfig,
 }
 
 /// Default ceiling on concurrent TCP DNS connections per listener. Shared
@@ -77,6 +78,7 @@ impl RuntimeConfig {
             local_dns_entries: Vec::new(),
             local_zones: Vec::new(),
             metrics: MetricsConfig::default_enabled(),
+            cache: CacheConfig::default(),
         };
         config.validate()?;
         Ok(config)
@@ -103,6 +105,7 @@ impl RuntimeConfig {
             local_dns_entries: Vec::new(),
             local_zones: Vec::new(),
             metrics: MetricsConfig::default_enabled(),
+            cache: CacheConfig::default(),
         }
     }
 
@@ -1252,6 +1255,8 @@ struct RawRuntimeConfig {
     local_zones: Vec<RawLocalZoneConfig>,
     #[serde(default)]
     metrics: Option<RawMetricsConfig>,
+    #[serde(default)]
+    cache: Option<RawCacheConfig>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1275,6 +1280,28 @@ fn default_metrics_max_connections() -> usize {
 
 fn default_max_tcp_connections() -> usize {
     DEFAULT_MAX_TCP_CONNECTIONS
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawCacheConfig {
+    #[serde(default = "default_cache_max_entries")]
+    max_entries: usize,
+    #[serde(default)]
+    shard_count: Option<usize>,
+}
+
+fn default_cache_max_entries() -> usize {
+    CacheConfig::default().max_entries
+}
+
+impl RawCacheConfig {
+    fn try_into_cache_config(self) -> Result<CacheConfig, ConfigError> {
+        Ok(CacheConfig {
+            max_entries: self.max_entries,
+            shard_count: self.shard_count,
+        })
+    }
 }
 
 impl RawMetricsConfig {
@@ -1577,6 +1604,11 @@ impl TryFrom<RawRuntimeConfig> for RuntimeConfig {
             .map(RawMetricsConfig::try_into_metrics_config)
             .transpose()?
             .unwrap_or_else(MetricsConfig::default_enabled);
+        let cache = raw
+            .cache
+            .map(RawCacheConfig::try_into_cache_config)
+            .transpose()?
+            .unwrap_or_default();
 
         let config = RuntimeConfig {
             dns_listen,
@@ -1588,6 +1620,7 @@ impl TryFrom<RawRuntimeConfig> for RuntimeConfig {
             local_dns_entries,
             local_zones,
             metrics,
+            cache,
         };
         config.validate()?;
         Ok(config)
@@ -2360,6 +2393,35 @@ a.root-servers.net.      3600000      Aaaa  2001:503:ba3e::2:30
         let entry = config.local_dns_entries[0].to_local_dns_entry().unwrap();
         assert_eq!(entry.name, DomainName::parse("nas.lan").unwrap());
         assert_eq!(entry.ipv4, vec![Ipv4Addr::new(192, 168, 1, 10)]);
+    }
+
+    #[test]
+    fn cache_config_defaults_when_absent() {
+        let config = RuntimeConfig::from_toml_str(&valid_toml()).unwrap();
+
+        assert_eq!(config.cache, CacheConfig::default());
+    }
+
+    #[test]
+    fn cache_config_explicit_override() {
+        let mut toml = valid_toml();
+        toml.push_str(
+            r#"
+            [cache]
+            max_entries = 500
+            shard_count = 4
+            "#,
+        );
+
+        let config = RuntimeConfig::from_toml_str(&toml).unwrap();
+
+        assert_eq!(
+            config.cache,
+            CacheConfig {
+                max_entries: 500,
+                shard_count: Some(4),
+            }
+        );
     }
 
     #[test]

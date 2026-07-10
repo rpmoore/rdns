@@ -24,18 +24,21 @@ mod singleflight;
 
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
+use std::time::SystemTime;
 
 use shard::Shard;
 
+pub use assemble::ChainLookup;
+pub(crate) use assemble::{
+    ResolvedAnswer, ResolvedNegative, assemble_negative_response, assemble_response,
+};
+pub use entry::{NegativeEntry, NegativeKey, RRsetEntry, StoredRecord};
+pub(crate) use singleflight::{
+    InFlightMiss, ShardedSingleFlight, SingleFlightLeader, SingleFlightTicket,
+};
+
 /// The top-level sharded cache: one `Shard` (its own lock, its own slice
 /// of `max_entries`) per configured shard, routed to by `shard_index`.
-///
-/// Read-side operations (`assemble::resolve_from_cache`,
-/// `assemble::assemble_response`) are built in this section
-/// (section-06). Section-07 adds `impl DomainDnsCache for
-/// ShardedDnsCache` (wrapping those plus `store_response`) and the
-/// call-site wiring that actually constructs and uses one of these.
-#[allow(dead_code)]
 pub struct ShardedDnsCache {
     shards: Vec<Shard>,
 }
@@ -45,7 +48,6 @@ impl ShardedDnsCache {
     /// `config.max_entries` across them via `config.shard_capacity` (the
     /// exact remainder-distributed formula from section-01 — not
     /// recomputed here).
-    #[allow(dead_code)]
     pub fn new(config: &crate::config::CacheConfig) -> Self {
         let shard_count = config.resolved_shard_count();
         let shards = (0..shard_count)
@@ -54,14 +56,119 @@ impl ShardedDnsCache {
         Self { shards }
     }
 
+    /// The number of shards this cache was built with — exposed so
+    /// callers (`ResolveQuery`'s construction, section-07) can build a
+    /// `ShardedSingleFlight` with a matching shard count, keeping "shard
+    /// N" meaning the same domain-routing bucket in both structures.
+    pub fn shard_count(&self) -> usize {
+        self.shards.len()
+    }
+
     /// Routes to the one shard responsible for `domain`, via `shard_index`.
-    /// Kept private/crate-visible: external callers (section-07's trait
-    /// impl, tests) go through `assemble::resolve_from_cache`, except
-    /// where a section-06 test needs to reach into a specific shard to set
-    /// up fixture state directly.
-    #[allow(dead_code)]
+    /// Kept private/crate-visible: external callers (the `DomainDnsCache`
+    /// impl below, tests) go through `assemble::resolve_from_cache` or the
+    /// trait methods, except where a section-06 test needs to reach into a
+    /// specific shard to set up fixture state directly.
     fn shard_for(&self, domain: &str) -> &Shard {
         &self.shards[shard_index(domain, self.shards.len())]
+    }
+}
+
+/// One backend response, decomposed into what the sharded cache actually
+/// stores: an `RRsetEntry` per `(name, qtype, qclass)` that was actually
+/// present in the answer (every CNAME hop's own RRset included), plus, if
+/// the terminal result was negative, a single `NegativeEntry` for that
+/// terminal name.
+///
+/// `negative`'s `NegativeKey` is not part of the plan's literal listing
+/// (which only lists `(String, NegativeEntry)`) — added because the key's
+/// `qtype: Option<u16>` (whole-name NXDOMAIN vs. NODATA-for-a-specific-type)
+/// can't be derived from `NegativeEntry` alone; the caller building this
+/// struct (`resolver::mod`'s store-decomposition logic, which already
+/// knows the original query's qtype) supplies it directly instead.
+#[derive(Debug, Clone)]
+pub struct DecomposedResponse {
+    pub positive: Vec<(String, u16, u16, RRsetEntry)>,
+    pub negative: Option<(String, NegativeKey, NegativeEntry)>,
+}
+
+/// Trait boundary between `resolver::mod`'s call sites and the concrete
+/// cache implementation — replaces the old flat `DnsCache` trait
+/// (`lookup`/`store` keyed on a flat `CacheKey`). Implemented by
+/// `ShardedDnsCache` (below) and `NoopDnsCache` (`resolver::mod`, unchanged
+/// name, new trait).
+pub trait DomainDnsCache: Send + Sync {
+    /// Chain-aware lookup — replaces the old flat `lookup`. Internally
+    /// calls `resolve_from_cache` (section-06).
+    ///
+    /// `max_chain_depth` is not in the plan's literal listed trait
+    /// signature — added for the same reason `resolve_from_cache` itself
+    /// needs it (section-06's documented deviation): the depth bound
+    /// (`RecursiveResolverConfig.max_cname_restarts`) isn't reachable from
+    /// this trait's other inputs, so callers thread it through explicitly.
+    fn lookup_chain(
+        &self,
+        qname: &str,
+        qtype: u16,
+        qclass: u16,
+        namespace: &str,
+        max_chain_depth: u8,
+        now: SystemTime,
+    ) -> ChainLookup;
+
+    /// Replaces the old flat `store` — called once per backend response,
+    /// storing the already-decomposed `RRsetEntry`/`NegativeEntry` values.
+    fn store_response(&self, decomposed: DecomposedResponse, namespace: &str);
+
+    /// Runs the section-05 sweep; called from the reload path.
+    fn sweep_stale_namespace(&self, current_namespace: &str);
+
+    /// Approximate (sum-across-shards, no single lock) domain count, for
+    /// the `OpenTelemetryMetrics` gauges.
+    fn domain_count(&self) -> usize;
+
+    fn capacity(&self) -> usize;
+}
+
+impl DomainDnsCache for ShardedDnsCache {
+    fn lookup_chain(
+        &self,
+        qname: &str,
+        qtype: u16,
+        qclass: u16,
+        namespace: &str,
+        max_chain_depth: u8,
+        now: SystemTime,
+    ) -> ChainLookup {
+        assemble::resolve_from_cache(self, qname, qtype, qclass, namespace, max_chain_depth, now)
+    }
+
+    fn store_response(&self, decomposed: DecomposedResponse, namespace: &str) {
+        // Stamps the current namespace onto every entry at store time
+        // (rather than trusting the caller's `DecomposedResponse` to have
+        // already set it correctly) so there is exactly one place that
+        // decides what namespace a freshly-stored entry belongs to.
+        for (name, qtype, qclass, mut entry) in decomposed.positive {
+            entry.cache_namespace = namespace.to_string();
+            self.shard_for(&name)
+                .store_positive(&name, (qtype, qclass), entry);
+        }
+        if let Some((name, key, mut entry)) = decomposed.negative {
+            entry.cache_namespace = namespace.to_string();
+            self.shard_for(&name).store_negative(&name, key, entry);
+        }
+    }
+
+    fn sweep_stale_namespace(&self, current_namespace: &str) {
+        namespace::sweep_stale_namespace(&self.shards, current_namespace);
+    }
+
+    fn domain_count(&self) -> usize {
+        self.shards.iter().map(Shard::domain_count).sum()
+    }
+
+    fn capacity(&self) -> usize {
+        self.shards.iter().map(Shard::capacity).sum()
     }
 }
 

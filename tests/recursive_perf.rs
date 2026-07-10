@@ -16,14 +16,14 @@ use std::net::{IpAddr, Ipv4Addr};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
 
-use rdns::config::{RecursiveResolutionConfig, ResolutionConfig, RuntimeConfig};
+use rdns::config::{CacheConfig, RecursiveResolutionConfig, ResolutionConfig, RuntimeConfig};
 use rdns::delivery::upstream::RecursiveAuthorityTransportClient;
 use rdns::protocol::Message;
 use rdns::resolver::{
-    BasicResponseFactory, CacheTtlPolicy, Clock, InMemoryDnsCache, MetricsSink,
-    QueryEventRecordResult, QueryEventSink, QueryEventV1, RecursiveResolutionBackend,
-    RecursiveResolverConfig, RecursiveRootHint, ResolveDecisionKind, ResolveQuery, ResolveRequest,
-    ResolverMetric, StandardProtocolCodec,
+    BasicResponseFactory, CacheTtlPolicy, Clock, MetricsSink, QueryEventRecordResult,
+    QueryEventSink, QueryEventV1, RecursiveResolutionBackend, RecursiveResolverConfig,
+    RecursiveRootHint, ResolveDecisionKind, ResolveQuery, ResolveRequest, ResolverMetric,
+    ShardedDnsCache, StandardProtocolCodec,
 };
 
 struct SystemClock;
@@ -141,7 +141,10 @@ fn resolver_without_cache(config: &RuntimeConfig) -> ResolveQuery {
 fn resolver_with_cache(config: &RuntimeConfig) -> ResolveQuery {
     ResolveQuery::with_cache(
         Arc::new(StandardProtocolCodec::new(config.max_udp_payload_size)),
-        Arc::new(InMemoryDnsCache::new(256)),
+        Arc::new(ShardedDnsCache::new(&CacheConfig {
+            max_entries: 256,
+            shard_count: None,
+        })),
         CacheTtlPolicy::default(),
         recursive_backend(config),
         Arc::new(BasicResponseFactory),
@@ -464,6 +467,20 @@ async fn run_benchmark_fully_cold(config: &RuntimeConfig, title: &str, edns_payl
     }
 
     print_benchmark_tables(&detail_rows, &summaries);
+}
+
+/// Not network-dependent (unlike the benchmarks below, which need live
+/// root/TLD access): `resolver_with_cache` only constructs a
+/// `ShardedDnsCache` and wires it into a `ResolveQuery`, no I/O. Exists
+/// specifically so a future change to `ResolveQuery::with_cache`'s cache
+/// parameter type breaks a fast, always-run test here, not just the
+/// ignored benchmarks — "the missed call site" this test helper was
+/// flagged as in an earlier review is easy to forget precisely because
+/// the benchmarks that use it are `#[ignore]`d by default.
+#[test]
+fn recursive_perf_bench_constructs_sharded_cache() {
+    let config = recursive_runtime_config();
+    let _resolver = resolver_with_cache(&config);
 }
 
 #[tokio::test]

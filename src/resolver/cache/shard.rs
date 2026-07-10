@@ -131,6 +131,10 @@ impl Shard {
         }
     }
 
+    pub(crate) fn capacity(&self) -> usize {
+        self.capacity
+    }
+
     /// Stores one positive RRset for `domain` under `(qtype, qclass)`,
     /// evicting the least-recently-touched domain first if this is a new
     /// domain and the shard is already at capacity. A no-op if

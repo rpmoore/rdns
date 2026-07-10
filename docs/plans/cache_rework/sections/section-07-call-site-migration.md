@@ -777,3 +777,68 @@ in the same file are currently broken:
   `publish_reload`, not once per request — the whole point of the
   explicit-sweep design (plan §5) is that it is a bounded, reload-triggered
   cost, not a per-lookup one.
+
+## Implementation notes (actual vs. planned)
+
+- **Scope decision — user override on test-compile state**: the plan
+  explicitly allows `cargo test` to not compile on `mod.rs` until
+  section-08 lands. Since `cargo test` compiles the whole crate at once, a
+  broken ~8500-line test module would have blocked every test in the
+  workspace, not just cache ones — diverging from every prior section's
+  green-before-commit discipline. Asked the user; they chose to get
+  everything compiling and passing now rather than defer to section-08.
+  This substantially widened this section's actual scope beyond the
+  plan's literal "wide, shallow, mechanical" framing.
+- **`InMemoryDnsCache` deleted, not left in place**: the plan calls it "out
+  of scope to delete in this section," but that's incompatible with also
+  retiring `CacheKey`/`CacheLookup`/`CachedResponse`/`CacheStore` (which
+  `InMemoryDnsCache`'s own `impl DnsCache` block directly depended on) plus
+  the user's compile-and-pass-everything override — deleted its struct,
+  state, entry type, all inherent methods, and its trait impl entirely.
+  Roughly a dozen tests that directly exercised its internals (LRU
+  eviction mechanics, the old flat `CacheKey`'s equality/hashing
+  semantics) or the old `SingleFlightMisses` directly were deleted rather
+  than ported, each with a comment pointing at the section (03/04) whose
+  own test suite already covers the equivalent behavior against the new
+  types — code-review spot-checked this claim and confirmed it.
+- **`DomainDnsCache::lookup_chain` takes an explicit `max_chain_depth: u8`**,
+  not in the plan's literal trait listing — same reasoning as section-06's
+  own `resolve_from_cache` deviation (the depth bound isn't reachable from
+  the trait's other inputs).
+- **`DecomposedResponse.negative` carries an explicit `NegativeKey`**, not
+  just `(String, NegativeEntry)` as literally listed — the key's
+  `qtype: Option<u16>` can't be derived from `NegativeEntry` alone; the
+  caller (already computing it from the original query's qtype) supplies
+  it directly.
+- **`ResolveQuery.max_chain_depth`/`miss_coalescer`'s shard count are
+  post-construction builder methods** (`with_max_chain_depth`,
+  `with_single_flight_shard_count`), not new parameters threaded through
+  all 8 `with_cache*` constructors — deliberately avoids a much wider
+  signature-change blast radius across dozens of call sites. Both default
+  to sane, config-independent fallbacks (`DEFAULT_MAX_CHAIN_DEPTH = 8`;
+  `CacheConfig::default().resolved_shard_count()`) so every pre-existing
+  constructor call site that never calls the builder methods still works.
+- **`ResolverMetric::CacheExpired`/`CacheUnavailable` are no longer
+  emitted** — an accepted, architecture-driven behavior change, not an
+  oversight. `resolve_from_cache` (section-06) folds an expired or
+  stale-namespace match into `Miss` before ever returning it, and the new
+  in-process cache has no failure mode that could produce "unavailable."
+- **Code review caught and fixed one real bug**:
+  `decompose_response_for_store` initially re-derived "is this hop a
+  satisfying positive answer" via its own predicate, independent of
+  `CacheTtlPolicy::ttl_for_response`'s classification of the same
+  response — the two disagree for a directly-queried CDS/CDNSKEY/32769
+  record (rare DNSSEC-metadata qtypes), where `ttl_for_response` correctly
+  classifies the response as negative but the independent predicate would
+  still match the record and store it as a positive answer, discarding
+  the already-computed negative metadata. Fixed to trust
+  `ttl_for_response`'s classification outright rather than re-deriving it;
+  added a regression test using a hand-built CDS response.
+- **Tests**: all tests from the plan's list implemented, including the
+  `src/config/mod.rs` TOML round-trip test and
+  `open_telemetry_cache_gauges_report_approximate_domain_count`
+  (main.rs) and `recursive_perf_bench_constructs_sharded_cache`
+  (tests/recursive_perf.rs) — all three were missing after the initial
+  implementation pass and added during code review. Final full-workspace
+  count: 449 lib + 19 bin + 8 forwarding + 1 recursive_perf tests passing
+  (up from 446 at the end of section-06).

@@ -41,7 +41,7 @@ const CNAME_RECORD_TYPE: u16 = 5;
 /// the original qtype — or, if qtype == CNAME itself, exactly one hop (the
 /// CNAME's own entry, no further walking past it).
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct ResolvedAnswer {
+pub struct ResolvedAnswer {
     pub(crate) chain: Vec<(String, RRsetEntry)>, // (owner name, entry), in walk order
 }
 
@@ -58,14 +58,14 @@ pub(crate) struct ResolvedAnswer {
 /// `assemble_negative_response` needs this to know what name to write the
 /// authority-section SOA (and any proof records) under.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct ResolvedNegative {
+pub struct ResolvedNegative {
     pub(crate) chain: Vec<(String, RRsetEntry)>,
     pub(crate) terminal_name: String,
     pub(crate) negative: NegativeEntry,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum ChainLookup {
+pub enum ChainLookup {
     /// Every name in the chain was found, unexpired, in the current
     /// namespace.
     Answered(ResolvedAnswer),
