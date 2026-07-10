@@ -15,8 +15,8 @@
 //! Sharded replacement for today's single-global-mutex
 //! `SingleFlightMisses` (`src/resolver/mod.rs:3826-3931`). Ported
 //! unchanged in leader/follower/notify behavior; only the key type
-//! (`CacheKey` -> `(String, u16, u16)`, i.e. normalized name + qtype +
-//! qclass) and the single-map-becomes-many-per-shard-maps shape change.
+//! (`CacheKey` -> `MissKey`, i.e. normalized name + qtype + qclass + cache
+//! namespace) and the single-map-becomes-many-per-shard-maps shape change.
 //!
 //! No non-test callers yet (section-07 rewires `probe_cache`/
 //! `resolve_coalesced_*` to use this instead of the old
@@ -34,6 +34,19 @@ use crate::resolver::{ResolutionBackendError, ResolutionResponse};
 
 use super::shard_index;
 
+/// Miss-coalescing key: normalized qname, qtype, qclass, and cache
+/// namespace (`BackendSnapshot.cache_namespace`, defaulted to `""` by
+/// callers that have no snapshot namespace). The namespace **must** be
+/// part of this key, not just `(qname, qtype, qclass)`: cache lookup/store
+/// is namespace-scoped (`DomainDnsCache::lookup_chain`/`store_response`),
+/// so a request that misses under namespace N1 and one that misses under
+/// namespace N2 for the same name/type/class are answering fundamentally
+/// different questions (different backend/upstream generation) and must
+/// never coalesce onto the same in-flight backend call — otherwise a
+/// request arriving just after a reload (new namespace) could be served a
+/// stale-generation response resolved before the reload even started.
+pub(crate) type MissKey = (String, u16, u16, String);
+
 /// Sharded replacement for today's single-mutex `SingleFlightMisses`.
 /// Shard count and routing must match the cache's own sharding so that,
 /// in principle, in-flight-miss bookkeeping for a domain and its cached
@@ -48,12 +61,12 @@ pub(crate) struct ShardedSingleFlight {
 
 #[derive(Default)]
 struct SingleFlightShard {
-    flights: Mutex<HashMap<(String, u16, u16), Arc<InFlightMiss>>>,
+    flights: Mutex<HashMap<MissKey, Arc<InFlightMiss>>>,
 }
 
 pub(crate) enum SingleFlightTicket {
     Leader {
-        key: (String, u16, u16),
+        key: MissKey,
         flight: Arc<InFlightMiss>,
     },
     Follower {
@@ -68,7 +81,7 @@ pub(crate) struct InFlightMiss {
 
 pub(crate) struct SingleFlightLeader {
     coalescer: Arc<ShardedSingleFlight>,
-    key: (String, u16, u16),
+    key: MissKey,
     flight: Arc<InFlightMiss>,
     completed: bool,
 }
@@ -90,8 +103,11 @@ impl ShardedSingleFlight {
     }
 
     /// Routes to the shard for `key.0` (the normalized domain name) and
-    /// delegates to that shard's `begin`.
-    pub(crate) fn begin(&self, key: (String, u16, u16)) -> SingleFlightTicket {
+    /// delegates to that shard's `begin`. Sharding is still purely by
+    /// domain — only the *comparison* used to decide leader-vs-follower
+    /// within that shard's map (the full `MissKey`, namespace included)
+    /// changes.
+    pub(crate) fn begin(&self, key: MissKey) -> SingleFlightTicket {
         self.shard_for(&key.0).begin(key)
     }
 
@@ -99,7 +115,7 @@ impl ShardedSingleFlight {
     /// `complete`/`Drop` path.
     fn finish(
         &self,
-        key: &(String, u16, u16),
+        key: &MissKey,
         flight: &Arc<InFlightMiss>,
         result: Result<ResolutionResponse, ResolutionBackendError>,
     ) {
@@ -108,7 +124,7 @@ impl ShardedSingleFlight {
 }
 
 impl SingleFlightShard {
-    fn begin(&self, key: (String, u16, u16)) -> SingleFlightTicket {
+    fn begin(&self, key: MissKey) -> SingleFlightTicket {
         let mut flights = self.flights.lock().unwrap();
         if let Some(flight) = flights.get(&key) {
             return SingleFlightTicket::Follower {
@@ -125,7 +141,7 @@ impl SingleFlightShard {
 
     fn finish(
         &self,
-        key: &(String, u16, u16),
+        key: &MissKey,
         flight: &Arc<InFlightMiss>,
         result: Result<ResolutionResponse, ResolutionBackendError>,
     ) {
@@ -146,7 +162,7 @@ impl SingleFlightShard {
 impl SingleFlightLeader {
     pub(crate) fn new(
         coalescer: Arc<ShardedSingleFlight>,
-        key: (String, u16, u16),
+        key: MissKey,
         flight: Arc<InFlightMiss>,
     ) -> Self {
         Self {
@@ -197,8 +213,8 @@ mod tests {
     use crate::resolver::{BackendProvenance, ResolutionCacheDirective, SourceCredibility};
     use std::time::{Duration, SystemTime};
 
-    fn key(name: &str) -> (String, u16, u16) {
-        (name.to_string(), 1, 1) // A, IN
+    fn key(name: &str) -> MissKey {
+        (name.to_string(), 1, 1, "ns-1".to_string()) // A, IN, namespace "ns-1"
     }
 
     fn sample_response(marker: &str) -> ResolutionResponse {
@@ -289,6 +305,59 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn single_flight_does_not_coalesce_across_cache_namespaces() {
+        // Regression test for the cross-namespace miss-coalescing bug: a
+        // leader begins a flight for (name, qtype, qclass) under namespace
+        // N1 (simulating a request that missed just before a reload
+        // published a new backend generation). A second request for the
+        // exact same (name, qtype, qclass) arriving under namespace N2
+        // (simulating a request that observed the post-reload snapshot)
+        // must NOT attach as a follower to the still-in-flight N1 leader —
+        // it must become its own leader, so it resolves against the
+        // current backend generation rather than being served N1's stale
+        // result.
+        let coalescer = Arc::new(ShardedSingleFlight::new(4));
+        let name = "example.com".to_string();
+        let key_n1 = (name.clone(), 1u16, 1u16, "ns-1".to_string());
+        let key_n2 = (name, 1u16, 1u16, "ns-2".to_string());
+
+        let SingleFlightTicket::Leader {
+            key: leader_key_n1,
+            flight: leader_flight_n1,
+        } = coalescer.begin(key_n1.clone())
+        else {
+            panic!("expected Leader for the first begin() under ns-1");
+        };
+
+        // A request for the same name/qtype/qclass, but under the new
+        // namespace, must get its own Leader ticket, not a Follower one.
+        match coalescer.begin(key_n2.clone()) {
+            SingleFlightTicket::Leader { key, .. } => assert_eq!(key, key_n2),
+            SingleFlightTicket::Follower { .. } => panic!(
+                "a request under a different cache namespace must not coalesce onto \
+                 another namespace's in-flight leader"
+            ),
+        }
+
+        // The ns-1 leader completing must not affect ns-2's independent
+        // flight: a fresh begin() under ns-1 (after the leader finishes)
+        // gets a new Leader, and ns-2's flight is untouched.
+        let leader_n1 = SingleFlightLeader::new(
+            Arc::clone(&coalescer),
+            leader_key_n1,
+            Arc::clone(&leader_flight_n1),
+        );
+        leader_n1.complete(Ok(sample_response("ns-1-result")));
+
+        match coalescer.begin(key_n1) {
+            SingleFlightTicket::Leader { .. } => {}
+            SingleFlightTicket::Follower { .. } => {
+                panic!("ns-1's flight must have been cleared by the leader's completion")
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn single_flight_leader_drop_wakes_followers_and_clears_key() {
         let coalescer = Arc::new(ShardedSingleFlight::new(4));
         let shared_key = key("cancelled.example.com");
@@ -353,7 +422,7 @@ mod tests {
 
         // Domain B's begin() on a different shard must proceed without
         // blocking on shard A's held lock.
-        let key_b = (domain_b, 1u16, 1u16);
+        let key_b = (domain_b, 1u16, 1u16, "ns-1".to_string());
         let outcome =
             tokio::time::timeout(Duration::from_millis(100), async { coalescer.begin(key_b) })
                 .await;

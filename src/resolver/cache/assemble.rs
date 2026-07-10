@@ -51,12 +51,19 @@ pub struct ResolvedAnswer {
 ///
 /// `terminal_name` is the name the negative entry was actually found
 /// under (the original qname if `chain` is empty, otherwise the last
-/// hop's CNAME target) — not part of the plan's literal `ResolvedNegative`
-/// listing, but required: `NegativeEntry` has no owner-name field of its
-/// own (consistent with `RRsetEntry`, whose owner name likewise comes
-/// from the chain tuple rather than the entry itself), so
-/// `assemble_negative_response` needs this to know what name to write the
-/// authority-section SOA (and any proof records) under.
+/// hop's CNAME target) — the *covered* name, which is not necessarily the
+/// SOA zone apex. Not part of the plan's literal `ResolvedNegative`
+/// listing, but kept for parity with `ResolvedAnswer`'s chain (whose
+/// per-hop owner names are always explicit) and for tests/diagnostics that
+/// want to know what name a negative result covers.
+///
+/// This field is *not* used for the authority-section SOA owner — that
+/// must be `negative.soa_owner` (the zone apex), which can differ from
+/// this covered name whenever the NXDOMAIN/NODATA is below the zone apex
+/// (e.g. covered name `nx.sub.example.com`, SOA owner `example.com`); see
+/// `NegativeEntry::soa_owner`'s doc comment and `write_negative_authority`'s
+/// call site below. Using `terminal_name` for the SOA owner was the bug
+/// this field split fixed.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ResolvedNegative {
     pub(crate) chain: Vec<(String, RRsetEntry)>,
@@ -496,7 +503,7 @@ pub(crate) fn assemble_negative_response(
     write_negative_authority(
         &mut response,
         &mut compressor,
-        &resolved.terminal_name,
+        &resolved.negative.soa_owner,
         &resolved.negative,
         dnssec_ok,
         now,
@@ -811,8 +818,19 @@ mod tests {
         soa_rrsig: Option<StoredRecord>,
         proof_records: Vec<StoredRecord>,
     ) -> NegativeEntry {
+        negative_entry_with_owner(now, ttl, soa_rrsig, proof_records, "example.com")
+    }
+
+    fn negative_entry_with_owner(
+        now: SystemTime,
+        ttl: u32,
+        soa_rrsig: Option<StoredRecord>,
+        proof_records: Vec<StoredRecord>,
+        soa_owner: &str,
+    ) -> NegativeEntry {
         NegativeEntry {
             kind: NegativeCacheKind::NxDomain,
+            soa_owner: soa_owner.to_string(),
             soa_record: soa_record(ttl),
             soa_rrsig,
             proof_records,
@@ -862,6 +880,49 @@ mod tests {
         assert_eq!(
             Message::parse(&nodata_response).unwrap().header.r_code(),
             ResponseCode::NoError as u8
+        );
+    }
+
+    // Regression test for the negative-cache SOA-owner bug: the SOA in the
+    // authority section must be written under the zone apex
+    // (`negative.soa_owner`), not under the covered/queried name
+    // (`resolved.terminal_name`). These differ whenever the NXDOMAIN is
+    // below the zone apex — e.g. querying `nx.sub.example.com`, covered by
+    // a SOA owned by `example.com`.
+    #[test]
+    fn assemble_negative_response_writes_soa_under_zone_apex_not_covered_name() {
+        let now = SystemTime::now();
+        let covered_name = "nx.sub.example.com";
+        let soa_owner = "example.com";
+        let negative = negative_entry_with_owner(now, 3600, None, Vec::new(), soa_owner);
+        let resolved = ResolvedNegative {
+            chain: Vec::new(),
+            terminal_name: covered_name.to_string(),
+            negative,
+        };
+        let wire = question_wire(covered_name, A_QTYPE, IN_QCLASS);
+
+        let response = assemble_negative_response(
+            1,
+            &wire,
+            &features(false),
+            &resolved,
+            ResponseCode::NxDomain,
+            now,
+            false,
+            4096,
+        );
+        let parsed = Message::parse(&response).unwrap();
+
+        assert_eq!(parsed.authorities.len(), 1);
+        assert_eq!(parsed.authorities[0].rtype, 6); // SOA
+        assert_eq!(
+            parsed.authorities[0].name, soa_owner,
+            "authority-section SOA must be owned by the zone apex, not the covered name"
+        );
+        assert_ne!(
+            parsed.authorities[0].name, covered_name,
+            "SOA owner must not be the covered/queried name when it differs from the zone apex"
         );
     }
 
@@ -1127,6 +1188,7 @@ mod tests {
 
         let negative = NegativeEntry {
             kind: NegativeCacheKind::NxDomain,
+            soa_owner: "example.com".to_string(),
             soa_record: StoredRecord {
                 rtype: 6,
                 rclass: IN_QCLASS,

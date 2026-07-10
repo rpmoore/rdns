@@ -38,8 +38,8 @@ use crate::protocol::{
 
 mod cache;
 use cache::{
-    ChainLookup, InFlightMiss, ShardedSingleFlight, SingleFlightLeader, SingleFlightTicket,
-    assemble_negative_response, assemble_response,
+    ChainLookup, InFlightMiss, MissKey, ShardedSingleFlight, SingleFlightLeader,
+    SingleFlightTicket, assemble_negative_response, assemble_response,
 };
 // `DecomposedResponse`/`RRsetEntry`/`StoredRecord`/`NegativeKey`/`NegativeEntry`
 // are re-exported (not just used privately) so external test crates — see
@@ -914,6 +914,7 @@ fn build_negative_entry(
         .expect("negative_ttl already located a matching SOA record for this response");
     NegativeEntry {
         kind: metadata.kind,
+        soa_owner: metadata.soa_owner.clone(),
         soa_record,
         soa_rrsig: None,
         proof_records: Vec::new(),
@@ -2709,10 +2710,14 @@ pub struct ResolveOutcome {
 struct CacheProbe {
     /// Replaces the old flat `CacheKey` as the identifier threaded through
     /// to `resolve_coalesced_miss`/the eventual store call: normalized
-    /// name, qtype, qclass — the same tuple `ShardedSingleFlight` (section-04)
-    /// already keys on, so no conversion is needed at the single-flight
-    /// call sites.
-    miss_key: Option<(String, u16, u16)>,
+    /// name, qtype, qclass, and cache namespace — the same `MissKey`
+    /// `ShardedSingleFlight` (section-04) already keys on, so no
+    /// conversion is needed at the single-flight call sites. The namespace
+    /// must be part of this key: without it, a request that misses just
+    /// before a reload publishes a new backend generation could coalesce
+    /// with one that misses just after, serving a stale-generation result
+    /// under the new namespace (see `MissKey`'s doc comment).
+    miss_key: Option<MissKey>,
     hit: Option<Vec<u8>>,
     store_allowed: bool,
     event_cache_result: Option<QueryEventCacheResult>,
@@ -2901,22 +2906,40 @@ impl ResolveQuery {
     /// Publishes a new backend snapshot and local DNS entries as a single
     /// atomic reload: no query can observe one field from the new config
     /// paired with the other from the old one. Also runs the section-05
-    /// namespace sweep (once per reload, not once per request) while still
-    /// holding `reload_gate`, so a concurrent reader can't observe the new
-    /// namespace published without the stale-namespace sweep having also
-    /// been triggered.
+    /// namespace sweep (once per reload, not once per request) — but,
+    /// unlike an earlier version of this method, *after* releasing
+    /// `reload_gate`, not while still holding it.
+    ///
+    /// `reload_gate` only needs to cover the atomic swap of `backend` and
+    /// `local_entries`; the sweep is pure cleanup/memory reclamation, not
+    /// something a reader depends on for correctness. A cached entry's own
+    /// `cache_namespace` is checked against the current namespace on every
+    /// lookup (`ChainLookup`/`Shard::lookup_hop`), so a stale-namespace
+    /// entry is already invisible to readers the instant the new snapshot
+    /// is published — the sweep merely reclaims the memory later. Holding
+    /// `reload_gate` (a `std::sync::RwLock`, so a writer blocks every new
+    /// reader) across `sweep_stale_namespace`'s full per-shard scan would
+    /// stall every concurrent `resolve()` call for the duration of the
+    /// sweep, reintroducing exactly the kind of single-lock-serializes-
+    /// everything problem this cache rework was meant to eliminate — just
+    /// moved from the cache's own lock onto `reload_gate`. Running the
+    /// sweep after the guard drops avoids that while keeping the same
+    /// correctness guarantee.
     pub fn publish_reload(&self, snapshot: BackendSnapshot, entries: Arc<dyn LocalDnsEntries>) {
-        let _gate = self
-            .reload_gate
-            .write()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let namespace = snapshot.cache_namespace.clone();
         let status = snapshot.status();
-        if let Some(namespace) = snapshot.cache_namespace.clone() {
+        {
+            let _gate = self
+                .reload_gate
+                .write()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            self.backend.publish(snapshot);
+            self.local_entries.publish(entries);
+            self.metrics.record_backend_status(&status);
+        }
+        if let Some(namespace) = namespace {
             self.cache.sweep_stale_namespace(&namespace);
         }
-        self.backend.publish(snapshot);
-        self.local_entries.publish(entries);
-        self.metrics.record_backend_status(&status);
     }
 
     /// Overrides the default CNAME-chain-walk depth bound
@@ -3299,7 +3322,7 @@ impl ResolveQuery {
         request: &ResolveRequest,
         decoded: &DecodedQuery,
         question: QuestionKey,
-        miss_key: (String, u16, u16),
+        miss_key: MissKey,
         event_cache_result: Option<QueryEventCacheResult>,
     ) -> ResolveOutcome {
         match self.miss_coalescer.begin(miss_key.clone()) {
@@ -3343,9 +3366,9 @@ impl ResolveQuery {
         request: &ResolveRequest,
         decoded: &DecodedQuery,
         question: QuestionKey,
-        miss_key: (String, u16, u16),
+        miss_key: MissKey,
         event_cache_result: Option<QueryEventCacheResult>,
-        key: (String, u16, u16),
+        key: MissKey,
         flight: Arc<InFlightMiss>,
     ) -> ResolveOutcome {
         let guard = SingleFlightLeader::new(Arc::clone(&self.miss_coalescer), key, flight);
@@ -3387,7 +3410,7 @@ impl ResolveQuery {
         request: &ResolveRequest,
         decoded: &DecodedQuery,
         question: QuestionKey,
-        miss_key: (String, u16, u16),
+        miss_key: MissKey,
         event_cache_result: Option<QueryEventCacheResult>,
         flight: Arc<InFlightMiss>,
     ) -> ResolveOutcome {
@@ -3467,7 +3490,7 @@ impl ResolveQuery {
         request: &ResolveRequest,
         decoded: &DecodedQuery,
         question: QuestionKey,
-        miss_key: Option<(String, u16, u16)>,
+        miss_key: Option<MissKey>,
         cache_store_allowed: bool,
         event_cache_result: Option<QueryEventCacheResult>,
     ) -> ResolveOutcome {
@@ -3581,6 +3604,7 @@ impl ResolveQuery {
                 decoded.question.qname.clone(),
                 decoded.question.qtype,
                 decoded.question.qclass,
+                namespace,
             )),
             hit,
             store_allowed,
@@ -3692,7 +3716,7 @@ impl ResolveQuery {
         request: &ResolveRequest,
         decoded: &DecodedQuery,
         backend_snapshot: &BackendSnapshot,
-        miss_key: &(String, u16, u16),
+        miss_key: &MissKey,
     ) -> Option<Vec<u8>> {
         let namespace = backend_snapshot.cache_namespace.clone().unwrap_or_default();
         let lookup = self.cache.lookup_chain(
@@ -3741,7 +3765,7 @@ impl ResolveQuery {
         request: &ResolveRequest,
         decoded: &DecodedQuery,
         question: QuestionKey,
-        miss_key: Option<(String, u16, u16)>,
+        miss_key: Option<MissKey>,
         cache_store_allowed: bool,
         event_cache_result: Option<QueryEventCacheResult>,
         backend_result: Result<ResolutionResponse, ResolutionBackendError>,
@@ -3776,7 +3800,7 @@ impl ResolveQuery {
         request: &ResolveRequest,
         decoded: &DecodedQuery,
         question: QuestionKey,
-        miss_key: Option<(String, u16, u16)>,
+        miss_key: Option<MissKey>,
         cache_store_allowed: bool,
         backend_mode: ResolutionMode,
         cache_namespace: Option<String>,
@@ -12710,6 +12734,115 @@ mod tests {
             })
         );
         assert_eq!(upstream.requests.lock().unwrap().len(), 0);
+    }
+
+    /// Test-only cache whose `sweep_stale_namespace` blocks for a
+    /// controllable duration, standing in for a large real namespace
+    /// sweep. Used by
+    /// `publish_reload_does_not_block_concurrent_resolve_during_namespace_sweep`
+    /// below to deterministically prove `resolve()` isn't blocked behind
+    /// the sweep, without needing to seed thousands of real cache entries
+    /// (whose scan time would be too fast, and too dependent on machine
+    /// speed, to assert on reliably in CI).
+    struct SlowSweepCache {
+        sweep_delay: Duration,
+    }
+
+    impl DomainDnsCache for SlowSweepCache {
+        fn lookup_chain(
+            &self,
+            _qname: &str,
+            _qtype: u16,
+            _qclass: u16,
+            _namespace: &str,
+            _max_chain_depth: u8,
+            _now: SystemTime,
+        ) -> ChainLookup {
+            ChainLookup::Miss
+        }
+
+        fn store_response(&self, _decomposed: DecomposedResponse, _namespace: &str) {}
+
+        fn sweep_stale_namespace(&self, _current_namespace: &str) {
+            std::thread::sleep(self.sweep_delay);
+        }
+
+        fn domain_count(&self) -> usize {
+            0
+        }
+
+        fn capacity(&self) -> usize {
+            0
+        }
+    }
+
+    // Regression test for the bug where `publish_reload` held `reload_gate`
+    // (a `std::sync::RwLock`, so a writer blocks every new reader) across
+    // the full namespace sweep, stalling every concurrent `resolve()` call
+    // for the sweep's duration. Needs a real second OS thread for the same
+    // reason `publish_reload_blocks_concurrent_query_until_both_fields_are_swapped`
+    // does: `publish_reload` is a blocking (non-async-aware) call.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 3)]
+    async fn publish_reload_does_not_block_concurrent_resolve_during_namespace_sweep() {
+        let upstream = Arc::new(StaticUpstream::new(Ok(upstream_response(
+            a_response_with_answer(0xabcd, "host.example", 60),
+        ))));
+        let cache = Arc::new(SlowSweepCache {
+            sweep_delay: Duration::from_millis(250),
+        });
+        let events = Arc::new(RecordingEvents::default());
+        let service = Arc::new(ResolveQuery::with_cache_and_policy(
+            Arc::new(StandardProtocolCodec::new(1232)),
+            cache,
+            Arc::new(NoopPolicyEvaluator),
+            Arc::new(NoopLocalDnsEntries),
+            CacheTtlPolicy::default(),
+            upstream.clone(),
+            Arc::new(BasicResponseFactory),
+            Arc::new(FixedClock(SystemTime::UNIX_EPOCH)),
+            events.clone(),
+            Arc::new(RecordingMetrics::default()),
+        ));
+
+        // `BackendSnapshot::forwarding` always sets a real `cache_namespace`,
+        // so this reload actually triggers the (slow) sweep.
+        let new_backend = BackendSnapshot::forwarding(upstream.clone(), 7);
+        let reload_service = Arc::clone(&service);
+        let reload_task = tokio::spawn(async move {
+            reload_service.publish_reload(new_backend, Arc::new(NoopLocalDnsEntries));
+        });
+
+        // Give the reload task time to acquire+release `reload_gate` and
+        // enter the slow sweep before starting the concurrent resolve.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(
+            !reload_task.is_finished(),
+            "the reload should still be inside its 250ms sweep at this point"
+        );
+
+        let resolve_started = Instant::now();
+        let outcome = service
+            .resolve(ResolveRequest::new(
+                "192.0.2.10".parse().unwrap(),
+                SystemTime::UNIX_EPOCH,
+                a_query(0x2222, "host.example"),
+            ))
+            .await;
+        let resolve_elapsed = resolve_started.elapsed();
+
+        assert_eq!(outcome.decision.kind, ResolveDecisionKind::Allowed);
+        assert!(
+            resolve_elapsed < Duration::from_millis(150),
+            "resolve() must not be blocked behind publish_reload's namespace sweep \
+             (reload_gate must be released before the sweep runs); took {resolve_elapsed:?}"
+        );
+        assert!(
+            !reload_task.is_finished(),
+            "resolve() finishing quickly must not itself be evidence the sweep already \
+             finished — the sweep (250ms sleep) should still be running"
+        );
+
+        reload_task.await.unwrap();
     }
 
     #[tokio::test]

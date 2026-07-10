@@ -34,7 +34,7 @@ pub(crate) use assemble::{
 };
 pub use entry::{NegativeEntry, NegativeKey, RRsetEntry, StoredRecord};
 pub(crate) use singleflight::{
-    InFlightMiss, ShardedSingleFlight, SingleFlightLeader, SingleFlightTicket,
+    InFlightMiss, MissKey, ShardedSingleFlight, SingleFlightLeader, SingleFlightTicket,
 };
 
 /// The top-level sharded cache: one `Shard` (its own lock, its own slice

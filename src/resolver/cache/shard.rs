@@ -417,6 +417,7 @@ mod tests {
         let now = SystemTime::now();
         NegativeEntry {
             kind: NegativeCacheKind::NxDomain,
+            soa_owner: "example.com".to_string(),
             soa_record: stored_record(),
             soa_rrsig: None,
             proof_records: Vec::new(),

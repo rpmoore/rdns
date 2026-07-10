@@ -107,16 +107,26 @@ pub struct NegativeKey {
 /// One negative-cache result (NXDOMAIN or NODATA) for a domain, keyed by
 /// `NegativeKey` inside `DomainNegativeEntries`. Unlike today's
 /// `NegativeCacheMetadata`, this stores the full covering SOA record so a
-/// servable authority section can be rebuilt from `soa_record` alone.
+/// servable authority section can be rebuilt from `soa_record` alone —
+/// except for the owner name, which `soa_record` (a bare `StoredRecord`)
+/// has no field for, hence `soa_owner` below.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NegativeEntry {
     pub(crate) kind: NegativeCacheKind, // reuse existing enum: NxDomain | NoData
-    /// The covering SOA record itself (owner, RDATA, TTL) — needed to
-    /// rebuild the authority section of a servable negative response, not
-    /// just to derive negative TTL. `soa_owner`/`soa_minimum_ttl` as
-    /// separate scalar fields (today's `NegativeCacheMetadata` shape) are
-    /// redundant once the full record is stored; derive them from this
-    /// instead of duplicating.
+    /// The owner name of the covering SOA record (the zone apex, e.g.
+    /// `example.com`) — distinct from the name this entry is stored/looked
+    /// up under (the *covered* name, e.g. `nx.sub.example.com`, whenever
+    /// the NXDOMAIN/NODATA is below the zone apex). The authority-section
+    /// SOA in a servable negative response must be written under this
+    /// name, not the covered name — using the covered name here was the
+    /// bug this field fixes (see `assemble::write_negative_authority`'s
+    /// call site).
+    pub(crate) soa_owner: String,
+    /// The covering SOA record itself (RDATA, TTL) — needed to rebuild the
+    /// authority section of a servable negative response, not just to
+    /// derive negative TTL. `soa_minimum_ttl` (today's
+    /// `NegativeCacheMetadata` shape) is not duplicated here since it's
+    /// derivable from `soa_record` alone.
     pub(crate) soa_record: StoredRecord,
     /// RRSIG covering `soa_record`, if DNSSEC data was fetched. None until
     /// real validation exists (mirrors `DnssecState::Unvalidated` on the
@@ -224,6 +234,7 @@ mod tests {
         };
         let entry = NegativeEntry {
             kind: NegativeCacheKind::NxDomain,
+            soa_owner: "example.com".to_string(),
             soa_record: soa_record.clone(),
             soa_rrsig: None,
             proof_records: Vec::new(),
@@ -255,6 +266,7 @@ mod tests {
         let soa_record = stored_record(3600);
         let negative_entry = |kind: NegativeCacheKind| NegativeEntry {
             kind,
+            soa_owner: "example.com".to_string(),
             soa_record: soa_record.clone(),
             soa_rrsig: None,
             proof_records: Vec::new(),
@@ -298,6 +310,7 @@ mod tests {
         let now = SystemTime::now();
         let entry = NegativeEntry {
             kind: NegativeCacheKind::NxDomain,
+            soa_owner: "example.com".to_string(),
             soa_record: stored_record(3600),
             soa_rrsig: None,
             proof_records: Vec::new(),
