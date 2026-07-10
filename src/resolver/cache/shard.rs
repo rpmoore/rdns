@@ -161,8 +161,58 @@ impl Shard {
         self.state.lock().unwrap().lru.len()
     }
 
+    /// Removes every positive/negative entry in this shard whose stored
+    /// `cache_namespace` no longer matches `current_namespace`, and drops
+    /// any domain (and its LRU token) left with no entries in either map
+    /// afterward. Takes this shard's lock for the duration of the scan
+    /// only — sweeping one shard never waits on any other shard's lock.
+    /// Returns the total number of entries removed (`cache::namespace`,
+    /// section-05).
+    pub(crate) fn sweep_stale_namespace(&self, current_namespace: &str) -> usize {
+        let mut state = self.state.lock().unwrap();
+        let mut removed = 0usize;
+        let mut emptied_domains: std::collections::HashSet<String> =
+            std::collections::HashSet::new();
+
+        state.positive.domains.retain(|domain, record_sets| {
+            let before = record_sets.record_sets.len();
+            record_sets
+                .record_sets
+                .retain(|_, entry| entry.cache_namespace == current_namespace);
+            removed += before - record_sets.record_sets.len();
+            let keep = !record_sets.record_sets.is_empty();
+            if !keep {
+                emptied_domains.insert(domain.clone());
+            }
+            keep
+        });
+
+        state.negative.domains.retain(|domain, entries| {
+            let before = entries.entries.len();
+            entries
+                .entries
+                .retain(|_, entry| entry.cache_namespace == current_namespace);
+            removed += before - entries.entries.len();
+            let keep = !entries.entries.is_empty();
+            if !keep {
+                emptied_domains.insert(domain.clone());
+            }
+            keep
+        });
+
+        for domain in emptied_domains {
+            if !state.positive.domains.contains_key(&domain)
+                && !state.negative.domains.contains_key(&domain)
+            {
+                state.lru.remove(&domain);
+            }
+        }
+
+        removed
+    }
+
     #[cfg(test)]
-    fn contains_positive(&self, domain: &str, key: (u16, u16)) -> bool {
+    pub(crate) fn contains_positive(&self, domain: &str, key: (u16, u16)) -> bool {
         self.state
             .lock()
             .unwrap()
@@ -173,7 +223,7 @@ impl Shard {
     }
 
     #[cfg(test)]
-    fn contains_negative(&self, domain: &str, key: &NegativeKey) -> bool {
+    pub(crate) fn contains_negative(&self, domain: &str, key: &NegativeKey) -> bool {
         self.state
             .lock()
             .unwrap()
@@ -184,8 +234,26 @@ impl Shard {
     }
 
     #[cfg(test)]
-    fn has_any_data(&self, domain: &str) -> bool {
+    pub(crate) fn has_any_data(&self, domain: &str) -> bool {
         self.state.lock().unwrap().domain_is_tracked(domain)
+    }
+
+    /// Test-only: locks this shard's state and sleeps, to let a
+    /// concurrency test prove some other shard's operations don't block on
+    /// this one's lock.
+    #[cfg(test)]
+    pub(crate) fn hold_lock_for_test(&self, duration: std::time::Duration) {
+        let _guard = self.state.lock().unwrap();
+        std::thread::sleep(duration);
+    }
+
+    /// Test-only: domains in this shard's LRU, oldest-touched first. Lets a
+    /// test assert relative recency ordering was left untouched by an
+    /// operation (e.g. the namespace sweep) rather than just checking
+    /// presence/absence.
+    #[cfg(test)]
+    pub(crate) fn lru_order_for_test(&self) -> Vec<String> {
+        self.state.lock().unwrap().lru.order_for_test()
     }
 }
 

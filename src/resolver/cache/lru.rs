@@ -87,6 +87,16 @@ impl ShardLru {
     pub(crate) fn contains(&self, domain: &str) -> bool {
         self.positions.contains_key(domain)
     }
+
+    /// Test-only: domains in oldest-touched-first order, for asserting
+    /// relative recency ordering rather than just presence/absence.
+    #[cfg(test)]
+    pub(crate) fn order_for_test(&self) -> Vec<String> {
+        self.order
+            .iter()
+            .map(|(_, domain)| domain.clone())
+            .collect()
+    }
 }
 
 #[cfg(test)]

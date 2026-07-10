@@ -212,3 +212,38 @@ eviction.
   `DomainDnsCache::sweep_stale_namespace` trait method) in this section —
   those exist in section-07-call-site-migration and will call this
   function once it exists.
+
+## Implementation notes (actual vs. planned)
+
+- **Files**: `src/resolver/cache/namespace.rs` (new content, as planned)
+  plus a small addition to `src/resolver/cache/shard.rs` — not originally
+  listed as touched by this section, but required: `Shard`'s internal
+  state (`ShardState`, `PositiveShardState`, `NegativeShardState`) is
+  private to the `shard` module, and `namespace` is a sibling module, not
+  a descendant, so it cannot reach into `Shard`'s fields directly. Added
+  `Shard::sweep_stale_namespace(&self, current_namespace: &str) -> usize`
+  (the actual per-shard scan-and-remove logic, encapsulated where the
+  private state already lives) and widened three existing `#[cfg(test)]`
+  helpers (`contains_positive`, `contains_negative`, `has_any_data`) from
+  private to `pub(crate)` so this section's tests can use them. `namespace::sweep_stale_namespace`
+  itself is a thin aggregator: `shards.iter().map(|s| s.sweep_stale_namespace(...)).sum()`.
+- **Signature deviation**: takes `shards: &[Shard]` instead of the plan's
+  literal `cache: &ShardedDnsCache`. `ShardedDnsCache` is section-06's
+  deliverable (built in parallel with this section from the same
+  section-03 dependency, per `index.md`'s dependency graph) and does not
+  exist at this section's implementation time. Section-07 will call this
+  as `sweep_stale_namespace(&cache.shards, ...)` once `ShardedDnsCache`
+  exists. Also returns `usize` (entries removed) rather than `()`, per the
+  plan's own explicitly-sanctioned deviation for testability/metrics.
+- **Test-only additions surfaced by review**: `ShardLru::order_for_test()`
+  (`lru.rs`) and `Shard::lru_order_for_test()`/`Shard::hold_lock_for_test()`
+  (`shard.rs`), all `#[cfg(test)]`-gated, added so tests could assert
+  relative LRU-recency ordering (not just presence/absence) and force real
+  cross-shard lock contention respectively.
+- **Tests**: all tests from the plan's list implemented, plus one not
+  originally listed — `sweep_stale_namespace_walks_every_shard_in_the_slice`
+  — added during code review after the reviewer noted every other test
+  exercised the sweep against a single-shard slice only, leaving the
+  multi-shard aggregation loop itself unverified. Final count: 6 tests in
+  `namespace.rs` (5 planned + 1 added), full suite at 439 (up from 438
+  after section-04).
