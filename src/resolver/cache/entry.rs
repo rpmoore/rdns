@@ -17,13 +17,6 @@
 //! and the negative-cache shape (`NegativeEntry`, `NegativeKey`,
 //! `DomainNegativeEntries`). No locking, shard combination, or LRU wiring
 //! lives here — that's section-03 (`cache::shard`, `cache::lru`).
-//!
-//! These types have no non-test callers yet (section-03 wraps them in
-//! shard state); `#[allow(dead_code)]` below is transient and should be
-//! removed once section-03 adds real callers, mirroring the same pattern
-//! used for `shard_index` in section-01.
-
-#![allow(dead_code)]
 
 use std::collections::HashMap;
 use std::time::{Duration, SystemTime};
@@ -82,8 +75,14 @@ pub(crate) struct StoredRecord {
 pub(crate) enum DnssecState {
     #[default]
     Unvalidated,
+    // Not constructed anywhere yet — real DNSSEC validation is out of
+    // scope for this whole rework; these variants exist so the data
+    // model doesn't need reshaping again when that work happens later.
+    #[allow(dead_code)]
     Insecure,
+    #[allow(dead_code)]
     Secure,
+    #[allow(dead_code)]
     Bogus(String), // reason, for diagnostics; short negative-style TTL applies
 }
 

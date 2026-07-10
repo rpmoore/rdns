@@ -234,6 +234,43 @@ file.
   more domain, and assert the untouched (least-recently-used) domain is
   the one evicted, while the touched ones survive.
 
+## Implementation notes (actual vs. planned)
+
+Implemented as specified: `ShardLru` (`BTreeSet<(u64, String)>` +
+`HashMap<String, u64>` reverse index) in `cache/lru.rs`, and
+`Shard`/`ShardState` (`PositiveShardState`/`NegativeShardState`/`ShardLru`
+behind one `std::sync::Mutex`) plus the eviction loop in `cache/shard.rs`.
+Public `Shard` API: `new(capacity)`, `store_positive`, `store_negative`,
+`touch` (simulates a cache-hit LRU bump without mutating data —
+implementer's naming choice, not prescribed by the plan), `domain_count`.
+
+One deviation from the plan's literal code sketch, landed during code
+review: `ShardLru` gained a `contains(&self, domain: &str) -> bool`
+method, and `ShardState::domain_is_tracked` now calls it instead of
+independently unioning `positive.domains`/`negative.domains` key
+presence. The plan's own background section already recommends
+consulting the LRU as the single source of truth for "is this domain
+live" rather than re-deriving it from the maps (see "Domain count for
+capacity checks" above) — this fix makes the code match that stated
+intent instead of duplicating the check.
+
+Three tests were added beyond the plan's listed minimum, all covering
+gaps identified during code review:
+`adding_a_second_qtype_to_an_existing_domain_never_evicts_at_full_capacity`
+(the highest-risk untested branch of `make_room_for` — an already-tracked
+domain gaining a new record set at full shard capacity must not trigger
+eviction), `touching_only_the_negative_side_of_a_dual_entry_domain_keeps_it_recently_used`
+(confirms capacity/recency is tracked per-domain, not per-map, per §3.3's
+uniform-counting rule), and `touch_on_untracked_domain_is_a_no_op`.
+
+Final test count: 4 in `src/resolver/cache/lru.rs`, 7 in
+`src/resolver/cache/shard.rs` (4 from the plan's minimum + 3 added during
+review). File paths match the plan exactly — no locking/namespace/assembly
+logic leaked into this section, and no files outside
+`lru.rs`/`shard.rs`/`entry.rs` (the last only for a transient
+`#[allow(dead_code)]` narrowing, described in section-02's own doc
+update) were touched.
+
 ## File paths touched by this section
 
 - `src/resolver/cache/lru.rs` — `ShardLru` and its unit tests (new content
