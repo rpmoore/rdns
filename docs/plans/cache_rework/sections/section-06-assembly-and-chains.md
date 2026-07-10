@@ -538,3 +538,67 @@ No other files are touched by this section. `resolve_from_cache`'s
 section-07 (`probe_cache`), which is where
 `RecursiveResolverConfig.max_cname_restarts` actually lives — this
 section does not read that config type directly.
+
+## Implementation notes (actual vs. planned)
+
+- **Files**: as planned — `src/resolver/cache/assemble.rs` (new content),
+  `src/resolver/cache/mod.rs` (`ShardedDnsCache` only), `src/protocol/mod.rs`
+  (generic encoder). One addition not in the plan's file list:
+  `src/resolver/cache/shard.rs` gained a `Shard::lookup_hop` method +
+  `HopResult` enum, for the same structural reason section-05 already
+  added `Shard::sweep_stale_namespace` — `Shard`'s internal state is
+  private to its own module, and `cache::assemble` is a sibling module
+  (not a descendant), so it cannot reach `Shard`'s fields directly.
+  `write_response_header` (existing) was left untouched rather than
+  widened, since it always zeroes authority/additional counts and has no
+  AD-bit control — a new `write_message_header` was added alongside it
+  instead of changing its signature and disturbing its existing callers.
+- **Signature deviations** (all intentional, all because the plan's listed
+  inputs don't carry the needed value): `resolve_from_cache` takes an
+  explicit `max_chain_depth: u8` (plan already calls this one out itself).
+  `assemble_response`/`assemble_negative_response` additionally take an
+  explicit `request_id: u16` (`QueryFeatures` has no transaction ID field)
+  and `configured_max_udp_payload_size: usize` (no `Message`/`DecodedQuery`
+  is passed in to derive the server-side UDP ceiling from).
+  `ResolvedNegative` gained a `terminal_name: String` field not in the
+  plan's literal struct listing: `NegativeEntry` has no owner-name field of
+  its own (mirrors how `RRsetEntry`'s owner name comes from the chain
+  tuple, not the entry itself), so `assemble_negative_response` needs to
+  know what name to write the authority-section SOA under. This uses the
+  terminal *queried* name as the SOA owner, not necessarily the true zone
+  apex (which this cache model has no field to track) — the same
+  simplification the model already applies to positive-side owner names.
+- **DNSSEC AD-bit/Bogus checks on negative results** are evaluated across
+  `ResolvedNegative.chain` (the CNAME hops, which carry `dnssec_state` via
+  their `RRsetEntry`) but not against the terminal `NegativeEntry` itself,
+  since section-02's `NegativeEntry` has no `dnssec_state` field. An empty
+  chain (direct NXDOMAIN/NODATA, no CNAME hops) never produces AD=1.
+- **No compression-pointer back-reference into the copied question
+  section**: `requester_question_wire` is appended raw after the header;
+  the `NameCompressor` used for the answer/authority sections starts fresh
+  and only compresses among themselves. Produces valid but not
+  maximally-compact wire output — an accepted simplification, not
+  revisited.
+- **Truncated-response shape — code review + user decision**: review
+  found the first draft hardcoded `ResponseCode::NoError` on truncation
+  regardless of the real response code (would have silently turned a
+  truncated NXDOMAIN/NODATA into a false NOERROR — fixed) and omitted the
+  question section, matching the codebase's pre-existing
+  `build_truncated_response` but contradicting this plan's own "header +
+  question only" text. Asked the user; they chose to follow the plan's
+  literal text. Truncated responses from this path now carry: header
+  (TC=1, real response code preserved) + question section, matching the
+  plan exactly — intentionally diverging from `build_truncated_response`,
+  which is untouched and still header-only for its own (non-cache)
+  callers.
+- **Tests**: all tests from the plan's list implemented, plus 8 added
+  during code review: 3 `assemble_negative_response` tests (no prior
+  coverage existed for the negative path at all), 3 wire-encoder
+  round-trip tests in `protocol/mod.rs` (SOA field order, NSEC3 hex
+  round-trip, TXT >255-byte chunking — the plan called the encoder "real,
+  non-trivial new code" needing its own test attention), a
+  NODATA-vs-NXDOMAIN priority test, and a non-cyclical depth-exceeded test
+  (the existing cyclical-chain test only exercised the visited-set guard,
+  not the `max_chain_depth` bound itself). Final count: 19 tests in
+  `assemble.rs` (14 planned/adapted + 5 added) + 3 in `protocol/mod.rs`,
+  full suite at 461 (up from 453 after section-05).

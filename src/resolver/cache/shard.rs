@@ -27,11 +27,36 @@
 
 use std::collections::HashMap;
 use std::sync::Mutex;
+use std::time::SystemTime;
 
 use super::entry::{
     DomainNegativeEntries, DomainRecordSets, NegativeEntry, NegativeKey, RRsetEntry,
 };
 use super::lru::ShardLru;
+use crate::protocol::RecordData;
+
+const CNAME_RECORD_TYPE: u16 = 5;
+
+/// Result of one hop's lookup within `resolve_from_cache`'s CNAME-chain
+/// walk (`cache::assemble`, section-06) — whatever this shard found (or
+/// didn't) for one name in the chain, already cloned out from under this
+/// shard's lock.
+#[derive(Debug, Clone)]
+pub(crate) enum HopResult {
+    /// A record set matching the queried `(qtype, qclass)` directly.
+    Answer(RRsetEntry),
+    /// The queried type wasn't found, but a CNAME record set was — carries
+    /// the CNAME's own entry (for the response's answer section) plus the
+    /// extracted target name to continue the walk.
+    CnameHop(RRsetEntry, String),
+    /// NODATA for the queried type at this (existing) name.
+    NoData(NegativeEntry),
+    /// Whole-name NXDOMAIN at this name.
+    NxDomain(NegativeEntry),
+    /// Nothing usable here: absent, expired, or stored under a stale
+    /// namespace.
+    Miss,
+}
 
 #[derive(Debug, Default)]
 struct PositiveShardState {
@@ -159,6 +184,98 @@ impl Shard {
     /// this shard (positive data, negative data, or both — counted once).
     pub(crate) fn domain_count(&self) -> usize {
         self.state.lock().unwrap().lru.len()
+    }
+
+    /// One hop of `resolve_from_cache`'s CNAME-chain walk (`cache::assemble`,
+    /// section-06): looks up `domain` for `(qtype, qclass)` directly,
+    /// falls back to a CNAME record set at the same name if `qtype` itself
+    /// isn't CNAME, then falls back to a negative entry (NODATA for
+    /// `qtype`, then whole-name NXDOMAIN). Rejects expired or
+    /// stale-namespace matches inline — independent of, and in addition
+    /// to, section-05's bulk namespace sweep. Touches this domain's LRU
+    /// position on any live match found, including CNAME hops. Takes and
+    /// releases this shard's lock for the duration of this one hop only —
+    /// callers must not hold it across hops.
+    pub(crate) fn lookup_hop(
+        &self,
+        domain: &str,
+        qtype: u16,
+        qclass: u16,
+        current_namespace: &str,
+        now: SystemTime,
+    ) -> HopResult {
+        let mut state = self.state.lock().unwrap();
+
+        let answer = state
+            .positive
+            .domains
+            .get(domain)
+            .and_then(|record_sets| record_sets.record_sets.get(&(qtype, qclass)))
+            .filter(|entry| entry.expires_at > now && entry.cache_namespace == current_namespace)
+            .cloned();
+        if let Some(entry) = answer {
+            state.lru.touch(domain);
+            return HopResult::Answer(entry);
+        }
+
+        if qtype != CNAME_RECORD_TYPE {
+            let cname_hop = state
+                .positive
+                .domains
+                .get(domain)
+                .and_then(|record_sets| record_sets.record_sets.get(&(CNAME_RECORD_TYPE, qclass)))
+                .filter(|entry| {
+                    entry.expires_at > now && entry.cache_namespace == current_namespace
+                })
+                .and_then(|entry| {
+                    entry
+                        .records
+                        .iter()
+                        .find_map(|record| match &record.rdata {
+                            RecordData::CNAME(target) => Some(target.clone()),
+                            _ => None,
+                        })
+                        .map(|target| (entry.clone(), target))
+                });
+            if let Some((entry, target)) = cname_hop {
+                state.lru.touch(domain);
+                return HopResult::CnameHop(entry, target);
+            }
+        }
+
+        let nodata_key = NegativeKey {
+            qtype: Some(qtype),
+            qclass,
+        };
+        let nodata = state
+            .negative
+            .domains
+            .get(domain)
+            .and_then(|entries| entries.entries.get(&nodata_key))
+            .filter(|entry| entry.expires_at > now && entry.cache_namespace == current_namespace)
+            .cloned();
+        if let Some(entry) = nodata {
+            state.lru.touch(domain);
+            return HopResult::NoData(entry);
+        }
+
+        let nxdomain_key = NegativeKey {
+            qtype: None,
+            qclass,
+        };
+        let nxdomain = state
+            .negative
+            .domains
+            .get(domain)
+            .and_then(|entries| entries.entries.get(&nxdomain_key))
+            .filter(|entry| entry.expires_at > now && entry.cache_namespace == current_namespace)
+            .cloned();
+        if let Some(entry) = nxdomain {
+            state.lru.touch(domain);
+            return HopResult::NxDomain(entry);
+        }
+
+        HopResult::Miss
     }
 
     /// Removes every positive/negative entry in this shard whose stored

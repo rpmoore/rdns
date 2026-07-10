@@ -25,6 +25,46 @@ mod singleflight;
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 
+use shard::Shard;
+
+/// The top-level sharded cache: one `Shard` (its own lock, its own slice
+/// of `max_entries`) per configured shard, routed to by `shard_index`.
+///
+/// Read-side operations (`assemble::resolve_from_cache`,
+/// `assemble::assemble_response`) are built in this section
+/// (section-06). Section-07 adds `impl DomainDnsCache for
+/// ShardedDnsCache` (wrapping those plus `store_response`) and the
+/// call-site wiring that actually constructs and uses one of these.
+#[allow(dead_code)]
+pub struct ShardedDnsCache {
+    shards: Vec<Shard>,
+}
+
+impl ShardedDnsCache {
+    /// Builds one `Shard` per `config.resolved_shard_count()`, splitting
+    /// `config.max_entries` across them via `config.shard_capacity` (the
+    /// exact remainder-distributed formula from section-01 — not
+    /// recomputed here).
+    #[allow(dead_code)]
+    pub fn new(config: &crate::config::CacheConfig) -> Self {
+        let shard_count = config.resolved_shard_count();
+        let shards = (0..shard_count)
+            .map(|index| Shard::new(config.shard_capacity(index, shard_count)))
+            .collect();
+        Self { shards }
+    }
+
+    /// Routes to the one shard responsible for `domain`, via `shard_index`.
+    /// Kept private/crate-visible: external callers (section-07's trait
+    /// impl, tests) go through `assemble::resolve_from_cache`, except
+    /// where a section-06 test needs to reach into a specific shard to set
+    /// up fixture state directly.
+    #[allow(dead_code)]
+    fn shard_for(&self, domain: &str) -> &Shard {
+        &self.shards[shard_index(domain, self.shards.len())]
+    }
+}
+
 /// Routes a domain name to a shard index in `[0, shard_count)`. Shared by
 /// the cache shards (`cache::shard`, section-03) and the single-flight
 /// shards (`cache::singleflight`, section-04) — both structures shard

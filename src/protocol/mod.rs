@@ -742,12 +742,272 @@ impl NameCompressor {
     }
 }
 
-fn write_u16(out: &mut Vec<u8>, value: u16) {
+pub(crate) fn write_u16(out: &mut Vec<u8>, value: u16) {
     out.extend_from_slice(&value.to_be_bytes());
 }
 
-fn write_u32(out: &mut Vec<u8>, value: u32) {
+pub(crate) fn write_u32(out: &mut Vec<u8>, value: u32) {
     out.extend_from_slice(&value.to_be_bytes());
+}
+
+/// Writes a DNS message header with full control over every section count
+/// and the AD bit — unlike `write_response_header` (which always zeroes
+/// the authority/additional counts and never sets AD), this is used by
+/// `resolver::cache::assemble` (section-06) to build responses carrying an
+/// authority-section SOA (negative results) and/or an AD bit computed from
+/// DNSSEC validation state.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn write_message_header(
+    out: &mut Vec<u8>,
+    id: u16,
+    recursion_desired: bool,
+    truncated: bool,
+    authenticated_data: bool,
+    rcode: ResponseCode,
+    question_count: u16,
+    answer_count: u16,
+    authority_count: u16,
+    additional_count: u16,
+) {
+    write_u16(out, id);
+    let mut flags = 0x8000; // QR = 1 (response)
+    if recursion_desired {
+        flags |= 0x0100;
+    }
+    if truncated {
+        flags |= 0x0200;
+    }
+    flags |= 0x0080; // RA = 1
+    if authenticated_data {
+        flags |= 0x0020;
+    }
+    flags |= rcode.as_u8() as u16;
+    write_u16(out, flags);
+    write_u16(out, question_count);
+    write_u16(out, answer_count);
+    write_u16(out, authority_count);
+    write_u16(out, additional_count);
+}
+
+fn write_name_uncompressed(out: &mut Vec<u8>, name: &str) {
+    let name = name.trim_end_matches('.');
+    if name.is_empty() {
+        out.push(0);
+        return;
+    }
+    for label in name.split('.') {
+        out.push(label.len() as u8);
+        out.extend_from_slice(label.as_bytes());
+    }
+    out.push(0);
+}
+
+fn from_hex(hex: &str) -> Vec<u8> {
+    (0..hex.len())
+        .step_by(2)
+        .filter_map(|i| {
+            hex.get(i..i + 2)
+                .and_then(|s| u8::from_str_radix(s, 16).ok())
+        })
+        .collect()
+}
+
+/// Encodes one arbitrary resource record to wire bytes: owner name, type,
+/// class, TTL, then a length-prefixed RDATA block sized to whatever
+/// `rdata` actually needs. Mirrors `parse_record_data`'s match arms in
+/// reverse — every `RecordData` variant that can be parsed can be written
+/// back out here. Used by `resolver::cache::assemble` (section-06) to
+/// serialize cached record sets fresh, per request, instead of replaying a
+/// stored byte template.
+///
+/// Domain names in legacy RDATA fields (CNAME/NS/PTR targets, MX exchange,
+/// SRV target, SOA mname/rname, RP names) are written through `compressor`
+/// like any owner name — this is standard practice and always valid.
+/// `RRSIG.signer_name` and `NSEC.next_domain` are written uncompressed
+/// instead, per RFC 4034 §6.2's canonical-form requirement for
+/// DNSSEC-relevant names.
+pub(crate) fn write_record(
+    out: &mut Vec<u8>,
+    compressor: &mut NameCompressor,
+    name: &str,
+    rtype: u16,
+    rclass: u16,
+    ttl: u32,
+    rdata: &RecordData,
+) {
+    compressor.write_name(out, name);
+    write_u16(out, rtype);
+    write_u16(out, rclass);
+    write_u32(out, ttl);
+    let rdlength_pos = out.len();
+    write_u16(out, 0);
+    let rdata_start = out.len();
+    write_rdata(out, compressor, rdata);
+    let rdlength = (out.len() - rdata_start) as u16;
+    out[rdlength_pos..rdlength_pos + 2].copy_from_slice(&rdlength.to_be_bytes());
+}
+
+fn write_rdata(out: &mut Vec<u8>, compressor: &mut NameCompressor, rdata: &RecordData) {
+    match rdata {
+        RecordData::A(address) => out.extend_from_slice(&address.octets()),
+        RecordData::AAAA(address) => out.extend_from_slice(&address.octets()),
+        RecordData::CAA { flags, tag, value } => {
+            out.push(*flags);
+            out.push(tag.len() as u8);
+            out.extend_from_slice(tag.as_bytes());
+            out.extend_from_slice(value.as_bytes());
+        }
+        RecordData::MX {
+            preference,
+            exchange,
+        } => {
+            write_u16(out, *preference);
+            compressor.write_name(out, exchange);
+        }
+        RecordData::CERT {
+            cert_type,
+            key_tag,
+            algorithm,
+            cert,
+        } => {
+            write_u16(out, *cert_type);
+            write_u16(out, *key_tag);
+            out.push(*algorithm);
+            out.extend_from_slice(cert);
+        }
+        RecordData::CNAME(target) => compressor.write_name(out, target),
+        RecordData::DNSKEY {
+            flags,
+            protocol,
+            algorithm,
+            public_key,
+        } => {
+            write_u16(out, *flags);
+            out.push(*protocol);
+            out.push(*algorithm);
+            out.extend_from_slice(public_key);
+        }
+        RecordData::DS {
+            key_tag,
+            algorithm,
+            digest_type,
+            digest,
+        } => {
+            write_u16(out, *key_tag);
+            out.push(*algorithm);
+            out.push(*digest_type);
+            out.extend_from_slice(digest);
+        }
+        RecordData::NSEC {
+            next_domain,
+            type_bit_maps,
+        } => {
+            write_name_uncompressed(out, next_domain);
+            out.extend_from_slice(type_bit_maps);
+        }
+        RecordData::NSEC3 {
+            hash_algorithm,
+            flags,
+            iterations,
+            salt_length,
+            salt,
+            hash_length,
+            next_domain,
+            type_bit_maps,
+        } => {
+            out.push(*hash_algorithm);
+            out.push(*flags);
+            write_u16(out, *iterations);
+            out.push(*salt_length);
+            out.extend_from_slice(salt);
+            out.push(*hash_length);
+            out.extend_from_slice(&from_hex(next_domain));
+            out.extend_from_slice(type_bit_maps);
+        }
+        RecordData::NSEC3PARAM {
+            hash_algorithm,
+            flags,
+            iterations,
+            salt_length,
+            salt,
+        } => {
+            out.push(*hash_algorithm);
+            out.push(*flags);
+            write_u16(out, *iterations);
+            out.push(*salt_length);
+            out.extend_from_slice(salt);
+        }
+        RecordData::NS(name) => compressor.write_name(out, name),
+        RecordData::PTR(name) => compressor.write_name(out, name),
+        RecordData::RP {
+            mboxdname,
+            txtdname,
+        } => {
+            compressor.write_name(out, mboxdname);
+            compressor.write_name(out, txtdname);
+        }
+        RecordData::RRSIG {
+            type_covered,
+            algorithm,
+            labels,
+            original_ttl,
+            signature_expiration,
+            signature_inception,
+            key_tag,
+            signer_name,
+            signature,
+        } => {
+            write_u16(out, *type_covered);
+            out.push(*algorithm);
+            out.push(*labels);
+            write_u32(out, *original_ttl);
+            write_u32(out, *signature_expiration);
+            write_u32(out, *signature_inception);
+            write_u16(out, *key_tag);
+            write_name_uncompressed(out, signer_name);
+            out.extend_from_slice(signature);
+        }
+        RecordData::SOA {
+            ttl: _,
+            rname,
+            mname,
+            serial,
+            refresh,
+            retry,
+            expire,
+            minimum,
+        } => {
+            compressor.write_name(out, mname);
+            compressor.write_name(out, rname);
+            write_u32(out, *serial);
+            write_u32(out, *refresh);
+            write_u32(out, *retry);
+            write_u32(out, *expire);
+            write_u32(out, *minimum);
+        }
+        RecordData::SRV {
+            priority,
+            weight,
+            port,
+            target,
+        } => {
+            write_u16(out, *priority);
+            write_u16(out, *weight);
+            write_u16(out, *port);
+            compressor.write_name(out, target);
+        }
+        RecordData::TXT(text) => {
+            if text.is_empty() {
+                return;
+            }
+            for chunk in text.as_bytes().chunks(255) {
+                out.push(chunk.len() as u8);
+                out.extend_from_slice(chunk);
+            }
+        }
+        RecordData::OPT(info) => out.extend_from_slice(&info.options),
+        RecordData::Unknown { rtype: _, bytes } => out.extend_from_slice(bytes),
+    }
 }
 
 fn validate_standard_query_header(
@@ -2540,6 +2800,86 @@ mod tests {
                 type_bit_maps: vec![0, 1, 0x40]
             }
         );
+    }
+
+    #[test]
+    fn write_record_round_trips_soa_with_mname_before_rname_wire_order() {
+        let rdata = RecordData::SOA {
+            ttl: 0,
+            rname: "hostmaster.example.com".to_string(),
+            mname: "ns1.example.com".to_string(),
+            serial: 2026070901,
+            refresh: 7200,
+            retry: 3600,
+            expire: 1_209_600,
+            minimum: 3600,
+        };
+        let mut bytes = Vec::new();
+        let mut compressor = NameCompressor::new();
+        write_record(
+            &mut bytes,
+            &mut compressor,
+            "example.com",
+            6,
+            1,
+            3600,
+            &rdata,
+        );
+
+        assert_eq!(parse_test_record(&bytes).record, rdata);
+    }
+
+    #[test]
+    fn write_record_round_trips_nsec3_hash_bytes_through_hex_encoding() {
+        // Same fixture as `parse_nsec_rrsig_and_nsec3_records`'s NSEC3 case
+        // (next_domain "bbcc" == hex(hash_length=2 bytes [0xbb, 0xcc])), but
+        // driven through the writer this time to prove `from_hex` correctly
+        // reverses `to_hex` rather than just checking the parser alone.
+        let rdata = RecordData::NSEC3 {
+            hash_algorithm: 1,
+            flags: 0,
+            iterations: 1,
+            salt_length: 1,
+            salt: vec![0xaa],
+            hash_length: 2,
+            next_domain: "bbcc".to_string(),
+            type_bit_maps: vec![0, 1, 0x40],
+        };
+        let mut bytes = Vec::new();
+        let mut compressor = NameCompressor::new();
+        write_record(
+            &mut bytes,
+            &mut compressor,
+            "example.com",
+            50,
+            1,
+            300,
+            &rdata,
+        );
+
+        assert_eq!(parse_test_record(&bytes).record, rdata);
+    }
+
+    #[test]
+    fn write_record_round_trips_txt_longer_than_one_255_byte_chunk() {
+        let text: String = "a".repeat(300);
+        let rdata = RecordData::TXT(text.clone());
+        let mut bytes = Vec::new();
+        let mut compressor = NameCompressor::new();
+        write_record(
+            &mut bytes,
+            &mut compressor,
+            "example.com",
+            16,
+            1,
+            300,
+            &rdata,
+        );
+
+        match parse_test_record(&bytes).record {
+            RecordData::TXT(parsed) => assert_eq!(parsed, text),
+            other => panic!("expected TXT, got {other:?}"),
+        }
     }
 
     #[test]
