@@ -38,11 +38,17 @@ use crate::protocol::{
 
 mod cache;
 use cache::{
-    ChainLookup, DecomposedResponse, InFlightMiss, NegativeEntry, NegativeKey, RRsetEntry,
-    ShardedSingleFlight, SingleFlightLeader, SingleFlightTicket, StoredRecord,
+    ChainLookup, InFlightMiss, ShardedSingleFlight, SingleFlightLeader, SingleFlightTicket,
     assemble_negative_response, assemble_response,
 };
-pub use cache::{DomainDnsCache, ShardedDnsCache};
+// `DecomposedResponse`/`RRsetEntry`/`StoredRecord`/`NegativeKey`/`NegativeEntry`
+// are re-exported (not just used privately) so external test crates — see
+// `tests/cache_concurrency_bench.rs` (section-08) — can drive
+// `DomainDnsCache::store_response` with real data, not just the read path.
+pub use cache::{
+    DecomposedResponse, DomainDnsCache, NegativeEntry, NegativeKey, RRsetEntry, ShardedDnsCache,
+    StoredRecord,
+};
 
 pub mod policy;
 pub use policy::{
@@ -14028,6 +14034,62 @@ mod tests {
         assert_eq!(second.decision.kind, ResolveDecisionKind::Allowed);
         assert_eq!(first_backend.requests.lock().unwrap().len(), 1);
         assert_eq!(second_backend.requests.lock().unwrap().len(), 1);
+    }
+
+    /// `backend_generation_separates_cache_entries` (above) only proves two
+    /// generations' entries land under different namespaces and so never
+    /// collide as *lookups* — it never proves `publish_reload`'s
+    /// namespace-sweep call (wired in section-07) actually runs and
+    /// removes the stale entry, versus just leaving it as orphaned, never
+    /// pruned capacity. This test seeds a real `ShardedDnsCache` under
+    /// generation 1's namespace, reloads to generation 2, and asserts the
+    /// domain is actually gone afterward, not merely unreachable.
+    #[tokio::test]
+    async fn backend_reload_sweep_invalidates_stale_generation_entries() {
+        let cache = Arc::new(ShardedDnsCache::new(&CacheConfig {
+            max_entries: 16,
+            shard_count: Some(1),
+        }));
+        let upstream = Arc::new(StaticUpstream::new(Ok(upstream_response(
+            a_response_with_answer(0x1111, "example.com", 60),
+        ))));
+        let events = Arc::new(RecordingEvents::default());
+        let metrics = Arc::new(RecordingMetrics::default());
+        let service = ResolveQuery::with_cache_and_backend_generation(
+            Arc::new(StandardProtocolCodec::new(1232)),
+            Arc::clone(&cache) as Arc<dyn DomainDnsCache>,
+            CacheTtlPolicy::default(),
+            upstream.clone(),
+            1,
+            Arc::new(BasicResponseFactory),
+            Arc::new(FixedClock(SystemTime::UNIX_EPOCH)),
+            events,
+            metrics,
+        );
+
+        let _ = service
+            .resolve(ResolveRequest::new(
+                "192.0.2.10".parse().unwrap(),
+                SystemTime::UNIX_EPOCH,
+                a_query(0x1111, "example.com"),
+            ))
+            .await;
+        assert_eq!(
+            cache.domain_count(),
+            1,
+            "warming resolve should have stored one domain under generation 1's namespace"
+        );
+
+        let new_backend = Arc::new(StaticUpstream::new(Err(UpstreamError::Timeout)));
+        let new_snapshot = BackendSnapshot::forwarding(new_backend, 2);
+        service.publish_reload(new_snapshot, Arc::new(NoopLocalDnsEntries));
+
+        assert_eq!(
+            cache.domain_count(),
+            0,
+            "publish_reload's namespace sweep should have removed the generation-1 entry, \
+             not just left it unreachable"
+        );
     }
 
     #[tokio::test]

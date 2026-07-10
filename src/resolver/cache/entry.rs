@@ -41,17 +41,17 @@ pub(crate) struct DomainRecordSets {
 /// assembly design, implemented in section-06, not this section).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RRsetEntry {
-    pub(crate) records: Vec<StoredRecord>,
-    pub(crate) rrsigs: Vec<StoredRecord>, // empty if none were fetched/cached
+    pub records: Vec<StoredRecord>,
+    pub rrsigs: Vec<StoredRecord>, // empty if none were fetched/cached
     // Almost always NoError; kept for parity with today's CachedResponse shape.
-    pub(crate) response_code: ResponseCode,
-    pub(crate) minimum_ttl: Duration,
-    pub(crate) stored_at: SystemTime,
-    pub(crate) expires_at: SystemTime,
-    pub(crate) dnssec_state: DnssecState,
+    pub response_code: ResponseCode,
+    pub minimum_ttl: Duration,
+    pub stored_at: SystemTime,
+    pub expires_at: SystemTime,
+    pub dnssec_state: DnssecState,
     // Namespace is no longer part of the lookup key, so it must be stored
     // per entry instead.
-    pub(crate) cache_namespace: String,
+    pub cache_namespace: String,
 }
 
 /// A single stored resource record, minus anything request-specific
@@ -60,10 +60,10 @@ pub struct RRsetEntry {
 /// existing `RecordData` type from `src/protocol`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StoredRecord {
-    pub(crate) rtype: u16,
-    pub(crate) rclass: u16,
-    pub(crate) ttl_at_store: u32,
-    pub(crate) rdata: RecordData,
+    pub rtype: u16,
+    pub rclass: u16,
+    pub ttl_at_store: u32,
+    pub rdata: RecordData,
 }
 
 /// Mirrors RFC 6840 §3.1's "BAD cache" concept and Unbound/BIND-style
@@ -72,7 +72,7 @@ pub struct StoredRecord {
 /// for this whole rework) — this enum exists purely so the data model
 /// doesn't need reshaping again when that work happens later.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
-pub(crate) enum DnssecState {
+pub enum DnssecState {
     #[default]
     Unvalidated,
     // Not constructed anywhere yet — real DNSSEC validation is out of
