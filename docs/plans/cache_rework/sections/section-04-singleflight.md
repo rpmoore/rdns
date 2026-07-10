@@ -371,3 +371,44 @@ not fully specified.
   them to call into `resolver::cache::singleflight` instead. Leaving both
   the old and new single-flight implementations compiling side-by-side
   until section-07 is expected and fine.
+
+## Implementation notes (actual vs. planned)
+
+Implemented as specified in `src/resolver/cache/singleflight.rs`:
+`ShardedSingleFlight`/`SingleFlightShard`/`InFlightMiss`/
+`SingleFlightTicket`/`SingleFlightLeader`, with `SingleFlightShard::begin`/
+`finish` ported verbatim from `SingleFlightMisses::begin`/`finish`
+(`src/resolver/mod.rs:3856-3889`) apart from the key-type change and the
+per-shard map. Both `begin` and `finish` route through a single shared
+`shard_for(&key.0)` helper (not two independent `shard_index` call sites)
+so they structurally cannot diverge in routing for the same key — a
+minor robustness improvement over the plan's literal two-call-site sketch.
+
+All 4 planned tests are present. Two were substantially rewritten during
+code review because their original versions, while passing, didn't
+exercise what their names claimed:
+
+- `single_flight_coalesces_concurrent_misses_for_same_name_and_qtype` now
+  genuinely spawns concurrent `tokio::spawn` tasks for both the `begin()`
+  calls and the followers' `.wait()` calls (with `yield_now().await` to
+  let waiters actually park before the leader completes), rather than a
+  sequential loop — this is what actually exercises `InFlightMiss::wait`'s
+  missed-wakeup-safe register-before-check ordering.
+- `single_flight_different_shards_do_not_contend` now forces real lock
+  contention on one shard via a background `std::thread` holding that
+  shard's raw `flights` mutex (a `std::sync::MutexGuard` is `!Send` and
+  can't cross an `.await`, so this requires a real OS thread rather than
+  a tokio task), then asserts a different-shard `begin()` still completes
+  within a short timeout. The original version never held a guard, so it
+  would have passed identically against the old single-global-mutex
+  design — it didn't actually prove the sharding benefit this section
+  exists to deliver.
+
+No other deviations. `ShardedSingleFlight::new(0)` will panic on first
+`begin`/`finish` (empty shard `Vec` indexed at 0) — consistent with the
+plan's explicit "not enforced here" stance; flagged for section-07 to
+validate `shard_count > 0` before wiring this into real call sites.
+
+Final test count: 4 in `src/resolver/cache/singleflight.rs`, matching the
+plan's required names exactly. File paths match the plan — only
+`singleflight.rs` was touched, `src/resolver/mod.rs` untouched.
