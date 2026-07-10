@@ -303,6 +303,27 @@ same domain.
   (`DomainDnsCache`) and its request/response shapes need to cross the
   `resolver::cache` module boundary.
 
+## Implementation notes (actual vs. planned)
+
+Implemented as specified: `DomainRecordSets`, `RRsetEntry`, `StoredRecord`,
+`DnssecState`, `DomainNegativeEntries`, `NegativeKey`, `NegativeEntry` all
+live in `src/resolver/cache/entry.rs` with the exact field shapes from the
+plan, reusing `RecordData`/`ResponseCode`/`NegativeCacheKind` rather than
+redefining them. All 6 planned tests are present. One fix landed during
+code review: the `negative_entry_stores_soa_record_for_response_reconstruction`
+test originally built its `soa_record` with `RecordData::A(...)` as a
+placeholder for what should be SOA rdata — that didn't actually exercise
+the "rebuild a full SOA record from `soa_record` alone" claim the test
+name makes. Fixed to use a real `RecordData::SOA { .. }` value and assert
+`mname`/`rname`/`serial` round-trip. No other deviations — no locking,
+shard, or LRU logic was introduced, and no files outside `entry.rs` were
+touched. `#![allow(dead_code)]` is present at module level (same transient
+pattern as `shard_index` in section-01) since section-03 is what adds
+non-test callers for these types.
+
+Final test count: 6 in `src/resolver/cache/entry.rs` (`#[cfg(test)] mod
+tests`), matching the plan's minimum exactly. File paths match the plan.
+
 ## Relevant file paths
 
 - `src/resolver/cache/entry.rs` — created/filled in by this section (types
