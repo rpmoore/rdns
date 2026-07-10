@@ -321,6 +321,35 @@ Directly from `claude-plan-tdd.md` §8:
   normalization logic elsewhere — later sections should reuse this
   function.
 
+## Implementation notes (actual vs. planned)
+
+Implemented as specified, with two deviations decided during code review:
+
+- `resolved_shard_count()` treats `shard_count: Some(0)` the same as
+  `None` (falls back to the computed default) rather than passing `0`
+  through unchanged. The plan didn't address this case explicitly; passing
+  it through would have left a divide-by-zero landmine for section-03/07's
+  per-shard capacity and routing math. Decided via user interview during
+  section-01's code review.
+- `shard_capacity(index, shard_count)` adds a
+  `debug_assert!(index < shard_count)` after the `shard_count == 0` early
+  return, to catch out-of-bounds caller mistakes in later sections during
+  debug/test builds.
+
+`CacheConfig` derives `Copy` in addition to the plan's implied `Debug,
+Clone, PartialEq, Eq` (not explicitly specified either way by the plan;
+harmless for a two-`usize`-field struct).
+
+Three tests beyond the plan's specified minimum (3 `shard_index` + 4
+`CacheConfig` = 7) were added: `shard_index_returns_zero_for_zero_shard_count`,
+`cache_config_shard_capacity_is_zero_when_shard_count_is_zero`, and
+`cache_config_resolved_shard_count_treats_explicit_zero_as_unset` — these
+cover the `shard_count == 0` edge cases called out above.
+
+Final test count: 7 in `src/resolver/cache/mod.rs` (`shard_index_*`), 6 in
+`src/config/mod.rs` (`cache_config_*`). All file paths match the plan
+exactly — no path deviations.
+
 ## Relevant file paths
 
 - `/home/rpmoore/code/rdns/src/resolver/mod.rs` (add `mod cache;`

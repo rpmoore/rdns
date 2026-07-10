@@ -37,6 +37,8 @@ use crate::protocol::{
     rewrite_response_id, rewrite_response_request_fields,
 };
 
+mod cache;
+
 pub mod policy;
 pub use policy::{
     CidrPrefixError, ClientIdentity, ClientSelector, DomainName, DomainNameError, DomainSelector,
