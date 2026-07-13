@@ -14,7 +14,7 @@ different shards never contend with each other.
 
 # Routing: `shard_index`
 
-`src/resolver/cache/mod.rs:216`:
+`src/resolver/cache/mod.rs:231`:
 
 ```rust
 pub(crate) fn shard_index(domain: &str, shard_count: usize) -> usize {

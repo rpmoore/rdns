@@ -15,7 +15,7 @@ sweep, no [epoch](cache-epoch.md).
 
 # Structure
 
-`LocalDnsEntriesHandle` (`src/resolver/mod.rs:2332`), backed by a
+`LocalDnsEntriesHandle` (`src/resolver/mod.rs:2351`), backed by a
 `LocalDnsEntries` trait implementation swapped wholesale on reload —
 there's no `RRsetEntry`/`NegativeEntry` involved, no shard, no TTL
 expiry loop. `publish_reload` replaces the whole thing in one atomic
@@ -24,8 +24,8 @@ write, under the same `reload_gate` section as the backend snapshot.
 # Where it's checked
 
 `ResolveQuery::resolve` calls `try_local_lookup`
-(`src/resolver/mod.rs:3829`) **before** `probe_cache`
-(`src/resolver/mod.rs:4200`) — a local match short-circuits the request
+(`src/resolver/mod.rs:3860`) **before** `probe_cache`
+(`src/resolver/mod.rs:4231`) — a local match short-circuits the request
 entirely; the sharded answer cache is never consulted for it, and a
 local answer is never stored there either.
 

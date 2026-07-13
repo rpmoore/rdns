@@ -27,7 +27,7 @@ entry, only used to decide whether to bump:
   — bumping it by itself is the manual "flush everything" lever, with no
   other config change required.
 
-`next_cache_epoch` (`src/resolver/mod.rs:2290`) compares this reload's
+`next_cache_epoch` (`src/resolver/mod.rs:2309`) compares this reload's
 fingerprint against the previous one:
 
 ```rust
@@ -69,14 +69,14 @@ impossible.
 Both go through `next_cache_epoch`, so neither can accidentally roll the
 epoch backwards or diverge from the other's rule:
 
-- **`publish_reload`** (`src/resolver/mod.rs:3521`) — the SIGHUP path.
+- **`publish_reload`** (`src/resolver/mod.rs:3552`) — the SIGHUP path.
   Swaps backend + local entries atomically under `reload_gate`, computes
   the new epoch, then — **only if the epoch actually changed** — runs
   `cache.sweep_stale_namespace(new_epoch)` *after* releasing
   `reload_gate`. Skipping the sweep on an unrelated reload is a real
   optimization over the old string-namespace design, which swept
   unconditionally on every reload.
-- **`publish_backend_snapshot`** (`src/resolver/mod.rs:3466`) — a
+- **`publish_backend_snapshot`** (`src/resolver/mod.rs:3485`) — a
   backend-only publisher (health-check-driven failover, tests). Applies
   the same epoch math, but never sweeps — stale entries are still
   instantly invisible at lookup time; sweeping just gets deferred to
@@ -102,9 +102,9 @@ it can't stall concurrent `resolve()` calls for its duration.
 
 # Per-request pinning: why in-flight requests don't tear
 
-`ResolveQuery::resolve` (`src/resolver/mod.rs:3649`) captures its
+`ResolveQuery::resolve` (`src/resolver/mod.rs:3680`) captures its
 `backend_snapshot` **once**, at the top of the request, under
-`reload_gate`'s read side (`:3652-3658`), and carries that same snapshot
+`reload_gate`'s read side (`:3684-3688`), and carries that same snapshot
 — mode, generation, and epoch together — through the entire request,
 including any store it does at the end. This wasn't introduced for the
 epoch specifically; it's the pre-existing pattern that already kept
@@ -140,7 +140,7 @@ in the machinery, not client-visible behavior. Epoch tagging was chosen
 because:
 
 - The cache object itself (`ResolveQuery.cache: Arc<dyn DomainDnsCache>`,
-  `src/resolver/mod.rs:3289`) is fixed for the process's lifetime — only
+  `src/resolver/mod.rs:3308`) is fixed for the process's lifetime — only
   `backend` and `local_entries` are behind a swappable, `reload_gate`-guarded
   pointer. Making the cache swappable too would add a lock on every
   single lookup, permanently, to support something that happens rarely
