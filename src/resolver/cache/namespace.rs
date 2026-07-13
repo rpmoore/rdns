@@ -16,7 +16,7 @@
 //! (n = total cached entries, not domains), run once after a reload
 //! publishes a new `cache_epoch`. Every other cache operation is
 //! O(log n) or better per shard. Wiring this into the reload path
-//! (`main.rs`'s `publish_reload`, `DomainDnsCache::sweep_stale_namespace`)
+//! (`ResolveQuery::publish_reload`, `DomainDnsCache::sweep_stale_namespace`)
 //! is section-07's job — here it is a free function, fully testable
 //! against hand-constructed shard state.
 
