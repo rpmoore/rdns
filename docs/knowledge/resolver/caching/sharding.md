@@ -35,7 +35,13 @@ pub(crate) fn shard_index(domain: &str, shard_count: usize) -> usize {
 - `domain` must already be normalized (lowercased, trailing dot
   stripped) by the caller — this function does no normalization itself,
   so two differently-cased spellings only route together if the caller
-  normalized first. Every real call site does.
+  normalized first. `normalize_question_name` (`src/resolver/mod.rs:225-226`)
+  does this; `QuestionKey::new` (`:211-217`) applies it, and
+  `DecodedQuery::new` (`:262-274`) builds `question: QuestionKey` through
+  that constructor for every decoded request — so every production
+  caller of `lookup_chain`/`store_response` (e.g. `probe_cache`,
+  `src/resolver/mod.rs:4255-4260`) is passing an already-normalized
+  `decoded.question.qname`, never a raw wire-format name.
 - Grouping granularity is **per domain name, not per (domain, qtype)**.
   All qtypes/qclasses for one name, its negative-cache entries, and its
   LRU token live in the same shard — see [answer-cache](answer-cache.md)'s
@@ -90,8 +96,10 @@ lock, does its work, and releases it:
 
 `ShardedSingleFlight` (`src/resolver/cache/singleflight.rs:83`), the
 miss-coalescing structure, uses the **same** `shard_index` routing —
-`ResolveQuery` constructs it with a matching shard count so "shard N"
-means the same domain-bucket in both structures. But its lock is
+`main.rs:146` calls `ResolveQuery::with_single_flight_shard_count`
+(`src/resolver/mod.rs:3591`) with the real `ShardedDnsCache`'s own
+`shard_count()`, once both are constructed, so "shard N" means the same
+domain-bucket in both structures. But its lock is
 **intentionally separate** from the cache shard's own lock: merging them
 would widen the cache shard's critical section to include unrelated
 in-flight-miss bookkeeping, reintroducing the "unrelated work serialized

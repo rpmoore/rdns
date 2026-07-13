@@ -16,7 +16,7 @@ structure entirely.
 
 # Structure
 
-```
+```text
 ShardedDnsCache { shards: Vec<Shard> }
 Shard { state: Mutex<ShardState>, capacity: usize }
 ShardState {
