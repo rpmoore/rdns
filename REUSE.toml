@@ -6,6 +6,7 @@ path = [
     ".github/**",
     ".gitignore",
     "AGENTS.md",
+    "CLAUDE.md",
     "Cargo.lock",
     "Cargo.toml",
     "LICENSE",
