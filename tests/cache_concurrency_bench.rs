@@ -60,8 +60,9 @@ fn seed_entry(now: SystemTime) -> RRsetEntry {
         dnssec_state: Default::default(),
         // `ShardedDnsCache::store_response` unconditionally overwrites this
         // with its own `namespace` argument at store time — this value is
-        // never actually read, but every field must be supplied.
-        cache_namespace: NAMESPACE.to_string(),
+        // never actually read, but every field must be supplied. Empty
+        // string avoids an allocation inside the measured hot path.
+        cache_namespace: String::new(),
         // Matches this benchmark's DO=false lookups (`run_workload` passes
         // `dnssec_ok: false` to `lookup_chain`) and normal population
         // semantics (`build_rrset_entry` stamps `dnssec_complete: dnssec_ok`).
