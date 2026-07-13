@@ -123,17 +123,17 @@ pub trait DomainDnsCache: Send + Sync {
         qtype: u16,
         qclass: u16,
         dnssec_ok: bool,
-        namespace: &str,
+        epoch: u64,
         max_chain_depth: u8,
         now: SystemTime,
     ) -> ChainLookup;
 
     /// Replaces the old flat `store` — called once per backend response,
     /// storing the already-decomposed `RRsetEntry`/`NegativeEntry` values.
-    fn store_response(&self, decomposed: DecomposedResponse, namespace: &str);
+    fn store_response(&self, decomposed: DecomposedResponse, epoch: u64);
 
     /// Runs the section-05 sweep; called from the reload path.
-    fn sweep_stale_namespace(&self, current_namespace: &str);
+    fn sweep_stale_namespace(&self, current_epoch: u64);
 
     /// Approximate (sum-across-shards, no single lock) domain count, for
     /// the `OpenTelemetryMetrics` gauges.
@@ -149,40 +149,31 @@ impl DomainDnsCache for ShardedDnsCache {
         qtype: u16,
         qclass: u16,
         dnssec_ok: bool,
-        namespace: &str,
+        epoch: u64,
         max_chain_depth: u8,
         now: SystemTime,
     ) -> ChainLookup {
-        assemble::resolve_from_cache(
-            self,
-            qname,
-            qtype,
-            qclass,
-            dnssec_ok,
-            namespace,
-            max_chain_depth,
-            now,
-        )
+        assemble::resolve_from_cache(self, qname, qtype, qclass, dnssec_ok, epoch, max_chain_depth, now)
     }
 
-    fn store_response(&self, decomposed: DecomposedResponse, namespace: &str) {
-        // Stamps the current namespace onto every entry at store time
-        // (rather than trusting the caller's `DecomposedResponse` to have
-        // already set it correctly) so there is exactly one place that
-        // decides what namespace a freshly-stored entry belongs to.
+    fn store_response(&self, decomposed: DecomposedResponse, epoch: u64) {
+        // Stamps the current epoch onto every entry at store time (rather
+        // than trusting the caller's `DecomposedResponse` to have already
+        // set it correctly) so there is exactly one place that decides what
+        // epoch a freshly-stored entry belongs to.
         for (name, qtype, qclass, mut entry) in decomposed.positive {
-            entry.cache_namespace = namespace.to_string();
+            entry.cache_epoch = epoch;
             self.shard_for(&name)
                 .store_positive(&name, (qtype, qclass), entry);
         }
         if let Some((name, key, mut entry)) = decomposed.negative {
-            entry.cache_namespace = namespace.to_string();
+            entry.cache_epoch = epoch;
             self.shard_for(&name).store_negative(&name, key, entry);
         }
     }
 
-    fn sweep_stale_namespace(&self, current_namespace: &str) {
-        namespace::sweep_stale_namespace(&self.shards, current_namespace);
+    fn sweep_stale_namespace(&self, current_epoch: u64) {
+        namespace::sweep_stale_namespace(&self.shards, current_epoch);
     }
 
     fn domain_count(&self) -> usize {

@@ -41,7 +41,7 @@ use rdns::resolver::{
 
 const A_QTYPE: u16 = 1;
 const IN_QCLASS: u16 = 1;
-const NAMESPACE: &str = "bench";
+const CACHE_EPOCH: u64 = 1;
 const MAX_CHAIN_DEPTH: u8 = 8;
 
 fn seed_entry(now: SystemTime) -> RRsetEntry {
@@ -59,10 +59,9 @@ fn seed_entry(now: SystemTime) -> RRsetEntry {
         expires_at: now + Duration::from_secs(300),
         dnssec_state: Default::default(),
         // `ShardedDnsCache::store_response` unconditionally overwrites this
-        // with its own `namespace` argument at store time — this value is
-        // never actually read, but every field must be supplied. Empty
-        // string avoids an allocation inside the measured hot path.
-        cache_namespace: String::new(),
+        // with its own `epoch` argument at store time — this value is never
+        // actually read, but every field must be supplied.
+        cache_epoch: 0,
         // Matches this benchmark's DO=false lookups (`run_workload` passes
         // `dnssec_ok: false` to `lookup_chain`) and normal population
         // semantics (`build_rrset_entry` stamps `dnssec_complete: dnssec_ok`).
@@ -91,7 +90,7 @@ fn run_workload(cache: &ShardedDnsCache, domains: &[String], operation_count: us
                     positive: vec![(domain.clone(), A_QTYPE, IN_QCLASS, seed_entry(now))],
                     negative: None,
                 },
-                NAMESPACE,
+                CACHE_EPOCH,
             );
         } else {
             let _ = cache.lookup_chain(
@@ -99,7 +98,7 @@ fn run_workload(cache: &ShardedDnsCache, domains: &[String], operation_count: us
                 A_QTYPE,
                 IN_QCLASS,
                 false,
-                NAMESPACE,
+                CACHE_EPOCH,
                 MAX_CHAIN_DEPTH,
                 now,
             );

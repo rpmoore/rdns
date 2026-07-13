@@ -98,7 +98,7 @@ pub enum ChainLookup {
 ///
 /// `max_chain_depth` is an intentional, documented deviation from the
 /// plan's literal listed signature `(cache, qname, qtype, qclass,
-/// current_namespace, now)`: the plan says to reuse
+/// current_epoch, now)`: the plan says to reuse
 /// `RecursiveResolverConfig.max_cname_restarts` "rather than introducing
 /// a second, possibly-inconsistent bound", but that field lives on a type
 /// `cache/` has no access to and isn't part of `CacheConfig`. The caller
@@ -121,7 +121,7 @@ pub(crate) fn resolve_from_cache(
     qtype: u16,
     qclass: u16,
     dnssec_ok: bool,
-    current_namespace: &str,
+    current_epoch: u64,
     max_chain_depth: u8,
     now: SystemTime,
 ) -> ChainLookup {
@@ -150,7 +150,7 @@ pub(crate) fn resolve_from_cache(
         visited.insert(current.clone());
 
         let shard = cache.shard_for(&current);
-        match shard.lookup_hop(&current, qtype, qclass, dnssec_ok, current_namespace, now) {
+        match shard.lookup_hop(&current, qtype, qclass, dnssec_ok, current_epoch, now) {
             HopResult::Answer(entry) => {
                 chain.push((current, entry));
                 return ChainLookup::Answered(ResolvedAnswer { chain });
@@ -737,7 +737,7 @@ mod tests {
             stored_at: now,
             expires_at: now + minimum_ttl,
             dnssec_state: DnssecState::Unvalidated,
-            cache_namespace: "ns-1".to_string(),
+            cache_epoch: 1,
             dnssec_complete: true,
             authoritative: false,
         }
@@ -1166,7 +1166,7 @@ mod tests {
             proof_records,
             stored_at: now,
             expires_at: now + Duration::from_secs(ttl as u64),
-            cache_namespace: "ns-1".to_string(),
+            cache_epoch: 1,
             dnssec_complete: true,
             dnssec_state: DnssecState::Unvalidated,
             authoritative: false,
@@ -1923,7 +1923,7 @@ mod tests {
             nxdomain,
         );
 
-        let result = resolve_from_cache(&cache, domain, A_QTYPE, IN_QCLASS, false, "ns-1", 8, now);
+        let result = resolve_from_cache(&cache, domain, A_QTYPE, IN_QCLASS, false, 1, 8, now);
 
         assert!(
             matches!(result, ChainLookup::NoData(_)),
@@ -1971,7 +1971,7 @@ mod tests {
             A_QTYPE,
             IN_QCLASS,
             false,
-            "ns-1",
+            1,
             8,
             now,
         );
@@ -1987,7 +1987,7 @@ mod tests {
             A_QTYPE,
             IN_QCLASS,
             false,
-            "ns-1",
+            1,
             2,
             now,
         );
@@ -2036,7 +2036,7 @@ mod tests {
             A_QTYPE,
             IN_QCLASS,
             false,
-            "ns-1",
+            1,
             3,
             now,
         );
@@ -2085,7 +2085,7 @@ mod tests {
             A_QTYPE,
             IN_QCLASS,
             false,
-            "ns-1",
+            1,
             3,
             now,
         );
@@ -2139,7 +2139,7 @@ mod tests {
         );
 
         let result = resolve_from_cache(
-            &cache, &names[0], A_QTYPE, IN_QCLASS, false, "ns-1",
+            &cache, &names[0], A_QTYPE, IN_QCLASS, false, 1,
             255, // max_chain_depth: one less than the 256 restarts this chain needs
             now,
         );
@@ -2171,7 +2171,7 @@ mod tests {
             A_QTYPE,
             IN_QCLASS,
             false,
-            "ns-1",
+            1,
             8,
             now,
         );
@@ -2193,7 +2193,7 @@ mod tests {
             Duration::from_secs(300),
             now,
         );
-        cname_entry.cache_namespace = "ns-1".to_string();
+        cname_entry.cache_epoch = 1;
         cache.shard_for("alias.example.com").store_positive(
             "alias.example.com",
             (CNAME_RECORD_TYPE, IN_QCLASS),
@@ -2222,7 +2222,7 @@ mod tests {
             proof_records: Vec::new(),
             stored_at: now,
             expires_at: now + Duration::from_secs(3600),
-            cache_namespace: "ns-1".to_string(),
+            cache_epoch: 1,
             dnssec_complete: true,
             dnssec_state: DnssecState::Unvalidated,
             authoritative: false,
@@ -2243,7 +2243,7 @@ mod tests {
             A_QTYPE,
             IN_QCLASS,
             false,
-            "ns-1",
+            1,
             8,
             now,
         );
@@ -2288,7 +2288,7 @@ mod tests {
             A_QTYPE,
             IN_QCLASS,
             false,
-            "ns-1",
+            1,
             8,
             now,
         );
@@ -2307,7 +2307,7 @@ mod tests {
             A_QTYPE,
             IN_QCLASS,
             false,
-            "ns-1",
+            1,
             8,
             now,
         );
@@ -2320,9 +2320,10 @@ mod tests {
         let cache = cache_with_shard_count(1);
         let now = SystemTime::now();
         let entry = rrset_entry(vec![a_record(300, 1)], Duration::from_secs(300), now);
-        // Entry is unexpired but stored under a namespace that no longer
-        // matches "current" — must be treated as a miss without requiring
-        // section-05's sweep to have run.
+        // Entry is unexpired but stored under an epoch (1, from
+        // `rrset_entry`) that no longer matches the current epoch (2) —
+        // must be treated as a miss without requiring section-05's sweep to
+        // have run.
         cache.shard_for("stale-ns.example.com").store_positive(
             "stale-ns.example.com",
             (A_QTYPE, IN_QCLASS),
@@ -2335,7 +2336,7 @@ mod tests {
             A_QTYPE,
             IN_QCLASS,
             false,
-            "current-ns",
+            2,
             8,
             now,
         );
@@ -2363,7 +2364,7 @@ mod tests {
             Duration::from_secs(300),
             now,
         );
-        cname_entry.cache_namespace = "ns-1".to_string();
+        cname_entry.cache_epoch = 1;
         cache.shard_for("cname-source.example.com").store_positive(
             "cname-source.example.com",
             (CNAME_RECORD_TYPE, IN_QCLASS),
@@ -2383,7 +2384,7 @@ mod tests {
             A_QTYPE,
             IN_QCLASS,
             false,
-            "ns-1",
+            1,
             8,
             now,
         );
@@ -2444,7 +2445,7 @@ mod tests {
 
         let start = std::time::Instant::now();
         let result =
-            resolve_from_cache(&cache, &domain_b, A_QTYPE, IN_QCLASS, false, "ns-1", 8, now);
+            resolve_from_cache(&cache, &domain_b, A_QTYPE, IN_QCLASS, false, 1, 8, now);
         let elapsed = start.elapsed();
 
         handle.join().unwrap();

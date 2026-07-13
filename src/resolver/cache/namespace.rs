@@ -12,9 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Namespace sweep: the one deliberate O(n) operation in the cache design
+//! Epoch sweep: the one deliberate O(n) operation in the cache design
 //! (n = total cached entries, not domains), run once after a reload
-//! publishes a new `cache_namespace`. Every other cache operation is
+//! publishes a new `cache_epoch`. Every other cache operation is
 //! O(log n) or better per shard. Wiring this into the reload path
 //! (`main.rs`'s `publish_reload`, `DomainDnsCache::sweep_stale_namespace`)
 //! is section-07's job — here it is a free function, fully testable
@@ -24,8 +24,8 @@
 
 use super::shard::Shard;
 
-/// Walks every shard and removes any entry whose stored `cache_namespace`
-/// no longer matches `current_namespace`, dropping any domain left with no
+/// Walks every shard and removes any entry whose stored `cache_epoch`
+/// no longer matches `current_epoch`, dropping any domain left with no
 /// remaining entries in either map (and its LRU token along with it). Each
 /// shard's lock is held only for the duration of that shard's own scan —
 /// never a lock shared across shards, so concurrent lookups against
@@ -43,10 +43,10 @@ use super::shard::Shard;
 /// reasonable deviation from the plan's bare `fn(...)` signature, useful
 /// for both direct assertions in tests below and logging/metrics in
 /// section-07's wiring.
-pub(crate) fn sweep_stale_namespace(shards: &[Shard], current_namespace: &str) -> usize {
+pub(crate) fn sweep_stale_namespace(shards: &[Shard], current_epoch: u64) -> usize {
     shards
         .iter()
-        .map(|shard| shard.sweep_stale_namespace(current_namespace))
+        .map(|shard| shard.sweep_stale_namespace(current_epoch))
         .sum()
 }
 
@@ -72,7 +72,7 @@ mod tests {
         }
     }
 
-    fn rrset_entry(namespace: &str) -> RRsetEntry {
+    fn rrset_entry(epoch: u64) -> RRsetEntry {
         let now = SystemTime::now();
         RRsetEntry {
             records: vec![stored_record()],
@@ -82,13 +82,13 @@ mod tests {
             stored_at: now,
             expires_at: now + Duration::from_secs(300),
             dnssec_state: Default::default(),
-            cache_namespace: namespace.to_string(),
+            cache_epoch: epoch,
             dnssec_complete: true,
             authoritative: false,
         }
     }
 
-    fn negative_entry(namespace: &str) -> NegativeEntry {
+    fn negative_entry(epoch: u64) -> NegativeEntry {
         let now = SystemTime::now();
         NegativeEntry {
             kind: NegativeCacheKind::NxDomain,
@@ -98,7 +98,7 @@ mod tests {
             proof_records: Vec::new(),
             stored_at: now,
             expires_at: now + Duration::from_secs(3600),
-            cache_namespace: namespace.to_string(),
+            cache_epoch: epoch,
             dnssec_complete: true,
             dnssec_state: Default::default(),
             authoritative: false,
@@ -111,21 +111,21 @@ mod tests {
         shard.store_positive(
             "stale.example.com",
             (A_QTYPE, IN_QCLASS),
-            rrset_entry("old"),
+            rrset_entry(0),
         );
         shard.store_positive(
             "current.example.com",
             (A_QTYPE, IN_QCLASS),
-            rrset_entry("current"),
+            rrset_entry(1),
         );
         shard.store_positive(
             "also-current.example.com",
             (A_QTYPE, IN_QCLASS),
-            rrset_entry("current"),
+            rrset_entry(1),
         );
         let before = shard.lru_order_for_test();
 
-        let removed = sweep_stale_namespace(std::slice::from_ref(&shard), "current");
+        let removed = sweep_stale_namespace(std::slice::from_ref(&shard), 1);
 
         assert_eq!(removed, 1);
         assert!(!shard.has_any_data("stale.example.com"));
@@ -143,15 +143,15 @@ mod tests {
     fn sweep_removes_domain_entirely_when_all_its_record_sets_are_stale() {
         let shard = Shard::new(4);
         let domain = "fully-stale.example.com";
-        shard.store_positive(domain, (A_QTYPE, IN_QCLASS), rrset_entry("old"));
-        shard.store_positive(domain, (AAAA_QTYPE, IN_QCLASS), rrset_entry("old"));
+        shard.store_positive(domain, (A_QTYPE, IN_QCLASS), rrset_entry(0));
+        shard.store_positive(domain, (AAAA_QTYPE, IN_QCLASS), rrset_entry(0));
         let neg_key = NegativeKey {
             qtype: Some(15),
             qclass: IN_QCLASS,
         };
-        shard.store_negative(domain, neg_key.clone(), negative_entry("old"));
+        shard.store_negative(domain, neg_key.clone(), negative_entry(0));
 
-        let removed = sweep_stale_namespace(std::slice::from_ref(&shard), "current");
+        let removed = sweep_stale_namespace(std::slice::from_ref(&shard), 1);
 
         assert_eq!(removed, 3);
         assert!(!shard.has_any_data(domain));
@@ -165,16 +165,16 @@ mod tests {
     fn sweep_keeps_domain_partially_when_some_record_sets_are_current() {
         let shard = Shard::new(4);
         let domain = "mixed.example.com";
-        shard.store_positive(domain, (A_QTYPE, IN_QCLASS), rrset_entry("old"));
-        shard.store_positive(domain, (AAAA_QTYPE, IN_QCLASS), rrset_entry("current"));
+        shard.store_positive(domain, (A_QTYPE, IN_QCLASS), rrset_entry(0));
+        shard.store_positive(domain, (AAAA_QTYPE, IN_QCLASS), rrset_entry(1));
         shard.store_positive(
             "other.example.com",
             (A_QTYPE, IN_QCLASS),
-            rrset_entry("current"),
+            rrset_entry(1),
         );
         let before = shard.lru_order_for_test();
 
-        let removed = sweep_stale_namespace(std::slice::from_ref(&shard), "current");
+        let removed = sweep_stale_namespace(std::slice::from_ref(&shard), 1);
 
         assert_eq!(removed, 1);
         assert!(shard.has_any_data(domain));
@@ -193,16 +193,16 @@ mod tests {
         let shard_a = Shard::new(4);
         let shard_b = Shard::new(4);
         let shard_c = Shard::new(4);
-        shard_a.store_positive("a.example.com", (A_QTYPE, IN_QCLASS), rrset_entry("old"));
-        shard_b.store_positive("b.example.com", (A_QTYPE, IN_QCLASS), rrset_entry("old"));
+        shard_a.store_positive("a.example.com", (A_QTYPE, IN_QCLASS), rrset_entry(0));
+        shard_b.store_positive("b.example.com", (A_QTYPE, IN_QCLASS), rrset_entry(0));
         shard_c.store_positive(
             "c.example.com",
             (A_QTYPE, IN_QCLASS),
-            rrset_entry("current"),
+            rrset_entry(1),
         );
         let shards = vec![shard_a, shard_b, shard_c];
 
-        let removed = sweep_stale_namespace(&shards, "current");
+        let removed = sweep_stale_namespace(&shards, 1);
 
         assert_eq!(
             removed, 2,
@@ -221,9 +221,9 @@ mod tests {
             qtype: None,
             qclass: IN_QCLASS,
         };
-        shard.store_negative(domain, neg_key.clone(), negative_entry("old"));
+        shard.store_negative(domain, neg_key.clone(), negative_entry(0));
 
-        let removed = sweep_stale_namespace(std::slice::from_ref(&shard), "current");
+        let removed = sweep_stale_namespace(std::slice::from_ref(&shard), 1);
 
         assert_eq!(removed, 1);
         assert!(!shard.has_any_data(domain));
@@ -235,11 +235,11 @@ mod tests {
     fn sweep_across_shards_does_not_require_a_shared_lock() {
         let shard_a = Shard::new(4);
         let shard_b = Shard::new(4);
-        shard_a.store_positive("a.example.com", (A_QTYPE, IN_QCLASS), rrset_entry("old"));
+        shard_a.store_positive("a.example.com", (A_QTYPE, IN_QCLASS), rrset_entry(0));
         shard_b.store_positive(
             "b.example.com",
             (A_QTYPE, IN_QCLASS),
-            rrset_entry("current"),
+            rrset_entry(1),
         );
 
         // Hold shard A's lock in a background thread for well longer than
@@ -251,7 +251,7 @@ mod tests {
         std::thread::sleep(Duration::from_millis(50));
 
         let start = Instant::now();
-        let removed = sweep_stale_namespace(std::slice::from_ref(&shard_b), "current");
+        let removed = sweep_stale_namespace(std::slice::from_ref(&shard_b), 1);
         let elapsed = start.elapsed();
 
         handle.join().unwrap();
