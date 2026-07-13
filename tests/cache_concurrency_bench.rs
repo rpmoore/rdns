@@ -62,7 +62,10 @@ fn seed_entry(now: SystemTime) -> RRsetEntry {
         // with its own `namespace` argument at store time — this value is
         // never actually read, but every field must be supplied.
         cache_namespace: NAMESPACE.to_string(),
-        dnssec_complete: true,
+        // Matches this benchmark's DO=false lookups (`run_workload` passes
+        // `dnssec_ok: false` to `lookup_chain`) and normal population
+        // semantics (`build_rrset_entry` stamps `dnssec_complete: dnssec_ok`).
+        dnssec_complete: false,
         authoritative: false,
     }
 }
