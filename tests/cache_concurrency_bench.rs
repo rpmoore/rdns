@@ -79,15 +79,16 @@ fn seed_entry(now: SystemTime) -> RRsetEntry {
 fn run_workload(cache: &ShardedDnsCache, domains: &[String], operation_count: usize) {
     for i in 0..operation_count {
         let domain = &domains[i % domains.len()];
+        // Captured once per iteration and reused below — `SystemTime::now()`
+        // is unrelated overhead this benchmark isn't meant to measure, and
+        // calling it twice per iteration (once for the store path, once for
+        // the lookup path) can dominate the throughput numbers this is
+        // actually trying to isolate: cache concurrency/lock contention.
+        let now = SystemTime::now();
         if i % 4 == 0 {
             cache.store_response(
                 DecomposedResponse {
-                    positive: vec![(
-                        domain.clone(),
-                        A_QTYPE,
-                        IN_QCLASS,
-                        seed_entry(SystemTime::now()),
-                    )],
+                    positive: vec![(domain.clone(), A_QTYPE, IN_QCLASS, seed_entry(now))],
                     negative: None,
                 },
                 NAMESPACE,
@@ -100,7 +101,7 @@ fn run_workload(cache: &ShardedDnsCache, domains: &[String], operation_count: us
                 false,
                 NAMESPACE,
                 MAX_CHAIN_DEPTH,
-                SystemTime::now(),
+                now,
             );
         }
     }

@@ -142,7 +142,11 @@ fn resolver_without_cache(config: &RuntimeConfig) -> ResolveQuery {
 fn resolver_with_cache(config: &RuntimeConfig) -> ResolveQuery {
     let cache = Arc::new(ShardedDnsCache::new(&CacheConfig {
         max_entries: 256,
-        shard_count: None,
+        // Explicit, not `None` (which resolves from
+        // `available_parallelism()`), so perf numbers are comparable
+        // across runs/hosts instead of depending on the machine's core
+        // count.
+        shard_count: Some(16),
     }));
     let shard_count = cache.shard_count();
     ResolveQuery::with_cache(
