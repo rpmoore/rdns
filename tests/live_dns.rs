@@ -152,6 +152,7 @@ async fn run_live_recursive_server() -> (
             per_query_deadline: config.per_query_deadline,
             max_recursion_depth: recursive.max_recursion_depth,
             max_cname_restarts: recursive.max_cname_restarts,
+            configured_max_udp_payload_size: config.max_udp_payload_size,
         },
         transport,
     ));

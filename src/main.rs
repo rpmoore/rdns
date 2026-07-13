@@ -31,19 +31,18 @@ use rdns::delivery::metrics_http::MetricsServer;
 use rdns::delivery::upstream::{ForwardingResolutionBackend, RecursiveAuthorityTransportClient};
 use rdns::resolver::{
     BackendHealth, BackendRootHintsStatus, BackendSnapshot, BackendStatus, BasicResponseFactory,
-    CacheTtlPolicy, ChannelQueryEventSink, Clock, DnsCache, DnssecValidationStatus, DomainName,
-    InMemoryDnsCache, InMemoryLocalDnsEntries, InMemoryQueryEventStore,
-    InMemoryQueryEventStoreConfig, InMemorySuspiciousLookupClassifier,
-    InMemorySuspiciousLookupClassifierConfig, LocalDnsEntry, MetricsSink, NoopPolicyEvaluator,
-    QueryEventRecordResult, QueryEventSink, QueryEventV1, RecursiveResolutionBackend,
-    RecursiveResolverConfig, RecursiveRootHint, ResolutionMode as ResolverResolutionMode,
-    ResolveQuery, ResolverMetric, StandardProtocolCodec,
+    CacheTtlPolicy, ChannelQueryEventSink, Clock, DnssecValidationStatus, DomainDnsCache,
+    DomainName, InMemoryLocalDnsEntries, InMemoryQueryEventStore, InMemoryQueryEventStoreConfig,
+    InMemorySuspiciousLookupClassifier, InMemorySuspiciousLookupClassifierConfig, LocalDnsEntry,
+    MetricsSink, NoopPolicyEvaluator, QueryEventRecordResult, QueryEventSink, QueryEventV1,
+    RecursiveResolutionBackend, RecursiveResolverConfig, RecursiveRootHint,
+    ResolutionMode as ResolverResolutionMode, ResolveQuery, ResolverMetric, ShardedDnsCache,
+    StandardProtocolCodec,
 };
 use tokio::task::{JoinError, JoinSet};
 use tracing::{error, info, warn};
 use tracing_subscriber::EnvFilter;
 
-const DEFAULT_CACHE_ENTRIES: usize = 10_000;
 const DEFAULT_QUERY_EVENT_STORE_ENTRIES: usize = 10_000;
 const QUERY_EVENT_QUEUE_CAPACITY: usize = 1024;
 const CONFIG_PATH_ENV_VAR: &str = "RDNS_CONFIG";
@@ -102,7 +101,7 @@ async fn main() -> io::Result<()> {
         })
     };
 
-    let cache = Arc::new(InMemoryDnsCache::new(DEFAULT_CACHE_ENTRIES));
+    let cache = Arc::new(ShardedDnsCache::new(&config.cache));
     let (metrics, metrics_registry): (Arc<dyn MetricsSink>, Registry) = if !config.metrics.enabled {
         (Arc::new(NoopMetrics), Registry::new())
     } else {
@@ -121,21 +120,31 @@ async fn main() -> io::Result<()> {
     let (local_entries, local_entry_counts) = build_local_entries(&config, config_path.as_deref())?;
     info!(summary = %local_entry_summary(&local_entry_counts), "loaded local dns entries");
     let reload_metrics = Arc::clone(&metrics);
-    let resolver = Arc::new(ResolveQuery::with_cache_policy_and_backend_snapshot(
-        Arc::new(StandardProtocolCodec::new(config.max_udp_payload_size)),
-        Arc::clone(&cache) as Arc<dyn DnsCache>,
-        Arc::new(NoopPolicyEvaluator),
-        local_entries,
-        CacheTtlPolicy::default(),
-        backend_snapshot,
-        Arc::new(BasicResponseFactory),
-        Arc::new(SystemClock),
-        Arc::new(StoreRecordingQueryEventSink::new(
-            ChannelQueryEventSink::new(event_tx),
-            Arc::clone(&query_event_store),
-        )),
-        metrics,
-    ));
+    let max_chain_depth = config
+        .resolution
+        .recursive
+        .as_ref()
+        .map(|recursive| recursive.max_cname_restarts)
+        .unwrap_or(8);
+    let resolver = Arc::new(
+        ResolveQuery::with_cache_policy_and_backend_snapshot(
+            Arc::new(StandardProtocolCodec::new(config.max_udp_payload_size)),
+            Arc::clone(&cache) as Arc<dyn DomainDnsCache>,
+            Arc::new(NoopPolicyEvaluator),
+            local_entries,
+            CacheTtlPolicy::default(),
+            backend_snapshot,
+            Arc::new(BasicResponseFactory),
+            Arc::new(SystemClock),
+            Arc::new(StoreRecordingQueryEventSink::new(
+                ChannelQueryEventSink::new(event_tx),
+                Arc::clone(&query_event_store),
+            )),
+            metrics,
+        )
+        .with_max_chain_depth(max_chain_depth)
+        .with_single_flight_shard_count(cache.shard_count()),
+    );
 
     let sighup_task =
         spawn_sighup_reload_task(Arc::clone(&resolver), reload_metrics, config_path.clone());
@@ -697,6 +706,7 @@ fn build_recursive_backend_snapshot(
             per_query_deadline: config.per_query_deadline,
             max_recursion_depth: recursive.max_recursion_depth,
             max_cname_restarts: recursive.max_cname_restarts,
+            configured_max_udp_payload_size: config.max_udp_payload_size,
         },
         transport,
         metrics,
@@ -839,7 +849,7 @@ struct OpenTelemetryMetrics {
 }
 
 impl OpenTelemetryMetrics {
-    fn new(cache: Arc<InMemoryDnsCache>) -> Result<Self, String> {
+    fn new(cache: Arc<ShardedDnsCache>) -> Result<Self, String> {
         let registry = Registry::new();
         // Our counter instrument names already end in `_total` (chosen to read
         // correctly as Prometheus metric names directly); without this, the
@@ -852,10 +862,16 @@ impl OpenTelemetryMetrics {
         let provider = SdkMeterProvider::builder().with_reader(exporter).build();
         let meter = provider.meter("rdns.resolver");
 
+        // `domain_count()`/`capacity()` sum across shards without a single
+        // global lock, so under concurrent mutation this gauge is an
+        // eventually-consistent approximation, not an exact
+        // point-in-time read (the same tradeoff DashMap's `len()` makes).
         let cache_for_size = Arc::clone(&cache);
         let cache_size_gauge = meter
             .u64_observable_gauge("cache_size")
-            .with_callback(move |observer| observer.observe(cache_for_size.len() as u64, &[]))
+            .with_callback(move |observer| {
+                observer.observe(cache_for_size.domain_count() as u64, &[])
+            })
             .build();
         let cache_capacity_gauge = meter
             .u64_observable_gauge("cache_capacity")
@@ -1126,6 +1142,36 @@ mod tests {
             enabled = true
             public_address_acknowledged = false
         "#
+    }
+
+    #[test]
+    fn open_telemetry_cache_gauges_report_approximate_domain_count() {
+        // `cache_size`/`cache_capacity` are OpenTelemetry `ObservableGauge`s
+        // whose callback only runs when something actually collects
+        // metrics — `registry.gather()` (the same call the Prometheus HTTP
+        // exporter makes) triggers that collection pass. Values are
+        // asserted as "plausible," not exact, per the documented
+        // eventually-consistent-under-sharding tradeoff: an empty,
+        // freshly-built single-shard cache should report 0 domains and its
+        // full configured capacity.
+        let cache = Arc::new(ShardedDnsCache::new(&rdns::config::CacheConfig {
+            max_entries: 16,
+            shard_count: Some(1),
+        }));
+        let metrics = OpenTelemetryMetrics::new(Arc::clone(&cache)).expect("metrics exporter");
+
+        let families = metrics.registry.gather();
+        let gauge_value = |name: &str| -> f64 {
+            families
+                .iter()
+                .find(|family| family.name() == name)
+                .and_then(|family| family.get_metric().first())
+                .map(|metric| metric.get_gauge().value())
+                .unwrap_or_else(|| panic!("missing gauge {name}"))
+        };
+
+        assert_eq!(gauge_value("cache_size"), 0.0);
+        assert_eq!(gauge_value("cache_capacity"), 16.0);
     }
 
     #[test]

@@ -19,6 +19,7 @@ use std::net::{IpAddr, SocketAddr};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime};
 
+use bytes::Bytes;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
@@ -26,7 +27,7 @@ use tokio::task::JoinSet;
 use tokio::time;
 
 use crate::config::{DEFAULT_MAX_TCP_CONNECTIONS, RuntimeConfig};
-use crate::protocol::{DNS_HEADER_LEN, build_servfail_response};
+use crate::protocol::{DNS_HEADER_LEN, Message, build_servfail_response};
 use crate::resolver::{ObservedSourceEndpoint, ResolveQuery, ResolveRequest};
 
 const DEFAULT_MAX_IN_FLIGHT_REQUESTS: usize = 1024;
@@ -522,6 +523,30 @@ async fn drain_tasks(tasks: &mut JoinSet<()>) {
     while tasks.join_next().await.is_some() {}
 }
 
+// Test-only call counter for the `Message::parse` retry inside
+// `serve_tcp_connection`'s oversized-response fallback branch -- proves
+// that parse only runs on that rare fallback path and not unconditionally
+// on every TCP query (the resolver already parses the same bytes
+// internally during `resolve()`, so an unconditional second parse here
+// would double the parse cost of every TCP query just to cover a branch
+// that almost never runs). `#[cfg(test)]`-gated, compiled out of release
+// builds.
+#[cfg(test)]
+thread_local! {
+    static OVERSIZED_FALLBACK_PARSE_CALLS: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+fn reset_oversized_fallback_parse_calls() {
+    OVERSIZED_FALLBACK_PARSE_CALLS.with(|calls| calls.set(0));
+}
+
+#[cfg(test)]
+fn oversized_fallback_parse_call_count() -> usize {
+    OVERSIZED_FALLBACK_PARSE_CALLS.with(|calls| calls.get())
+}
+
 /// Serves one TCP connection: reads pipelined, length-prefixed queries
 /// until the client closes the connection or goes idle past
 /// `TCP_CONNECTION_IDLE_TIMEOUT`, resolving and answering each in turn.
@@ -564,13 +589,30 @@ async fn serve_tcp_connection(
         time::timeout(TCP_CONNECTION_IDLE_TIMEOUT, stream.read_exact(&mut message))
             .await
             .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "tcp dns read timed out"))??;
+        // `Vec<u8> -> Bytes` takes ownership of the vec's existing
+        // allocation in place (no copy) -- it exists so the fallback copy
+        // retained below is a cheap refcount bump instead of a second
+        // full-size `Vec<u8>` allocation + memcpy of the request on every
+        // TCP query.
+        let message = Bytes::from(message);
 
         // Captured before `message` moves into the request below: needed to
         // build a same-transaction SERVFAIL if the resolved response can't
-        // fit a TCP frame (see below).
+        // fit a TCP frame (see below). This is the rare path (a misbehaving
+        // backend producing an oversized response), so the raw bytes are
+        // kept around via a `Bytes` clone -- a refcount bump, not a copy --
+        // rather than eagerly running `Message::parse` here: the resolver
+        // already parses the same bytes internally during `resolve()`, and
+        // re-parsing them unconditionally would pay that cost on every TCP
+        // query just to cover a fallback branch that almost never runs.
+        // The clone is only parsed, lazily, inside the oversized-response
+        // branch below, where it gives that fallback access to the
+        // requester's question/EDNS/CD context (RFC 6891 §6.1.1 requires
+        // an OPT record in response to any EDNS query).
         let request_id = message
             .get(0..2)
             .map(|bytes| u16::from_be_bytes([bytes[0], bytes[1]]));
+        let request_bytes_for_fallback = message.clone();
 
         let outcome = resolver
             .resolve(ResolveRequest::new_with_observed_source(
@@ -591,7 +633,24 @@ async fn serve_tcp_connection(
                 response_len = outcome.response_bytes.len(),
                 "resolved response exceeds the tcp message size limit; answering servfail"
             );
-            build_servfail_response(None, request_id)
+            // Route through the same EDNS/CD-aware SERVFAIL path used
+            // everywhere else in the resolver: an EDNS requester still gets
+            // an OPT record (RFC 6891 §6.1.1) advertising this resolver's
+            // own configured UDP payload size (not the requester's), and
+            // CD is still copied per RFC 4035 §3.2.2, even though this
+            // response is a same-transaction fallback rather than a normal
+            // `resolve()` output. `parsed_request` is `None` only if the
+            // request itself fails to parse, in which case there's no
+            // question/EDNS context to mirror anyway and the header-only
+            // fallback (keyed on `request_id`) is the correct degradation.
+            #[cfg(test)]
+            OVERSIZED_FALLBACK_PARSE_CALLS.with(|calls| calls.set(calls.get() + 1));
+            let parsed_request = Message::parse(&request_bytes_for_fallback).ok();
+            build_servfail_response(
+                parsed_request.as_ref(),
+                request_id,
+                resolver.configured_max_udp_payload_size(),
+            )
         } else {
             outcome.response_bytes
         };
@@ -643,6 +702,53 @@ mod tests {
         let mut bytes = a_query(id, name);
         bytes[2] = 0x81;
         bytes[3] = 0x80;
+        bytes
+    }
+
+    /// Builds a syntactically valid (fully parseable) A response for `name`
+    /// whose answer section is padded with enough real, well-formed A
+    /// records to exceed `MAX_TCP_MESSAGE_SIZE`. Unlike a buffer of
+    /// arbitrary garbage bytes, this passes `resolve()`'s own
+    /// backend-response validation (`validate_backend_response_bytes`,
+    /// which requires the bytes to parse as a `Message` with a question
+    /// matching the query) instead of being rejected outright as
+    /// unparseable -- rejection maps to a small SERVFAIL from a different
+    /// path entirely (`resolve_backend_and_finish`'s own servfail mapping
+    /// for a malformed backend response) and would never actually reach
+    /// `serve_tcp_connection`'s oversized-`response_bytes` fallback branch.
+    fn oversized_a_response(id: u16, name: &str) -> Vec<u8> {
+        let mut bytes = a_response(id, name);
+        let answer_count: u16 = 5000;
+        bytes[6..8].copy_from_slice(&answer_count.to_be_bytes());
+        for _ in 0..answer_count {
+            bytes.extend_from_slice(&0xc00cu16.to_be_bytes()); // name: pointer to question at offset 12
+            bytes.extend_from_slice(&1u16.to_be_bytes()); // TYPE = A
+            bytes.extend_from_slice(&1u16.to_be_bytes()); // CLASS = IN
+            bytes.extend_from_slice(&60u32.to_be_bytes()); // TTL
+            bytes.extend_from_slice(&4u16.to_be_bytes()); // RDLENGTH
+            bytes.extend_from_slice(&[192, 0, 2, 1]); // RDATA: 192.0.2.1
+        }
+        assert!(bytes.len() > MAX_TCP_MESSAGE_SIZE);
+        bytes
+    }
+
+    /// Builds an `a_query` with a trailing EDNS OPT record (ARCOUNT=1,
+    /// `udp_payload_size` advertised in the OPT CLASS field) and, if
+    /// requested, the CD (checking disabled) header bit set.
+    fn a_query_with_edns_and_cd(id: u16, name: &str, udp_payload_size: u16, cd: bool) -> Vec<u8> {
+        let mut bytes = a_query(id, name);
+        if cd {
+            let flags = u16::from_be_bytes([bytes[2], bytes[3]]) | 0x0010;
+            bytes[2..4].copy_from_slice(&flags.to_be_bytes());
+        }
+        bytes[10..12].copy_from_slice(&1u16.to_be_bytes()); // ARCOUNT = 1
+        bytes.push(0); // OPT record owner name: root
+        bytes.extend_from_slice(&41u16.to_be_bytes()); // TYPE = OPT
+        bytes.extend_from_slice(&udp_payload_size.to_be_bytes()); // CLASS = requested UDP payload size
+        bytes.push(0); // extended RCODE
+        bytes.push(0); // EDNS version
+        bytes.extend_from_slice(&0u16.to_be_bytes()); // extended flags (DO=0)
+        bytes.extend_from_slice(&0u16.to_be_bytes()); // RDLEN = 0
         bytes
     }
 
@@ -1182,6 +1288,210 @@ mod tests {
         let parsed = Message::parse(&second_response).unwrap();
         assert_eq!(parsed.header.id, 0xbbbb);
         assert_eq!(parsed.header.r_code(), ResponseCode::ServFail as u8);
+
+        drop(client);
+        shutdown_tx.send(()).unwrap();
+        server_task.await.unwrap().unwrap();
+    }
+
+    /// Regression test for the TCP oversized-response SERVFAIL fallback
+    /// dropping the requester's EDNS OPT record: an EDNS query whose
+    /// resolved response is too large for a TCP frame must still get a
+    /// SERVFAIL that carries exactly one OPT record advertising *this
+    /// resolver's* configured UDP payload size (RFC 6891 §6.1.1 requires an
+    /// OPT record in response to any EDNS query; the payload size must not
+    /// be omitted or echo the requester's own advertised size), and must
+    /// still copy CD from the request (RFC 4035 §3.2.2). Previously this
+    /// fallback called `build_servfail_response(None, ...)`, which always
+    /// takes the header-only branch and drops the question, OPT, and CD
+    /// entirely.
+    #[tokio::test]
+    async fn tcp_server_oversized_response_servfail_preserves_requester_opt_and_cd() {
+        let oversized_backend_response = vec![0xabu8; MAX_TCP_MESSAGE_SIZE + 1];
+        let upstream = Arc::new(StaticUpstream::new(Ok(upstream_response(
+            oversized_backend_response,
+        ))));
+        // `resolve_service` configures `StandardProtocolCodec::new(1232)`,
+        // so the resolver's own configured UDP payload size is 1232 --
+        // distinct from the 4096 this query advertises, proving the OPT in
+        // the fallback response reflects the resolver's size, not a mirror
+        // of the requester's.
+        let resolver = resolve_service(upstream, Arc::new(RecordingEvents::default()));
+        let server = TcpDnsServer::bind("127.0.0.1:0".parse().unwrap(), resolver)
+            .await
+            .unwrap();
+        let server_addr = server.local_addr().unwrap();
+        let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
+        let server_task = tokio::spawn(async move {
+            server
+                .serve_until(async {
+                    let _ = shutdown_rx.await;
+                })
+                .await
+        });
+
+        let mut client = TcpStream::connect(server_addr).await.unwrap();
+        tcp_send_query(
+            &mut client,
+            &a_query_with_edns_and_cd(0xaaaa, "example.com", 4096, true),
+        )
+        .await;
+        let response_bytes = tcp_recv_response(&mut client).await;
+        let response = Message::parse(&response_bytes).unwrap();
+
+        assert_eq!(response.header.id, 0xaaaa);
+        assert_eq!(response.header.r_code(), ResponseCode::ServFail as u8);
+        assert_eq!(response.questions.len(), 1);
+        assert!(
+            response.header.cd(),
+            "CD must be copied from the request per RFC 4035 §3.2.2"
+        );
+        let opt_records: Vec<_> = response
+            .additionals
+            .iter()
+            .filter_map(|record| match &record.record {
+                crate::protocol::RecordData::OPT(edns) => Some(edns),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            opt_records.len(),
+            1,
+            "an EDNS requester must get exactly one OPT record back, even on this \
+             same-transaction SERVFAIL fallback path (RFC 6891 §6.1.1)"
+        );
+        assert_eq!(
+            opt_records[0].udp_payload_size, 1232,
+            "OPT must advertise this resolver's own configured UDP payload size (1232), \
+             not echo the requester's advertised 4096"
+        );
+
+        drop(client);
+        shutdown_tx.send(()).unwrap();
+        server_task.await.unwrap().unwrap();
+    }
+
+    /// Performance regression test: `serve_tcp_connection` retains
+    /// `request_bytes_for_fallback` (the copy handed to the rare
+    /// oversized-response SERVFAIL branch) as a `Bytes` clone of the
+    /// request it also hands to `resolve()`, not a second `Vec<u8>`
+    /// allocation + memcpy. `Bytes::clone` is documented to be an O(1)
+    /// refcount bump that shares the original buffer -- this test pins
+    /// that guarantee down against the exact pattern `serve_tcp_connection`
+    /// relies on (clone before handing one copy to `resolve()`), so a
+    /// future change that swaps the fallback copy back to `Vec<u8>` (which
+    /// *would* reintroduce a full allocation + memcpy on every TCP query,
+    /// even though `Vec::clone` is spelled identically to `Bytes::clone` at
+    /// the call site) fails a pointer-identity check here rather than only
+    /// showing up as a throughput regression.
+    #[test]
+    fn tcp_fallback_bytes_clone_shares_the_original_allocation() {
+        let message = Bytes::from(vec![0u8; 4096]);
+        let original_ptr = message.as_ptr();
+        let request_bytes_for_fallback = message.clone();
+        assert_eq!(
+            request_bytes_for_fallback.as_ptr(),
+            original_ptr,
+            "the TCP fallback copy must share the request's existing allocation, \
+             not allocate a second full-size buffer"
+        );
+    }
+
+    /// Performance regression test: the `Message::parse` retry that
+    /// recovers EDNS/CD context for the oversized-response SERVFAIL
+    /// fallback (see
+    /// `tcp_server_oversized_response_servfail_preserves_requester_opt_and_cd`
+    /// above) must stay lazy -- it should only run when a query's resolved
+    /// response is actually too large for a TCP frame, not unconditionally
+    /// on every TCP query. An earlier version of that fix placed the parse
+    /// call unconditionally on the normal path, silently paying a second
+    /// full DNS message parse (on top of the one `resolve()` already does
+    /// internally) for every successful TCP query.
+    #[tokio::test]
+    async fn tcp_server_normal_response_does_not_parse_fallback_request() {
+        reset_oversized_fallback_parse_calls();
+
+        let upstream = Arc::new(StaticUpstream::new(Ok(upstream_response(a_response(
+            0x1234,
+            "example.com",
+        )))));
+        let resolver = resolve_service(upstream, Arc::new(RecordingEvents::default()));
+        let server = TcpDnsServer::bind("127.0.0.1:0".parse().unwrap(), resolver)
+            .await
+            .unwrap();
+        let server_addr = server.local_addr().unwrap();
+        let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
+        let server_task = tokio::spawn(async move {
+            server
+                .serve_until(async {
+                    let _ = shutdown_rx.await;
+                })
+                .await
+        });
+
+        let mut client = TcpStream::connect(server_addr).await.unwrap();
+        tcp_send_query(&mut client, &a_query(0x1234, "example.com")).await;
+        let response = tcp_recv_response(&mut client).await;
+        assert_eq!(response, a_response(0x1234, "example.com"));
+
+        // A second pipelined query on the same connection, to make sure the
+        // lazy parse stays lazy across repeated queries, not just the
+        // first.
+        tcp_send_query(&mut client, &a_query(0x5678, "example.com")).await;
+        let response = tcp_recv_response(&mut client).await;
+        assert_eq!(response, a_response(0x5678, "example.com"));
+
+        assert_eq!(
+            oversized_fallback_parse_call_count(),
+            0,
+            "Message::parse must not run on the normal (non-oversized) TCP response path"
+        );
+
+        drop(client);
+        shutdown_tx.send(()).unwrap();
+        server_task.await.unwrap().unwrap();
+    }
+
+    /// Companion to the test above: confirms the counter it relies on
+    /// actually increments on the rare path it's meant to observe, so a
+    /// `0` result there is meaningful rather than the counter being wired
+    /// up wrong / never incrementing at all.
+    #[tokio::test]
+    async fn tcp_server_oversized_response_parses_fallback_request_exactly_once() {
+        reset_oversized_fallback_parse_calls();
+
+        let upstream = Arc::new(StaticUpstream::new(Ok(upstream_response(
+            oversized_a_response(0xaaaa, "example.com"),
+        ))));
+        let resolver = resolve_service(upstream, Arc::new(RecordingEvents::default()));
+        let server = TcpDnsServer::bind("127.0.0.1:0".parse().unwrap(), resolver)
+            .await
+            .unwrap();
+        let server_addr = server.local_addr().unwrap();
+        let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
+        let server_task = tokio::spawn(async move {
+            server
+                .serve_until(async {
+                    let _ = shutdown_rx.await;
+                })
+                .await
+        });
+
+        let mut client = TcpStream::connect(server_addr).await.unwrap();
+        tcp_send_query(&mut client, &a_query(0xaaaa, "example.com")).await;
+        let response_bytes = tcp_recv_response(&mut client).await;
+        let response = Message::parse(&response_bytes).unwrap();
+        assert_eq!(
+            response.header.r_code(),
+            ResponseCode::ServFail as u8,
+            "sanity check: the oversized response must actually take the fallback branch"
+        );
+
+        assert_eq!(
+            oversized_fallback_parse_call_count(),
+            1,
+            "Message::parse must run exactly once on the oversized-response fallback path"
+        );
 
         drop(client);
         shutdown_tx.send(()).unwrap();
