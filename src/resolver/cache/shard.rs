@@ -19,9 +19,10 @@
 //! and its LRU recency token — lives in exactly one shard and is mutated
 //! together, atomically, under that shard's single lock.
 //!
-//! No non-test callers yet (section-06/section-07 wire this into the
-//! top-level cache type); `#[allow(dead_code)]` below is transient, same
-//! pattern as `shard_index` in section-01.
+//! `ShardedDnsCache` (`mod.rs`) routes production lookups/stores through
+//! `Shard`, so most of this module is exercised outside tests now.
+//! `#[allow(dead_code)]` below only covers the handful of methods (e.g.
+//! `Shard::touch`) that remain test-only conveniences.
 
 #![allow(dead_code)]
 

@@ -20,8 +20,12 @@
 //! (truncation), neither of which are cache-key dimensions anymore.
 //!
 //! Storing a backend response into the cache (`store_response`) and
-//! wiring this into `DomainDnsCache` are section-07's job — this section
-//! only produces the read side.
+//! `DomainDnsCache` are implemented in `mod.rs`, which calls
+//! `resolve_from_cache` from this module for the read side — that wiring
+//! landed in section-07, so it's no longer scaffolding-only. The
+//! `#[allow(dead_code)]` below is for `CNAME_RECORD_TYPE`, which this
+//! module's own tests use but production code doesn't reference directly
+//! (production goes through `shard.rs`'s copy).
 
 #![allow(dead_code)]
 

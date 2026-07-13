@@ -12,14 +12,17 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Exact per-shard LRU (`ShardLru`), replacing the current ghost-token
-//! `VecDeque` design used by `InMemoryDnsCache`. Gives O(log n)
-//! average-case touch/evict with no periodic full-scan compaction, and
-//! exact (not approximate) recency ordering within a shard.
+//! Exact per-shard LRU (`ShardLru`), replacing the ghost-token `VecDeque`
+//! design used by the old `InMemoryDnsCache`. Gives O(log n) average-case
+//! touch/evict with no periodic full-scan compaction, and exact (not
+//! approximate) recency ordering within a shard.
 //!
-//! No non-test callers yet (section-06/section-07 wire this into the
-//! top-level cache type); `#[allow(dead_code)]` below is transient, same
-//! pattern as `shard_index` in section-01.
+//! `Shard` (`shard.rs`) wires this into the production cache via
+//! `ShardState`'s derived `Default`, not `ShardLru::new` directly — so
+//! `ShardLru::new` itself, and `Shard::touch` (the only production path
+//! to `ShardLru::touch`, only called from tests today), remain unused
+//! outside tests. `#[allow(dead_code)]` below covers that residual
+//! test-only surface, not the whole module.
 
 #![allow(dead_code)]
 
