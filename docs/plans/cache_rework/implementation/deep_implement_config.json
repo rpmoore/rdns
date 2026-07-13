@@ -1,0 +1,62 @@
+{
+  "plugin_root": "/home/rpmoore/.claude/plugins/cache/piercelamb-plugins/deep-implement/0.2.1",
+  "sections_dir": "/home/rpmoore/code/rdns/docs/plans/cache_rework/sections",
+  "target_dir": "/home/rpmoore/code/rdns",
+  "state_dir": "/home/rpmoore/code/rdns/docs/plans/cache_rework/implementation",
+  "git_root": "/home/rpmoore/code/rdns",
+  "commit_style": "simple",
+  "test_command": "cargo test --locked",
+  "sections": [
+    "section-01-foundation",
+    "section-02-data-model",
+    "section-03-shard-and-lru",
+    "section-04-singleflight",
+    "section-05-namespace-sweep",
+    "section-06-assembly-and-chains",
+    "section-07-call-site-migration",
+    "section-08-test-migration-and-benchmark"
+  ],
+  "sections_state": {
+    "section-01-foundation": {
+      "status": "complete",
+      "commit_hash": "ca5e47b"
+    },
+    "section-02-data-model": {
+      "status": "complete",
+      "commit_hash": "109bea1"
+    },
+    "section-03-shard-and-lru": {
+      "status": "complete",
+      "commit_hash": "04c435b"
+    },
+    "section-04-singleflight": {
+      "status": "complete",
+      "commit_hash": "9c589be"
+    },
+    "section-05-namespace-sweep": {
+      "status": "complete",
+      "commit_hash": "6f4dc64"
+    },
+    "section-06-assembly-and-chains": {
+      "status": "complete",
+      "commit_hash": "0218914"
+    },
+    "section-07-call-site-migration": {
+      "status": "complete",
+      "commit_hash": "f4759d2"
+    },
+    "section-08-test-migration-and-benchmark": {
+      "status": "complete",
+      "commit_hash": "b4bd5b4"
+    }
+  },
+  "pre_commit": {
+    "present": false,
+    "type": "none",
+    "config_file": null,
+    "native_hook": null,
+    "may_modify_files": false,
+    "detected_formatters": []
+  },
+  "created_at": "2026-07-10T01:38:03.468325+00:00"
+}

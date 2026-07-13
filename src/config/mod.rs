@@ -37,6 +37,7 @@ pub struct RuntimeConfig {
     pub local_dns_entries: Vec<LocalDnsEntryConfig>,
     pub local_zones: Vec<LocalZoneConfig>,
     pub metrics: MetricsConfig,
+    pub cache: CacheConfig,
 }
 
 /// Default ceiling on concurrent TCP DNS connections per listener. Shared
@@ -77,6 +78,7 @@ impl RuntimeConfig {
             local_dns_entries: Vec::new(),
             local_zones: Vec::new(),
             metrics: MetricsConfig::default_enabled(),
+            cache: CacheConfig::default(),
         };
         config.validate()?;
         Ok(config)
@@ -103,6 +105,7 @@ impl RuntimeConfig {
             local_dns_entries: Vec::new(),
             local_zones: Vec::new(),
             metrics: MetricsConfig::default_enabled(),
+            cache: CacheConfig::default(),
         }
     }
 
@@ -186,6 +189,8 @@ impl RuntimeConfig {
                 value: self.max_tcp_connections,
             });
         }
+
+        self.cache.validate()?;
 
         Ok(())
     }
@@ -283,6 +288,117 @@ const DEFAULT_METRICS_MAX_CONNECTIONS: usize = 32;
 
 fn default_metrics_listen_addr() -> SocketAddr {
     SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 9090)
+}
+
+/// Configuration for the sharded answer cache (`resolver::cache`).
+///
+/// Capacity is counted in domains, not individual cached record sets — a
+/// domain with multiple cached qtypes still occupies one slot.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CacheConfig {
+    /// Total domain-count capacity across the whole cache. Replaces the
+    /// `main.rs` `DEFAULT_CACHE_ENTRIES` constant. Default: 10_000,
+    /// preserving today's behavior for anyone not setting this explicitly.
+    pub max_entries: usize,
+    /// Number of shards. `None` means "pick a sensible default" — a power
+    /// of two near `available_parallelism()`, following the
+    /// DashMap/RocksDB convention of roughly 4x parallelism.
+    pub shard_count: Option<usize>,
+}
+
+impl CacheConfig {
+    /// Returns the configured shard count, or a computed default when
+    /// unset or explicitly zero: `available_parallelism() * 4`, rounded up
+    /// to the next power of two. Falls back to a parallelism of `1` if the
+    /// platform can't report it. `Some(0)` is treated the same as `None`
+    /// rather than passed through, since a resolved shard count of 0 would
+    /// make every capacity/routing computation downstream divide by zero.
+    ///
+    /// Also caps the result at `max_entries` whenever `max_entries > 0`:
+    /// `shard_capacity`'s remainder-distributed formula gives shard `i`
+    /// capacity `max_entries / shard_count` (plus one for the first
+    /// `max_entries % shard_count` shards) — if `shard_count` exceeds
+    /// `max_entries`, that division floors to zero for every shard past
+    /// index `max_entries`, silently making those shards permanently
+    /// unable to cache anything (`Shard::store_positive`/`store_negative`
+    /// are no-ops at capacity 0). Any domain whose hash lands in one of
+    /// those shards would miss forever under a configuration that looks
+    /// valid. Capping here — the one place both `ShardedDnsCache::new` and
+    /// `ResolveQuery::with_single_flight_shard_count` source their shard
+    /// count from — guarantees every shard gets at least capacity 1
+    /// whenever the cache has any capacity at all, without requiring every
+    /// caller (including tests/benchmarks that construct `CacheConfig`
+    /// directly, bypassing `RuntimeConfig::validate()`) to remember to
+    /// check this themselves. `max_entries == 0` is left uncapped (still
+    /// resolves to the parallelism-derived shard count) since every shard
+    /// is already correctly zero-capacity in that case — nothing to
+    /// protect against.
+    pub fn resolved_shard_count(&self) -> usize {
+        let count = match self.shard_count {
+            Some(count) if count > 0 => count,
+            _ => {
+                let parallelism = std::thread::available_parallelism()
+                    .map(|n| n.get())
+                    .unwrap_or(1);
+                (parallelism * 4).next_power_of_two()
+            }
+        };
+        if self.max_entries == 0 {
+            count
+        } else {
+            count.min(self.max_entries)
+        }
+    }
+
+    /// Returns the capacity assigned to shard `index` out of `shard_count`
+    /// total shards, given this config's `max_entries`. Per-shard
+    /// capacities sum exactly to `max_entries`: each shard gets
+    /// `max_entries / shard_count`, plus one extra for the first
+    /// `max_entries % shard_count` shards, so the remainder is distributed
+    /// rather than rounded up per-shard (which would overshoot the
+    /// configured total).
+    pub fn shard_capacity(&self, index: usize, shard_count: usize) -> usize {
+        if shard_count == 0 {
+            return 0;
+        }
+        debug_assert!(index < shard_count, "shard index out of bounds");
+        let base = self.max_entries / shard_count;
+        let remainder = self.max_entries % shard_count;
+        if index < remainder { base + 1 } else { base }
+    }
+
+    /// Rejects an explicit `shard_count` large enough to make
+    /// `ShardedDnsCache::new`'s `Vec<Shard>` allocation a startup-time
+    /// footgun. `resolved_shard_count()` only caps `shard_count` against
+    /// `max_entries` when `max_entries > 0` (deliberately -- see that
+    /// method's doc comment); a config with `max_entries = 0` (caching
+    /// disabled) plus a large explicit `shard_count` sails through
+    /// uncapped, since every shard is correctly zero-capacity either way.
+    /// That combination is a plausible typo (e.g. an extra digit) rather
+    /// than a deliberate choice, and can turn into an oversized allocation
+    /// at startup with no caching benefit to show for it. This cap applies
+    /// regardless of `max_entries` for the same reason `resolved_shard_count`
+    /// doesn't special-case it further: one bound, one place to check it.
+    pub fn validate(&self) -> Result<(), ConfigError> {
+        if let Some(shard_count) = self.shard_count
+            && shard_count > MAX_CACHE_SHARD_COUNT
+        {
+            return Err(ConfigError::InvalidCacheShardCount {
+                value: shard_count,
+                max: MAX_CACHE_SHARD_COUNT,
+            });
+        }
+        Ok(())
+    }
+}
+
+impl Default for CacheConfig {
+    fn default() -> Self {
+        Self {
+            max_entries: 10_000,
+            shard_count: None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1170,6 +1286,10 @@ pub enum ConfigError {
     InvalidMaxTcpConnections {
         value: usize,
     },
+    InvalidCacheShardCount {
+        value: usize,
+        max: usize,
+    },
 }
 
 #[derive(Debug, Deserialize)]
@@ -1190,6 +1310,8 @@ struct RawRuntimeConfig {
     local_zones: Vec<RawLocalZoneConfig>,
     #[serde(default)]
     metrics: Option<RawMetricsConfig>,
+    #[serde(default)]
+    cache: Option<RawCacheConfig>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1213,6 +1335,28 @@ fn default_metrics_max_connections() -> usize {
 
 fn default_max_tcp_connections() -> usize {
     DEFAULT_MAX_TCP_CONNECTIONS
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawCacheConfig {
+    #[serde(default = "default_cache_max_entries")]
+    max_entries: usize,
+    #[serde(default)]
+    shard_count: Option<usize>,
+}
+
+fn default_cache_max_entries() -> usize {
+    CacheConfig::default().max_entries
+}
+
+impl RawCacheConfig {
+    fn try_into_cache_config(self) -> Result<CacheConfig, ConfigError> {
+        Ok(CacheConfig {
+            max_entries: self.max_entries,
+            shard_count: self.shard_count,
+        })
+    }
 }
 
 impl RawMetricsConfig {
@@ -1515,6 +1659,11 @@ impl TryFrom<RawRuntimeConfig> for RuntimeConfig {
             .map(RawMetricsConfig::try_into_metrics_config)
             .transpose()?
             .unwrap_or_else(MetricsConfig::default_enabled);
+        let cache = raw
+            .cache
+            .map(RawCacheConfig::try_into_cache_config)
+            .transpose()?
+            .unwrap_or_default();
 
         let config = RuntimeConfig {
             dns_listen,
@@ -1526,6 +1675,7 @@ impl TryFrom<RawRuntimeConfig> for RuntimeConfig {
             local_dns_entries,
             local_zones,
             metrics,
+            cache,
         };
         config.validate()?;
         Ok(config)
@@ -1561,6 +1711,13 @@ const MAX_RECURSION_DEPTH: u8 = 64;
 const MAX_CNAME_RESTARTS: u8 = 16;
 const MIN_UDP_PAYLOAD_SIZE: usize = 512;
 const MAX_UDP_PAYLOAD_SIZE: usize = 4096;
+/// Generous upper bound on `CacheConfig::shard_count` -- far beyond any
+/// real deployment's parallelism, but small enough that a `Vec<Shard>` of
+/// this size is a trivial allocation. Exists solely to catch fat-finger
+/// config mistakes (an extra digit) before they turn into an oversized
+/// startup allocation, particularly since `max_entries = 0` (caching
+/// disabled) leaves `shard_count` otherwise uncapped.
+const MAX_CACHE_SHARD_COUNT: usize = 65_536;
 const FNV1A64_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
 const FNV1A64_PRIME: u64 = 0x0000_0100_0000_01b3;
 
@@ -2301,6 +2458,35 @@ a.root-servers.net.      3600000      Aaaa  2001:503:ba3e::2:30
     }
 
     #[test]
+    fn cache_config_defaults_when_absent() {
+        let config = RuntimeConfig::from_toml_str(&valid_toml()).unwrap();
+
+        assert_eq!(config.cache, CacheConfig::default());
+    }
+
+    #[test]
+    fn cache_config_explicit_override() {
+        let mut toml = valid_toml();
+        toml.push_str(
+            r#"
+            [cache]
+            max_entries = 500
+            shard_count = 4
+            "#,
+        );
+
+        let config = RuntimeConfig::from_toml_str(&toml).unwrap();
+
+        assert_eq!(
+            config.cache,
+            CacheConfig {
+                max_entries: 500,
+                shard_count: Some(4),
+            }
+        );
+    }
+
+    #[test]
     fn metrics_config_defaults_when_absent() {
         let config = RuntimeConfig::from_toml_str(&valid_toml()).unwrap();
 
@@ -2409,6 +2595,43 @@ a.root-servers.net.      3600000      Aaaa  2001:503:ba3e::2:30
         let error = RuntimeConfig::from_toml_str(&toml).unwrap_err();
 
         assert_eq!(error, ConfigError::InvalidMaxTcpConnections { value: 0 });
+    }
+
+    #[test]
+    fn config_rejects_oversized_cache_shard_count() {
+        let mut toml = valid_toml();
+        toml.push_str(
+            r#"
+            [cache]
+            max_entries = 0
+            shard_count = 100000000
+            "#,
+        );
+
+        let error = RuntimeConfig::from_toml_str(&toml).unwrap_err();
+
+        assert_eq!(
+            error,
+            ConfigError::InvalidCacheShardCount {
+                value: 100_000_000,
+                max: MAX_CACHE_SHARD_COUNT,
+            }
+        );
+    }
+
+    #[test]
+    fn config_allows_cache_shard_count_at_the_cap() {
+        let mut toml = valid_toml();
+        toml.push_str(&format!(
+            "\n            [cache]\n            shard_count = {MAX_CACHE_SHARD_COUNT}\n            "
+        ));
+
+        RuntimeConfig::from_toml_str(&toml).expect("shard_count at the cap must be accepted");
+    }
+
+    #[test]
+    fn cache_config_validate_accepts_default() {
+        assert_eq!(CacheConfig::default().validate(), Ok(()));
     }
 
     #[test]
@@ -3133,5 +3356,143 @@ a.root-servers.net.      3600000      Aaaa  2001:503:ba3e::2:30
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn cache_config_defaults_preserve_current_max_entries() {
+        assert_eq!(CacheConfig::default().max_entries, 10_000);
+    }
+
+    #[test]
+    fn cache_config_shard_capacity_sums_exactly_to_max_entries() {
+        let cases: &[(usize, usize)] = &[(10, 8), (10_000, 16), (1, 4), (0, 8), (7, 1), (100, 3)];
+        for &(max_entries, shard_count) in cases {
+            let config = CacheConfig {
+                max_entries,
+                shard_count: Some(shard_count),
+            };
+            let total: usize = (0..shard_count)
+                .map(|index| config.shard_capacity(index, shard_count))
+                .sum();
+            assert_eq!(
+                total, max_entries,
+                "max_entries={max_entries} shard_count={shard_count}"
+            );
+        }
+    }
+
+    #[test]
+    fn cache_config_zero_max_entries_gives_every_shard_zero_capacity() {
+        let config = CacheConfig {
+            max_entries: 0,
+            shard_count: Some(8),
+        };
+        for index in 0..8 {
+            assert_eq!(config.shard_capacity(index, 8), 0);
+        }
+    }
+
+    #[test]
+    fn cache_config_shard_capacity_is_zero_when_shard_count_is_zero() {
+        let config = CacheConfig {
+            max_entries: 10_000,
+            shard_count: Some(0),
+        };
+        assert_eq!(config.shard_capacity(0, 0), 0);
+    }
+
+    #[test]
+    fn cache_config_resolved_shard_count_treats_explicit_zero_as_unset() {
+        let explicit_zero = CacheConfig {
+            max_entries: 10_000,
+            shard_count: Some(0),
+        };
+        let unset = CacheConfig {
+            max_entries: 10_000,
+            shard_count: None,
+        };
+        assert_eq!(
+            explicit_zero.resolved_shard_count(),
+            unset.resolved_shard_count()
+        );
+        assert!(explicit_zero.resolved_shard_count() > 0);
+    }
+
+    #[test]
+    fn cache_config_resolved_shard_count_caps_at_max_entries() {
+        // Regression test: shard_count > max_entries used to resolve
+        // unchanged, so `shard_capacity`'s remainder-distributed formula
+        // gave every shard past index `max_entries` a capacity of 0 —
+        // `Shard::store_positive`/`store_negative` are no-ops at capacity
+        // 0, so any domain hashing into one of those shards could never
+        // be cached, silently, under a configuration that looks valid.
+        let config = CacheConfig {
+            max_entries: 5,
+            shard_count: Some(64),
+        };
+        assert_eq!(config.resolved_shard_count(), 5);
+    }
+
+    #[test]
+    fn cache_config_resolved_shard_count_every_shard_gets_nonzero_capacity_when_possible() {
+        // For every nonzero max_entries, no shard produced by the
+        // resolved shard count should ever end up with capacity 0 — every
+        // hash bucket must be able to retain at least one domain.
+        for max_entries in [1usize, 2, 5, 10, 100] {
+            for requested_shard_count in [1usize, 4, 8, 16, 64, 1000] {
+                let config = CacheConfig {
+                    max_entries,
+                    shard_count: Some(requested_shard_count),
+                };
+                let shard_count = config.resolved_shard_count();
+                for index in 0..shard_count {
+                    let capacity = config.shard_capacity(index, shard_count);
+                    assert!(
+                        capacity >= 1,
+                        "max_entries={max_entries} requested_shard_count=\
+                         {requested_shard_count} resolved_shard_count={shard_count} \
+                         shard {index} got capacity 0"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn cache_config_resolved_shard_count_leaves_max_entries_zero_uncapped() {
+        // max_entries == 0 legitimately means "every shard has capacity
+        // 0" (see `cache_config_zero_max_entries_gives_every_shard_zero_capacity`)
+        // — nothing to protect against, so the shard count is left at
+        // whatever it would otherwise resolve to.
+        let config = CacheConfig {
+            max_entries: 0,
+            shard_count: Some(64),
+        };
+        assert_eq!(config.resolved_shard_count(), 64);
+    }
+
+    #[test]
+    fn cache_config_shard_count_defaults_to_power_of_two_near_parallelism() {
+        let config = CacheConfig {
+            max_entries: 10_000,
+            shard_count: None,
+        };
+        let resolved = config.resolved_shard_count();
+        assert!(
+            resolved.is_power_of_two(),
+            "resolved shard count {resolved} should be a power of two"
+        );
+
+        let parallelism = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(1);
+        assert!(
+            resolved >= parallelism,
+            "resolved={resolved} parallelism={parallelism}"
+        );
+        assert!(
+            resolved <= parallelism * 8,
+            "resolved={resolved} parallelism={parallelism}"
+        );
     }
 }
