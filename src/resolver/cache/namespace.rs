@@ -15,12 +15,10 @@
 //! Epoch sweep: the one deliberate O(n) operation in the cache design
 //! (n = total cached entries, not domains), run once after a reload
 //! publishes a new `cache_epoch`. Every other cache operation is
-//! O(log n) or better per shard. Wiring this into the reload path
-//! (`ResolveQuery::publish_reload`, `DomainDnsCache::sweep_stale_namespace`)
-//! is section-07's job — here it is a free function, fully testable
-//! against hand-constructed shard state.
-
-#![allow(dead_code)]
+//! O(log n) or better per shard. `ResolveQuery::publish_reload` calls
+//! this (via `DomainDnsCache::sweep_stale_namespace` on
+//! `ShardedDnsCache`, `src/resolver/cache/mod.rs`) after releasing
+//! `reload_gate`, only when the epoch actually changed.
 
 use super::shard::Shard;
 
@@ -31,18 +29,14 @@ use super::shard::Shard;
 /// never a lock shared across shards, so concurrent lookups against
 /// already-swept or not-yet-swept shards proceed normally throughout.
 ///
-/// Takes `shards` directly rather than the `ShardedDnsCache` container.
-/// `ShardedDnsCache` is section-06's deliverable, built in parallel with
-/// this section from the same section-03 dependency, so it does not exist
-/// at this section's implementation time — see this section's
-/// implementation notes. Section-07 will call this as
-/// `sweep_stale_namespace(&cache.shards, ...)` once `ShardedDnsCache`
-/// exists.
+/// Takes `shards` directly rather than the `ShardedDnsCache` container so
+/// this stays testable against hand-constructed shard state without
+/// building a full cache. `ShardedDnsCache::sweep_stale_namespace`
+/// (`src/resolver/cache/mod.rs`) is the only production caller, passing
+/// its own `self.shards`.
 ///
-/// Returns the total number of entries removed across all shards — a
-/// reasonable deviation from the plan's bare `fn(...)` signature, useful
-/// for both direct assertions in tests below and logging/metrics in
-/// section-07's wiring.
+/// Returns the total number of entries removed across all shards, used
+/// directly in the tests below and available to callers for logging/metrics.
 pub(crate) fn sweep_stale_namespace(shards: &[Shard], current_epoch: u64) -> usize {
     shards
         .iter()
