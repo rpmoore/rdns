@@ -34,17 +34,16 @@ use crate::resolver::{ResolutionBackendError, ResolutionResponse};
 
 use super::shard_index;
 
-/// Miss-coalescing key: normalized qname, qtype, qclass, cache namespace
-/// (`BackendSnapshot.cache_namespace`, defaulted to `""` by callers that
-/// have no snapshot namespace), and the requester's EDNS DO
-/// (`dnssec_ok`) flag. The namespace **must** be part of this key, not
-/// just `(qname, qtype, qclass)`: cache lookup/store is namespace-scoped
+/// Miss-coalescing key: normalized qname, qtype, qclass, cache epoch
+/// (`BackendSnapshot.cache_epoch`), and the requester's EDNS DO
+/// (`dnssec_ok`) flag. The epoch **must** be part of this key, not
+/// just `(qname, qtype, qclass)`: cache lookup/store is epoch-scoped
 /// (`DomainDnsCache::lookup_chain`/`store_response`), so a request that
-/// misses under namespace N1 and one that misses under namespace N2 for
+/// misses under epoch E1 and one that misses under epoch E2 for
 /// the same name/type/class are answering fundamentally different
 /// questions (different backend/upstream generation) and must never
 /// coalesce onto the same in-flight backend call — otherwise a request
-/// arriving just after a reload (new namespace) could be served a
+/// arriving just after a reload (new epoch) could be served a
 /// stale-generation response resolved before the reload even started.
 ///
 /// The DO flag's meaning is mode-dependent -- it is *not* always the
@@ -71,7 +70,7 @@ use super::shard_index;
 ///   on the same name; the per-requester DO=false/DO=true response
 ///   difference is handled correctly downstream, after the shared fetch,
 ///   by `filter_response_for_requester`.
-pub(crate) type MissKey = (String, u16, u16, String, bool);
+pub(crate) type MissKey = (String, u16, u16, u64, bool);
 
 /// Sharded replacement for today's single-mutex `SingleFlightMisses`.
 /// Shard count and routing must match the cache's own sharding so that,
@@ -240,7 +239,7 @@ mod tests {
     use std::time::{Duration, SystemTime};
 
     fn key(name: &str) -> MissKey {
-        (name.to_string(), 1, 1, "ns-1".to_string(), false) // A, IN, namespace "ns-1", DO=false
+        (name.to_string(), 1, 1, 1, false) // A, IN, epoch 1, DO=false
     }
 
     fn sample_response(marker: &str) -> ResolutionResponse {
@@ -332,54 +331,55 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn single_flight_does_not_coalesce_across_cache_namespaces() {
-        // Regression test for the cross-namespace miss-coalescing bug: a
-        // leader begins a flight for (name, qtype, qclass) under namespace
-        // N1 (simulating a request that missed just before a reload
+    async fn single_flight_does_not_coalesce_across_cache_epochs() {
+        // Regression test for the cross-epoch miss-coalescing bug: a
+        // leader begins a flight for (name, qtype, qclass) under epoch 1
+        // (simulating a request that missed just before a reload
         // published a new backend generation). A second request for the
-        // exact same (name, qtype, qclass) arriving under namespace N2
+        // exact same (name, qtype, qclass) arriving under epoch 2
         // (simulating a request that observed the post-reload snapshot)
-        // must NOT attach as a follower to the still-in-flight N1 leader —
-        // it must become its own leader, so it resolves against the
-        // current backend generation rather than being served N1's stale
-        // result.
+        // must NOT attach as a follower to the still-in-flight epoch-1
+        // leader — it must become its own leader, so it resolves against
+        // the current backend generation rather than being served
+        // epoch 1's stale result.
         let coalescer = Arc::new(ShardedSingleFlight::new(4));
         let name = "example.com".to_string();
-        let key_n1 = (name.clone(), 1u16, 1u16, "ns-1".to_string(), false);
-        let key_n2 = (name, 1u16, 1u16, "ns-2".to_string(), false);
+        let key_epoch1 = (name.clone(), 1u16, 1u16, 1, false);
+        let key_epoch2 = (name, 1u16, 1u16, 2, false);
 
         let SingleFlightTicket::Leader {
-            key: leader_key_n1,
-            flight: leader_flight_n1,
-        } = coalescer.begin(key_n1.clone())
+            key: leader_key_epoch1,
+            flight: leader_flight_epoch1,
+        } = coalescer.begin(key_epoch1.clone())
         else {
-            panic!("expected Leader for the first begin() under ns-1");
+            panic!("expected Leader for the first begin() under epoch 1");
         };
 
         // A request for the same name/qtype/qclass, but under the new
-        // namespace, must get its own Leader ticket, not a Follower one.
-        match coalescer.begin(key_n2.clone()) {
-            SingleFlightTicket::Leader { key, .. } => assert_eq!(key, key_n2),
+        // epoch, must get its own Leader ticket, not a Follower one.
+        match coalescer.begin(key_epoch2.clone()) {
+            SingleFlightTicket::Leader { key, .. } => assert_eq!(key, key_epoch2),
             SingleFlightTicket::Follower { .. } => panic!(
-                "a request under a different cache namespace must not coalesce onto \
-                 another namespace's in-flight leader"
+                "a request under a different cache epoch must not coalesce onto \
+                 another epoch's in-flight leader"
             ),
         }
 
-        // The ns-1 leader completing must not affect ns-2's independent
-        // flight: a fresh begin() under ns-1 (after the leader finishes)
-        // gets a new Leader, and ns-2's flight is untouched.
-        let leader_n1 = SingleFlightLeader::new(
+        // The epoch-1 leader completing must not affect epoch 2's
+        // independent flight: a fresh begin() under epoch 1 (after the
+        // leader finishes) gets a new Leader, and epoch 2's flight is
+        // untouched.
+        let leader_epoch1 = SingleFlightLeader::new(
             Arc::clone(&coalescer),
-            leader_key_n1,
-            Arc::clone(&leader_flight_n1),
+            leader_key_epoch1,
+            Arc::clone(&leader_flight_epoch1),
         );
-        leader_n1.complete(Ok(sample_response("ns-1-result")));
+        leader_epoch1.complete(Ok(sample_response("epoch-1-result")));
 
-        match coalescer.begin(key_n1) {
+        match coalescer.begin(key_epoch1) {
             SingleFlightTicket::Leader { .. } => {}
             SingleFlightTicket::Follower { .. } => {
-                panic!("ns-1's flight must have been cleared by the leader's completion")
+                panic!("epoch 1's flight must have been cleared by the leader's completion")
             }
         }
     }
@@ -395,8 +395,8 @@ mod tests {
         // ever fetched at all.
         let coalescer = Arc::new(ShardedSingleFlight::new(4));
         let name = "example.com".to_string();
-        let key_do_false = (name.clone(), 1u16, 1u16, "ns-1".to_string(), false);
-        let key_do_true = (name, 1u16, 1u16, "ns-1".to_string(), true);
+        let key_do_false = (name.clone(), 1u16, 1u16, 1, false);
+        let key_do_true = (name, 1u16, 1u16, 1, true);
 
         let SingleFlightTicket::Leader {
             key: leader_key_do_false,
@@ -500,7 +500,7 @@ mod tests {
 
         // Domain B's begin() on a different shard must proceed without
         // blocking on shard A's held lock.
-        let key_b = (domain_b, 1u16, 1u16, "ns-1".to_string(), false);
+        let key_b = (domain_b, 1u16, 1u16, 1, false);
         let outcome =
             tokio::time::timeout(Duration::from_millis(100), async { coalescer.begin(key_b) })
                 .await;

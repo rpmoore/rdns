@@ -165,7 +165,7 @@ impl ShardState {
         domain: &str,
         key: (u16, u16),
         dnssec_ok: bool,
-        current_namespace: &str,
+        current_epoch: u64,
         now: SystemTime,
     ) -> Option<RRsetEntry> {
         let expired = match self
@@ -177,9 +177,7 @@ impl ShardState {
             None => return None,
             Some(entry) if entry.expires_at <= now => true,
             Some(entry) => {
-                if entry.cache_namespace == current_namespace
-                    && (!dnssec_ok || entry.dnssec_complete)
-                {
+                if entry.cache_epoch == current_epoch && (!dnssec_ok || entry.dnssec_complete) {
                     return Some(entry.clone());
                 }
                 false
@@ -202,7 +200,7 @@ impl ShardState {
         domain: &str,
         key: (u16, u16),
         dnssec_ok: bool,
-        current_namespace: &str,
+        current_epoch: u64,
         now: SystemTime,
     ) -> Option<(RRsetEntry, String)> {
         let expired = match self
@@ -214,9 +212,7 @@ impl ShardState {
             None => return None,
             Some(entry) if entry.expires_at <= now => true,
             Some(entry) => {
-                if entry.cache_namespace == current_namespace
-                    && (!dnssec_ok || entry.dnssec_complete)
-                {
+                if entry.cache_epoch == current_epoch && (!dnssec_ok || entry.dnssec_complete) {
                     let target = entry.records.iter().find_map(|record| match &record.rdata {
                         RecordData::CNAME(target) => Some(target.clone()),
                         _ => None,
@@ -244,7 +240,7 @@ impl ShardState {
         domain: &str,
         key: &NegativeKey,
         dnssec_ok: bool,
-        current_namespace: &str,
+        current_epoch: u64,
         now: SystemTime,
     ) -> Option<NegativeEntry> {
         let expired = match self
@@ -256,7 +252,7 @@ impl ShardState {
             None => return None,
             Some(entry) if entry.expires_at <= now => true,
             Some(entry) => {
-                if entry.cache_namespace == current_namespace
+                if entry.cache_epoch == current_epoch
                     && (!dnssec_ok
                         || (entry.dnssec_complete && entry.dnssec_proof_material_fresh(now)))
                 {
@@ -412,7 +408,7 @@ impl Shard {
         qtype: u16,
         qclass: u16,
         dnssec_ok: bool,
-        current_namespace: &str,
+        current_epoch: u64,
         now: SystemTime,
     ) -> HopResult {
         let mut state = self.state.lock().unwrap();
@@ -425,7 +421,7 @@ impl Shard {
         // same call), rather than a separate expiry precheck followed by a
         // second, independent lookup for the live/filtered case.
         if let Some(entry) =
-            state.take_live_positive(domain, answer_key, dnssec_ok, current_namespace, now)
+            state.take_live_positive(domain, answer_key, dnssec_ok, current_epoch, now)
         {
             state.lru.touch(domain);
             return HopResult::Answer(entry);
@@ -434,7 +430,7 @@ impl Shard {
         if qtype != CNAME_RECORD_TYPE {
             let cname_key = (CNAME_RECORD_TYPE, qclass);
             if let Some((entry, target)) =
-                state.take_live_cname_hop(domain, cname_key, dnssec_ok, current_namespace, now)
+                state.take_live_cname_hop(domain, cname_key, dnssec_ok, current_epoch, now)
             {
                 state.lru.touch(domain);
                 return HopResult::CnameHop(entry, target);
@@ -446,7 +442,7 @@ impl Shard {
             qclass,
         };
         if let Some(entry) =
-            state.take_live_negative(domain, &nodata_key, dnssec_ok, current_namespace, now)
+            state.take_live_negative(domain, &nodata_key, dnssec_ok, current_epoch, now)
         {
             state.lru.touch(domain);
             return HopResult::NoData(entry);
@@ -457,7 +453,7 @@ impl Shard {
             qclass,
         };
         if let Some(entry) =
-            state.take_live_negative(domain, &nxdomain_key, dnssec_ok, current_namespace, now)
+            state.take_live_negative(domain, &nxdomain_key, dnssec_ok, current_epoch, now)
         {
             state.lru.touch(domain);
             return HopResult::NxDomain(entry);
@@ -467,13 +463,12 @@ impl Shard {
     }
 
     /// Removes every positive/negative entry in this shard whose stored
-    /// `cache_namespace` no longer matches `current_namespace`, and drops
+    /// `cache_epoch` no longer matches `current_epoch`, and drops
     /// any domain (and its LRU token) left with no entries in either map
     /// afterward. Takes this shard's lock for the duration of the scan
     /// only — sweeping one shard never waits on any other shard's lock.
-    /// Returns the total number of entries removed (`cache::namespace`,
-    /// section-05).
-    pub(crate) fn sweep_stale_namespace(&self, current_namespace: &str) -> usize {
+    /// Returns the total number of entries removed.
+    pub(crate) fn sweep_stale_namespace(&self, current_epoch: u64) -> usize {
         let mut state = self.state.lock().unwrap();
         let mut removed = 0usize;
         let mut emptied_domains: std::collections::HashSet<String> =
@@ -483,7 +478,7 @@ impl Shard {
             let before = record_sets.record_sets.len();
             record_sets
                 .record_sets
-                .retain(|_, entry| entry.cache_namespace == current_namespace);
+                .retain(|_, entry| entry.cache_epoch == current_epoch);
             removed += before - record_sets.record_sets.len();
             let keep = !record_sets.record_sets.is_empty();
             if !keep {
@@ -496,7 +491,7 @@ impl Shard {
             let before = entries.entries.len();
             entries
                 .entries
-                .retain(|_, entry| entry.cache_namespace == current_namespace);
+                .retain(|_, entry| entry.cache_epoch == current_epoch);
             removed += before - entries.entries.len();
             let keep = !entries.entries.is_empty();
             if !keep {
@@ -593,7 +588,7 @@ mod tests {
             stored_at: now,
             expires_at: now + Duration::from_secs(300),
             dnssec_state: Default::default(),
-            cache_namespace: "ns-1".to_string(),
+            cache_epoch: 1,
             dnssec_complete: true,
             authoritative: false,
         }
@@ -609,7 +604,7 @@ mod tests {
             proof_records: Vec::new(),
             stored_at: now,
             expires_at: now + Duration::from_secs(3600),
-            cache_namespace: "ns-1".to_string(),
+            cache_epoch: 1,
             dnssec_complete: true,
             dnssec_state: Default::default(),
             authoritative: false,
@@ -759,13 +754,13 @@ mod tests {
         shard.store_positive(domain, (A_QTYPE, IN_QCLASS), entry);
         let now = SystemTime::now();
 
-        let do_false_result = shard.lookup_hop(domain, A_QTYPE, IN_QCLASS, false, "ns-1", now);
+        let do_false_result = shard.lookup_hop(domain, A_QTYPE, IN_QCLASS, false, 1, now);
         assert!(
             matches!(do_false_result, HopResult::Answer(_)),
             "a DO=false reader may still be served from a dnssec-incomplete entry"
         );
 
-        let do_true_result = shard.lookup_hop(domain, A_QTYPE, IN_QCLASS, true, "ns-1", now);
+        let do_true_result = shard.lookup_hop(domain, A_QTYPE, IN_QCLASS, true, 1, now);
         assert!(
             matches!(do_true_result, HopResult::Miss),
             "a DO=true reader must not be served from a dnssec-incomplete entry, got {do_true_result:?}"
@@ -781,7 +776,7 @@ mod tests {
         shard.store_positive(domain, (A_QTYPE, IN_QCLASS), entry);
         let now = SystemTime::now();
 
-        let result = shard.lookup_hop(domain, A_QTYPE, IN_QCLASS, true, "ns-1", now);
+        let result = shard.lookup_hop(domain, A_QTYPE, IN_QCLASS, true, 1, now);
         assert!(matches!(result, HopResult::Answer(_)));
     }
 
@@ -800,7 +795,7 @@ mod tests {
         shard.store_positive(domain, (CNAME_RECORD_TYPE, IN_QCLASS), entry);
         let now = SystemTime::now();
 
-        let do_true_result = shard.lookup_hop(domain, A_QTYPE, IN_QCLASS, true, "ns-1", now);
+        let do_true_result = shard.lookup_hop(domain, A_QTYPE, IN_QCLASS, true, 1, now);
         assert!(
             matches!(do_true_result, HopResult::Miss),
             "a DO=true reader must not follow a dnssec-incomplete CNAME hop, got {do_true_result:?}"
@@ -820,10 +815,10 @@ mod tests {
         shard.store_negative(domain, nxdomain_key, entry.clone());
         let now = SystemTime::now();
 
-        let do_false_result = shard.lookup_hop(domain, A_QTYPE, IN_QCLASS, false, "ns-1", now);
+        let do_false_result = shard.lookup_hop(domain, A_QTYPE, IN_QCLASS, false, 1, now);
         assert!(matches!(do_false_result, HopResult::NxDomain(_)));
 
-        let do_true_result = shard.lookup_hop(domain, A_QTYPE, IN_QCLASS, true, "ns-1", now);
+        let do_true_result = shard.lookup_hop(domain, A_QTYPE, IN_QCLASS, true, 1, now);
         assert!(
             matches!(do_true_result, HopResult::Miss),
             "a DO=true reader must not be served from a dnssec-incomplete NXDOMAIN entry, got {do_true_result:?}"
@@ -835,7 +830,7 @@ mod tests {
             qclass: IN_QCLASS,
         };
         shard.store_negative(domain2, nodata_key, entry);
-        let do_true_nodata = shard.lookup_hop(domain2, A_QTYPE, IN_QCLASS, true, "ns-1", now);
+        let do_true_nodata = shard.lookup_hop(domain2, A_QTYPE, IN_QCLASS, true, 1, now);
         assert!(
             matches!(do_true_nodata, HopResult::Miss),
             "a DO=true reader must not be served from a dnssec-incomplete NODATA entry, got {do_true_nodata:?}"
@@ -875,7 +870,7 @@ mod tests {
             )],
             stored_at,
             expires_at: stored_at + Duration::from_secs(3600),
-            cache_namespace: "ns-1".to_string(),
+            cache_epoch: 1,
             dnssec_complete: true,
             dnssec_state: Default::default(),
             authoritative: false,
@@ -901,15 +896,13 @@ mod tests {
             negative_entry_with_short_lived_proof(stored_at),
         );
 
-        let do_false_result =
-            shard.lookup_hop(nxdomain_domain, A_QTYPE, IN_QCLASS, false, "ns-1", now);
+        let do_false_result = shard.lookup_hop(nxdomain_domain, A_QTYPE, IN_QCLASS, false, 1, now);
         assert!(
             matches!(do_false_result, HopResult::NxDomain(_)),
             "a DO=false reader may still be served despite the stale proof record, got {do_false_result:?}"
         );
 
-        let do_true_result =
-            shard.lookup_hop(nxdomain_domain, A_QTYPE, IN_QCLASS, true, "ns-1", now);
+        let do_true_result = shard.lookup_hop(nxdomain_domain, A_QTYPE, IN_QCLASS, true, 1, now);
         assert!(
             matches!(do_true_result, HopResult::Miss),
             "a DO=true reader must not be served an NXDOMAIN entry whose proof record TTL has elapsed, got {do_true_result:?}"
@@ -926,7 +919,7 @@ mod tests {
             negative_entry_with_short_lived_proof(stored_at),
         );
         let do_true_nodata_result =
-            shard.lookup_hop(nodata_domain, A_QTYPE, IN_QCLASS, true, "ns-1", now);
+            shard.lookup_hop(nodata_domain, A_QTYPE, IN_QCLASS, true, 1, now);
         assert!(
             matches!(do_true_nodata_result, HopResult::Miss),
             "a DO=true reader must not be served a NODATA entry whose proof record TTL has elapsed, got {do_true_nodata_result:?}"
@@ -951,7 +944,7 @@ mod tests {
             negative_entry_with_short_lived_proof(stored_at),
         );
 
-        let do_true_result = shard.lookup_hop(domain, A_QTYPE, IN_QCLASS, true, "ns-1", now);
+        let do_true_result = shard.lookup_hop(domain, A_QTYPE, IN_QCLASS, true, 1, now);
         assert!(
             matches!(do_true_result, HopResult::NxDomain(_)),
             "a DO=true reader must still be served while every stored record remains within its own TTL, got {do_true_result:?}"
@@ -985,7 +978,7 @@ mod tests {
         shard.store_positive(domain, (A_QTYPE, IN_QCLASS), expired_rrset_entry(now));
         assert_eq!(shard.domain_count(), 1);
 
-        let result = shard.lookup_hop(domain, A_QTYPE, IN_QCLASS, false, "ns-1", now);
+        let result = shard.lookup_hop(domain, A_QTYPE, IN_QCLASS, false, 1, now);
 
         assert!(matches!(result, HopResult::Miss));
         assert!(
@@ -1015,7 +1008,7 @@ mod tests {
         shard.store_positive(domain, (CNAME_RECORD_TYPE, IN_QCLASS), entry);
         assert_eq!(shard.domain_count(), 1);
 
-        let result = shard.lookup_hop(domain, A_QTYPE, IN_QCLASS, false, "ns-1", now);
+        let result = shard.lookup_hop(domain, A_QTYPE, IN_QCLASS, false, 1, now);
 
         assert!(matches!(result, HopResult::Miss));
         assert!(!shard.contains_positive(domain, (CNAME_RECORD_TYPE, IN_QCLASS)));
@@ -1035,7 +1028,7 @@ mod tests {
         shard.store_negative(domain, nodata_key.clone(), expired_negative_entry(now));
         assert_eq!(shard.domain_count(), 1);
 
-        let result = shard.lookup_hop(domain, A_QTYPE, IN_QCLASS, false, "ns-1", now);
+        let result = shard.lookup_hop(domain, A_QTYPE, IN_QCLASS, false, 1, now);
 
         assert!(matches!(result, HopResult::Miss));
         assert!(
@@ -1058,7 +1051,7 @@ mod tests {
         shard.store_negative(domain, nxdomain_key.clone(), expired_negative_entry(now));
         assert_eq!(shard.domain_count(), 1);
 
-        let result = shard.lookup_hop(domain, A_QTYPE, IN_QCLASS, false, "ns-1", now);
+        let result = shard.lookup_hop(domain, A_QTYPE, IN_QCLASS, false, 1, now);
 
         assert!(matches!(result, HopResult::Miss));
         assert!(!shard.contains_negative(domain, &nxdomain_key));
@@ -1080,7 +1073,7 @@ mod tests {
         shard.store_positive(domain, (AAAA_QTYPE, IN_QCLASS), rrset_entry());
         assert_eq!(shard.domain_count(), 1);
 
-        let result = shard.lookup_hop(domain, A_QTYPE, IN_QCLASS, false, "ns-1", now);
+        let result = shard.lookup_hop(domain, A_QTYPE, IN_QCLASS, false, 1, now);
 
         assert!(matches!(result, HopResult::Miss));
         assert!(!shard.contains_positive(domain, (A_QTYPE, IN_QCLASS)));

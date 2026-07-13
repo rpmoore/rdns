@@ -1017,9 +1017,8 @@ fn build_rrset_entry(
         expires_at: stored_at + ttl,
         dnssec_state: Default::default(),
         // Overwritten by `ShardedDnsCache::store_response` at store time —
-        // see that method's doc comment for why the namespace isn't set
-        // here.
-        cache_namespace: String::new(),
+        // see that method's doc comment for why the epoch isn't set here.
+        cache_epoch: 0,
         dnssec_complete: dnssec_ok,
         authoritative: store_authoritative,
     }
@@ -1074,7 +1073,7 @@ fn build_negative_entry(
         proof_records,
         stored_at,
         expires_at: stored_at + ttl,
-        cache_namespace: String::new(),
+        cache_epoch: 0,
         dnssec_complete: dnssec_ok,
         dnssec_state: Default::default(),
         authoritative: store_authoritative,
@@ -2212,11 +2211,41 @@ pub struct BackendSnapshot {
     pub generation: u64,
     pub health: BackendHealth,
     pub dnssec_validation: DnssecValidationStatus,
+    /// Descriptive fingerprint of resolution-affecting config
+    /// (`Config::backend_cache_namespace`), kept for operator-facing
+    /// status/event output (`BackendStatus`/`QueryEventBackend`) and to
+    /// detect, at reload time, whether the cache's own `cache_epoch` needs
+    /// to bump (see `next_cache_epoch`). No longer threaded into per-entry
+    /// cache storage — that's `cache_epoch` below.
     pub cache_namespace: Option<String>,
+    /// The cache-identity epoch actually stamped onto cache entries and
+    /// compared at lookup/sweep time (`DomainDnsCache::lookup_chain`/
+    /// `store_response`/`sweep_stale_namespace`). Always a real value (not
+    /// optional, unlike `cache_namespace`): a fresh snapshot starts at `0`,
+    /// and `next_cache_epoch` bumps it by exactly 1 whenever
+    /// `cache_namespace` actually changes from the previous published
+    /// snapshot — see `ResolveQuery::publish_reload`/
+    /// `publish_backend_snapshot`, the only two places that mutate it.
+    pub cache_epoch: u64,
     pub root_hints: Option<BackendRootHintsStatus>,
 }
 
 impl BackendSnapshot {
+    /// Every freshly-constructed snapshot starts at `cache_epoch: 0`,
+    /// regardless of `generation` or `cache_namespace` — the epoch carries
+    /// no content-derived uniqueness of its own; only `next_cache_epoch`,
+    /// called from `publish_reload`/`publish_backend_snapshot` relative to
+    /// a *previously-published* snapshot, ever bumps it. This is safe only
+    /// because production has exactly one long-lived `ResolveQuery`
+    /// backed by one `ShardedDnsCache`, so "backend changed" is always
+    /// observed by comparing against that one instance's own previous
+    /// snapshot (see `main.rs`'s single `ShardedDnsCache::new` /
+    /// `ResolveQuery::with_cache_policy_and_backend_snapshot` call sites).
+    /// Two independently-constructed `BackendSnapshot`s that were never
+    /// linked through that same `ResolveQuery` both start at epoch 0 and
+    /// would collide if made to share one cache — see
+    /// `backend_generation_separates_cache_entries`'s doc comment for the
+    /// regression test covering this distinction.
     pub fn new(
         backend: Arc<dyn ResolutionBackend>,
         mode: ResolutionMode,
@@ -2231,6 +2260,7 @@ impl BackendSnapshot {
             health,
             dnssec_validation: DnssecValidationStatus::Disabled,
             cache_namespace,
+            cache_epoch: 0,
             root_hints: None,
         }
     }
@@ -2259,6 +2289,28 @@ impl BackendSnapshot {
             BackendHealth::Healthy,
             backend_cache_namespace(ResolutionMode::Forward, generation),
         )
+    }
+}
+
+/// The cache epoch `new_snapshot` should publish under, given the
+/// previously-published snapshot: unchanged if `new_snapshot.cache_namespace`
+/// matches `previous`'s (an unrelated reload leaves every existing cache
+/// entry's epoch matching, so the sweep can be skipped entirely — see
+/// callers), or `previous.cache_epoch.wrapping_add(1)` if the descriptive
+/// fingerprint actually changed. Wrapping, not checked/saturating, is
+/// deliberate: a `u64` only wraps after ~1.8e19 reloads, which is not a
+/// reachable count for a long-lived process reloaded on SIGHUP, so treating
+/// overflow as an error case would add handling for something that cannot
+/// occur in practice. Shared by `publish_reload` and `publish_backend_snapshot`
+/// so both publishers apply the exact same cache-identity semantics — the
+/// single-flight-only publisher must never let a caller-supplied
+/// `BackendSnapshot`'s default `cache_epoch: 0` silently roll the epoch
+/// backwards.
+fn next_cache_epoch(previous: &BackendSnapshot, new_snapshot: &BackendSnapshot) -> u64 {
+    if previous.cache_namespace == new_snapshot.cache_namespace {
+        previous.cache_epoch
+    } else {
+        previous.cache_epoch.wrapping_add(1)
     }
 }
 
@@ -3420,11 +3472,23 @@ impl ResolveQuery {
         self.protocol.configured_max_udp_payload_size()
     }
 
-    pub fn publish_backend_snapshot(&self, snapshot: BackendSnapshot) {
+    /// Publishes a backend-only snapshot (no local-entries swap, no sweep)
+    /// — used where a full `publish_reload` isn't warranted. Still applies
+    /// `next_cache_epoch` against the previously-published snapshot, same as
+    /// `publish_reload`: `snapshot`'s own `cache_epoch` field (whatever the
+    /// caller set it to, typically the constructor default `0`) is never
+    /// trusted directly, so this can never roll the live epoch backwards and
+    /// resurrect entries from an older, unrelated generation. Not sweeping
+    /// here just delays reclaiming any newly-stale entries' memory until the
+    /// next `publish_reload` — correctness is unaffected, since lookup-time
+    /// epoch checks already make them invisible immediately.
+    pub fn publish_backend_snapshot(&self, mut snapshot: BackendSnapshot) {
         let _gate = self
             .reload_gate
             .write()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let previous = self.backend.current();
+        snapshot.cache_epoch = next_cache_epoch(&previous, &snapshot);
         let status = snapshot.status();
         self.backend.publish(snapshot);
         self.metrics.record_backend_status(&status);
@@ -3448,10 +3512,10 @@ impl ResolveQuery {
     /// `reload_gate` only needs to cover the atomic swap of `backend` and
     /// `local_entries`; the sweep is pure cleanup/memory reclamation, not
     /// something a reader depends on for correctness. A cached entry's own
-    /// `cache_namespace` is checked against the current namespace on every
-    /// lookup (`ChainLookup`/`Shard::lookup_hop`), so a stale-namespace
-    /// entry is already invisible to readers the instant the new snapshot
-    /// is published — the sweep merely reclaims the memory later. Holding
+    /// `cache_epoch` is checked against the current epoch on every lookup
+    /// (`ChainLookup`/`Shard::lookup_hop`), so a stale-epoch entry is
+    /// already invisible to readers the instant the new snapshot is
+    /// published — the sweep merely reclaims the memory later. Holding
     /// `reload_gate` (a `std::sync::RwLock`, so a writer blocks every new
     /// reader) across `sweep_stale_namespace`'s full per-shard scan would
     /// stall every concurrent `resolve()` call for the duration of the
@@ -3460,20 +3524,50 @@ impl ResolveQuery {
     /// moved from the cache's own lock onto `reload_gate`. Running the
     /// sweep after the guard drops avoids that while keeping the same
     /// correctness guarantee.
-    pub fn publish_reload(&self, snapshot: BackendSnapshot, entries: Arc<dyn LocalDnsEntries>) {
-        let namespace = snapshot.cache_namespace.clone();
-        let status = snapshot.status();
+    ///
+    /// The epoch bump itself (`next_cache_epoch`, compared against the
+    /// previously-published snapshot) happens inside the same `reload_gate`
+    /// write section as the backend/local-entries swap, so every reader
+    /// that captures a `BackendSnapshot` under `reload_gate`'s read side
+    /// always sees a `cache_epoch` paired with the backend it was actually
+    /// bumped for — never an old backend with a new epoch or vice versa.
+    /// The sweep only runs when the epoch actually changed: an unrelated
+    /// reload (e.g. a metrics-only config edit) leaves every entry stored
+    /// *before this reload* matching, so sweeping now would find nothing new
+    /// to remove for those — skipping it is strictly cheaper than today's
+    /// unconditional sweep-every-reload behavior.
+    ///
+    /// One bounded exception: a request that captured the *previous*,
+    /// epoch-changing snapshot can still be in flight when that reload's
+    /// sweep runs, and store an old-epoch entry after the sweep already
+    /// passed over it. Such an entry is never a correctness problem (an
+    /// epoch mismatch is already an unconditional miss at lookup time, see
+    /// `sweep_stale_namespace`'s doc), and it will still be swept by
+    /// whichever *next* reload actually changes the epoch again — but a
+    /// long run of unrelated, same-namespace reloads won't sweep it away
+    /// itself. It sits invisible, occupying one domain slot, until ordinary
+    /// LRU pressure reclaims it. This is the same trade-off described in
+    /// `ResolveQuery::resolve`'s per-request snapshot pinning: correctness
+    /// doesn't depend on the sweep, only prompt memory reclamation does.
+    pub fn publish_reload(&self, mut snapshot: BackendSnapshot, entries: Arc<dyn LocalDnsEntries>) {
+        let new_epoch;
+        let epoch_changed;
         {
             let _gate = self
                 .reload_gate
                 .write()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let previous = self.backend.current();
+            new_epoch = next_cache_epoch(&previous, &snapshot);
+            epoch_changed = new_epoch != previous.cache_epoch;
+            snapshot.cache_epoch = new_epoch;
+            let status = snapshot.status();
             self.backend.publish(snapshot);
             self.local_entries.publish(entries);
             self.metrics.record_backend_status(&status);
         }
-        if let Some(namespace) = namespace {
-            self.cache.sweep_stale_namespace(&namespace);
+        if epoch_changed {
+            self.cache.sweep_stale_namespace(new_epoch);
         }
     }
 
@@ -3935,7 +4029,7 @@ impl ResolveQuery {
                 Some(miss_key),
                 true,
                 backend_snapshot.mode,
-                backend_snapshot.cache_namespace.clone(),
+                backend_snapshot.cache_epoch,
                 backend_result.clone(),
             )
             .await;
@@ -4157,13 +4251,13 @@ impl ResolveQuery {
         // a pre-built response, so `allow_udp_truncation`/`is_tcp()` checks
         // at serve time (assemble_response, not the cache key) are what
         // keep each response correct for the current request's transport.
-        let namespace = backend_snapshot.cache_namespace.clone().unwrap_or_default();
+        let epoch = backend_snapshot.cache_epoch;
         let lookup = self.cache.lookup_chain(
             &decoded.question.qname,
             decoded.question.qtype,
             decoded.question.qclass,
             decoded.features.dnssec_ok,
-            &namespace,
+            epoch,
             self.max_chain_depth,
             request.received_at.0,
         );
@@ -4197,7 +4291,7 @@ impl ResolveQuery {
                 decoded.question.qname.clone(),
                 decoded.question.qtype,
                 decoded.question.qclass,
-                namespace,
+                epoch,
                 miss_key_dnssec_ok,
             )),
             hit,
@@ -4312,13 +4406,13 @@ impl ResolveQuery {
         backend_snapshot: &BackendSnapshot,
         miss_key: &MissKey,
     ) -> Option<Vec<u8>> {
-        let namespace = backend_snapshot.cache_namespace.clone().unwrap_or_default();
+        let epoch = backend_snapshot.cache_epoch;
         let lookup = self.cache.lookup_chain(
             &miss_key.0,
             miss_key.1,
             miss_key.2,
             miss_key.4,
-            &namespace,
+            epoch,
             self.max_chain_depth,
             request.received_at.0,
         );
@@ -4373,7 +4467,7 @@ impl ResolveQuery {
                 miss_key,
                 cache_store_allowed,
                 backend_snapshot.mode,
-                backend_snapshot.cache_namespace.clone(),
+                backend_snapshot.cache_epoch,
                 backend_result,
             )
             .await;
@@ -4398,7 +4492,7 @@ impl ResolveQuery {
         miss_key: Option<MissKey>,
         cache_store_allowed: bool,
         backend_mode: ResolutionMode,
-        cache_namespace: Option<String>,
+        cache_epoch: u64,
         backend_result: Result<ResolutionResponse, ResolutionBackendError>,
     ) -> (ResolveDecision, Vec<u8>) {
         let Ok(mut response) = backend_result else {
@@ -4480,7 +4574,7 @@ impl ResolveQuery {
                     ResolutionMode::Forward => response_message.header.aa(),
                 };
                 self.store_cache_response(
-                    cache_namespace.unwrap_or_default(),
+                    cache_epoch,
                     &response_message,
                     &question,
                     request,
@@ -4822,7 +4916,7 @@ impl ResolveQuery {
 
     async fn store_cache_response(
         &self,
-        namespace: String,
+        epoch: u64,
         response: &Message,
         question: &QuestionKey,
         request: &ResolveRequest,
@@ -4840,7 +4934,7 @@ impl ResolveQuery {
                 self.metrics.increment(ResolverMetric::CacheNegativeStore);
             }
             self.metrics.increment(ResolverMetric::CacheStore);
-            self.cache.store_response(decomposed, &namespace);
+            self.cache.store_response(decomposed, epoch);
         } else {
             self.metrics.increment(ResolverMetric::CacheStoreSkipped);
         }
@@ -5575,16 +5669,16 @@ impl DomainDnsCache for NoopDnsCache {
         _qtype: u16,
         _qclass: u16,
         _dnssec_ok: bool,
-        _namespace: &str,
+        _epoch: u64,
         _max_chain_depth: u8,
         _now: SystemTime,
     ) -> ChainLookup {
         ChainLookup::Miss
     }
 
-    fn store_response(&self, _decomposed: DecomposedResponse, _namespace: &str) {}
+    fn store_response(&self, _decomposed: DecomposedResponse, _epoch: u64) {}
 
-    fn sweep_stale_namespace(&self, _current_namespace: &str) {}
+    fn sweep_stale_namespace(&self, _current_epoch: u64) {}
 
     fn domain_count(&self) -> usize {
         0
@@ -9459,7 +9553,7 @@ mod tests {
     struct RecordingCache {
         lookup: Mutex<ChainLookup>,
         lookups: Mutex<Vec<(String, u16, u16)>>,
-        stores: Mutex<Vec<(DecomposedResponse, String)>>,
+        stores: Mutex<Vec<(DecomposedResponse, u64)>>,
     }
 
     impl RecordingCache {
@@ -9479,7 +9573,7 @@ mod tests {
             qtype: u16,
             qclass: u16,
             _dnssec_ok: bool,
-            _namespace: &str,
+            _epoch: u64,
             _max_chain_depth: u8,
             _now: SystemTime,
         ) -> ChainLookup {
@@ -9490,14 +9584,11 @@ mod tests {
             self.lookup.lock().unwrap().clone()
         }
 
-        fn store_response(&self, decomposed: DecomposedResponse, namespace: &str) {
-            self.stores
-                .lock()
-                .unwrap()
-                .push((decomposed, namespace.to_string()));
+        fn store_response(&self, decomposed: DecomposedResponse, epoch: u64) {
+            self.stores.lock().unwrap().push((decomposed, epoch));
         }
 
-        fn sweep_stale_namespace(&self, _current_namespace: &str) {}
+        fn sweep_stale_namespace(&self, _current_epoch: u64) {}
 
         fn domain_count(&self) -> usize {
             0
@@ -15005,16 +15096,16 @@ mod tests {
             _qtype: u16,
             _qclass: u16,
             _dnssec_ok: bool,
-            _namespace: &str,
+            _epoch: u64,
             _max_chain_depth: u8,
             _now: SystemTime,
         ) -> ChainLookup {
             ChainLookup::Miss
         }
 
-        fn store_response(&self, _decomposed: DecomposedResponse, _namespace: &str) {}
+        fn store_response(&self, _decomposed: DecomposedResponse, _epoch: u64) {}
 
-        fn sweep_stale_namespace(&self, _current_namespace: &str) {
+        fn sweep_stale_namespace(&self, _current_epoch: u64) {
             std::thread::sleep(self.sweep_delay);
         }
 
@@ -15422,12 +15513,7 @@ mod tests {
         }
     }
 
-    fn seed_rrset_entry(
-        record: &Record,
-        ttl: Duration,
-        now: SystemTime,
-        namespace: &str,
-    ) -> RRsetEntry {
+    fn seed_rrset_entry(record: &Record, ttl: Duration, now: SystemTime, epoch: u64) -> RRsetEntry {
         RRsetEntry {
             records: vec![stored_record_from(record)],
             rrsigs: Vec::new(),
@@ -15436,7 +15522,7 @@ mod tests {
             stored_at: now,
             expires_at: now + ttl,
             dnssec_state: Default::default(),
-            cache_namespace: namespace.to_string(),
+            cache_epoch: epoch,
             dnssec_complete: true,
             authoritative: false,
         }
@@ -15449,7 +15535,7 @@ mod tests {
             shard_count: Some(1),
         }));
         let now = SystemTime::UNIX_EPOCH;
-        let namespace = backend_cache_namespace(ResolutionMode::Forward, 0).unwrap_or_default();
+        let epoch = 0u64;
         let cname = cname_record("alias.example", 60, "target.malicious.example");
         let terminal = a_record("target.malicious.example", 60);
         cache.store_response(
@@ -15459,18 +15545,18 @@ mod tests {
                         "alias.example".to_string(),
                         CNAME_RECORD_TYPE,
                         1,
-                        seed_rrset_entry(&cname, Duration::from_secs(60), now, &namespace),
+                        seed_rrset_entry(&cname, Duration::from_secs(60), now, epoch),
                     ),
                     (
                         "target.malicious.example".to_string(),
                         A_RECORD_TYPE,
                         1,
-                        seed_rrset_entry(&terminal, Duration::from_secs(60), now, &namespace),
+                        seed_rrset_entry(&terminal, Duration::from_secs(60), now, epoch),
                     ),
                 ],
                 negative: None,
             },
-            &namespace,
+            epoch,
         );
         let upstream = Arc::new(StaticUpstream::new(Err(UpstreamError::Timeout)));
         let events = Arc::new(RecordingEvents::default());
@@ -15720,7 +15806,7 @@ mod tests {
             max_entries: 16,
             shard_count: Some(1),
         }));
-        let namespace = backend_cache_namespace(ResolutionMode::Forward, 0).unwrap_or_default();
+        let epoch = 0u64;
         let now = SystemTime::UNIX_EPOCH;
         let record = a_record("example.com", 60);
         cache.store_response(
@@ -15729,11 +15815,11 @@ mod tests {
                     "example.com".to_string(),
                     A_RECORD_TYPE,
                     1,
-                    seed_rrset_entry(&record, Duration::from_secs(60), now, &namespace),
+                    seed_rrset_entry(&record, Duration::from_secs(60), now, epoch),
                 )],
                 negative: None,
             },
-            &namespace,
+            epoch,
         );
         let upstream = Arc::new(StaticUpstream::new(Err(UpstreamError::Timeout)));
         let events = Arc::new(RecordingEvents::default());
@@ -15783,7 +15869,7 @@ mod tests {
             max_entries: 16,
             shard_count: Some(1),
         }));
-        let namespace = backend_cache_namespace(ResolutionMode::Forward, 0).unwrap_or_default();
+        let epoch = 0u64;
         let now = SystemTime::UNIX_EPOCH;
         let record = a_record("example.com", 60);
         cache.store_response(
@@ -15792,11 +15878,11 @@ mod tests {
                     "example.com".to_string(),
                     A_RECORD_TYPE,
                     1,
-                    seed_rrset_entry(&record, Duration::from_secs(60), now, &namespace),
+                    seed_rrset_entry(&record, Duration::from_secs(60), now, epoch),
                 )],
                 negative: None,
             },
-            &namespace,
+            epoch,
         );
         let upstream = Arc::new(StaticUpstream::new(Err(UpstreamError::Timeout)));
         let events = Arc::new(RecordingEvents::default());
@@ -15822,7 +15908,7 @@ mod tests {
             max_entries: 16,
             shard_count: Some(1),
         }));
-        let namespace = backend_cache_namespace(ResolutionMode::Forward, 0).unwrap_or_default();
+        let epoch = 0u64;
         let now = SystemTime::UNIX_EPOCH;
         let record = a_record("example.com", 60);
         cache.store_response(
@@ -15831,11 +15917,11 @@ mod tests {
                     "example.com".to_string(),
                     A_RECORD_TYPE,
                     1,
-                    seed_rrset_entry(&record, Duration::from_secs(60), now, &namespace),
+                    seed_rrset_entry(&record, Duration::from_secs(60), now, epoch),
                 )],
                 negative: None,
             },
-            &namespace,
+            epoch,
         );
         let upstream = Arc::new(StaticUpstream::new(Err(UpstreamError::Timeout)));
         let events = Arc::new(RecordingEvents::default());
@@ -15861,7 +15947,7 @@ mod tests {
             max_entries: 16,
             shard_count: Some(1),
         }));
-        let namespace = backend_cache_namespace(ResolutionMode::Forward, 0).unwrap_or_default();
+        let epoch = 0u64;
         let now = SystemTime::UNIX_EPOCH;
         // Record's own wire TTL (3600) is far longer than the entry's
         // governing lifetime (60s) — the assembled TTL must be capped by
@@ -15873,11 +15959,11 @@ mod tests {
                     "example.com".to_string(),
                     A_RECORD_TYPE,
                     1,
-                    seed_rrset_entry(&record, Duration::from_secs(60), now, &namespace),
+                    seed_rrset_entry(&record, Duration::from_secs(60), now, epoch),
                 )],
                 negative: None,
             },
-            &namespace,
+            epoch,
         );
         let upstream = Arc::new(StaticUpstream::new(Err(UpstreamError::Timeout)));
         let events = Arc::new(RecordingEvents::default());
@@ -15900,7 +15986,6 @@ mod tests {
     #[tokio::test]
     async fn resolve_truncates_oversized_cached_response_for_current_request() {
         let now = SystemTime::UNIX_EPOCH;
-        let namespace = "ns-1".to_string();
         let records: Vec<StoredRecord> = (0..40u8)
             .map(|i| StoredRecord {
                 rtype: A_RECORD_TYPE,
@@ -15917,7 +16002,7 @@ mod tests {
             stored_at: now,
             expires_at: now + Duration::from_secs(60),
             dnssec_state: Default::default(),
-            cache_namespace: namespace,
+            cache_epoch: 1,
             dnssec_complete: true,
             authoritative: false,
         };
@@ -15960,17 +16045,17 @@ mod tests {
             max_entries: 16,
             shard_count: Some(1),
         }));
-        let namespace = backend_cache_namespace(ResolutionMode::Forward, 0).unwrap_or_default();
+        let epoch = 0u64;
         let stored_at = SystemTime::UNIX_EPOCH;
         let record = a_record("example.com", 60);
-        let mut entry = seed_rrset_entry(&record, Duration::from_secs(30), stored_at, &namespace);
+        let mut entry = seed_rrset_entry(&record, Duration::from_secs(30), stored_at, epoch);
         entry.expires_at = stored_at + Duration::from_secs(30);
         cache.store_response(
             DecomposedResponse {
                 positive: vec![("example.com".to_string(), A_RECORD_TYPE, 1, entry)],
                 negative: None,
             },
-            &namespace,
+            epoch,
         );
         let upstream = Arc::new(StaticUpstream::new(Ok(upstream_response(
             a_response_with_answer(0x8888, "example.com", 60),
@@ -18006,7 +18091,7 @@ mod tests {
         assert_eq!(&outcome.response_bytes[0..2], &[0x44, 0x44]);
         let stores = cache.stores.lock().unwrap();
         assert_eq!(stores.len(), 1);
-        let (decomposed, _namespace) = &stores[0];
+        let (decomposed, _epoch) = &stores[0];
         assert_eq!(decomposed.positive.len(), 1);
         let (name, qtype, qclass, entry) = &decomposed.positive[0];
         assert_eq!(name, "example.com");
@@ -18047,7 +18132,7 @@ mod tests {
 
         let stores = cache.stores.lock().unwrap();
         assert_eq!(stores.len(), 1);
-        let (decomposed, _namespace) = &stores[0];
+        let (decomposed, _epoch) = &stores[0];
         let (_, _, _, entry) = &decomposed.positive[0];
         assert!(
             entry.authoritative,
@@ -18092,7 +18177,7 @@ mod tests {
 
         let stores = cache.stores.lock().unwrap();
         assert_eq!(stores.len(), 1);
-        let (decomposed, _namespace) = &stores[0];
+        let (decomposed, _epoch) = &stores[0];
         let (_, _, _, entry) = &decomposed.positive[0];
         assert!(
             !entry.authoritative,
@@ -18123,7 +18208,7 @@ mod tests {
         assert_eq!(outcome.decision.kind, ResolveDecisionKind::Allowed);
         let stores = cache.stores.lock().unwrap();
         assert_eq!(stores.len(), 1);
-        let (decomposed, _namespace) = &stores[0];
+        let (decomposed, _epoch) = &stores[0];
         assert!(decomposed.positive.is_empty());
         let (name, key, entry) = decomposed
             .negative
@@ -18248,20 +18333,33 @@ mod tests {
         assert_eq!(statuses[2].generation, 2);
     }
 
+    // Regression test for the string-namespace -> u64-epoch cache-identity
+    // refactor: two independently-*constructed* `BackendSnapshot`s (never
+    // linked by a `publish_reload`) both start at the fresh-construction
+    // baseline `cache_epoch: 0` regardless of their `generation` field --
+    // unlike the old descriptive-string namespace, a bare epoch carries no
+    // content-derived uniqueness of its own. That's fine in production,
+    // where there is always exactly one long-lived `ResolveQuery` and
+    // "backend generation changed" is only ever observed through
+    // `publish_reload`/`publish_backend_snapshot`, both of which bump the
+    // epoch relative to the *previous* published snapshot. So this test
+    // exercises that real mechanism -- one service, reloaded from
+    // generation 1 to generation 2 -- rather than two from-scratch services
+    // sharing a cache, which was never how cache identity is actually
+    // established.
     #[tokio::test]
     async fn backend_generation_separates_cache_entries() {
-        let cache = Arc::new(ShardedDnsCache::new(&CacheConfig {
-            max_entries: 16,
-            shard_count: Some(1),
-        }));
         let first_backend = Arc::new(StaticUpstream::new(Ok(upstream_response(
             a_response_with_answer(0x1111, "example.com", 60),
         ))));
         let events = Arc::new(RecordingEvents::default());
         let metrics = Arc::new(RecordingMetrics::default());
-        let first_service = ResolveQuery::with_cache_and_backend_generation(
+        let service = ResolveQuery::with_cache_and_backend_generation(
             Arc::new(StandardProtocolCodec::new(1232)),
-            cache.clone(),
+            Arc::new(ShardedDnsCache::new(&CacheConfig {
+                max_entries: 16,
+                shard_count: Some(1),
+            })),
             CacheTtlPolicy::default(),
             first_backend.clone(),
             1,
@@ -18270,29 +18368,36 @@ mod tests {
             events.clone(),
             metrics.clone(),
         );
-        let second_backend = Arc::new(StaticUpstream::new(Ok(upstream_response(
-            a_response_with_answer(0x2222, "example.com", 60),
-        ))));
-        let second_service = ResolveQuery::with_cache_and_backend_generation(
-            Arc::new(StandardProtocolCodec::new(1232)),
-            cache,
-            CacheTtlPolicy::default(),
-            second_backend.clone(),
-            2,
-            Arc::new(BasicResponseFactory),
-            Arc::new(FixedClock(SystemTime::UNIX_EPOCH)),
-            events,
-            metrics,
-        );
 
-        let first = first_service
+        let first = service
             .resolve(ResolveRequest::new(
                 "192.0.2.10".parse().unwrap(),
                 SystemTime::UNIX_EPOCH,
                 a_query(0x1111, "example.com"),
             ))
             .await;
-        let second = second_service
+        assert_eq!(first.decision.kind, ResolveDecisionKind::Allowed);
+        assert_eq!(first_backend.requests.lock().unwrap().len(), 1);
+
+        let second_backend = Arc::new(StaticUpstream::new(Ok(upstream_response(
+            a_response_with_answer(0x2222, "example.com", 60),
+        ))));
+        // Reloading to generation 2 bumps the cache epoch (the descriptive
+        // fingerprint differs by generation), so the entry warmed above
+        // under generation 1 must not be served to this query -- proving a
+        // real backend-generation reload actually separates cache entries
+        // end-to-end through `resolve()`. `publish_reload` runs its sweep
+        // synchronously before returning here, so this alone doesn't
+        // isolate lookup-time epoch rejection from sweep-based removal --
+        // `resolve_from_cache_rejects_stale_epoch_independent_of_sweep`
+        // (`cache::assemble`'s tests) covers that property directly,
+        // against a hand-seeded shard a sweep never touched.
+        service.publish_reload(
+            BackendSnapshot::forwarding(second_backend.clone(), 2),
+            Arc::new(NoopLocalDnsEntries),
+        );
+
+        let second = service
             .resolve(ResolveRequest::new(
                 "192.0.2.10".parse().unwrap(),
                 SystemTime::UNIX_EPOCH,
@@ -18300,9 +18405,7 @@ mod tests {
             ))
             .await;
 
-        assert_eq!(first.decision.kind, ResolveDecisionKind::Allowed);
         assert_eq!(second.decision.kind, ResolveDecisionKind::Allowed);
-        assert_eq!(first_backend.requests.lock().unwrap().len(), 1);
         assert_eq!(second_backend.requests.lock().unwrap().len(), 1);
     }
 
@@ -18440,7 +18543,7 @@ mod tests {
         assert_eq!(outcome.decision.kind, ResolveDecisionKind::Allowed);
         let stores = cache.stores.lock().unwrap();
         assert_eq!(stores.len(), 1);
-        let (decomposed, _namespace) = &stores[0];
+        let (decomposed, _epoch) = &stores[0];
         assert_eq!(decomposed.positive[0].0, "example.com");
         assert_eq!(metrics.count(ResolverMetric::CacheStore), 1);
         assert_eq!(metrics.count(ResolverMetric::CacheStoreSkipped), 0);
