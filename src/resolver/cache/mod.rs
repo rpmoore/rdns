@@ -136,7 +136,7 @@ pub trait DomainDnsCache: Send + Sync {
     /// `current_epoch` — pure memory reclamation, not a correctness
     /// dependency, since `lookup_chain` already treats an epoch mismatch as
     /// a miss regardless of whether this has run. Called from the reload
-    /// path (`ResolverHandle::publish_reload`). The name is retained from
+    /// path (`ResolveQuery::publish_reload`). The name is retained from
     /// the pre-epoch string-namespace design; it no longer compares
     /// namespaces.
     fn sweep_stale_namespace(&self, current_epoch: u64);

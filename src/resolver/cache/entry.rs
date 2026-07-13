@@ -51,7 +51,7 @@ pub struct RRsetEntry {
     pub dnssec_state: DnssecState,
     // Cache identity is no longer part of the lookup key, so it must be
     // stored per entry instead. An opaque, monotonically-increasing epoch
-    // (bumped by `ResolverHandle::publish_reload`/`publish_backend_snapshot`
+    // (bumped by `ResolveQuery::publish_reload`/`publish_backend_snapshot`
     // whenever resolution-affecting config actually changes) rather than a
     // descriptive string — the cache only ever compares this for equality,
     // never parses it, so a `u64` is a strictly cheaper equivalent.

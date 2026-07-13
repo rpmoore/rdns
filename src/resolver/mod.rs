@@ -2224,7 +2224,7 @@ pub struct BackendSnapshot {
     /// optional, unlike `cache_namespace`): a fresh snapshot starts at `0`,
     /// and `next_cache_epoch` bumps it by exactly 1 whenever
     /// `cache_namespace` actually changes from the previous published
-    /// snapshot — see `ResolverHandle::publish_reload`/
+    /// snapshot — see `ResolveQuery::publish_reload`/
     /// `publish_backend_snapshot`, the only two places that mutate it.
     pub cache_epoch: u64,
     pub root_hints: Option<BackendRootHintsStatus>,
@@ -2236,14 +2236,14 @@ impl BackendSnapshot {
     /// no content-derived uniqueness of its own; only `next_cache_epoch`,
     /// called from `publish_reload`/`publish_backend_snapshot` relative to
     /// a *previously-published* snapshot, ever bumps it. This is safe only
-    /// because production has exactly one long-lived `ResolverHandle`
+    /// because production has exactly one long-lived `ResolveQuery`
     /// backed by one `ShardedDnsCache`, so "backend changed" is always
-    /// observed by comparing against that one handle's own previous
+    /// observed by comparing against that one instance's own previous
     /// snapshot (see `main.rs`'s single `ShardedDnsCache::new` /
     /// `ResolveQuery::with_cache_policy_and_backend_snapshot` call sites).
     /// Two independently-constructed `BackendSnapshot`s that were never
-    /// linked through that same handle both start at epoch 0 and would
-    /// collide if made to share one cache — see
+    /// linked through that same `ResolveQuery` both start at epoch 0 and
+    /// would collide if made to share one cache — see
     /// `backend_generation_separates_cache_entries`'s doc comment for the
     /// regression test covering this distinction.
     pub fn new(
@@ -18339,7 +18339,7 @@ mod tests {
     // baseline `cache_epoch: 0` regardless of their `generation` field --
     // unlike the old descriptive-string namespace, a bare epoch carries no
     // content-derived uniqueness of its own. That's fine in production,
-    // where there is always exactly one long-lived `ResolverHandle` and
+    // where there is always exactly one long-lived `ResolveQuery` and
     // "backend generation changed" is only ever observed through
     // `publish_reload`/`publish_backend_snapshot`, both of which bump the
     // epoch relative to the *previous* published snapshot. So this test

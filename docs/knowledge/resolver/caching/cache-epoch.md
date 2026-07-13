@@ -180,9 +180,9 @@ because:
   domain slot, reclaimed eventually by ordinary LRU pressure.
 - Two independently-constructed `BackendSnapshot`s (e.g. via
   `BackendSnapshot::new` directly, never linked through one
-  `ResolverHandle`'s `publish_reload`/`publish_backend_snapshot`) both
+  `ResolveQuery`'s `publish_reload`/`publish_backend_snapshot`) both
   start at `cache_epoch: 0` — safe only because production always has
-  exactly one long-lived `ResolverHandle` observing backend changes
+  exactly one long-lived `ResolveQuery` observing backend changes
   relative to its own previous snapshot. Sharing one `ShardedDnsCache`
   across two independently-built snapshots would collide at epoch 0
   regardless of `generation`; see
