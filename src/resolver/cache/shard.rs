@@ -467,8 +467,7 @@ impl Shard {
     /// any domain (and its LRU token) left with no entries in either map
     /// afterward. Takes this shard's lock for the duration of the scan
     /// only — sweeping one shard never waits on any other shard's lock.
-    /// Returns the total number of entries removed (`cache::namespace`,
-    /// section-05).
+    /// Returns the total number of entries removed.
     pub(crate) fn sweep_stale_namespace(&self, current_epoch: u64) -> usize {
         let mut state = self.state.lock().unwrap();
         let mut removed = 0usize;
