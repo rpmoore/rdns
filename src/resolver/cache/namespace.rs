@@ -83,6 +83,7 @@ mod tests {
             expires_at: now + Duration::from_secs(300),
             dnssec_state: Default::default(),
             cache_namespace: namespace.to_string(),
+            dnssec_complete: true,
         }
     }
 
@@ -97,6 +98,7 @@ mod tests {
             stored_at: now,
             expires_at: now + Duration::from_secs(3600),
             cache_namespace: namespace.to_string(),
+            dnssec_complete: true,
         }
     }
 

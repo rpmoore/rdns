@@ -200,11 +200,42 @@ impl Shard {
     /// position on any live match found, including CNAME hops. Takes and
     /// releases this shard's lock for the duration of this one hop only —
     /// callers must not hold it across hops.
+    ///
+    /// `dnssec_ok` is the *reading* requester's own DO flag — not to be
+    /// confused with any entry's own `dnssec_complete` (whether the entry
+    /// was itself populated by a DO=true fetch). When `dnssec_ok` is true,
+    /// every candidate entry (positive answer, CNAME hop, NODATA,
+    /// NXDOMAIN) is additionally filtered on `entry.dnssec_complete`: an
+    /// entry populated by a DO=false fetch cannot be trusted to reflect
+    /// the true DNSSEC state (its empty `rrsigs`/`proof_records` might
+    /// just mean "never asked"), so it must be treated the same as if it
+    /// weren't present at all, falling through the same
+    /// answer/CNAME/NODATA/NXDOMAIN/Miss chain a genuinely absent entry
+    /// would. A DO=false reader is unaffected by `dnssec_complete` either
+    /// way, since it never needs/emits RRSIGs.
+    ///
+    /// For NODATA/NXDOMAIN candidates specifically, a DO=true lookup is
+    /// *also* filtered on `NegativeEntry::dnssec_proof_material_fresh`:
+    /// `dnssec_complete` alone only proves this entry's DNSSEC material
+    /// was confirmed at store time, not that the individually-TTLed SOA
+    /// RRSIG/NSEC/NSEC3 proof records it carries are still within their
+    /// own TTL as of `now` — those can expire well before the entry's
+    /// overall SOA-derived `expires_at` does. The positive-answer path
+    /// needs no equivalent extra check: `RRsetEntry::expires_at` is
+    /// already derived from the minimum TTL across the whole backend
+    /// answer section, which includes any RRSIGs stored alongside it (see
+    /// `decompose_response_for_store`/`ttl_for_response`), so a positive
+    /// entry's RRSIGs can never individually outlive `expires_at`. Negative
+    /// entries have no equivalent guarantee: the SOA RRSIG/proof records
+    /// live in the *authority* section and their TTLs play no part in the
+    /// SOA-minimum-derived negative TTL computation, hence this dedicated
+    /// read-time check.
     pub(crate) fn lookup_hop(
         &self,
         domain: &str,
         qtype: u16,
         qclass: u16,
+        dnssec_ok: bool,
         current_namespace: &str,
         now: SystemTime,
     ) -> HopResult {
@@ -215,7 +246,11 @@ impl Shard {
             .domains
             .get(domain)
             .and_then(|record_sets| record_sets.record_sets.get(&(qtype, qclass)))
-            .filter(|entry| entry.expires_at > now && entry.cache_namespace == current_namespace)
+            .filter(|entry| {
+                entry.expires_at > now
+                    && entry.cache_namespace == current_namespace
+                    && (!dnssec_ok || entry.dnssec_complete)
+            })
             .cloned();
         if let Some(entry) = answer {
             state.lru.touch(domain);
@@ -229,7 +264,9 @@ impl Shard {
                 .get(domain)
                 .and_then(|record_sets| record_sets.record_sets.get(&(CNAME_RECORD_TYPE, qclass)))
                 .filter(|entry| {
-                    entry.expires_at > now && entry.cache_namespace == current_namespace
+                    entry.expires_at > now
+                        && entry.cache_namespace == current_namespace
+                        && (!dnssec_ok || entry.dnssec_complete)
                 })
                 .and_then(|entry| {
                     entry
@@ -256,7 +293,12 @@ impl Shard {
             .domains
             .get(domain)
             .and_then(|entries| entries.entries.get(&nodata_key))
-            .filter(|entry| entry.expires_at > now && entry.cache_namespace == current_namespace)
+            .filter(|entry| {
+                entry.expires_at > now
+                    && entry.cache_namespace == current_namespace
+                    && (!dnssec_ok
+                        || (entry.dnssec_complete && entry.dnssec_proof_material_fresh(now)))
+            })
             .cloned();
         if let Some(entry) = nodata {
             state.lru.touch(domain);
@@ -272,7 +314,12 @@ impl Shard {
             .domains
             .get(domain)
             .and_then(|entries| entries.entries.get(&nxdomain_key))
-            .filter(|entry| entry.expires_at > now && entry.cache_namespace == current_namespace)
+            .filter(|entry| {
+                entry.expires_at > now
+                    && entry.cache_namespace == current_namespace
+                    && (!dnssec_ok
+                        || (entry.dnssec_complete && entry.dnssec_proof_material_fresh(now)))
+            })
             .cloned();
         if let Some(entry) = nxdomain {
             state.lru.touch(domain);
@@ -410,6 +457,7 @@ mod tests {
             expires_at: now + Duration::from_secs(300),
             dnssec_state: Default::default(),
             cache_namespace: "ns-1".to_string(),
+            dnssec_complete: true,
         }
     }
 
@@ -424,6 +472,7 @@ mod tests {
             stored_at: now,
             expires_at: now + Duration::from_secs(3600),
             cache_namespace: "ns-1".to_string(),
+            dnssec_complete: true,
         }
     }
 
@@ -553,5 +602,217 @@ mod tests {
 
         assert_eq!(shard.domain_count(), 1);
         assert!(!shard.has_any_data("never-stored.example.com"));
+    }
+
+    // Regression tests for the stale-DO-false-entry bug: `lookup_hop` must
+    // treat a DO=true (`dnssec_ok = true`) lookup against an entry whose
+    // `dnssec_complete` is `false` as though the entry weren't there at
+    // all, falling through to `HopResult::Miss` rather than serving
+    // possibly-incomplete DNSSEC material for the entry's full TTL.
+
+    #[test]
+    fn lookup_hop_treats_do_true_read_of_dnssec_incomplete_answer_as_miss() {
+        let shard = Shard::new(4);
+        let domain = "incomplete.example.com";
+        let mut entry = rrset_entry();
+        entry.dnssec_complete = false;
+        shard.store_positive(domain, (A_QTYPE, IN_QCLASS), entry);
+        let now = SystemTime::now();
+
+        let do_false_result = shard.lookup_hop(domain, A_QTYPE, IN_QCLASS, false, "ns-1", now);
+        assert!(
+            matches!(do_false_result, HopResult::Answer(_)),
+            "a DO=false reader may still be served from a dnssec-incomplete entry"
+        );
+
+        let do_true_result = shard.lookup_hop(domain, A_QTYPE, IN_QCLASS, true, "ns-1", now);
+        assert!(
+            matches!(do_true_result, HopResult::Miss),
+            "a DO=true reader must not be served from a dnssec-incomplete entry, got {do_true_result:?}"
+        );
+    }
+
+    #[test]
+    fn lookup_hop_serves_do_true_read_of_dnssec_complete_answer() {
+        let shard = Shard::new(4);
+        let domain = "complete.example.com";
+        let mut entry = rrset_entry();
+        entry.dnssec_complete = true;
+        shard.store_positive(domain, (A_QTYPE, IN_QCLASS), entry);
+        let now = SystemTime::now();
+
+        let result = shard.lookup_hop(domain, A_QTYPE, IN_QCLASS, true, "ns-1", now);
+        assert!(matches!(result, HopResult::Answer(_)));
+    }
+
+    #[test]
+    fn lookup_hop_treats_do_true_read_of_dnssec_incomplete_cname_hop_as_miss() {
+        let shard = Shard::new(4);
+        let domain = "alias-incomplete.example.com";
+        let mut entry = rrset_entry();
+        entry.dnssec_complete = false;
+        entry.records = vec![StoredRecord {
+            rtype: CNAME_RECORD_TYPE,
+            rclass: IN_QCLASS,
+            ttl_at_store: 300,
+            rdata: RecordData::CNAME("target.example.com".to_string()),
+        }];
+        shard.store_positive(domain, (CNAME_RECORD_TYPE, IN_QCLASS), entry);
+        let now = SystemTime::now();
+
+        let do_true_result = shard.lookup_hop(domain, A_QTYPE, IN_QCLASS, true, "ns-1", now);
+        assert!(
+            matches!(do_true_result, HopResult::Miss),
+            "a DO=true reader must not follow a dnssec-incomplete CNAME hop, got {do_true_result:?}"
+        );
+    }
+
+    #[test]
+    fn lookup_hop_treats_do_true_read_of_dnssec_incomplete_negative_entries_as_miss() {
+        let shard = Shard::new(4);
+        let domain = "nxincomplete.example.com";
+        let mut entry = negative_entry();
+        entry.dnssec_complete = false;
+        let nxdomain_key = NegativeKey {
+            qtype: None,
+            qclass: IN_QCLASS,
+        };
+        shard.store_negative(domain, nxdomain_key, entry.clone());
+        let now = SystemTime::now();
+
+        let do_false_result = shard.lookup_hop(domain, A_QTYPE, IN_QCLASS, false, "ns-1", now);
+        assert!(matches!(do_false_result, HopResult::NxDomain(_)));
+
+        let do_true_result = shard.lookup_hop(domain, A_QTYPE, IN_QCLASS, true, "ns-1", now);
+        assert!(
+            matches!(do_true_result, HopResult::Miss),
+            "a DO=true reader must not be served from a dnssec-incomplete NXDOMAIN entry, got {do_true_result:?}"
+        );
+
+        let domain2 = "nodataincomplete.example.com";
+        let nodata_key = NegativeKey {
+            qtype: Some(A_QTYPE),
+            qclass: IN_QCLASS,
+        };
+        shard.store_negative(domain2, nodata_key, entry);
+        let do_true_nodata = shard.lookup_hop(domain2, A_QTYPE, IN_QCLASS, true, "ns-1", now);
+        assert!(
+            matches!(do_true_nodata, HopResult::Miss),
+            "a DO=true reader must not be served from a dnssec-incomplete NODATA entry, got {do_true_nodata:?}"
+        );
+    }
+
+    // Regression tests for the negative-entry DNSSEC-proof-TTL bug:
+    // `lookup_hop` must treat a DO=true lookup as a miss once any
+    // individual DNSSEC-relevant record stored in a `dnssec_complete`
+    // negative entry (the SOA RRSIG or an NSEC/NSEC3 proof record) has
+    // outlived its own TTL, even while the entry's overall SOA-derived
+    // `expires_at` is still in the future. A DO=false reader must remain
+    // unaffected, since it neither needs nor emits this material.
+
+    fn negative_entry_with_short_lived_proof(stored_at: SystemTime) -> NegativeEntry {
+        NegativeEntry {
+            kind: NegativeCacheKind::NxDomain,
+            soa_owner: "example.com".to_string(),
+            soa_record: stored_record(),
+            soa_rrsig: None,
+            // The overall negative TTL (driven by `expires_at` below) is a
+            // full hour, but this NSEC proof record's own TTL is only
+            // 300s — a DO=true lookup arriving after 300s (but well before
+            // the hour is up) must not be served this record at a stale/
+            // wire-TTL-0 state.
+            proof_records: vec![(
+                "adjacent.example.com".to_string(),
+                StoredRecord {
+                    rtype: 47, // NSEC
+                    rclass: IN_QCLASS,
+                    ttl_at_store: 300,
+                    rdata: RecordData::NSEC {
+                        next_domain: "zzz.example.com".to_string(),
+                        type_bit_maps: vec![0, 1],
+                    },
+                },
+            )],
+            stored_at,
+            expires_at: stored_at + Duration::from_secs(3600),
+            cache_namespace: "ns-1".to_string(),
+            dnssec_complete: true,
+        }
+    }
+
+    #[test]
+    fn lookup_hop_treats_do_true_read_of_negative_entry_with_expired_proof_record_ttl_as_miss() {
+        let shard = Shard::new(4);
+        let now = SystemTime::now();
+        // Stored 301s ago: the proof record's own 300s TTL has elapsed,
+        // but the entry's overall hour-long negative TTL has not.
+        let stored_at = now - Duration::from_secs(301);
+
+        let nxdomain_domain = "nx-stale-proof.example.com";
+        let nxdomain_key = NegativeKey {
+            qtype: None,
+            qclass: IN_QCLASS,
+        };
+        shard.store_negative(
+            nxdomain_domain,
+            nxdomain_key,
+            negative_entry_with_short_lived_proof(stored_at),
+        );
+
+        let do_false_result =
+            shard.lookup_hop(nxdomain_domain, A_QTYPE, IN_QCLASS, false, "ns-1", now);
+        assert!(
+            matches!(do_false_result, HopResult::NxDomain(_)),
+            "a DO=false reader may still be served despite the stale proof record, got {do_false_result:?}"
+        );
+
+        let do_true_result =
+            shard.lookup_hop(nxdomain_domain, A_QTYPE, IN_QCLASS, true, "ns-1", now);
+        assert!(
+            matches!(do_true_result, HopResult::Miss),
+            "a DO=true reader must not be served an NXDOMAIN entry whose proof record TTL has elapsed, got {do_true_result:?}"
+        );
+
+        let nodata_domain = "nodata-stale-proof.example.com";
+        let nodata_key = NegativeKey {
+            qtype: Some(A_QTYPE),
+            qclass: IN_QCLASS,
+        };
+        shard.store_negative(
+            nodata_domain,
+            nodata_key,
+            negative_entry_with_short_lived_proof(stored_at),
+        );
+        let do_true_nodata_result =
+            shard.lookup_hop(nodata_domain, A_QTYPE, IN_QCLASS, true, "ns-1", now);
+        assert!(
+            matches!(do_true_nodata_result, HopResult::Miss),
+            "a DO=true reader must not be served a NODATA entry whose proof record TTL has elapsed, got {do_true_nodata_result:?}"
+        );
+    }
+
+    #[test]
+    fn lookup_hop_serves_do_true_read_of_negative_entry_while_proof_record_still_fresh() {
+        let shard = Shard::new(4);
+        let now = SystemTime::now();
+        // Stored only 10s ago: the proof record's 300s TTL has not
+        // elapsed, so a DO=true reader must still be served.
+        let stored_at = now - Duration::from_secs(10);
+        let domain = "nx-fresh-proof.example.com";
+        let nxdomain_key = NegativeKey {
+            qtype: None,
+            qclass: IN_QCLASS,
+        };
+        shard.store_negative(
+            domain,
+            nxdomain_key,
+            negative_entry_with_short_lived_proof(stored_at),
+        );
+
+        let do_true_result = shard.lookup_hop(domain, A_QTYPE, IN_QCLASS, true, "ns-1", now);
+        assert!(
+            matches!(do_true_result, HopResult::NxDomain(_)),
+            "a DO=true reader must still be served while every stored record remains within its own TTL, got {do_true_result:?}"
+        );
     }
 }

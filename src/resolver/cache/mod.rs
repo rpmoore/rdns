@@ -106,11 +106,22 @@ pub trait DomainDnsCache: Send + Sync {
     /// needs it (section-06's documented deviation): the depth bound
     /// (`RecursiveResolverConfig.max_cname_restarts`) isn't reachable from
     /// this trait's other inputs, so callers thread it through explicitly.
+    ///
+    /// `dnssec_ok` is likewise not in the plan's literal listing — added
+    /// so a DO=true lookup can reject a hit against an entry whose DNSSEC
+    /// material isn't confirmed complete (see `RRsetEntry::dnssec_complete`
+    /// and `Shard::lookup_hop`), the fix for the stale-DO-false-entry bug:
+    /// without this, a DO=false request's cache miss could populate an
+    /// entry with no RRSIGs, and a later DO=true request would be served
+    /// that same entry as a hit for its full remaining TTL, never
+    /// re-fetching with DNSSEC material actually requested.
+    #[allow(clippy::too_many_arguments)]
     fn lookup_chain(
         &self,
         qname: &str,
         qtype: u16,
         qclass: u16,
+        dnssec_ok: bool,
         namespace: &str,
         max_chain_depth: u8,
         now: SystemTime,
@@ -136,11 +147,21 @@ impl DomainDnsCache for ShardedDnsCache {
         qname: &str,
         qtype: u16,
         qclass: u16,
+        dnssec_ok: bool,
         namespace: &str,
         max_chain_depth: u8,
         now: SystemTime,
     ) -> ChainLookup {
-        assemble::resolve_from_cache(self, qname, qtype, qclass, namespace, max_chain_depth, now)
+        assemble::resolve_from_cache(
+            self,
+            qname,
+            qtype,
+            qclass,
+            dnssec_ok,
+            namespace,
+            max_chain_depth,
+            now,
+        )
     }
 
     fn store_response(&self, decomposed: DecomposedResponse, namespace: &str) {
@@ -248,5 +269,34 @@ mod tests {
     #[test]
     fn shard_index_returns_zero_for_zero_shard_count() {
         assert_eq!(shard_index("example.com", 0), 0);
+    }
+
+    #[test]
+    fn sharded_dns_cache_never_creates_zero_capacity_shards_when_max_entries_positive() {
+        // Regression test: a `CacheConfig` with `shard_count` greater than
+        // `max_entries` used to silently create shards with capacity 0
+        // (`max_entries / shard_count` floors to 0 for every shard past
+        // index `max_entries`). `Shard::store_positive`/`store_negative`
+        // are no-ops at capacity 0, so any domain hashing into one of
+        // those shards could never be cached — a permanent, silent miss
+        // storm under a configuration that looks valid.
+        // `CacheConfig::resolved_shard_count` now caps the effective shard
+        // count at `max_entries` to prevent this.
+        let config = crate::config::CacheConfig {
+            max_entries: 5,
+            shard_count: Some(64),
+        };
+        let cache = ShardedDnsCache::new(&config);
+        assert_eq!(
+            cache.shard_count(),
+            5,
+            "shard count should be capped at max_entries"
+        );
+        for shard in &cache.shards {
+            assert!(
+                shard.capacity() > 0,
+                "every shard must retain at least one domain's worth of capacity"
+            );
+        }
     }
 }

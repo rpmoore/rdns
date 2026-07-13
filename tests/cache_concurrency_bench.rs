@@ -62,6 +62,7 @@ fn seed_entry(now: SystemTime) -> RRsetEntry {
         // with its own `namespace` argument at store time — this value is
         // never actually read, but every field must be supplied.
         cache_namespace: NAMESPACE.to_string(),
+        dnssec_complete: true,
     }
 }
 
@@ -91,6 +92,7 @@ fn run_workload(cache: &ShardedDnsCache, domains: &[String], operation_count: us
                 domain,
                 A_QTYPE,
                 IN_QCLASS,
+                false,
                 NAMESPACE,
                 MAX_CHAIN_DEPTH,
                 SystemTime::now(),

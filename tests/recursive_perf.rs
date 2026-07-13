@@ -122,6 +122,7 @@ fn recursive_backend(config: &RuntimeConfig) -> Arc<RecursiveResolutionBackend> 
             per_query_deadline: config.per_query_deadline,
             max_recursion_depth: recursive.max_recursion_depth,
             max_cname_restarts: recursive.max_cname_restarts,
+            configured_max_udp_payload_size: config.max_udp_payload_size,
         },
         transport,
     ))

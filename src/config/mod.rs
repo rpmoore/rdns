@@ -311,8 +311,28 @@ impl CacheConfig {
     /// platform can't report it. `Some(0)` is treated the same as `None`
     /// rather than passed through, since a resolved shard count of 0 would
     /// make every capacity/routing computation downstream divide by zero.
+    ///
+    /// Also caps the result at `max_entries` whenever `max_entries > 0`:
+    /// `shard_capacity`'s remainder-distributed formula gives shard `i`
+    /// capacity `max_entries / shard_count` (plus one for the first
+    /// `max_entries % shard_count` shards) — if `shard_count` exceeds
+    /// `max_entries`, that division floors to zero for every shard past
+    /// index `max_entries`, silently making those shards permanently
+    /// unable to cache anything (`Shard::store_positive`/`store_negative`
+    /// are no-ops at capacity 0). Any domain whose hash lands in one of
+    /// those shards would miss forever under a configuration that looks
+    /// valid. Capping here — the one place both `ShardedDnsCache::new` and
+    /// `ResolveQuery::with_single_flight_shard_count` source their shard
+    /// count from — guarantees every shard gets at least capacity 1
+    /// whenever the cache has any capacity at all, without requiring every
+    /// caller (including tests/benchmarks that construct `CacheConfig`
+    /// directly, bypassing `RuntimeConfig::validate()`) to remember to
+    /// check this themselves. `max_entries == 0` is left uncapped (still
+    /// resolves to the parallelism-derived shard count) since every shard
+    /// is already correctly zero-capacity in that case — nothing to
+    /// protect against.
     pub fn resolved_shard_count(&self) -> usize {
-        match self.shard_count {
+        let count = match self.shard_count {
             Some(count) if count > 0 => count,
             _ => {
                 let parallelism = std::thread::available_parallelism()
@@ -320,6 +340,11 @@ impl CacheConfig {
                     .unwrap_or(1);
                 (parallelism * 4).next_power_of_two()
             }
+        };
+        if self.max_entries == 0 {
+            count
+        } else {
+            count.min(self.max_entries)
         }
     }
 
@@ -3317,6 +3342,59 @@ a.root-servers.net.      3600000      Aaaa  2001:503:ba3e::2:30
             unset.resolved_shard_count()
         );
         assert!(explicit_zero.resolved_shard_count() > 0);
+    }
+
+    #[test]
+    fn cache_config_resolved_shard_count_caps_at_max_entries() {
+        // Regression test: shard_count > max_entries used to resolve
+        // unchanged, so `shard_capacity`'s remainder-distributed formula
+        // gave every shard past index `max_entries` a capacity of 0 —
+        // `Shard::store_positive`/`store_negative` are no-ops at capacity
+        // 0, so any domain hashing into one of those shards could never
+        // be cached, silently, under a configuration that looks valid.
+        let config = CacheConfig {
+            max_entries: 5,
+            shard_count: Some(64),
+        };
+        assert_eq!(config.resolved_shard_count(), 5);
+    }
+
+    #[test]
+    fn cache_config_resolved_shard_count_every_shard_gets_nonzero_capacity_when_possible() {
+        // For every nonzero max_entries, no shard produced by the
+        // resolved shard count should ever end up with capacity 0 — every
+        // hash bucket must be able to retain at least one domain.
+        for max_entries in [1usize, 2, 5, 10, 100] {
+            for requested_shard_count in [1usize, 4, 8, 16, 64, 1000] {
+                let config = CacheConfig {
+                    max_entries,
+                    shard_count: Some(requested_shard_count),
+                };
+                let shard_count = config.resolved_shard_count();
+                for index in 0..shard_count {
+                    let capacity = config.shard_capacity(index, shard_count);
+                    assert!(
+                        capacity >= 1,
+                        "max_entries={max_entries} requested_shard_count=\
+                         {requested_shard_count} resolved_shard_count={shard_count} \
+                         shard {index} got capacity 0"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn cache_config_resolved_shard_count_leaves_max_entries_zero_uncapped() {
+        // max_entries == 0 legitimately means "every shard has capacity
+        // 0" (see `cache_config_zero_max_entries_gives_every_shard_zero_capacity`)
+        // — nothing to protect against, so the shard count is left at
+        // whatever it would otherwise resolve to.
+        let config = CacheConfig {
+            max_entries: 0,
+            shard_count: Some(64),
+        };
+        assert_eq!(config.resolved_shard_count(), 64);
     }
 
     #[test]

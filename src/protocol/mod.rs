@@ -69,6 +69,16 @@ impl From<DnsParseError> for QueryValidationError {
     }
 }
 
+/// A `QueryValidationError` from
+/// `Message::parse_standard_query_owned_with_recovery`, paired with the
+/// `Message` recovered on a best-effort basis (see that method's docs for
+/// when recovery does and doesn't succeed).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct QueryDecodeFailure {
+    pub error: QueryValidationError,
+    pub recovered_message: Option<Box<Message>>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub enum ResponseCode {
     NoError = 0,
@@ -294,9 +304,15 @@ impl Message {
         Ok(Self::from_parts(Bytes::copy_from_slice(dns_message), parts))
     }
 
-    pub fn parse_owned(dns_message: Vec<u8>) -> Result<Self> {
+    /// Accepts anything cheaply convertible to `Bytes` -- notably `Vec<u8>`
+    /// (an O(1) move of the vec's existing allocation, not a copy) and
+    /// `Bytes` itself (an O(1) refcount bump when the caller already holds
+    /// a `Bytes`, e.g. because it also needs to retain a cheap-clone
+    /// handle to the same wire bytes for some other purpose).
+    pub fn parse_owned(dns_message: impl Into<Bytes>) -> Result<Self> {
+        let dns_message = dns_message.into();
         let parts = Self::parse_parts(&dns_message)?;
-        Ok(Self::from_parts(Bytes::from(dns_message), parts))
+        Ok(Self::from_parts(dns_message, parts))
     }
 
     fn parse_parts(dns_message: &[u8]) -> Result<MessageParts> {
@@ -343,12 +359,125 @@ impl Message {
     }
 
     pub fn parse_standard_query_owned(
-        dns_message: Vec<u8>,
+        dns_message: impl Into<Bytes>,
     ) -> std::result::Result<Self, QueryValidationError> {
+        let dns_message = dns_message.into();
         let header = parse_header(&dns_message)?;
         validate_standard_query_header(&header)?;
         let message = Self::parse_owned(dns_message)?;
         validate_standard_query_body(&message)?;
+        Ok(message)
+    }
+
+    /// Same acceptance criteria as `parse_standard_query_owned`, but on
+    /// failure also makes a best-effort attempt to recover enough of the
+    /// `Message` for an EDNS/CD-aware protocol-error response (RFC 6891
+    /// §6.1.1 requires an OPT record in response to any EDNS query; RFC
+    /// 4035 §3.2.2 requires CD to be copied from query to response).
+    ///
+    /// When `parse_header` itself fails, recovery yields `None` -- the
+    /// wire format is too malformed to have any header, let alone a
+    /// question/OPT/CD, to recover. When only
+    /// `validate_standard_query_header` fails (e.g. an unsupported opcode,
+    /// or more questions/records than a standard query allows),
+    /// `recover_query_context` always returns `Some`: the header itself
+    /// (id/flags, including CD) is always usable by that point, and the
+    /// question/EDNS context is recovered on a strictly bounded budget --
+    /// see that function's docs -- independent of, and specifically
+    /// distrusting, the header's own section counts, since a query that
+    /// already failed header validation cannot be trusted to bound how
+    /// much work recovering it costs.
+    ///
+    /// This exists as a separate method (rather than changing
+    /// `parse_standard_query_owned` itself) so every existing caller and
+    /// test asserting on `Result<Self, QueryValidationError>` is unaffected
+    /// -- recovery is purely additive, and (unlike eagerly cloning or
+    /// unconditionally parsing on every call) only costs anything on this
+    /// already-rare error path, not on every decoded query.
+    pub fn parse_standard_query_owned_with_recovery(
+        dns_message: impl Into<Bytes>,
+    ) -> std::result::Result<Self, QueryDecodeFailure> {
+        let dns_message = dns_message.into();
+        let header = match parse_header(&dns_message) {
+            Ok(header) => header,
+            Err(error) => {
+                return Err(QueryDecodeFailure {
+                    error: error.into(),
+                    recovered_message: None,
+                });
+            }
+        };
+        if let Err(error) = validate_standard_query_header(&header) {
+            // A full `Self::parse` here would trust the header's own
+            // (by definition, at this point, already-invalid) section
+            // counts to bound how much of the packet it walks and
+            // allocates -- letting a crafted `an_count`/`ns_count`/
+            // `ar_count` turn every header-validation failure into a
+            // full-parse-and-allocate pass, which is exactly the cost the
+            // pre-recovery code avoided by bailing out after the 12-byte
+            // header check alone. `recover_query_context` recovers the
+            // same question/EDNS/CD context on a strictly bounded budget
+            // instead, and (unlike `Self::parse`) tolerates a duplicate
+            // OPT record rather than discarding everything recovered.
+            let recovered_message = Some(Box::new(recover_query_context(dns_message, &header)));
+            return Err(QueryDecodeFailure {
+                error,
+                recovered_message,
+            });
+        }
+        // `validate_standard_query_header` only checks `ar_count <= 1`, not
+        // what that one additional record's *type* is -- a crafted query
+        // can pass header validation with a single additional record that
+        // isn't actually OPT (e.g. a large unknown/DNSSEC-style RDATA).
+        // Without this check, that shape would fall straight through to
+        // the full `Self::parse_owned` below, which fully materializes the
+        // record (including a `to_vec()` copy for unknown-type RDATA) only
+        // for `validate_standard_query_body` to reject it afterwards for
+        // not being OPT -- reintroducing, via a different validation-
+        // ordering gap, the same "malformed packet forces expensive parse
+        // work" cost the header-validation-failure branch above already
+        // closed off. `recovery_additional_is_opt` answers "is this worth
+        // a full parse" with the same lightweight, non-allocating
+        // technique `recovery_skip_record` uses, so a non-OPT additional
+        // is rejected here without ever calling `parse_record_data`. A
+        // precheck parse error is deliberately *not* treated as
+        // conclusive: it means the packet is malformed in a way the full
+        // parse will also hit early (before the expensive RDATA copy), so
+        // falling through and letting `Self::parse_owned` produce the
+        // authoritative error is both correct and still cheap.
+        if header.ar_count == 1 && recovery_additional_is_opt(&dns_message, &header) == Ok(false) {
+            let recovered_message = Some(Box::new(recover_query_context(dns_message, &header)));
+            return Err(QueryDecodeFailure {
+                error: QueryValidationError::InvalidEdns,
+                recovered_message,
+            });
+        }
+        // By this point `parse_header` and `validate_standard_query_header`
+        // have both already succeeded, so the 12-byte header -- including
+        // the CD bit (RFC 4035 §3.2.2 requires CD to be copied from query
+        // to response) -- was read successfully even if the body below
+        // fails to parse (e.g. a malformed question, or a malformed
+        // additional-section record body `recovery_additional_is_opt`'s
+        // cheap precheck didn't catch). `dns_message.clone()` is an O(1)
+        // `Bytes` refcount bump, not a copy, so retaining a handle to it
+        // here to drive `recover_query_context` on this error path costs
+        // nothing on the (overwhelmingly common) success path.
+        let message = match Self::parse_owned(dns_message.clone()) {
+            Ok(message) => message,
+            Err(error) => {
+                let recovered_message = Some(Box::new(recover_query_context(dns_message, &header)));
+                return Err(QueryDecodeFailure {
+                    error: error.into(),
+                    recovered_message,
+                });
+            }
+        };
+        if let Err(error) = validate_standard_query_body(&message) {
+            return Err(QueryDecodeFailure {
+                error,
+                recovered_message: Some(Box::new(message)),
+            });
+        }
         Ok(message)
     }
 
@@ -386,63 +515,130 @@ pub fn build_formerr_response(request_id: u16) -> Vec<u8> {
     build_header_only_response(request_id, false, ResponseCode::FormErr)
 }
 
-pub fn build_servfail_response(request: Option<&Message>, request_id: Option<u16>) -> Vec<u8> {
+/// Builds an `rcode`-coded error response for `request_id`, using
+/// `request`'s question/EDNS/CD context when available (RFC 6891 §6.1.1
+/// requires an OPT record in response to any EDNS query; RFC 4035 §3.2.2
+/// requires CD to be copied from query to response) and falling back to a
+/// header-only response (keyed on `request_id`) only when no parsed
+/// `request` could be recovered at all -- i.e. the packet's wire format
+/// itself couldn't be parsed, so there's no question/OPT/CD to mirror.
+/// Shared by every generic error-response builder that can be asked to
+/// build any of several response codes for the same request shape (SERVFAIL
+/// today, and protocol errors like FORMERR/NOTIMP).
+pub fn build_question_aware_error_response(
+    request: Option<&Message>,
+    request_id: Option<u16>,
+    rcode: ResponseCode,
+    configured_max_udp_payload_size: usize,
+) -> Vec<u8> {
     match request {
-        Some(request) => build_question_response(request, ResponseCode::ServFail, &[]),
-        None => build_header_only_response(request_id.unwrap_or(0), false, ResponseCode::ServFail),
+        Some(request) => {
+            build_question_response(request, rcode, &[], configured_max_udp_payload_size)
+        }
+        None => build_header_only_response(request_id.unwrap_or(0), false, rcode),
     }
 }
 
-pub fn build_refused_response(request: &Message) -> Vec<u8> {
-    build_question_response(request, ResponseCode::Refused, &[])
+pub fn build_servfail_response(
+    request: Option<&Message>,
+    request_id: Option<u16>,
+    configured_max_udp_payload_size: usize,
+) -> Vec<u8> {
+    build_question_aware_error_response(
+        request,
+        request_id,
+        ResponseCode::ServFail,
+        configured_max_udp_payload_size,
+    )
 }
 
-pub fn build_nxdomain_response(request: &Message) -> Vec<u8> {
-    build_question_response(request, ResponseCode::NxDomain, &[])
+pub fn build_refused_response(
+    request: &Message,
+    configured_max_udp_payload_size: usize,
+) -> Vec<u8> {
+    build_question_response(
+        request,
+        ResponseCode::Refused,
+        &[],
+        configured_max_udp_payload_size,
+    )
 }
 
-pub fn build_nodata_response(request: &Message) -> Vec<u8> {
-    build_question_response(request, ResponseCode::NoError, &[])
+pub fn build_nxdomain_response(
+    request: &Message,
+    configured_max_udp_payload_size: usize,
+) -> Vec<u8> {
+    build_question_response(
+        request,
+        ResponseCode::NxDomain,
+        &[],
+        configured_max_udp_payload_size,
+    )
 }
 
-pub fn build_a_block_response(request: &Message, ipv4: Ipv4Addr, ttl: u32) -> Vec<u8> {
-    build_a_answers_response(request, &[ipv4], ttl)
+pub fn build_nodata_response(request: &Message, configured_max_udp_payload_size: usize) -> Vec<u8> {
+    build_question_response(
+        request,
+        ResponseCode::NoError,
+        &[],
+        configured_max_udp_payload_size,
+    )
 }
 
-pub fn build_aaaa_block_response(request: &Message, ipv6: Ipv6Addr, ttl: u32) -> Vec<u8> {
-    build_aaaa_answers_response(request, &[ipv6], ttl)
+pub fn build_a_block_response(
+    request: &Message,
+    ipv4: Ipv4Addr,
+    ttl: u32,
+    configured_max_udp_payload_size: usize,
+) -> Vec<u8> {
+    build_a_answers_response(request, &[ipv4], ttl, configured_max_udp_payload_size)
 }
 
-pub fn build_a_answers_response(request: &Message, ipv4: &[Ipv4Addr], ttl: u32) -> Vec<u8> {
+pub fn build_aaaa_block_response(
+    request: &Message,
+    ipv6: Ipv6Addr,
+    ttl: u32,
+    configured_max_udp_payload_size: usize,
+) -> Vec<u8> {
+    build_aaaa_answers_response(request, &[ipv6], ttl, configured_max_udp_payload_size)
+}
+
+pub fn build_a_answers_response(
+    request: &Message,
+    ipv4: &[Ipv4Addr],
+    ttl: u32,
+    configured_max_udp_payload_size: usize,
+) -> Vec<u8> {
     let answers: Vec<_> = ipv4
         .iter()
         .copied()
         .map(|address| AddressAnswer::A { address, ttl })
         .collect();
-    build_question_response(request, ResponseCode::NoError, &answers)
+    build_question_response(
+        request,
+        ResponseCode::NoError,
+        &answers,
+        configured_max_udp_payload_size,
+    )
 }
 
-pub fn build_aaaa_answers_response(request: &Message, ipv6: &[Ipv6Addr], ttl: u32) -> Vec<u8> {
+pub fn build_aaaa_answers_response(
+    request: &Message,
+    ipv6: &[Ipv6Addr],
+    ttl: u32,
+    configured_max_udp_payload_size: usize,
+) -> Vec<u8> {
     let answers: Vec<_> = ipv6
         .iter()
         .copied()
         .map(|address| AddressAnswer::Aaaa { address, ttl })
         .collect();
-    build_question_response(request, ResponseCode::NoError, &answers)
-}
-
-pub fn build_truncated_response(request: &Message) -> Vec<u8> {
-    let mut response = Vec::new();
-    write_response_header(
-        &mut response,
-        request.header.id,
-        request.header.rd(),
-        true,
+    build_question_response(
+        request,
         ResponseCode::NoError,
-        0,
-        0,
-    );
-    response
+        &answers,
+        configured_max_udp_payload_size,
+    )
 }
 
 pub fn rewrite_response_id(response_bytes: &mut [u8], request_id: u16) -> Result<()> {
@@ -609,21 +805,39 @@ fn build_header_only_response(
     response
 }
 
+/// Builds a header + question (+ optional answers) response for `request`,
+/// used by every generic failure/policy-block builder in this module
+/// (SERVFAIL, REFUSED, NXDOMAIN, NODATA, sinkhole A/AAAA answers). Per RFC
+/// 6891 §6.1.1 a compliant responder MUST include an OPT record in any
+/// response to a query that itself carried one, and per RFC 4035 §3.2.2 the
+/// CD bit MUST be copied from query to response -- both are derived
+/// directly from `request` (which already carries `edns` and `header.cd()`)
+/// rather than threaded in separately, since every caller already has the
+/// full request `Message` in hand. `configured_max_udp_payload_size` is
+/// this responder's own UDP payload size (RFC 6891 §6.1.1: the OPT record
+/// on a *response* describes the sender's -- i.e. this resolver's -- own
+/// size, never an echo of the requester's advertised size).
 fn build_question_response(
     request: &Message,
     rcode: ResponseCode,
     answers: &[AddressAnswer],
+    configured_max_udp_payload_size: usize,
 ) -> Vec<u8> {
     let mut response = Vec::new();
     let question_count = u16::from(!request.questions.is_empty());
-    write_response_header(
+    let opt = message_edns_opt_record(request, configured_max_udp_payload_size);
+    write_message_header(
         &mut response,
         request.header.id,
         request.header.rd(),
         false,
+        false,
+        request.header.cd(),
         rcode,
         question_count,
         answers.len() as u16,
+        0,
+        u16::from(opt.is_some()),
     );
 
     if let Some(question) = request.questions.first() {
@@ -632,6 +846,9 @@ fn build_question_response(
         for answer in answers {
             write_sinkhole_answer(&mut response, &mut compressor, question, answer);
         }
+    }
+    if let Some(opt) = &opt {
+        write_opt_record(&mut response, opt);
     }
 
     response
@@ -756,6 +973,10 @@ pub(crate) fn write_u32(out: &mut Vec<u8>, value: u32) {
 /// `resolver::cache::assemble` (section-06) to build responses carrying an
 /// authority-section SOA (negative results) and/or an AD bit computed from
 /// DNSSEC validation state.
+///
+/// `checking_disabled` copies the query's CD bit onto the response, per
+/// RFC 4035 §3.2.2 ("a security-aware recursive name server MUST copy the
+/// CD bit from a query to the corresponding response").
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn write_message_header(
     out: &mut Vec<u8>,
@@ -763,6 +984,7 @@ pub(crate) fn write_message_header(
     recursion_desired: bool,
     truncated: bool,
     authenticated_data: bool,
+    checking_disabled: bool,
     rcode: ResponseCode,
     question_count: u16,
     answer_count: u16,
@@ -781,12 +1003,56 @@ pub(crate) fn write_message_header(
     if authenticated_data {
         flags |= 0x0020;
     }
+    if checking_disabled {
+        flags |= 0x0010;
+    }
     flags |= rcode.as_u8() as u16;
     write_u16(out, flags);
     write_u16(out, question_count);
     write_u16(out, answer_count);
     write_u16(out, authority_count);
     write_u16(out, additional_count);
+}
+
+/// Builds a truncated (TC=1) response: header + question + a mirrored OPT
+/// record (when `opt` is `Some`), no answer/authority section and no other
+/// additional records. Per RFC 6891 §7, a compliant truncated response to
+/// an EDNS requester must still carry the question and a responder OPT
+/// record; per RFC 4035 §3.2.2, CD must still be copied.
+///
+/// Shared by `resolver::cache::assemble::finish_with_truncation_check`
+/// (`QueryFeatures`-sourced, cache-hit serve time) and
+/// `resolver::truncated_response_for_query` (`Message`-sourced, recursive
+/// backend miss and local-entry paths) so both truncation call sites build
+/// from the same primitives (`write_message_header` + `write_opt_record`)
+/// and can't drift out of RFC compliance independently of each other again.
+pub(crate) fn build_truncated_wire_response(
+    request_id: u16,
+    recursion_desired: bool,
+    checking_disabled: bool,
+    response_code: ResponseCode,
+    question_wire: &[u8],
+    opt: Option<&Record>,
+) -> Vec<u8> {
+    let mut response = Vec::new();
+    write_message_header(
+        &mut response,
+        request_id,
+        recursion_desired,
+        true,
+        false,
+        checking_disabled,
+        response_code,
+        1,
+        0,
+        0,
+        u16::from(opt.is_some()),
+    );
+    response.extend_from_slice(question_wire);
+    if let Some(opt) = opt {
+        write_opt_record(&mut response, opt);
+    }
+    response
 }
 
 fn write_name_uncompressed(out: &mut Vec<u8>, name: &str) {
@@ -810,6 +1076,62 @@ fn from_hex(hex: &str) -> Vec<u8> {
                 .and_then(|s| u8::from_str_radix(s, 16).ok())
         })
         .collect()
+}
+
+/// Builds a per-transaction OPT record mirroring a requester's own EDNS
+/// UDP payload size and DO flag, with the extended RCODE/version zeroed
+/// and no options — used to echo a requester's EDNS presence back onto a
+/// response. Per RFC 6891 §6.1.1, a compliant responder MUST include an
+/// OPT record in any response to a query that itself carried one; per
+/// RFC 6891 §7, even a minimal truncated response must still carry
+/// header + question + OPT.
+///
+/// Shared by `resolver::mirrored_client_opt_record` (sourced from a
+/// parsed `Message`, used on the recursive-miss path) and
+/// `resolver::cache::assemble` (sourced from `QueryFeatures`, which has no
+/// `Message` to read from at cache-hit serve time) so both build the exact
+/// same OPT shape rather than duplicating this construction.
+pub(crate) fn build_opt_record(udp_payload_size: u16, dnssec_ok: bool) -> Record {
+    let flags = if dnssec_ok { EDNS_DO_FLAG } else { 0 };
+    Record {
+        name: String::new(),
+        rtype: OPT_RECORD_TYPE,
+        rclass: udp_payload_size,
+        ttl: u32::from(flags),
+        record: RecordData::OPT(EdnsInfo {
+            udp_payload_size,
+            extended_rcode: 0,
+            version: 0,
+            flags,
+            dnssec_ok,
+            options: Vec::new(),
+        }),
+    }
+}
+
+/// `build_opt_record`, sourced from a parsed request `Message` rather than
+/// raw `(udp_payload_size, dnssec_ok)` values -- `None` if `message` carried
+/// no EDNS OPT record at all. Shared by every response builder in this
+/// module that has a `&Message` in hand (`build_question_response`) and by
+/// `resolver::mirrored_client_opt_record` (which delegates here), so the
+/// "does this message have EDNS, and if so what does its OPT look like"
+/// logic exists exactly once regardless of which side of the
+/// protocol/resolver boundary is asking.
+///
+/// `responder_udp_payload_size` is *this resolver's own* configured/effective
+/// UDP payload size, not `message`'s. Per RFC 6891 §6.1.1 the UDP payload
+/// size field in an OPT RR is sender-specific: on a query it's the
+/// requester's own advertised size, but on a *response* -- which is all this
+/// function ever builds an OPT record for -- it must describe the
+/// responder's own size. Only EDNS *presence* (whether to emit an OPT record
+/// at all) and the DO flag are derived from `message`.
+pub(crate) fn message_edns_opt_record(
+    message: &Message,
+    responder_udp_payload_size: usize,
+) -> Option<Record> {
+    let edns = message.edns.as_ref()?;
+    let udp_payload_size = responder_udp_payload_size.min(u16::MAX as usize) as u16;
+    Some(build_opt_record(udp_payload_size, edns.dnssec_ok))
 }
 
 /// Encodes one arbitrary resource record to wire bytes: owner name, type,
@@ -845,6 +1167,24 @@ pub(crate) fn write_record(
     write_rdata(out, compressor, rdata);
     let rdlength = (out.len() - rdata_start) as u16;
     out[rdlength_pos..rdlength_pos + 2].copy_from_slice(&rdlength.to_be_bytes());
+}
+
+/// Writes a single OPT record (owner name always root, so a fresh,
+/// single-use compressor is fine -- there is nothing for it to compress
+/// against or be compressed by). Shared by every response builder that
+/// appends a mirrored/requester OPT record, so the "OPT records use their
+/// own throwaway compressor" detail exists exactly once.
+pub(crate) fn write_opt_record(out: &mut Vec<u8>, opt: &Record) {
+    let mut compressor = NameCompressor::new();
+    write_record(
+        out,
+        &mut compressor,
+        &opt.name,
+        opt.rtype,
+        opt.rclass,
+        opt.ttl,
+        &opt.record,
+    );
 }
 
 fn write_rdata(out: &mut Vec<u8>, compressor: &mut NameCompressor, rdata: &RecordData) {
@@ -1008,6 +1348,474 @@ fn write_rdata(out: &mut Vec<u8>, compressor: &mut NameCompressor, rdata: &Recor
         RecordData::OPT(info) => out.extend_from_slice(&info.options),
         RecordData::Unknown { rtype: _, bytes } => out.extend_from_slice(bytes),
     }
+}
+
+/// Bound on the header-declared `an_count`/`ns_count`/`ar_count`
+/// `recover_query_context` is willing to trust before walking the packet
+/// body: those counts are, by definition, already untrusted at the point
+/// this is called (the header failed `validate_standard_query_header`),
+/// so nothing bounds them but the packet's actual length. Generous enough
+/// to cover the recoverable-but-malformed shapes this exists for (a
+/// duplicate-OPT query needs `ar_count == 2`), while keeping the total
+/// parse-and-allocate work here a small constant instead of proportional
+/// to an attacker-chosen count.
+const RECOVERY_MAX_SECTION_RECORDS: u16 = 4;
+
+/// Bound on the number of *extra* questions (beyond the first, which is
+/// the only one ever kept -- see `recover_query_context`) recovery is
+/// willing to skip past in order to reach the answer section when
+/// `qd_count > 1`. Without skipping those, EDNS recovery would start
+/// scanning from right after the first question instead of the start of
+/// the answer section, and scan into leftover question bytes for a
+/// multi-question query instead of the answer/authority/additional
+/// sections -- silently losing OPT/CD recovery for an otherwise
+/// recoverable shape. Reuses `RECOVERY_MAX_SECTION_RECORDS`'s value: the
+/// risk is the same attacker-controlled-count-turned-into-unbounded-work
+/// shape, just for `qd_count` instead of `an_count`/`ns_count`/`ar_count`.
+const RECOVERY_MAX_EXTRA_QUESTIONS: u16 = RECOVERY_MAX_SECTION_RECORDS;
+
+/// Bounded, best-effort recovery of the question/CD/EDNS context needed to
+/// build a compliant protocol-error response (RFC 6891 §6.1.1's mandatory
+/// responder OPT record, RFC 4035 §3.2.2's CD echo) after
+/// `validate_standard_query_header` has already rejected `dns_message`.
+/// `header` itself is always usable (parsing it is what let the caller
+/// reach this point), so the returned `Message` always at least carries
+/// `header`'s id/flags -- including CD -- even when nothing past the
+/// header can be recovered.
+///
+/// Deliberately does not fall back to the general `Self::parse`, for two
+/// reasons:
+///
+///   - Cost: `Self::parse` would walk and allocate every answer/authority/
+///     additional record using the header's own counts -- which, again,
+///     are untrusted here. Before recovery existed, a
+///     `validate_standard_query_header` failure bailed out after the
+///     12-byte header check alone; naively reusing `Self::parse` for
+///     recovery reintroduced that cost on every malformed packet reaching
+///     this branch, turning a crafted large `an_count`/`ns_count`/
+///     `ar_count` into a flood/amplification lever. This function bounds
+///     the *number* of records/questions walked to at most
+///     `RECOVERY_MAX_SECTION_RECORDS` per section and at most
+///     `RECOVERY_MAX_EXTRA_QUESTIONS` extra questions, regardless of what
+///     the header claims -- if any of those counts exceeds its bound, the
+///     corresponding sections (and, since additionals can't be safely
+///     located without first walking past the questions/answers/
+///     authorities, EDNS) are skipped rather than walked, but the
+///     recovered question and header (id/flags/CD) are still returned.
+///     Just bounding the record *count* isn't enough on its own, though --
+///     see `recovery_skip_record`'s docs for why the per-record work also
+///     has to avoid the general `parse_record_data` path.
+///   - Strictness: `Self::parse` rejects (via `extract_edns_info`) a
+///     query with more than one OPT record, which is correct for the
+///     primary decode path but means a duplicate-OPT query -- itself a
+///     distinct FORMERR condition (RFC 6891 §6.1.1), yet one with a
+///     perfectly parseable header and question -- recovered nothing at
+///     all, losing both the mandatory responder OPT and the CD echo. This
+///     function tolerates extra OPT records by using only the first one
+///     found.
+fn recover_query_context(dns_message: Bytes, header: &Header) -> Message {
+    let mut context = ParseContext::default();
+    let mut offset = DNS_HEADER_LEN;
+
+    // At most one question is ever useful for an error response, so keep
+    // at most one regardless of how many the (untrusted) header claims --
+    // this bounds the cost of *keeping* a question without needing a cap
+    // on `qd_count`'s value.
+    let question = if header.qd_count >= 1 {
+        parse_question(&dns_message, &mut offset, &mut context).ok()
+    } else {
+        None
+    };
+
+    // Keeping only the first question above still leaves `offset` right
+    // after it -- for a malformed multi-question query (`qd_count > 1`,
+    // itself a distinct FORMERR condition), the remaining declared
+    // questions sit between `offset` and the start of the answer section.
+    // Skip over those (bounded, since `qd_count` is attacker-controlled)
+    // before scanning for EDNS context, or recovery would scan the
+    // leftover question bytes instead of the answer/authority/additional
+    // sections and never find a real OPT record. Any other case (no
+    // question recovered, or exactly one declared) leaves `offset`
+    // already correctly positioned, so defaults to proceeding.
+    let positioned_for_edns_scan = if question.is_some() && header.qd_count > 1 {
+        header.qd_count <= 1 + RECOVERY_MAX_EXTRA_QUESTIONS
+            && skip_questions(&dns_message, &mut offset, header.qd_count - 1).is_ok()
+    } else {
+        true
+    };
+
+    let edns = if positioned_for_edns_scan
+        && header.an_count <= RECOVERY_MAX_SECTION_RECORDS
+        && header.ns_count <= RECOVERY_MAX_SECTION_RECORDS
+        && header.ar_count <= RECOVERY_MAX_SECTION_RECORDS
+    {
+        recover_edns_info(&dns_message, offset, header)
+    } else {
+        None
+    };
+
+    Message::from_parts(
+        dns_message,
+        MessageParts {
+            header: *header,
+            questions: question.into_iter().collect(),
+            answers: Vec::new(),
+            authorities: Vec::new(),
+            additionals: Vec::new(),
+            edns,
+        },
+    )
+}
+
+/// Walks the (bounded, per `recover_query_context`) answer and authority
+/// sections without materializing their records, then scans the additional
+/// section for the first OPT record, tolerating -- and simply ignoring --
+/// a second one rather than treating it as a hard parse failure the way
+/// `extract_edns_info` correctly does on the primary parse path.
+///
+/// Unlike the primary parse path, this never calls `parse_record_data`:
+/// a record count bound (`RECOVERY_MAX_SECTION_RECORDS`) only bounds the
+/// *number* of records walked, not their size, so a crafted packet with a
+/// low `an_count`/`ns_count`/`ar_count` but one or two records carrying a
+/// large RDATA blob (an unknown/DNSSEC/binary type near the message size
+/// limit) would still force a full parse-and-allocate -- including a
+/// `to_vec()` copy of the blob for `RecordData::Unknown` and similar --
+/// on what's supposed to be a cheap reject-early path for a protocol
+/// error. `recovery_skip_record` reads only each record's fixed-size
+/// header (name/type/class/ttl/rdlength) and jumps over `rdlength` bytes
+/// of RDATA without copying it, so per-record cost is a small constant
+/// regardless of RDATA size; only when a record's type is OPT does this
+/// extract the small, fixed-size OPT metadata (payload size, extended
+/// rcode/version, flags/DO bit) -- never the OPT's own RDATA (its
+/// options), which aren't needed to answer "is there EDNS, and what does
+/// it say" for recovery purposes.
+fn recover_edns_info(dns_message: &[u8], mut offset: usize, header: &Header) -> Option<EdnsInfo> {
+    recovery_skip_records(dns_message, &mut offset, header.an_count).ok()?;
+    recovery_skip_records(dns_message, &mut offset, header.ns_count).ok()?;
+    recovery_find_opt_in_additionals(dns_message, &mut offset, header.ar_count).ok()?
+}
+
+/// Advances `offset` past `count` resource records without materializing
+/// any of them -- see `recover_edns_info`'s docs for why this exists
+/// instead of `parse_records`.
+fn recovery_skip_records(dns_message: &[u8], offset: &mut usize, count: u16) -> Result<()> {
+    for _ in 0..count {
+        recovery_skip_record(dns_message, offset)?;
+    }
+    Ok(())
+}
+
+/// Advances `offset` past a single resource record's name, fixed-size
+/// type/class/ttl/rdlength header, and `rdlength` bytes of RDATA, without
+/// ever materializing a `RecordData` or copying the RDATA bytes. Bounds
+/// checks the RDATA region against the buffer length so a truncated
+/// packet is still reported as an error rather than silently under- or
+/// over-skipping.
+fn recovery_skip_record(dns_message: &[u8], offset: &mut usize) -> Result<()> {
+    parse_domain_with_context(dns_message, offset, None)?;
+    let mut reader = Reader::new(dns_message, *offset)?;
+    reader.read_u16()?; // rtype
+    reader.read_u16()?; // rclass
+    reader.read_u32()?; // ttl
+    let rdlength = reader.read_u16()? as usize;
+    let rdata_offset = reader.position();
+    let rdata_end = rdata_offset
+        .checked_add(rdlength)
+        .ok_or(DnsParseError::MalformedRecord)?;
+    dns_message
+        .get(rdata_offset..rdata_end)
+        .ok_or(DnsParseError::UnexpectedEof)?;
+    *offset = rdata_end;
+    Ok(())
+}
+
+/// Returns whether `owner_start` -- the offset a record's owner name began
+/// at, captured *before* the name was decoded -- is the canonical,
+/// unambiguous root-domain owner-name encoding RFC 6891 §6.1.2 requires of
+/// an OPT record: a single literal `0x00` root-label-length byte, never a
+/// compression pointer, even one that would legitimately (per a real
+/// `ParseContext`) decode to an empty name. Real OPT records are always
+/// emitted with the direct, uncompressed root byte; accepting a compressed
+/// encoding that merely *resolves* to empty would be a spec deviation and
+/// would let this parser and any other OPT-owner check in the file
+/// silently disagree about what counts as a valid OPT owner. Shared by
+/// every place that needs this check -- `parse_record` (the primary,
+/// general-purpose parser), `recovery_additional_is_opt` (the cheap
+/// precheck), and `recovery_find_opt_in_additionals` (the recovery
+/// scanner) -- so canonical-OPT-ownership detection can't drift apart
+/// across them again.
+fn is_canonical_root_owner(dns_message: &[u8], owner_start: usize) -> bool {
+    dns_message.get(owner_start) == Some(&0)
+}
+
+/// Bounds the number of compression-pointer redirects
+/// `skip_name_offset_only` will follow before reporting a pointer loop.
+/// Pointing strictly backward from each pointer's own position (the same
+/// check `decode_compression_pointer` enforces) doesn't by itself rule out
+/// a cycle: label-walking is allowed to move the cursor forward past a
+/// previously-followed pointer's address, so a crafted `pointer -> label
+/// run -> pointer back to the same target` shape can still loop forever
+/// (e.g. offsets `[0]=05 'A' 'A' 'A' 'A' 'A'` then `[6]=0xC0 0x00`: landing
+/// on offset 6 jumps to offset 0, whose 5-byte label walks the cursor
+/// right back to offset 6). A real name chains through at most a handful
+/// of pointers, so a small hop cap catches that shape in bounded work
+/// without `parse_domain_with_context`'s `HashSet`-based visited-offset
+/// tracking.
+const MAX_POINTER_HOPS: usize = 128;
+
+/// Advances `offset` past a single DNS name -- the same span
+/// `parse_domain_with_context` would consume -- without decoding any
+/// label into a `String`, collecting labels into a `Vec`, or allocating a
+/// `HashSet` for compression-pointer-loop tracking. Used by
+/// `recovery_additional_is_opt` specifically: that precheck only needs to
+/// advance past the question to reach the additional section, never the
+/// decoded qname itself, and paying `parse_domain_with_context`'s
+/// allocation cost here was pure waste -- `Self::parse_owned` parses the
+/// exact same question again immediately afterward on the (overwhelmingly
+/// common) path where the precheck passes.
+///
+/// This still follows compression pointers -- a compressed question name
+/// is legal, if unusual -- but bounds the number of redirects it will
+/// follow (`MAX_POINTER_HOPS`) instead of tracking every visited offset.
+/// That's enough to guarantee termination (see `MAX_POINTER_HOPS`'s docs
+/// for why a bare backward-pointing check isn't already enough on its
+/// own) without the allocation. This is intentionally *not* a general
+/// replacement for `parse_domain_with_context`: it doesn't validate
+/// pointers against a `ParseContext` of legitimate prior name occurrences
+/// (callers that need that keep using the full parser), and a chain of
+/// more than `MAX_POINTER_HOPS` redirects is reported as `PointerLoop`
+/// even in the (purely theoretical -- no real resolver emits this) case
+/// where it would eventually have terminated on its own.
+fn skip_name_offset_only(dns_message: &[u8], offset: &mut usize) -> Result<()> {
+    let mut cursor = *offset;
+    let mut hops = 0usize;
+    let mut consumed_offset = None;
+    // Mirrors `parse_domain_with_context`'s cumulative wire-format length
+    // accounting exactly (same starting value, same per-label
+    // `length + 1` increment, same `MAX_NAME_LEN` bound, and -- like that
+    // parser -- never incremented on a compression-pointer hop). Without
+    // this, an overlong name could be walked past by this cheap precheck
+    // even though the authoritative full parser would reject it as
+    // exceeding RFC 1035 §3.1's 255-byte limit, letting the precheck
+    // consume more attacker-controlled bytes than the real parser allows.
+    let mut wire_len = 1usize;
+
+    loop {
+        let length_octet = *dns_message
+            .get(cursor)
+            .ok_or(DnsParseError::UnexpectedEof)?;
+        match length_octet & 0b1100_0000 {
+            0b0000_0000 => {
+                let length = length_octet as usize;
+                cursor += 1;
+                if length == 0 {
+                    if consumed_offset.is_none() {
+                        consumed_offset = Some(cursor);
+                    }
+                    break;
+                }
+                if length > MAX_LABEL_LEN {
+                    return Err(DnsParseError::InvalidLabel);
+                }
+                let label_end = cursor
+                    .checked_add(length)
+                    .ok_or(DnsParseError::UnexpectedEof)?;
+                if label_end > dns_message.len() {
+                    return Err(DnsParseError::UnexpectedEof);
+                }
+                wire_len = wire_len
+                    .checked_add(length + 1)
+                    .ok_or(DnsParseError::InvalidLabel)?;
+                if wire_len > MAX_NAME_LEN {
+                    return Err(DnsParseError::InvalidLabel);
+                }
+                cursor = label_end;
+            }
+            0b1100_0000 => {
+                hops += 1;
+                if hops > MAX_POINTER_HOPS {
+                    return Err(DnsParseError::PointerLoop);
+                }
+                let pointer_offset =
+                    decode_compression_pointer(dns_message, cursor, length_octet, None)?;
+                if consumed_offset.is_none() {
+                    consumed_offset = Some(cursor + 2);
+                }
+                cursor = pointer_offset;
+            }
+            _ => return Err(DnsParseError::InvalidLabel),
+        }
+    }
+
+    *offset = consumed_offset.ok_or(DnsParseError::UnexpectedEof)?;
+    Ok(())
+}
+
+/// Advances `offset` past `question_count` questions' names and their
+/// fixed 4-byte qtype+qclass fields -- the same shape `skip_questions`
+/// walks -- but using `skip_name_offset_only` instead of
+/// `parse_domain_with_context` for the name portion, so this doesn't
+/// allocate. Only used by `recovery_additional_is_opt`'s cheap precheck
+/// below; `skip_questions` itself is untouched and every other call site
+/// (e.g. the multi-question-skip recovery path) keeps using the full,
+/// general-purpose domain parser.
+fn recovery_skip_questions_offset_only(
+    dns_message: &[u8],
+    offset: &mut usize,
+    question_count: u16,
+) -> Result<()> {
+    for _ in 0..question_count {
+        skip_name_offset_only(dns_message, offset)?;
+        let mut reader = Reader::new(dns_message, *offset)?;
+        reader.read_u16()?; // qtype
+        reader.read_u16()?; // qclass
+        *offset = reader.position();
+    }
+    Ok(())
+}
+
+/// Cheaply determines whether a standard query's single declared
+/// additional record (`header.ar_count == 1`, the only nonzero shape
+/// `validate_standard_query_body` accepts) is a validly-owned OPT record,
+/// without ever materializing the record's RDATA -- see
+/// `parse_standard_query_owned_with_recovery`'s call site for why this
+/// exists: `validate_standard_query_header` only checks `ar_count <= 1`,
+/// not what that one record's *type* is, so a query with a large,
+/// non-OPT additional record in that slot passes header validation and
+/// would otherwise fall through to the full `Self::parse_owned` ->
+/// `parse_record_data` path -- fully materializing (including a
+/// `to_vec()` copy for unknown-type RDATA) a record `validate_standard_query_body`
+/// was always going to reject once discovered not to be OPT. This reads
+/// only the record's owner name and fixed-size type field, the same
+/// lightweight, non-allocating technique `recovery_skip_record` uses, and
+/// stops there -- it doesn't need `rdlength` or the RDATA bounds check
+/// since the caller only needs a type answer, not a fully skipped record.
+///
+/// Also requires the owner name to be the canonical root encoding (see
+/// `is_canonical_root_owner`), not merely a name that decodes to empty via
+/// a compression pointer -- a record with `rtype == OPT_RECORD_TYPE` but a
+/// non-canonical owner is treated the same as a non-OPT additional here
+/// (`Ok(false)`), so it's rejected by this cheap precheck instead of
+/// falling through to the full parse, consistent with how a non-OPT
+/// additional is already handled.
+///
+/// Only called after `validate_standard_query_header` has already
+/// confirmed `qd_count == 1`, `an_count == 0`, and `ns_count == 0`, so
+/// this only needs to skip exactly one question to reach the additional
+/// record. `header.ar_count == 1` is not a rare/malformed shape -- it's
+/// the normal wire shape of *every* EDNS query, since a standard EDNS
+/// request has exactly one additional record (the OPT pseudo-record) --
+/// so this precheck runs on essentially every EDNS query the server sees,
+/// not just the rare malformed one it was built to reject cheaply. That's
+/// why the question-skip step here uses `skip_name_offset_only` /
+/// `recovery_skip_questions_offset_only` instead of `skip_questions`, and
+/// why the additional record's own owner name is never run through
+/// `parse_domain_with_context` either: unlike the truly-rare recovery
+/// paths elsewhere in this file, this one needed to be allocation-free on
+/// the common case, not just bounded. The owner-name step below fast-paths
+/// the canonical single-byte root encoding (the shape every real OPT
+/// record's owner uses) without any name-parsing at all, and falls back to
+/// the allocation-free `skip_name_offset_only` -- never the allocating
+/// `parse_domain_with_context` -- for the rare non-root-owner shape, since
+/// that branch only needs to know where the name ends, not decode it.
+fn recovery_additional_is_opt(dns_message: &[u8], header: &Header) -> Result<bool> {
+    let mut offset = DNS_HEADER_LEN;
+    recovery_skip_questions_offset_only(dns_message, &mut offset, header.qd_count)?;
+    let owner_start = offset;
+    // The overwhelmingly common shape here -- a real OPT record -- always
+    // uses the canonical, unambiguous single `0x00` root-label byte as its
+    // owner (RFC 6891 §6.1.2; see `is_canonical_root_owner`'s docs). Fast-
+    // path that exact byte directly instead of paying for *any* name
+    // parse, allocating or not: it's a single length check, so there's
+    // nothing left to skip.
+    if is_canonical_root_owner(dns_message, owner_start) {
+        offset += 1;
+    } else {
+        // A non-root owner can never pass the `is_canonical_root_owner`
+        // check below no matter what type the record turns out to be, so
+        // this branch only needs to skip past the name cheaply to reach
+        // (and correctly step over) the record that follows -- not decode
+        // or validate it. `skip_name_offset_only` (see its docs) is the
+        // allocation-free equivalent of `parse_domain_with_context` for
+        // exactly that "skip, don't decode" need.
+        skip_name_offset_only(dns_message, &mut offset)?;
+    }
+    let mut reader = Reader::new(dns_message, offset)?;
+    let rtype = reader.read_u16()?;
+    Ok(rtype == OPT_RECORD_TYPE && is_canonical_root_owner(dns_message, owner_start))
+}
+
+/// Walks `count` additional-section records looking for the first OPT
+/// record (RFC 6891 §6.1.2: owner name root, i.e. empty), extracting only
+/// its fixed-size metadata -- never its RDATA (options) -- and otherwise
+/// skips each record the same lightweight way as `recovery_skip_record`.
+/// A record whose type happens to be OPT but whose owner name isn't the
+/// canonical root encoding is simply skipped like any other record rather
+/// than treated as a hard parse failure, since this is a best-effort scan,
+/// not the primary parse path's strict `extract_edns_info` validation.
+///
+/// The "is this owner name root" check deliberately does *not* trust
+/// `parse_domain_with_context`'s general notion of an "empty" name here.
+/// Every record's owner name in this scan is parsed with `context: None`
+/// (see `recovery_skip_record`'s docs for why -- a full `ParseContext`
+/// isn't available/safe to build on this bounded, best-effort path), and
+/// `decode_compression_pointer` only requires a pointer to point strictly
+/// backward in the message when it has no context to check against --
+/// it never confirms the pointer actually lands on a prior legitimate
+/// domain-name occurrence. So a crafted OPT record whose owner name is a
+/// compression pointer aimed at, say, the message header (where byte 0 is
+/// frequently `0x00`, the ID's high byte) would pointer-chase to an
+/// "empty" name here without the name being legitimately root-owned,
+/// letting a spoofed/invalidly-compressed OPT claim be accepted by
+/// recovery (RFC 1035 §4.1.4: pointers must reference a prior domain-name
+/// occurrence, not arbitrary bytes). Real OPT records always use the
+/// canonical, unambiguous root encoding -- a single `0x00` label-length
+/// byte with no compression pointer involved at all -- so this only
+/// treats a record as root-owned when that literal byte is what's at the
+/// record's start, and fails EDNS recovery closed (skipping the record,
+/// not aborting the scan) for anything else, including a compression
+/// pointer that might otherwise legitimately resolve to root: recovery
+/// has no full parse context to validate that safely.
+fn recovery_find_opt_in_additionals(
+    dns_message: &[u8],
+    offset: &mut usize,
+    count: u16,
+) -> Result<Option<EdnsInfo>> {
+    let mut found = None;
+    for _ in 0..count {
+        let owner_start = *offset;
+        parse_domain_with_context(dns_message, offset, None)?;
+        let mut reader = Reader::new(dns_message, *offset)?;
+        let rtype = reader.read_u16()?;
+        let rclass = reader.read_u16()?;
+        let ttl = reader.read_u32()?;
+        let rdlength = reader.read_u16()? as usize;
+        let rdata_offset = reader.position();
+        let rdata_end = rdata_offset
+            .checked_add(rdlength)
+            .ok_or(DnsParseError::MalformedRecord)?;
+        dns_message
+            .get(rdata_offset..rdata_end)
+            .ok_or(DnsParseError::UnexpectedEof)?;
+        if found.is_none()
+            && rtype == OPT_RECORD_TYPE
+            && is_canonical_root_owner(dns_message, owner_start)
+        {
+            let extended_rcode = ((ttl >> 24) & 0xff) as u8;
+            let version = ((ttl >> 16) & 0xff) as u8;
+            let flags = (ttl & 0xffff) as u16;
+            found = Some(EdnsInfo {
+                udp_payload_size: rclass,
+                extended_rcode,
+                version,
+                flags,
+                dnssec_ok: (flags & EDNS_DO_FLAG) != 0,
+                options: Vec::new(),
+            });
+        }
+        *offset = rdata_end;
+    }
+    Ok(found)
 }
 
 fn validate_standard_query_header(
@@ -1234,13 +2042,27 @@ fn parse_record(
     offset: &mut usize,
     context: &mut ParseContext,
 ) -> Result<Record> {
+    let owner_start = *offset;
     let name = parse_domain_with_context(dns_message, offset, Some(context))?;
     let mut reader = Reader::new(dns_message, *offset)?;
     let rtype = reader.read_u16()?;
     let rclass = reader.read_u16()?;
     let ttl = reader.read_u32()?;
     let rdlength = reader.read_u16()? as usize;
-    if rtype == OPT_RECORD_TYPE && !name.is_empty() {
+    // RFC 6891 §6.1.2: the OPT record's NAME field "MUST be 0 (root
+    // domain)" -- the literal wire encoding, not merely a name that
+    // *resolves* to empty. `name.is_empty()` alone would also accept a
+    // compression pointer that legitimately (per this call's real
+    // `ParseContext`) points at a prior root-label occurrence; real OPT
+    // records never use compression for their owner name, so also require
+    // the canonical encoding via `is_canonical_root_owner`. A record with
+    // `rtype == OPT_RECORD_TYPE` but a non-canonical owner is malformed
+    // EDNS, treated the same as the already-established duplicate-OPT
+    // rejection on this primary parse path (not silently "no EDNS" and not
+    // silently "valid EDNS").
+    if rtype == OPT_RECORD_TYPE
+        && !(name.is_empty() && is_canonical_root_owner(dns_message, owner_start))
+    {
         return Err(DnsParseError::MalformedRecord);
     }
     let rdata_offset = reader.position();
@@ -1660,11 +2482,36 @@ fn parse_domain(dns_message: &[u8], offset: &mut usize) -> Result<String> {
     parse_domain_with_context(dns_message, offset, None)
 }
 
+#[cfg(test)]
+thread_local! {
+    // Per-thread call counter for `parse_domain_with_context`, used only to
+    // prove that specific fast paths (e.g. `recovery_additional_is_opt`'s
+    // canonical-root-owner check) never reach the allocating
+    // general-purpose domain parser at all, not just that they're
+    // bounded/cheap. Thread-local rather than a single global counter so
+    // parallel test execution can't make tests interfere with each other's
+    // counts.
+    static PARSE_DOMAIN_WITH_CONTEXT_CALLS: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+fn reset_parse_domain_with_context_call_count() {
+    PARSE_DOMAIN_WITH_CONTEXT_CALLS.with(|calls| calls.set(0));
+}
+
+#[cfg(test)]
+fn parse_domain_with_context_call_count() -> usize {
+    PARSE_DOMAIN_WITH_CONTEXT_CALLS.with(|calls| calls.get())
+}
+
 fn parse_domain_with_context(
     dns_message: &[u8],
     offset: &mut usize,
     mut context: Option<&mut ParseContext>,
 ) -> Result<String> {
+    #[cfg(test)]
+    PARSE_DOMAIN_WITH_CONTEXT_CALLS.with(|calls| calls.set(calls.get() + 1));
     let mut labels = Vec::new();
     let mut cursor = *offset;
     let mut consumed_offset = None;
@@ -1932,6 +2779,706 @@ mod tests {
         }
     }
 
+    /// Regression test: a header-validation failure whose header also
+    /// claims a large (attacker-controlled) additional-record count must
+    /// not trigger unbounded parse work while recovering context for the
+    /// protocol-error response. Before recovery was bounded, this shape
+    /// made the recovery retry call the general `Self::parse`, which walks
+    /// records using the header's own (already-untrusted) counts -- with
+    /// real record bytes present that's a real parse+allocate cost paid on
+    /// every such malformed packet; with too few bytes to back the claimed
+    /// count (as constructed here) it fails outright and recovers nothing
+    /// at all, losing even the question. Bounding recovery to
+    /// `RECOVERY_MAX_SECTION_RECORDS` means a declared count beyond that
+    /// bound is never walked -- regardless of whether the packet actually
+    /// backs it up -- so the question is still recovered and only the
+    /// EDNS/OPT context is cleanly dropped instead of recovery failing
+    /// wholesale.
+    #[test]
+    fn recovery_skips_edns_when_section_counts_exceed_bound_but_still_recovers_question() {
+        let mut message = Vec::new();
+        // opcode = 1 (unsupported), RD = 1, ar_count = 5000 -- the packet
+        // ends right after the question, nowhere near enough bytes to back
+        // 5000 additional records.
+        push_header_with_flags(&mut message, 0x0900, 1, 0, 0, 5000);
+        push_question(&mut message, "example.com", 1, 1);
+
+        let failure = Message::parse_standard_query_owned_with_recovery(message).unwrap_err();
+        assert_eq!(
+            failure.error,
+            QueryValidationError::UnsupportedOpcode { opcode: 1 }
+        );
+        let recovered = failure
+            .recovered_message
+            .expect("the header and question should still be recovered");
+        assert_eq!(recovered.questions.len(), 1);
+        assert_eq!(recovered.questions[0].qname, "example.com");
+        assert!(
+            recovered.edns.is_none(),
+            "a section count beyond the recovery bound must not be walked, even best-effort"
+        );
+    }
+
+    /// Regression test: a query with two OPT records (itself a FORMERR
+    /// condition per RFC 6891 §6.1.1, since `ar_count > 1` fails
+    /// `validate_standard_query_header`) must still recover CD and enough
+    /// EDNS context to build a compliant FORMERR-with-OPT response, even
+    /// though a full `Self::parse` retry would itself fail on the
+    /// duplicate OPT (`extract_edns_info` correctly rejects more than one
+    /// OPT record on the primary parse path). Recovery tolerates the extra
+    /// OPT record by using only the first one found.
+    #[test]
+    fn recovery_tolerates_duplicate_opt_and_recovers_first_ones_dnssec_ok() {
+        let mut message = Vec::new();
+        push_header_with_flags(&mut message, 0x0110, 1, 0, 0, 2); // RD=1, CD=1
+        push_question(&mut message, "example.com", 1, 1);
+        push_opt_record(&mut message, 1232, true, &[]);
+        push_opt_record(&mut message, 4096, false, &[]);
+
+        let failure = Message::parse_standard_query_owned_with_recovery(message).unwrap_err();
+        assert_eq!(
+            failure.error,
+            QueryValidationError::UnexpectedSectionRecords {
+                answers: 0,
+                authorities: 0,
+                additionals: 2,
+            }
+        );
+        let recovered = failure
+            .recovered_message
+            .expect("a duplicate OPT record must not prevent CD/question recovery");
+        assert!(
+            recovered.header.cd(),
+            "CD must still be recovered per RFC 4035 §3.2.2"
+        );
+        assert_eq!(recovered.questions.len(), 1);
+        let edns = recovered
+            .edns
+            .expect("the first OPT record should still be recovered");
+        assert!(
+            edns.dnssec_ok,
+            "should reflect the first OPT record's DO flag, not the second"
+        );
+    }
+
+    /// Regression test: `recover_edns_info` must not run each recovered
+    /// record through the general `parse_record_data` path. A record-count
+    /// bound (`RECOVERY_MAX_SECTION_RECORDS`) only bounds how many records
+    /// are walked, not how large any individual one's RDATA is -- a
+    /// crafted packet with `an_count <= RECOVERY_MAX_SECTION_RECORDS` can
+    /// still carry a large RDATA blob. Forcing that through
+    /// `parse_record_data` would mean either a large `to_vec()` copy (for
+    /// an unknown/blob type) or, as constructed here, a hard parse failure
+    /// for a type whose RDATA doesn't match its type's expected shape (an
+    /// A record's RDATA must be exactly 4 bytes; this one claims 60000).
+    /// The old, `parse_records`-based implementation propagated that
+    /// failure via `?` and lost EDNS/OPT recovery entirely, even though
+    /// the OPT record immediately after it is perfectly well-formed. The
+    /// lightweight `recovery_skip_record` only reads the record's
+    /// fixed-size header (name/type/class/ttl/rdlength) to skip past it --
+    /// it never looks at whether the RDATA content actually matches the
+    /// type, so recovery must still find the OPT record that follows,
+    /// which -- since a full parse of the oversized A record would have
+    /// failed outright -- also proves the oversized RDATA was never fully
+    /// parsed or copied.
+    #[test]
+    fn recovery_skips_oversized_non_opt_rdata_without_full_parsing_it() {
+        let mut message = Vec::new();
+        // opcode = 1 (unsupported), an_count = 1, ar_count = 1 -- both
+        // within RECOVERY_MAX_SECTION_RECORDS.
+        push_header_with_flags(&mut message, 0x0900, 1, 1, 0, 1);
+        push_question(&mut message, "example.com", 1, 1);
+        // An A record (rtype 1) with a 60000-byte RDATA -- nowhere near
+        // the 4 bytes an A record requires, but large enough that a
+        // `to_vec()` copy of it would be a real cost were one performed.
+        let huge_rdata = vec![0u8; 60_000];
+        push_record(&mut message, "example.com", 1, 0, &huge_rdata);
+        push_opt_record(&mut message, 1232, true, &[]);
+
+        let failure = Message::parse_standard_query_owned_with_recovery(message).unwrap_err();
+        assert_eq!(
+            failure.error,
+            QueryValidationError::UnsupportedOpcode { opcode: 1 }
+        );
+        let recovered = failure
+            .recovered_message
+            .expect("the header and question should still be recovered");
+        assert_eq!(recovered.questions.len(), 1);
+        assert_eq!(recovered.questions[0].qname, "example.com");
+        let edns = recovered.edns.expect(
+            "the OPT record after the oversized answer record must still be recovered -- \
+             proves the oversized answer record was skipped by its header alone, not fully parsed",
+        );
+        assert!(edns.dnssec_ok);
+        assert_eq!(edns.udp_payload_size, 1232);
+    }
+
+    /// Regression test: a malformed multi-question query (`qd_count == 2`,
+    /// itself a distinct FORMERR condition -- `InvalidQuestionCount`, since
+    /// `validate_standard_query_header` requires exactly one question) with
+    /// a well-formed OPT record after both questions must still recover
+    /// that OPT record. Before the offset fix, `recover_query_context`
+    /// kept only the first question but left `offset` positioned right
+    /// after it, so `recover_edns_info` started scanning into the *second*
+    /// question's bytes instead of skipping past it to the answer/
+    /// additional sections -- losing EDNS/CD recovery for an otherwise
+    /// recoverable shape.
+    #[test]
+    fn recovery_skips_extra_questions_before_scanning_for_opt() {
+        let mut message = Vec::new();
+        push_header_with_flags(&mut message, 0x0110, 2, 0, 0, 1); // RD=1, CD=1, qd=2
+        push_question(&mut message, "example.com", 1, 1);
+        push_question(&mut message, "example.net", 1, 1);
+        push_opt_record(&mut message, 4096, true, &[]);
+
+        let failure = Message::parse_standard_query_owned_with_recovery(message).unwrap_err();
+        assert_eq!(
+            failure.error,
+            QueryValidationError::InvalidQuestionCount { count: 2 }
+        );
+        let recovered = failure
+            .recovered_message
+            .expect("the header and first question should still be recovered");
+        assert!(
+            recovered.header.cd(),
+            "CD must still be recovered per RFC 4035 §3.2.2"
+        );
+        assert_eq!(recovered.questions.len(), 1);
+        assert_eq!(recovered.questions[0].qname, "example.com");
+        let edns = recovered.edns.expect(
+            "the OPT record after the second question must still be recovered once the \
+             second question is skipped rather than scanned into",
+        );
+        assert!(edns.dnssec_ok);
+        assert_eq!(edns.udp_payload_size, 4096);
+    }
+
+    /// Regression test: a query whose *header* passes
+    /// `validate_standard_query_header` cleanly (`qd_count == 1,
+    /// an_count == 0, ns_count == 0, ar_count == 1`) but whose single
+    /// declared additional record isn't actually OPT must be rejected by a
+    /// cheap, type-only precheck (`recovery_additional_is_opt`) rather than
+    /// falling through to the full `Self::parse_owned` -> `parse_record_data`
+    /// path -- otherwise a crafted non-OPT additional with a large/unknown
+    /// RDATA would force the same "malformed packet forces expensive parse
+    /// work" cost the header-validation-failure recovery path was built to
+    /// close off, just via a different validation-ordering gap.
+    ///
+    /// The additional record here declares a large `rdlength` (60000) but
+    /// the packet is truncated right after the fixed-size record header --
+    /// none of the claimed RDATA bytes are actually present. This makes
+    /// the two code paths distinguishable by which error comes back: the
+    /// precheck only reads the owner name and 2-byte type field (both
+    /// present) and rejects for `InvalidEdns` without ever looking at
+    /// `rdlength`; if the precheck weren't wired in, `Self::parse_owned`
+    /// would instead try to bounds-check the (absent) 60000-byte RDATA
+    /// region and fail with `DnsParseError::UnexpectedEof` -- a distinct
+    /// error code from `InvalidEdns` even though both paths now recover the
+    /// question (`Self::parse_owned` failures also recover context; see
+    /// `cd_is_recovered_when_body_parse_fails_after_valid_header`).
+    #[test]
+    fn precheck_rejects_non_opt_additional_before_full_parse() {
+        let mut message = Vec::new();
+        push_header(&mut message, 1, 0, 0, 1); // opcode 0 (supported), ar = 1
+        push_question(&mut message, "example.com", 1, 1);
+        // The additional record's fixed-size header: root owner name, an
+        // unknown/non-OPT type, and a large declared `rdlength` -- but no
+        // backing RDATA bytes at all.
+        message.push(0); // owner name: root
+        push_u16(&mut message, 9999); // rtype: not OPT_RECORD_TYPE
+        push_u16(&mut message, 1); // rclass
+        push_u32(&mut message, 0); // ttl
+        push_u16(&mut message, 60_000); // rdlength -- no bytes actually follow
+
+        let failure = Message::parse_standard_query_owned_with_recovery(message).unwrap_err();
+        assert_eq!(
+            failure.error,
+            QueryValidationError::InvalidEdns,
+            "a non-OPT additional record must be rejected by the cheap precheck, not by a \
+             full-parse bounds-check failure"
+        );
+        let recovered = failure.recovered_message.expect(
+            "the question must still be recovered -- proves the cheap precheck path was taken \
+             rather than a full-parse attempt that would have discarded it entirely",
+        );
+        assert_eq!(recovered.questions.len(), 1);
+        assert_eq!(recovered.questions[0].qname, "example.com");
+        assert!(
+            recovered.edns.is_none(),
+            "the single additional record isn't OPT, so no EDNS should be recovered"
+        );
+    }
+
+    /// `skip_name_offset_only` (the allocation-free name-skip used by
+    /// `recovery_additional_is_opt`'s precheck) must consume exactly the
+    /// same span of bytes `parse_domain_with_context` -- the general,
+    /// allocating parser -- would have consumed for an ordinary,
+    /// uncompressed multi-label name. If these two ever disagreed on where
+    /// a name ends, the precheck would misread the additional record that
+    /// follows it.
+    #[test]
+    fn skip_name_offset_only_matches_parse_domain_with_context_for_simple_name() {
+        let mut message = Vec::new();
+        push_name(&mut message, "www.example.com");
+        message.extend_from_slice(&[0xAB, 0xCD]); // trailing bytes past the name.
+
+        let mut offset_a = 0;
+        parse_domain_with_context(&message, &mut offset_a, None).unwrap();
+
+        let mut offset_b = 0;
+        skip_name_offset_only(&message, &mut offset_b).unwrap();
+
+        assert_eq!(offset_a, offset_b);
+    }
+
+    /// Same equivalence check as above, but for a name that ends in a
+    /// compression pointer instead of a literal root byte -- the branch
+    /// `skip_name_offset_only` handles differently (bounded hop count
+    /// instead of a visited-offset `HashSet`) from
+    /// `parse_domain_with_context`.
+    #[test]
+    fn skip_name_offset_only_matches_parse_domain_with_context_for_compressed_name() {
+        let mut message = Vec::new();
+        push_name(&mut message, "example.com"); // occupies offsets 0..=12
+        let pointer_target = message.len();
+        message.extend_from_slice(b"\x03www"); // an unterminated label, only reachable via the pointer below.
+        push_pointer(&mut message, 0); // "www" + pointer back to "example.com" at offset 0.
+        message.extend_from_slice(&[0xAB, 0xCD]); // trailing bytes past the name.
+
+        let mut offset_a = pointer_target;
+        parse_domain_with_context(&message, &mut offset_a, None).unwrap();
+
+        let mut offset_b = pointer_target;
+        skip_name_offset_only(&message, &mut offset_b).unwrap();
+
+        assert_eq!(offset_a, offset_b);
+    }
+
+    /// Regression test: a pointer-and-label layout that forms a cycle
+    /// (offset A points to offset B, but the label at B walks the cursor
+    /// forward past A again) must still terminate in bounded work instead
+    /// of hanging, even though `skip_name_offset_only` doesn't track every
+    /// visited offset the way `parse_domain_with_context`'s `HashSet`
+    /// does. See `MAX_POINTER_HOPS`'s docs for why a bare
+    /// "pointer must point strictly backward" check alone doesn't already
+    /// rule this out.
+    ///
+    /// Since the cumulative wire-length cap was added (mirroring
+    /// `parse_domain_with_context`'s `MAX_NAME_LEN` accounting), every
+    /// repetition of this loop's label also grows the cumulative wire
+    /// length by a fixed, nonzero amount (a compression pointer can only
+    /// ever move the cursor *backward*, so any cycle's forward progress
+    /// must come from re-walking at least one label each time around).
+    /// With a 6-byte-per-lap loop, that means the 255-byte length cap is
+    /// exceeded after roughly 43 laps -- long before `MAX_POINTER_HOPS`
+    /// (128) would ever fire -- so this construction now terminates via
+    /// `InvalidLabel`, not `PointerLoop`. That's still correct: the
+    /// malformed cycle is still rejected in bounded work, just via the
+    /// length cap instead of the hop cap this time. `MAX_POINTER_HOPS`
+    /// remains as an independent backstop bound on redirect-following work
+    /// regardless of which check ends up firing first for a given input.
+    #[test]
+    fn skip_name_offset_only_detects_pointer_loop_without_hanging() {
+        // Offsets 0..=5: a 5-byte label ("AAAAA"), consuming exactly the
+        // span that lands back on offset 6 when walked.
+        let mut message = vec![5u8, b'A', b'A', b'A', b'A', b'A'];
+        // Offsets 6..=7: a pointer back to offset 0.
+        push_pointer(&mut message, 0);
+
+        let mut offset = 6;
+        let error = skip_name_offset_only(&message, &mut offset).unwrap_err();
+        assert_eq!(
+            error,
+            DnsParseError::InvalidLabel,
+            "the cumulative wire-length cap must catch this cycle -- in bounded work, without \
+             hanging -- before the hop cap ever gets a chance to"
+        );
+
+        // The full, `HashSet`-tracked parser detects the same cycle far
+        // sooner (after just two offset revisits) via its visited-offset
+        // tracking, so it still reports `PointerLoop` rather than ever
+        // approaching the length cap on this input. Both parsers correctly
+        // reject the malformed cycle and both provably terminate; they just
+        // use different bounding strategies and so can (as here) disagree
+        // on the specific error variant.
+        let mut offset = 6;
+        let error = parse_domain_with_context(&message, &mut offset, None).unwrap_err();
+        assert_eq!(error, DnsParseError::PointerLoop);
+    }
+
+    /// Companion regression test proving `MAX_POINTER_HOPS` itself still
+    /// bounds work independently of the length cap: a long but strictly
+    /// acyclic chain of distinct, always-strictly-backward-pointing
+    /// redirects (never revisiting the same offset, so this is not a
+    /// `PointerLoop`) that exceeds `MAX_POINTER_HOPS` redirects must still
+    /// be rejected rather than followed indefinitely.
+    #[test]
+    fn skip_name_offset_only_bounds_a_long_acyclic_pointer_chain() {
+        // Build MAX_POINTER_HOPS + 1 single-byte root names, each one
+        // (other than the first) a two-byte pointer back to the previous
+        // one. Every offset is visited exactly once -- this is a straight
+        // line, not a cycle -- so only the hop cap (not the length cap,
+        // and not a loop detector) can be what rejects it.
+        let mut message = vec![0u8]; // offset 0: the bare root label.
+        let mut previous_offset = 0usize;
+        for _ in 0..(MAX_POINTER_HOPS + 1) {
+            let this_offset = message.len();
+            push_pointer(&mut message, previous_offset);
+            previous_offset = this_offset;
+        }
+
+        let mut offset = previous_offset;
+        let error = skip_name_offset_only(&message, &mut offset).unwrap_err();
+        assert_eq!(
+            error,
+            DnsParseError::PointerLoop,
+            "a chain with more than MAX_POINTER_HOPS redirects must be rejected even though it \
+             never revisits an offset and never approaches the length cap"
+        );
+    }
+
+    /// Regression test: `skip_name_offset_only` must enforce the same
+    /// RFC 1035 §3.1 255-byte cumulative wire-format name-length limit
+    /// (`MAX_NAME_LEN`) that `parse_domain_with_context` already enforces.
+    /// Before this fix, the offset-only skipper tracked individual label
+    /// lengths and buffer bounds but no *cumulative* wire length at all, so
+    /// an overlong name the authoritative full parser rejects as
+    /// `InvalidLabel` could still be walked past successfully by this
+    /// cheap precheck -- letting it walk more attacker-controlled bytes
+    /// than the real parser allows, and silently disagreeing with it about
+    /// what counts as a validly-shaped name.
+    #[test]
+    fn skip_name_offset_only_enforces_max_name_len_like_parse_domain_with_context() {
+        // Four 63-byte labels: each contributes `length + 1 == 64` wire
+        // bytes, so the fourth label pushes the cumulative wire length to
+        // `1 + 4 * 64 == 257`, past `MAX_NAME_LEN` (255) -- the same
+        // accounting convention `parse_domain_with_context` uses (see its
+        // `wire_len` tracking).
+        let label = "a".repeat(63);
+        let name = format!("{label}.{label}.{label}.{label}");
+        let mut message = Vec::new();
+        push_name(&mut message, &name);
+
+        let mut offset_a = 0;
+        let error_a = parse_domain_with_context(&message, &mut offset_a, None).unwrap_err();
+        assert_eq!(error_a, DnsParseError::InvalidLabel);
+
+        let mut offset_b = 0;
+        let error_b = skip_name_offset_only(&message, &mut offset_b).unwrap_err();
+        assert_eq!(
+            error_b, error_a,
+            "skip_name_offset_only must reject an overlong name with the same error the \
+             authoritative full parser uses, at the same boundary, instead of silently \
+             succeeding where parse_domain_with_context would fail"
+        );
+    }
+
+    /// Regression test guarding the actual perf fix: a normal, valid EDNS
+    /// query with a many-label question name near the 255-byte wire-format
+    /// maximum (RFC 1035 §3.1) must still be accepted by
+    /// `parse_standard_query_owned_with_recovery`. Before this fix, the
+    /// `ar_count == 1` precheck (`recovery_additional_is_opt`) skipped the
+    /// question with the fully allocating `skip_questions` /
+    /// `parse_domain_with_context` on every such query -- correct, but
+    /// wasteful, since a normal EDNS query's `ar_count` is always exactly
+    /// 1 (the OPT pseudo-record), not a rare/malformed shape. This proves
+    /// the new allocation-free `skip_name_offset_only` path is still
+    /// correct on a large, many-label name, not just cheaper.
+    #[test]
+    fn recovery_precheck_accepts_valid_edns_query_with_near_max_length_question_name() {
+        let label_a = "a".repeat(63);
+        let label_b = "b".repeat(60);
+        let name = format!("{label_a}.{label_a}.{label_a}.{label_b}");
+
+        let mut message = Vec::new();
+        push_header(&mut message, 1, 0, 0, 1);
+        push_question(&mut message, &name, 1, 1);
+        push_opt_record(&mut message, 4096, true, &[]);
+
+        let parsed = Message::parse_standard_query_owned_with_recovery(message).expect(
+            "a many-label question name near the 255-byte wire-format maximum must still let \
+             the allocation-free precheck correctly reach and classify the OPT additional \
+             record",
+        );
+        assert_eq!(parsed.questions[0].qname, name);
+        let edns = parsed
+            .edns
+            .expect("the OPT additional record must still be recognized");
+        assert!(edns.dnssec_ok);
+        assert_eq!(edns.udp_payload_size, 4096);
+    }
+
+    /// Companion to the near-max-length-name test above, exercising
+    /// `recovery_additional_is_opt` directly (rather than through
+    /// `parse_standard_query_owned_with_recovery`) with a question name
+    /// that ends in a compression pointer -- `skip_name_offset_only`'s
+    /// pointer-following branch, not just its plain-label branch. This is
+    /// deliberately a unit-level test of the precheck rather than an
+    /// end-to-end one: the strict, `ParseContext`-checked full parser
+    /// (`Self::parse_owned`) can never legitimately accept a pointer in a
+    /// message's very *first* name -- there's nothing prior for it to
+    /// validly reference (see
+    /// `recovery_rejects_opt_with_compression_pointer_owner_even_if_it_targets_a_zero_byte`
+    /// for the same constraint on an OPT owner name) -- but the cheap,
+    /// context-free precheck only needs to reach the additional section,
+    /// not validate the pointer's legitimacy, so it must still follow it
+    /// correctly.
+    #[test]
+    fn recovery_additional_is_opt_follows_compressed_question_name() {
+        let mut message = Vec::new();
+        push_u16(&mut message, 0x0000); // ID -- byte 0 is 0x00, the pointer target below.
+        push_u16(&mut message, 0x0100); // flags: opcode 0 (supported), RD = 1
+        push_u16(&mut message, 1); // qd_count
+        push_u16(&mut message, 0); // an_count
+        push_u16(&mut message, 0); // ns_count
+        push_u16(&mut message, 1); // ar_count
+        // Question name: a two-byte compression pointer aimed at offset 0
+        // (the message's own ID high byte, deliberately 0x00) instead of a
+        // literal root byte.
+        push_pointer(&mut message, 0);
+        push_u16(&mut message, 1); // qtype
+        push_u16(&mut message, 1); // qclass
+        push_opt_record(&mut message, 4096, false, &[]);
+
+        let header = parse_header(&message).unwrap();
+        let is_opt = recovery_additional_is_opt(&message, &header).unwrap();
+        assert!(
+            is_opt,
+            "the precheck must follow the compression-pointer question name (without \
+             materializing it) to correctly reach and classify the OPT additional record \
+             that follows"
+        );
+    }
+
+    /// Regression test guarding the perf fix on top of last round's: the
+    /// canonical-root-owned OPT case (`ar_count == 1`, the normal shape of
+    /// every real EDNS query) must classify correctly *and* never invoke
+    /// the allocating `parse_domain_with_context` at all when reading the
+    /// additional record's owner name -- not even with `context: None`.
+    /// Before this fix, `recovery_additional_is_opt` still ran the
+    /// additional owner through `parse_domain_with_context` on every such
+    /// query even though a real OPT owner is always the single canonical
+    /// `0x00` byte, so there was nothing to parse. Uses the
+    /// `PARSE_DOMAIN_WITH_CONTEXT_CALLS` counter (see its docs) to prove
+    /// the absence of the call directly, rather than only inferring it
+    /// indirectly from timing or correctness.
+    #[test]
+    fn recovery_additional_is_opt_root_owner_fast_path_skips_domain_parser() {
+        let mut message = Vec::new();
+        push_header(&mut message, 1, 0, 0, 1);
+        push_question(&mut message, "example.com", 1, 1);
+        push_opt_record(&mut message, 4096, false, &[]);
+
+        let header = parse_header(&message).unwrap();
+
+        reset_parse_domain_with_context_call_count();
+        let is_opt = recovery_additional_is_opt(&message, &header).unwrap();
+        assert!(
+            is_opt,
+            "a canonical root-owned OPT additional record must still be classified as OPT"
+        );
+        assert_eq!(
+            parse_domain_with_context_call_count(),
+            0,
+            "the canonical-root-owner fast path must never call the allocating domain parser"
+        );
+    }
+
+    /// Companion to the fast-path test above: a non-root-owned additional
+    /// record (so the fast path can't apply) must still be classified
+    /// correctly by falling back to the allocation-free
+    /// `skip_name_offset_only` -- and, like the fast path, must still never
+    /// call the allocating `parse_domain_with_context`, since this
+    /// precheck never needs the decoded name, only where it ends.
+    #[test]
+    fn recovery_additional_is_opt_non_root_owner_fallback_skips_domain_parser() {
+        let mut message = Vec::new();
+        push_header(&mut message, 1, 0, 0, 1);
+        push_question(&mut message, "example.com", 1, 1);
+        // A non-canonical, multi-label owner name on the additional
+        // record, so the record can never pass the canonical-root-owner
+        // check regardless of its declared type.
+        push_record(
+            &mut message,
+            "not-root.example.com",
+            OPT_RECORD_TYPE,
+            0,
+            &[],
+        );
+
+        let header = parse_header(&message).unwrap();
+
+        reset_parse_domain_with_context_call_count();
+        let is_opt = recovery_additional_is_opt(&message, &header).unwrap();
+        assert!(
+            !is_opt,
+            "a non-canonical-root-owned additional record must never be classified as OPT, \
+             even when its declared type is OPT_RECORD_TYPE"
+        );
+        assert_eq!(
+            parse_domain_with_context_call_count(),
+            0,
+            "the non-root-owner fallback must skip the name with the allocation-free \
+             skip_name_offset_only, never the allocating domain parser"
+        );
+    }
+
+    /// Regression test: `recovery_find_opt_in_additionals` must only treat
+    /// an additional record as root-owned (RFC 6891 §6.1.2) when its owner
+    /// name uses the canonical, unambiguous single `0x00` byte encoding --
+    /// never a compression pointer, even one that pointer-chases to an
+    /// "empty" name. `parse_domain_with_context(.., None)` (used throughout
+    /// recovery, since a full `ParseContext` isn't available on this
+    /// bounded path) only requires a compression pointer to point strictly
+    /// backward in the message; it never confirms the target is a
+    /// legitimate prior domain-name occurrence (RFC 1035 §4.1.4). This
+    /// constructs an OPT-typed additional record whose owner name is the
+    /// two-byte pointer `0xC0 0x00`, aimed at message offset 0 -- which
+    /// this packet's ID field is deliberately set to make `0x00`, so a
+    /// naive pointer-chase would decode it as the empty (root) name and
+    /// spoof RFC 6891 §6.1.2's root-owner requirement.
+    #[test]
+    fn recovery_rejects_opt_with_compression_pointer_owner_even_if_it_targets_a_zero_byte() {
+        let mut message = Vec::new();
+        push_u16(&mut message, 0x0000); // ID -- byte 0 is 0x00, the pointer target below.
+        push_u16(&mut message, 0x0900); // flags: opcode = 1 (unsupported), RD = 1
+        push_u16(&mut message, 1); // qd_count
+        push_u16(&mut message, 0); // an_count
+        push_u16(&mut message, 0); // ns_count
+        push_u16(&mut message, 1); // ar_count
+        push_question(&mut message, "example.com", 1, 1);
+        // Additional record: owner name is a compression pointer aimed at
+        // offset 0 (the message header, byte 0x00) instead of the
+        // canonical uncompressed root byte real OPT records use.
+        push_pointer(&mut message, 0);
+        push_u16(&mut message, OPT_RECORD_TYPE);
+        push_u16(&mut message, 4096); // rclass / udp payload size
+        push_u32(&mut message, 0); // ttl (extended rcode/version/flags all 0)
+        push_u16(&mut message, 0); // rdlength
+
+        let failure = Message::parse_standard_query_owned_with_recovery(message).unwrap_err();
+        assert_eq!(
+            failure.error,
+            QueryValidationError::UnsupportedOpcode { opcode: 1 }
+        );
+        let recovered = failure
+            .recovered_message
+            .expect("the header and question should still be recovered");
+        assert_eq!(recovered.questions.len(), 1);
+        assert_eq!(recovered.questions[0].qname, "example.com");
+        assert!(
+            recovered.edns.is_none(),
+            "a compression-pointer-encoded owner name must never be accepted as a canonical \
+             root OPT owner, even when the pointer happens to target a zero byte"
+        );
+    }
+
+    /// Regression test: the *primary* (non-recovery) record parser,
+    /// `parse_record`, must apply the same canonical-root-owner requirement
+    /// (RFC 6891 §6.1.2) that recovery already enforces -- not just
+    /// `name.is_empty()`. This constructs a query whose OPT record's owner
+    /// name is a two-byte compression pointer aimed at the question's own
+    /// terminating root-label byte: a *legitimate* prior root-label
+    /// occurrence that `ParseContext` (built from the real, unbounded
+    /// primary parse, unlike recovery's `context: None`) would happily
+    /// validate as a proper backward-pointing reference, decoding to "".
+    /// Before this fix, `parse_record` accepted this shape as valid EDNS
+    /// because it only checked `name.is_empty()`, silently disagreeing with
+    /// the newly-hardened recovery scanner about what counts as a valid OPT
+    /// owner. Real OPT records are always emitted with the direct,
+    /// uncompressed root byte, so even a strictly valid compression pointer
+    /// must still be rejected here.
+    #[test]
+    fn parse_record_rejects_compression_pointer_opt_owner_even_when_context_validates_it() {
+        let mut message = Vec::new();
+        push_header(&mut message, 1, 0, 0, 1); // opcode 0 (supported), qd=1, ar=1
+        push_name(&mut message, "example.com");
+        // The question name's own terminating root-label byte -- a
+        // legitimate prior domain-name occurrence per RFC 1035 §4.1.4,
+        // which the primary parser's real `ParseContext` will register and
+        // later validate a pointer against.
+        let root_offset = message.len() - 1;
+        push_u16(&mut message, 1); // qtype: A
+        push_u16(&mut message, 1); // qclass: IN
+        // The additional record's owner name: a compression pointer at the
+        // question's root-label byte, instead of the canonical direct
+        // `0x00` encoding real OPT records use.
+        push_pointer(&mut message, root_offset);
+        push_u16(&mut message, OPT_RECORD_TYPE);
+        push_u16(&mut message, 4096); // rclass / udp payload size
+        push_u32(&mut message, 0); // ttl: extended rcode/version/flags all 0
+        push_u16(&mut message, 0); // rdlength
+
+        let error = Message::parse(&message).unwrap_err();
+        assert_eq!(
+            error,
+            DnsParseError::MalformedRecord,
+            "a compression-pointer-encoded OPT owner name must be rejected on the primary \
+             parse path even when it legitimately resolves to root via a valid ParseContext"
+        );
+    }
+
+    /// Regression test: when `parse_header` and `validate_standard_query_header`
+    /// both succeed -- meaning the header, including the CD bit, was read
+    /// successfully -- but the subsequent `Self::parse_owned` body parse
+    /// then fails for an unrelated reason (here, a malformed question the
+    /// header-level checks don't inspect), `recovered_message` must not
+    /// collapse to `None` and silently drop the already-readable CD bit.
+    /// Per RFC 4035 §3.2.2 a security-aware recursive name server MUST copy
+    /// CD from query to response; there's no reason a malformed body should
+    /// cost the query its CD echo when the header was perfectly parseable.
+    /// This also drives the recovered message through
+    /// `build_question_aware_error_response` end-to-end to confirm the
+    /// eventual FORMERR response actually carries CD=1, not just that
+    /// `recovered_message` is non-`None` in isolation.
+    #[test]
+    fn cd_is_recovered_when_body_parse_fails_after_valid_header() {
+        let mut message = Vec::new();
+        push_header_with_flags(&mut message, 0x0110, 1, 0, 0, 0); // RD=1, CD=1, qd=1, no additionals
+        // A single label-length octet using the reserved `0b10` top-bit
+        // pattern -- neither a normal label (`0b00`) nor a compression
+        // pointer (`0b11`) -- which `parse_domain_with_context` rejects
+        // with `InvalidLabel`. `validate_standard_query_header` never looks
+        // at question bytes, so this fails only once `Self::parse_owned`
+        // actually tries to parse the question.
+        message.push(0b1000_0000);
+
+        let failure = Message::parse_standard_query_owned_with_recovery(message).unwrap_err();
+        assert_eq!(
+            failure.error,
+            QueryValidationError::Parse(DnsParseError::InvalidLabel),
+            "the malformed question must surface as the authoritative Self::parse_owned error"
+        );
+        let recovered = failure.recovered_message.expect(
+            "the header -- including CD -- was fully readable before the body-parse failure, \
+             so recovery must not collapse to None",
+        );
+        assert!(
+            recovered.header.cd(),
+            "CD must still be recovered per RFC 4035 §3.2.2 even when the body (here, the \
+             question itself) could not be parsed at all"
+        );
+        assert!(
+            recovered.questions.is_empty(),
+            "the question itself was unparseable, so it correctly isn't recovered"
+        );
+
+        let configured_max_udp_payload_size = 1232;
+        let response = build_question_aware_error_response(
+            Some(&recovered),
+            None,
+            ResponseCode::FormErr,
+            configured_max_udp_payload_size,
+        );
+        let parsed = Message::parse(&response).unwrap();
+        assert!(
+            parsed.header.cd(),
+            "the FORMERR response actually sent to the client must still echo CD=1, even \
+             though no question/OPT could be recovered"
+        );
+        assert_eq!(parsed.header.r_code(), ResponseCode::FormErr.as_u8());
+    }
+
     #[test]
     fn parse_standard_query_accepts_single_edns_opt_additional() {
         let mut message = Vec::new();
@@ -2146,7 +3693,8 @@ mod tests {
         push_question(&mut request, "example.com", 1, 1);
         let request = Message::parse_standard_query(&request).unwrap();
 
-        let response = Message::parse(&build_servfail_response(Some(&request), None)).unwrap();
+        let response =
+            Message::parse(&build_servfail_response(Some(&request), None, 1232)).unwrap();
 
         assert_eq!(response.header.id, 0xbeef);
         assert!(response.header.rd());
@@ -2157,7 +3705,7 @@ mod tests {
 
     #[test]
     fn build_servfail_response_without_request_uses_supplied_id() {
-        let response = build_servfail_response(None, Some(0x1234));
+        let response = build_servfail_response(None, Some(0x1234), 1232);
         let parsed = Message::parse(&response).unwrap();
 
         assert_eq!(parsed.header.id, 0x1234);
@@ -2173,18 +3721,125 @@ mod tests {
         push_question(&mut request, "example.com", 1, 1);
         let request = Message::parse_standard_query(&request).unwrap();
 
-        let refused = Message::parse(&build_refused_response(&request)).unwrap();
+        let refused = Message::parse(&build_refused_response(&request, 1232)).unwrap();
         assert_eq!(refused.header.r_code(), ResponseCode::Refused.as_u8());
         assert_eq!(refused.questions[0], request.questions[0]);
         assert!(refused.answers.is_empty());
 
-        let nxdomain = Message::parse(&build_nxdomain_response(&request)).unwrap();
+        let nxdomain = Message::parse(&build_nxdomain_response(&request, 1232)).unwrap();
         assert_eq!(nxdomain.header.r_code(), ResponseCode::NxDomain.as_u8());
         assert_eq!(nxdomain.questions[0], request.questions[0]);
 
-        let nodata = Message::parse(&build_nodata_response(&request)).unwrap();
+        let nodata = Message::parse(&build_nodata_response(&request, 1232)).unwrap();
         assert_eq!(nodata.header.r_code(), ResponseCode::NoError.as_u8());
         assert!(nodata.answers.is_empty());
+    }
+
+    /// Regression test for the OPT/CD gap Codex's DNS-compliance review
+    /// caught (Finding C): every generic failure/policy-block builder
+    /// (SERVFAIL, REFUSED, NXDOMAIN, NODATA, sinkhole) flowed through
+    /// `build_question_response`/`write_response_header`, which hardcoded
+    /// ARCOUNT=0 and never copied CD -- so an EDNS+CD=1 requester got back
+    /// a response with no OPT record (RFC 6891 §6.1.1) and CD silently
+    /// reset to 0 (RFC 4035 §3.2.2) on every one of these response types.
+    ///
+    /// The request advertises a UDP payload size (1232) deliberately
+    /// different from `configured_max_udp_payload_size` (700) passed to
+    /// each builder below: per RFC 6891 §6.1.1 the OPT record on a
+    /// *response* must describe the responder's own size, never an echo of
+    /// the requester's -- if this ever regresses back to echoing 1232, this
+    /// assertion catches it.
+    #[test]
+    fn build_question_response_family_mirrors_opt_and_cd_for_edns_requester() {
+        let mut request = Vec::new();
+        push_header_with_flags(&mut request, 0x0110, 1, 0, 0, 1); // RD=1, CD=1
+        push_question(&mut request, "example.com", 1, 1);
+        push_opt_record(&mut request, 1232, true, &[]);
+        let request = Message::parse_standard_query(&request).unwrap();
+        assert!(request.header.cd());
+        assert!(request.edns.is_some());
+
+        let configured_max_udp_payload_size = 700;
+        let responses = [
+            (
+                "refused",
+                build_refused_response(&request, configured_max_udp_payload_size),
+            ),
+            (
+                "nxdomain",
+                build_nxdomain_response(&request, configured_max_udp_payload_size),
+            ),
+            (
+                "nodata",
+                build_nodata_response(&request, configured_max_udp_payload_size),
+            ),
+            (
+                "servfail",
+                build_servfail_response(Some(&request), None, configured_max_udp_payload_size),
+            ),
+            (
+                "sinkhole_a",
+                build_a_block_response(
+                    &request,
+                    Ipv4Addr::new(10, 0, 0, 1),
+                    60,
+                    configured_max_udp_payload_size,
+                ),
+            ),
+        ];
+
+        for (label, response) in responses {
+            let parsed = Message::parse(&response).unwrap();
+            assert!(
+                parsed.header.cd(),
+                "{label}: CD must be copied from an EDNS+CD=1 request"
+            );
+            let opt = parsed
+                .additionals
+                .iter()
+                .find(|record| matches!(record.record, RecordData::OPT(_)));
+            let Some(Record {
+                record: RecordData::OPT(edns),
+                ..
+            }) = opt
+            else {
+                panic!("{label}: expected a mirrored OPT record in the additional section");
+            };
+            assert_eq!(
+                edns.udp_payload_size, 700,
+                "{label}: OPT must advertise this responder's own UDP payload size, \
+                 not echo the requester's 1232"
+            );
+            assert!(edns.dnssec_ok, "{label}");
+            assert_eq!(
+                parsed.header.ar_count, 1,
+                "{label}: ARCOUNT must include the OPT"
+            );
+        }
+    }
+
+    #[test]
+    fn build_question_response_family_omits_opt_for_non_edns_requester() {
+        let mut request = Vec::new();
+        push_header(&mut request, 1, 0, 0, 0);
+        push_question(&mut request, "example.com", 1, 1);
+        let request = Message::parse_standard_query(&request).unwrap();
+        assert!(request.edns.is_none());
+        assert!(!request.header.cd());
+
+        for response in [
+            build_refused_response(&request, 1232),
+            build_nxdomain_response(&request, 1232),
+            build_nodata_response(&request, 1232),
+        ] {
+            let parsed = Message::parse(&response).unwrap();
+            assert!(!parsed.header.cd());
+            assert!(
+                parsed.additionals.is_empty(),
+                "a non-EDNS requester must not get an OPT record back"
+            );
+            assert_eq!(parsed.header.ar_count, 0);
+        }
     }
 
     #[test]
@@ -2198,6 +3853,7 @@ mod tests {
             &request,
             Ipv4Addr::new(10, 0, 0, 1),
             60,
+            1232,
         ))
         .unwrap();
 
@@ -2218,7 +3874,7 @@ mod tests {
         push_question(&mut request, "blocked.example", 1, 1);
         let request = Message::parse_standard_query(&request).unwrap();
 
-        let bytes = build_a_block_response(&request, Ipv4Addr::new(10, 0, 0, 1), 60);
+        let bytes = build_a_block_response(&request, Ipv4Addr::new(10, 0, 0, 1), 60, 1232);
 
         // The answer's owner name repeats the question name verbatim, so it
         // should be a 2-byte compression pointer rather than the full label
@@ -2241,7 +3897,8 @@ mod tests {
         let request = Message::parse_standard_query(&request).unwrap();
         let sinkhole = Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1);
 
-        let response = Message::parse(&build_aaaa_block_response(&request, sinkhole, 30)).unwrap();
+        let response =
+            Message::parse(&build_aaaa_block_response(&request, sinkhole, 30, 1232)).unwrap();
 
         assert_eq!(response.header.r_code(), ResponseCode::NoError.as_u8());
         assert_eq!(response.answers.len(), 1);
@@ -2250,17 +3907,62 @@ mod tests {
     }
 
     #[test]
-    fn build_truncated_response_sets_tc_and_omits_sections() {
+    fn build_truncated_wire_response_includes_question_cd_and_mirrored_opt() {
         let mut request = Vec::new();
         push_header(&mut request, 1, 0, 0, 0);
         push_question(&mut request, "example.com", 1, 1);
         let request = Message::parse_standard_query(&request).unwrap();
+        let question_wire = message_question_wire(&request).unwrap();
+        let opt = build_opt_record(1232, true);
 
-        let response = Message::parse(&build_truncated_response(&request)).unwrap();
+        let response = Message::parse(&build_truncated_wire_response(
+            request.header.id,
+            request.header.rd(),
+            true,
+            ResponseCode::NxDomain,
+            &question_wire,
+            Some(&opt),
+        ))
+        .unwrap();
 
         assert!(response.header.tc());
-        assert!(response.questions.is_empty());
+        assert!(response.header.cd());
+        assert_eq!(response.header.r_code(), ResponseCode::NxDomain as u8);
+        assert_eq!(response.questions.len(), 1);
+        assert_eq!(response.questions[0].qname, "example.com");
         assert!(response.answers.is_empty());
+        assert!(
+            response
+                .additionals
+                .iter()
+                .any(|record| matches!(record.record, RecordData::OPT(_))),
+            "a truncated response to an EDNS requester must still carry a mirrored OPT record \
+             (RFC 6891 §7)"
+        );
+    }
+
+    #[test]
+    fn build_truncated_wire_response_without_opt_omits_additional_section() {
+        let mut request = Vec::new();
+        push_header(&mut request, 1, 0, 0, 0);
+        push_question(&mut request, "example.com", 1, 1);
+        let request = Message::parse_standard_query(&request).unwrap();
+        let question_wire = message_question_wire(&request).unwrap();
+
+        let response = Message::parse(&build_truncated_wire_response(
+            request.header.id,
+            request.header.rd(),
+            false,
+            ResponseCode::NoError,
+            &question_wire,
+            None,
+        ))
+        .unwrap();
+
+        assert!(response.header.tc());
+        assert!(!response.header.cd());
+        assert_eq!(response.questions.len(), 1);
+        assert!(response.additionals.is_empty());
     }
 
     #[test]
@@ -3130,7 +4832,7 @@ mod tests {
         push_opt_record(&mut request, 1232, false, &[]);
         let request = Message::parse_standard_query(&request).unwrap();
 
-        let mut response = build_a_block_response(&request, Ipv4Addr::new(10, 0, 0, 1), 60);
+        let mut response = build_a_block_response(&request, Ipv4Addr::new(10, 0, 0, 1), 60, 1500);
         response.resize(800, 0);
         assert_eq!(request.effective_udp_payload_size(1500), 1232);
         assert!(!request.response_exceeds_udp_payload(response.len(), 1500));

@@ -34,18 +34,44 @@ use crate::resolver::{ResolutionBackendError, ResolutionResponse};
 
 use super::shard_index;
 
-/// Miss-coalescing key: normalized qname, qtype, qclass, and cache
-/// namespace (`BackendSnapshot.cache_namespace`, defaulted to `""` by
-/// callers that have no snapshot namespace). The namespace **must** be
-/// part of this key, not just `(qname, qtype, qclass)`: cache lookup/store
-/// is namespace-scoped (`DomainDnsCache::lookup_chain`/`store_response`),
-/// so a request that misses under namespace N1 and one that misses under
-/// namespace N2 for the same name/type/class are answering fundamentally
-/// different questions (different backend/upstream generation) and must
-/// never coalesce onto the same in-flight backend call — otherwise a
-/// request arriving just after a reload (new namespace) could be served a
+/// Miss-coalescing key: normalized qname, qtype, qclass, cache namespace
+/// (`BackendSnapshot.cache_namespace`, defaulted to `""` by callers that
+/// have no snapshot namespace), and the requester's EDNS DO
+/// (`dnssec_ok`) flag. The namespace **must** be part of this key, not
+/// just `(qname, qtype, qclass)`: cache lookup/store is namespace-scoped
+/// (`DomainDnsCache::lookup_chain`/`store_response`), so a request that
+/// misses under namespace N1 and one that misses under namespace N2 for
+/// the same name/type/class are answering fundamentally different
+/// questions (different backend/upstream generation) and must never
+/// coalesce onto the same in-flight backend call — otherwise a request
+/// arriving just after a reload (new namespace) could be served a
 /// stale-generation response resolved before the reload even started.
-pub(crate) type MissKey = (String, u16, u16, String);
+///
+/// The DO flag's meaning is mode-dependent -- it is *not* always the
+/// requester's raw `dnssec_ok`. `probe_cache` (`src/resolver/mod.rs`)
+/// computes it per `ResolutionMode`:
+///
+/// * `ResolutionMode::Forward`: the requester's real `dnssec_ok`. The
+///   forwarding backend relays the client's own DO flag verbatim to
+///   whatever it forwards to, so a DO=0 request and a DO=1 request for
+///   the same name/type/class/namespace can still get genuinely
+///   different backend bytes and must not coalesce onto one fetch --
+///   whichever one happened to win the race to become leader would
+///   decide whether DNSSEC material was ever fetched at all, and a DO=1
+///   follower riding a DO=0 leader's fetch would silently get (and
+///   cache) an entry with no RRSIGs for that entry's full TTL lifetime.
+///
+/// * `ResolutionMode::Recursive`: canonicalized to `true` regardless of
+///   the requester's own flag. Since the always-fetch-DNSSEC change in
+///   `resolve_one_hop`, the recursive backend queries upstream
+///   authorities with `dnssec_ok = true` unconditionally, so backend work
+///   is identical for every requester regardless of their own DO flag.
+///   Keying on the real per-requester flag here would only cost
+///   duplicate upstream authority queries for concurrent mixed-DO misses
+///   on the same name; the per-requester DO=false/DO=true response
+///   difference is handled correctly downstream, after the shared fetch,
+///   by `filter_response_for_requester`.
+pub(crate) type MissKey = (String, u16, u16, String, bool);
 
 /// Sharded replacement for today's single-mutex `SingleFlightMisses`.
 /// Shard count and routing must match the cache's own sharding so that,
@@ -214,7 +240,7 @@ mod tests {
     use std::time::{Duration, SystemTime};
 
     fn key(name: &str) -> MissKey {
-        (name.to_string(), 1, 1, "ns-1".to_string()) // A, IN, namespace "ns-1"
+        (name.to_string(), 1, 1, "ns-1".to_string(), false) // A, IN, namespace "ns-1", DO=false
     }
 
     fn sample_response(marker: &str) -> ResolutionResponse {
@@ -229,6 +255,7 @@ mod tests {
             source_credibility: SourceCredibility::Authoritative,
             backend_provenance: BackendProvenance::forwarding(1, "test-upstream"),
             cache_directive: ResolutionCacheDirective::Cacheable,
+            recursive_synthesis: None,
         }
     }
 
@@ -318,8 +345,8 @@ mod tests {
         // result.
         let coalescer = Arc::new(ShardedSingleFlight::new(4));
         let name = "example.com".to_string();
-        let key_n1 = (name.clone(), 1u16, 1u16, "ns-1".to_string());
-        let key_n2 = (name, 1u16, 1u16, "ns-2".to_string());
+        let key_n1 = (name.clone(), 1u16, 1u16, "ns-1".to_string(), false);
+        let key_n2 = (name, 1u16, 1u16, "ns-2".to_string(), false);
 
         let SingleFlightTicket::Leader {
             key: leader_key_n1,
@@ -353,6 +380,57 @@ mod tests {
             SingleFlightTicket::Leader { .. } => {}
             SingleFlightTicket::Follower { .. } => {
                 panic!("ns-1's flight must have been cleared by the leader's completion")
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn single_flight_does_not_coalesce_across_dnssec_ok() {
+        // Regression test for the DO-flag miss-coalescing bug: the
+        // recursive backend forwards the requester's own `dnssec_ok` flag
+        // to upstream authorities, so a DO=0 request and a DO=1 request
+        // for the same (name, qtype, qclass, namespace) must resolve
+        // against independent backend fetches — otherwise whichever one
+        // becomes leader decides, for both, whether DNSSEC material is
+        // ever fetched at all.
+        let coalescer = Arc::new(ShardedSingleFlight::new(4));
+        let name = "example.com".to_string();
+        let key_do_false = (name.clone(), 1u16, 1u16, "ns-1".to_string(), false);
+        let key_do_true = (name, 1u16, 1u16, "ns-1".to_string(), true);
+
+        let SingleFlightTicket::Leader {
+            key: leader_key_do_false,
+            flight: leader_flight_do_false,
+        } = coalescer.begin(key_do_false.clone())
+        else {
+            panic!("expected Leader for the first begin() with DO=false");
+        };
+
+        // A request for the same name/qtype/qclass/namespace but with
+        // DO=true must get its own Leader ticket, not a Follower one.
+        match coalescer.begin(key_do_true.clone()) {
+            SingleFlightTicket::Leader { key, .. } => assert_eq!(key, key_do_true),
+            SingleFlightTicket::Follower { .. } => panic!(
+                "a request with a different DO flag must not coalesce onto another \
+                 DO flag's in-flight leader"
+            ),
+        }
+
+        // The DO=false leader completing must not affect the DO=true
+        // flight: a fresh begin() with DO=false (after the leader
+        // finishes) gets a new Leader, and the DO=true flight is
+        // untouched.
+        let leader_do_false = SingleFlightLeader::new(
+            Arc::clone(&coalescer),
+            leader_key_do_false,
+            Arc::clone(&leader_flight_do_false),
+        );
+        leader_do_false.complete(Ok(sample_response("do-false-result")));
+
+        match coalescer.begin(key_do_false) {
+            SingleFlightTicket::Leader { .. } => {}
+            SingleFlightTicket::Follower { .. } => {
+                panic!("DO=false's flight must have been cleared by the leader's completion")
             }
         }
     }
@@ -422,7 +500,7 @@ mod tests {
 
         // Domain B's begin() on a different shard must proceed without
         // blocking on shard A's held lock.
-        let key_b = (domain_b, 1u16, 1u16, "ns-1".to_string());
+        let key_b = (domain_b, 1u16, 1u16, "ns-1".to_string(), false);
         let outcome =
             tokio::time::timeout(Duration::from_millis(100), async { coalescer.begin(key_b) })
                 .await;

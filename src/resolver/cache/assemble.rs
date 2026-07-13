@@ -28,7 +28,10 @@
 use std::collections::HashSet;
 use std::time::{Duration, SystemTime};
 
-use crate::protocol::{NameCompressor, ResponseCode, write_message_header, write_record};
+use crate::protocol::{
+    NameCompressor, Record, ResponseCode, build_truncated_wire_response, write_message_header,
+    write_opt_record, write_record,
+};
 use crate::resolver::QueryFeatures;
 
 use super::ShardedDnsCache;
@@ -101,11 +104,19 @@ pub enum ChainLookup {
 /// Never holds more than one shard's lock at a time: each hop acquires,
 /// clones, and releases its shard's lock (via `Shard::lookup_hop`) before
 /// the next hop begins.
+///
+/// `dnssec_ok` is the *reading* requester's own DO flag, threaded through
+/// to every hop's `Shard::lookup_hop` call so a DO=true walk never gets
+/// stuck on (or silently serves from) an entry whose DNSSEC material isn't
+/// confirmed complete — see `Shard::lookup_hop`'s doc comment for the full
+/// contract.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn resolve_from_cache(
     cache: &ShardedDnsCache,
     qname: &str,
     qtype: u16,
     qclass: u16,
+    dnssec_ok: bool,
     current_namespace: &str,
     max_chain_depth: u8,
     now: SystemTime,
@@ -121,7 +132,7 @@ pub(crate) fn resolve_from_cache(
         visited.insert(current.clone());
 
         let shard = cache.shard_for(&current);
-        match shard.lookup_hop(&current, qtype, qclass, current_namespace, now) {
+        match shard.lookup_hop(&current, qtype, qclass, dnssec_ok, current_namespace, now) {
             HopResult::Answer(entry) => {
                 chain.push((current, entry));
                 return ChainLookup::Answered(ResolvedAnswer { chain });
@@ -264,7 +275,7 @@ fn write_negative_authority(
                 &rrsig.rdata,
             );
         }
-        for proof in &negative.proof_records {
+        for (proof_owner, proof) in &negative.proof_records {
             let ttl = compute_wire_ttl(
                 proof.ttl_at_store,
                 negative.stored_at,
@@ -274,7 +285,7 @@ fn write_negative_authority(
             write_record(
                 out,
                 compressor,
-                owner,
+                proof_owner,
                 proof.rtype,
                 proof.rclass,
                 ttl,
@@ -323,11 +334,42 @@ fn dnssec_ad_bit(chain: &[(String, RRsetEntry)], features: &QueryFeatures) -> bo
             .all(|(_, entry)| entry.dnssec_state == DnssecState::Secure)
 }
 
+/// Builds the per-transaction OPT record to append to a response's
+/// additional section, mirroring the requester's own DO flag but *this
+/// resolver's own* UDP payload size — `None` if the requester's original
+/// query carried no EDNS OPT record at all
+/// (`requester_features.edns_udp_payload_size` is only ever `Some` when the
+/// query had one; see `QueryFeatures::from_message`). Per RFC 6891 §6.1.1,
+/// a compliant responder MUST include an OPT record in any response to a
+/// query that itself contained one, and the UDP payload size field on that
+/// OPT record is sender-specific: on a *response* it must describe the
+/// responder's own size, never an echo of the requester's advertised size
+/// (`requester_features.edns_udp_payload_size` only decides *presence*
+/// here, matching `crate::protocol::message_edns_opt_record`).
+///
+/// Shares `crate::protocol::build_opt_record`'s construction with
+/// `resolver::mirrored_client_opt_record`, which builds the same shape
+/// from a parsed `Message` on the recursive-miss path — this module only
+/// has `QueryFeatures`, not a `Message`, at cache-hit serve time.
+fn requester_opt_record(
+    requester_features: &QueryFeatures,
+    configured_max_udp_payload_size: usize,
+) -> Option<Record> {
+    requester_features.edns_udp_payload_size?;
+    let udp_payload_size = configured_max_udp_payload_size.min(u16::MAX as usize) as u16;
+    Some(crate::protocol::build_opt_record(
+        udp_payload_size,
+        requester_features.dnssec_ok,
+    ))
+}
+
 fn build_servfail(
     request_id: u16,
     requester_question_wire: &[u8],
     requester_features: &QueryFeatures,
+    configured_max_udp_payload_size: usize,
 ) -> Vec<u8> {
+    let opt = requester_opt_record(requester_features, configured_max_udp_payload_size);
     let mut response = Vec::new();
     write_message_header(
         &mut response,
@@ -335,13 +377,17 @@ fn build_servfail(
         requester_features.recursion_desired,
         false,
         false,
+        requester_features.checking_disabled,
         ResponseCode::ServFail,
         1,
         0,
         0,
-        0,
+        u16::from(opt.is_some()),
     );
     response.extend_from_slice(requester_question_wire);
+    if let Some(opt) = &opt {
+        write_opt_record(&mut response, opt);
+    }
     response
 }
 
@@ -351,15 +397,20 @@ fn build_servfail(
 /// `Message::effective_udp_payload_size`'s bounds-clamping), in which case
 /// a truncated response is returned instead: header + question section
 /// (per the plan's "header + question only, TC bit set"), TC bit set, no
-/// answer/authority/additional records, `response_code` preserved from
-/// the caller (an earlier draft hardcoded `NoError` here, which would
-/// have silently turned a truncated NXDOMAIN/NODATA into a false
-/// NOERROR). `configured_max_udp_payload_size` is the server-side
-/// ceiling — an intentional, documented deviation from the plan's literal
+/// answer/authority records, `response_code` preserved from the caller
+/// (an earlier draft hardcoded `NoError` here, which would have silently
+/// turned a truncated NXDOMAIN/NODATA into a false NOERROR).
+/// `configured_max_udp_payload_size` is the server-side ceiling — an
+/// intentional, documented deviation from the plan's literal
 /// `assemble_response` signature, needed for the same reason
 /// `resolve_from_cache`'s `max_chain_depth` is: `assemble_response` has no
 /// `Message`/`DecodedQuery` to pull it from, only raw question wire bytes
 /// and `QueryFeatures`.
+///
+/// Per RFC 6891 §7, even this minimal truncated response must still carry
+/// an OPT record if the requester's original query had one — so the
+/// additional section is not unconditionally empty; it holds exactly the
+/// mirrored OPT record when the requester used EDNS, nothing otherwise.
 fn finish_with_truncation_check(
     response: Vec<u8>,
     request_id: u16,
@@ -382,21 +433,15 @@ fn finish_with_truncation_check(
     if response.len() <= effective {
         return response;
     }
-    let mut truncated = Vec::new();
-    write_message_header(
-        &mut truncated,
+    let opt = requester_opt_record(requester_features, configured_max_udp_payload_size);
+    build_truncated_wire_response(
         request_id,
         requester_features.recursion_desired,
-        true,
-        false,
+        requester_features.checking_disabled,
         response_code,
-        1,
-        0,
-        0,
-        0,
-    );
-    truncated.extend_from_slice(requester_question_wire);
-    truncated
+        requester_question_wire,
+        opt.as_ref(),
+    )
 }
 
 /// Builds a complete wire response from a `ChainLookup::Answered` result,
@@ -416,12 +461,18 @@ pub(crate) fn assemble_response(
     configured_max_udp_payload_size: usize,
 ) -> Vec<u8> {
     if dnssec_servfail_check(&resolved.chain, requester_features) {
-        return build_servfail(request_id, requester_question_wire, requester_features);
+        return build_servfail(
+            request_id,
+            requester_question_wire,
+            requester_features,
+            configured_max_udp_payload_size,
+        );
     }
 
     let dnssec_ok = requester_features.dnssec_ok;
     let ad = dnssec_ad_bit(&resolved.chain, requester_features);
     let an_count = chain_answer_count(&resolved.chain, dnssec_ok);
+    let opt = requester_opt_record(requester_features, configured_max_udp_payload_size);
 
     let mut response = Vec::new();
     write_message_header(
@@ -430,17 +481,21 @@ pub(crate) fn assemble_response(
         requester_features.recursion_desired,
         false,
         ad,
+        requester_features.checking_disabled,
         ResponseCode::NoError,
         1,
         an_count,
         0,
-        0,
+        u16::from(opt.is_some()),
     );
     response.extend_from_slice(requester_question_wire);
 
     let mut compressor = NameCompressor::new();
     for (name, entry) in &resolved.chain {
         write_rrset(&mut response, &mut compressor, name, entry, dnssec_ok, now);
+    }
+    if let Some(opt) = &opt {
+        write_opt_record(&mut response, opt);
     }
 
     finish_with_truncation_check(
@@ -473,13 +528,19 @@ pub(crate) fn assemble_negative_response(
     configured_max_udp_payload_size: usize,
 ) -> Vec<u8> {
     if dnssec_servfail_check(&resolved.chain, requester_features) {
-        return build_servfail(request_id, requester_question_wire, requester_features);
+        return build_servfail(
+            request_id,
+            requester_question_wire,
+            requester_features,
+            configured_max_udp_payload_size,
+        );
     }
 
     let dnssec_ok = requester_features.dnssec_ok;
     let ad = dnssec_ad_bit(&resolved.chain, requester_features);
     let an_count = chain_answer_count(&resolved.chain, dnssec_ok);
     let ns_count = negative_authority_count(&resolved.negative, dnssec_ok);
+    let opt = requester_opt_record(requester_features, configured_max_udp_payload_size);
 
     let mut response = Vec::new();
     write_message_header(
@@ -488,11 +549,12 @@ pub(crate) fn assemble_negative_response(
         requester_features.recursion_desired,
         false,
         ad,
+        requester_features.checking_disabled,
         response_code,
         1,
         an_count,
         ns_count,
-        0,
+        u16::from(opt.is_some()),
     );
     response.extend_from_slice(requester_question_wire);
 
@@ -508,6 +570,9 @@ pub(crate) fn assemble_negative_response(
         dnssec_ok,
         now,
     );
+    if let Some(opt) = &opt {
+        write_opt_record(&mut response, opt);
+    }
 
     finish_with_truncation_check(
         response,
@@ -575,6 +640,7 @@ mod tests {
             expires_at: now + minimum_ttl,
             dnssec_state: DnssecState::Unvalidated,
             cache_namespace: "ns-1".to_string(),
+            dnssec_complete: true,
         }
     }
 
@@ -693,6 +759,83 @@ mod tests {
         let tcp_parsed = Message::parse(&tcp_response).unwrap();
         assert!(!tcp_parsed.header.tc());
         assert_eq!(tcp_parsed.answers.len(), 40);
+    }
+
+    // Regression test for RFC 6891 §6.1.1: a compliant responder MUST
+    // include an OPT record in any response to a query that itself
+    // carried one. Before this fix, `assemble_response` always wrote
+    // ARCOUNT=0 and never emitted an OPT record, regardless of the
+    // requester's own EDNS usage.
+    //
+    // The requester advertises 4096 while `configured_max_udp_payload_size`
+    // (700) is deliberately different: per RFC 6891 §6.1.1 the OPT record
+    // on a *response* must describe the responder's own size, never an
+    // echo of the requester's -- using the same value for both here would
+    // let a regression back to echoing the requester's size pass silently.
+    #[test]
+    fn assemble_response_includes_opt_record_when_requester_used_edns() {
+        let now = SystemTime::now();
+        let entry = rrset_entry(vec![a_record(300, 1)], Duration::from_secs(300), now);
+        let resolved = ResolvedAnswer {
+            chain: vec![("example.com".to_string(), entry)],
+        };
+        let wire = question_wire("example.com", A_QTYPE, IN_QCLASS);
+
+        let mut edns_features = features(false);
+        edns_features.edns_udp_payload_size = Some(4096);
+
+        let response = assemble_response(1, &wire, &edns_features, &resolved, now, false, 700);
+        let parsed = Message::parse(&response).unwrap();
+
+        assert_eq!(
+            parsed.header.ar_count, 1,
+            "ARCOUNT must account for the mirrored OPT record"
+        );
+        let edns = parsed
+            .edns
+            .expect("response must carry an OPT record when the requester's query had one");
+        assert_eq!(
+            edns.udp_payload_size, 700,
+            "OPT must advertise this resolver's own configured UDP payload size (700), \
+             not echo the requester's 4096"
+        );
+        assert!(!edns.dnssec_ok);
+
+        // A requester with no EDNS at all must not get an OPT record back.
+        let no_edns_response =
+            assemble_response(1, &wire, &features(false), &resolved, now, false, 700);
+        let no_edns_parsed = Message::parse(&no_edns_response).unwrap();
+        assert_eq!(no_edns_parsed.header.ar_count, 0);
+        assert!(no_edns_parsed.edns.is_none());
+    }
+
+    // Regression test for RFC 4035 §3.2.2: a security-aware recursive name
+    // server MUST copy the CD (checking disabled) bit from the query to
+    // the response. Before this fix, `write_message_header` had no CD
+    // parameter at all.
+    #[test]
+    fn assemble_response_copies_cd_bit_from_requester() {
+        let now = SystemTime::now();
+        let entry = rrset_entry(vec![a_record(300, 1)], Duration::from_secs(300), now);
+        let resolved = ResolvedAnswer {
+            chain: vec![("example.com".to_string(), entry)],
+        };
+        let wire = question_wire("example.com", A_QTYPE, IN_QCLASS);
+
+        let mut cd_features = features(false);
+        cd_features.checking_disabled = true;
+        let cd_response = assemble_response(1, &wire, &cd_features, &resolved, now, false, 4096);
+        assert!(
+            Message::parse(&cd_response).unwrap().header.cd(),
+            "CD=1 on the query must produce CD=1 on the response"
+        );
+
+        let no_cd_response =
+            assemble_response(1, &wire, &features(false), &resolved, now, false, 4096);
+        assert!(
+            !Message::parse(&no_cd_response).unwrap().header.cd(),
+            "CD=0 on the query must produce CD=0 on the response"
+        );
     }
 
     #[test]
@@ -816,7 +959,7 @@ mod tests {
         now: SystemTime,
         ttl: u32,
         soa_rrsig: Option<StoredRecord>,
-        proof_records: Vec<StoredRecord>,
+        proof_records: Vec<(String, StoredRecord)>,
     ) -> NegativeEntry {
         negative_entry_with_owner(now, ttl, soa_rrsig, proof_records, "example.com")
     }
@@ -825,7 +968,7 @@ mod tests {
         now: SystemTime,
         ttl: u32,
         soa_rrsig: Option<StoredRecord>,
-        proof_records: Vec<StoredRecord>,
+        proof_records: Vec<(String, StoredRecord)>,
         soa_owner: &str,
     ) -> NegativeEntry {
         NegativeEntry {
@@ -837,6 +980,7 @@ mod tests {
             stored_at: now,
             expires_at: now + Duration::from_secs(ttl as u64),
             cache_namespace: "ns-1".to_string(),
+            dnssec_complete: true,
         }
     }
 
@@ -926,6 +1070,131 @@ mod tests {
         );
     }
 
+    // Regression test for the negative-cache proof-record-owner bug: NSEC/
+    // NSEC3 proof records (and their RRSIGs) are frequently owned by names
+    // other than both the covered/queried name and the SOA zone apex (they
+    // bracket the queried name with adjacent existing names in the zone).
+    // Each must be written in the authority section under its own
+    // preserved owner, not blanket-assigned to `negative.soa_owner`.
+    #[test]
+    fn assemble_negative_response_preserves_each_proof_records_own_owner() {
+        let now = SystemTime::now();
+        let covered_name = "nx.example.com";
+        let soa_owner = "example.com";
+        let nsec_owner_before = "adjacent-before.example.com";
+        let nsec_owner_after = "zzz-adjacent-after.example.com";
+
+        let proof_before = StoredRecord {
+            rtype: 47, // NSEC
+            rclass: IN_QCLASS,
+            ttl_at_store: 3600,
+            rdata: RecordData::NSEC {
+                next_domain: "nx.example.com".to_string(),
+                type_bit_maps: vec![0, 1],
+            },
+        };
+        let proof_before_rrsig = StoredRecord {
+            rtype: 46, // RRSIG
+            rclass: IN_QCLASS,
+            ttl_at_store: 3600,
+            rdata: RecordData::RRSIG {
+                type_covered: 47,
+                algorithm: 8,
+                labels: 3,
+                original_ttl: 3600,
+                signature_expiration: 2_000_000_000,
+                signature_inception: 1_900_000_000,
+                key_tag: 2,
+                signer_name: soa_owner.to_string(),
+                signature: vec![0xbb],
+            },
+        };
+        let proof_after = StoredRecord {
+            rtype: 47, // NSEC
+            rclass: IN_QCLASS,
+            ttl_at_store: 3600,
+            rdata: RecordData::NSEC {
+                next_domain: "example.com".to_string(),
+                type_bit_maps: vec![0, 1],
+            },
+        };
+
+        let negative = negative_entry_with_owner(
+            now,
+            3600,
+            None,
+            vec![
+                (nsec_owner_before.to_string(), proof_before),
+                (nsec_owner_before.to_string(), proof_before_rrsig),
+                (nsec_owner_after.to_string(), proof_after),
+            ],
+            soa_owner,
+        );
+        let resolved = ResolvedNegative {
+            chain: Vec::new(),
+            terminal_name: covered_name.to_string(),
+            negative,
+        };
+        let wire = question_wire(covered_name, A_QTYPE, IN_QCLASS);
+
+        let response = assemble_negative_response(
+            1,
+            &wire,
+            &features(true),
+            &resolved,
+            ResponseCode::NxDomain,
+            now,
+            false,
+            4096,
+        );
+        let parsed = Message::parse(&response).unwrap();
+
+        // SOA + 2 NSEC proofs + 1 RRSIG = 4 authority records.
+        assert_eq!(parsed.authorities.len(), 4);
+        assert_eq!(parsed.authorities[0].name, soa_owner, "SOA under zone apex");
+
+        let nsec_records: Vec<_> = parsed
+            .authorities
+            .iter()
+            .filter(|record| record.rtype == 47)
+            .collect();
+        assert_eq!(nsec_records.len(), 2);
+        assert!(
+            nsec_records
+                .iter()
+                .any(|record| record.name == nsec_owner_before),
+            "expected an NSEC record preserved under its own owner {nsec_owner_before}, got {:?}",
+            parsed.authorities
+        );
+        assert!(
+            nsec_records
+                .iter()
+                .any(|record| record.name == nsec_owner_after),
+            "expected an NSEC record preserved under its own owner {nsec_owner_after}, got {:?}",
+            parsed.authorities
+        );
+        assert!(
+            nsec_records.iter().all(|record| record.name != soa_owner),
+            "NSEC proof records must not be rewritten to the SOA zone apex"
+        );
+        assert!(
+            nsec_records
+                .iter()
+                .all(|record| record.name != covered_name),
+            "NSEC proof records must not be rewritten to the covered/queried name"
+        );
+
+        let rrsig_record = parsed
+            .authorities
+            .iter()
+            .find(|record| record.rtype == 46)
+            .expect("expected the proof RRSIG in the authority section");
+        assert_eq!(
+            rrsig_record.name, nsec_owner_before,
+            "proof RRSIG must be preserved under the same owner as the NSEC it covers"
+        );
+    }
+
     #[test]
     fn assemble_negative_response_includes_cname_chain_and_dnssec_proof_only_when_do() {
         let now = SystemTime::now();
@@ -964,7 +1233,12 @@ mod tests {
                 type_bit_maps: vec![0, 1],
             },
         };
-        let negative = negative_entry(now, 3600, Some(soa_rrsig), vec![proof]);
+        let negative = negative_entry(
+            now,
+            3600,
+            Some(soa_rrsig),
+            vec![("proof-owner.example.com".to_string(), proof)],
+        );
         let resolved = ResolvedNegative {
             chain: vec![("target.example.com".to_string(), cname_entry)],
             terminal_name: "target.example.com".to_string(),
@@ -1016,15 +1290,20 @@ mod tests {
     #[test]
     fn assemble_negative_response_truncates_while_preserving_response_code_and_question() {
         let now = SystemTime::now();
-        let big_proof_records: Vec<StoredRecord> = (0..40u16)
-            .map(|i| StoredRecord {
-                rtype: 999,
-                rclass: IN_QCLASS,
-                ttl_at_store: 3600,
-                rdata: RecordData::Unknown {
-                    rtype: 999,
-                    bytes: vec![i as u8; 20],
-                },
+        let big_proof_records: Vec<(String, StoredRecord)> = (0..40u16)
+            .map(|i| {
+                (
+                    "proof-owner.example.com".to_string(),
+                    StoredRecord {
+                        rtype: 999,
+                        rclass: IN_QCLASS,
+                        ttl_at_store: 3600,
+                        rdata: RecordData::Unknown {
+                            rtype: 999,
+                            bytes: vec![i as u8; 20],
+                        },
+                    },
+                )
             })
             .collect();
         let negative = negative_entry(now, 3600, None, big_proof_records);
@@ -1057,6 +1336,120 @@ mod tests {
         );
         assert_eq!(parsed.questions.len(), 1);
         assert_eq!(parsed.authorities.len(), 0);
+        // Regression test for RFC 6891 §7: even a minimal truncated
+        // response must still carry an OPT record for an EDNS requester.
+        assert_eq!(
+            parsed.header.ar_count, 1,
+            "minimal truncated response must still carry the requester's OPT record"
+        );
+        assert!(
+            parsed.edns.is_some(),
+            "truncated response for an EDNS requester must include OPT"
+        );
+    }
+
+    // Regression test for RFC 6891 §6.1.1 on the negative-response path:
+    // `assemble_negative_response` must also mirror the requester's OPT
+    // record, with ARCOUNT accounting for it alongside the authority
+    // section's SOA (+ optional RRSIG/proof records).
+    #[test]
+    fn assemble_negative_response_includes_opt_record_when_requester_used_edns() {
+        let now = SystemTime::now();
+        let negative = negative_entry(now, 3600, None, Vec::new());
+        let resolved = ResolvedNegative {
+            chain: Vec::new(),
+            terminal_name: "nx.example.com".to_string(),
+            negative,
+        };
+        let wire = question_wire("nx.example.com", A_QTYPE, IN_QCLASS);
+
+        let mut edns_features = features(false);
+        edns_features.edns_udp_payload_size = Some(4096);
+
+        let response = assemble_negative_response(
+            1,
+            &wire,
+            &edns_features,
+            &resolved,
+            ResponseCode::NxDomain,
+            now,
+            false,
+            700,
+        );
+        let parsed = Message::parse(&response).unwrap();
+
+        assert_eq!(parsed.authorities.len(), 1, "SOA still present");
+        assert_eq!(
+            parsed.header.ar_count, 1,
+            "ARCOUNT must account for the mirrored OPT record"
+        );
+        let edns = parsed
+            .edns
+            .expect("negative cache-hit response must carry OPT when the requester used EDNS");
+        assert_eq!(
+            edns.udp_payload_size, 700,
+            "OPT must advertise this resolver's own configured UDP payload size (700), \
+             not echo the requester's 4096"
+        );
+
+        let no_edns_response = assemble_negative_response(
+            1,
+            &wire,
+            &features(false),
+            &resolved,
+            ResponseCode::NxDomain,
+            now,
+            false,
+            4096,
+        );
+        let no_edns_parsed = Message::parse(&no_edns_response).unwrap();
+        assert_eq!(no_edns_parsed.header.ar_count, 0);
+        assert!(no_edns_parsed.edns.is_none());
+    }
+
+    // Regression test for RFC 4035 §3.2.2 on the negative-response path.
+    #[test]
+    fn assemble_negative_response_copies_cd_bit_from_requester() {
+        let now = SystemTime::now();
+        let negative = negative_entry(now, 3600, None, Vec::new());
+        let resolved = ResolvedNegative {
+            chain: Vec::new(),
+            terminal_name: "nx.example.com".to_string(),
+            negative,
+        };
+        let wire = question_wire("nx.example.com", A_QTYPE, IN_QCLASS);
+
+        let mut cd_features = features(false);
+        cd_features.checking_disabled = true;
+        let cd_response = assemble_negative_response(
+            1,
+            &wire,
+            &cd_features,
+            &resolved,
+            ResponseCode::NxDomain,
+            now,
+            false,
+            4096,
+        );
+        assert!(
+            Message::parse(&cd_response).unwrap().header.cd(),
+            "CD=1 on the query must produce CD=1 on the negative response"
+        );
+
+        let no_cd_response = assemble_negative_response(
+            1,
+            &wire,
+            &features(false),
+            &resolved,
+            ResponseCode::NxDomain,
+            now,
+            false,
+            4096,
+        );
+        assert!(
+            !Message::parse(&no_cd_response).unwrap().header.cd(),
+            "CD=0 on the query must produce CD=0 on the negative response"
+        );
     }
 
     #[test]
@@ -1084,7 +1477,7 @@ mod tests {
             nxdomain,
         );
 
-        let result = resolve_from_cache(&cache, domain, A_QTYPE, IN_QCLASS, "ns-1", 8, now);
+        let result = resolve_from_cache(&cache, domain, A_QTYPE, IN_QCLASS, false, "ns-1", 8, now);
 
         assert!(
             matches!(result, ChainLookup::NoData(_)),
@@ -1126,16 +1519,32 @@ mod tests {
         );
 
         // With enough depth, the walk reaches the terminal answer.
-        let answered =
-            resolve_from_cache(&cache, "a.example.com", A_QTYPE, IN_QCLASS, "ns-1", 8, now);
+        let answered = resolve_from_cache(
+            &cache,
+            "a.example.com",
+            A_QTYPE,
+            IN_QCLASS,
+            false,
+            "ns-1",
+            8,
+            now,
+        );
         assert!(matches!(answered, ChainLookup::Answered(_)));
 
         // With too little depth (2 hops allowed, but 3 are needed to reach
         // "d"), the walk must give up rather than loop or return a partial
         // answer — and this chain never revisits a name, so this exercises
         // the depth bound itself, not the visited-set cycle guard.
-        let too_shallow =
-            resolve_from_cache(&cache, "a.example.com", A_QTYPE, IN_QCLASS, "ns-1", 2, now);
+        let too_shallow = resolve_from_cache(
+            &cache,
+            "a.example.com",
+            A_QTYPE,
+            IN_QCLASS,
+            false,
+            "ns-1",
+            2,
+            now,
+        );
         assert_eq!(too_shallow, ChainLookup::Miss);
     }
 
@@ -1157,6 +1566,7 @@ mod tests {
             "expired.example.com",
             A_QTYPE,
             IN_QCLASS,
+            false,
             "ns-1",
             8,
             now,
@@ -1209,6 +1619,7 @@ mod tests {
             stored_at: now,
             expires_at: now + Duration::from_secs(3600),
             cache_namespace: "ns-1".to_string(),
+            dnssec_complete: true,
         };
         let neg_key = NegativeKey {
             qtype: None,
@@ -1225,6 +1636,7 @@ mod tests {
             "alias.example.com",
             A_QTYPE,
             IN_QCLASS,
+            false,
             "ns-1",
             8,
             now,
@@ -1264,8 +1676,16 @@ mod tests {
                 .store_positive(name, (CNAME_RECORD_TYPE, IN_QCLASS), entry);
         }
 
-        let result =
-            resolve_from_cache(&cache, "a.example.com", A_QTYPE, IN_QCLASS, "ns-1", 8, now);
+        let result = resolve_from_cache(
+            &cache,
+            "a.example.com",
+            A_QTYPE,
+            IN_QCLASS,
+            false,
+            "ns-1",
+            8,
+            now,
+        );
 
         assert_eq!(result, ChainLookup::Miss);
     }
@@ -1280,6 +1700,7 @@ mod tests {
             "never-stored.example.com",
             A_QTYPE,
             IN_QCLASS,
+            false,
             "ns-1",
             8,
             now,
@@ -1307,6 +1728,7 @@ mod tests {
             "stale-ns.example.com",
             A_QTYPE,
             IN_QCLASS,
+            false,
             "current-ns",
             8,
             now,
@@ -1354,6 +1776,7 @@ mod tests {
             "cname-source.example.com",
             A_QTYPE,
             IN_QCLASS,
+            false,
             "ns-1",
             8,
             now,
@@ -1414,7 +1837,8 @@ mod tests {
         std::thread::sleep(Duration::from_millis(50));
 
         let start = std::time::Instant::now();
-        let result = resolve_from_cache(&cache, &domain_b, A_QTYPE, IN_QCLASS, "ns-1", 8, now);
+        let result =
+            resolve_from_cache(&cache, &domain_b, A_QTYPE, IN_QCLASS, false, "ns-1", 8, now);
         let elapsed = start.elapsed();
 
         handle.join().unwrap();

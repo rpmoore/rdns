@@ -52,6 +52,19 @@ pub struct RRsetEntry {
     // Namespace is no longer part of the lookup key, so it must be stored
     // per entry instead.
     pub cache_namespace: String,
+    /// Whether `rrsigs` reflects a *confirmed* DNSSEC state, i.e. this
+    /// entry was populated from a backend response fetched with the
+    /// *storing* request's own DO (`dnssec_ok`) flag set. Recursive
+    /// resolution forwards each requester's own DO flag upstream, so a
+    /// DO=false-driven fetch's empty `rrsigs` means "never asked" — not
+    /// "confirmed no RRSIGs exist". A DO=true reader must never be served
+    /// from an entry with `dnssec_complete == false`: doing so would
+    /// silently serve an answer that looks validated-empty but was simply
+    /// never checked, for that entry's full remaining TTL (see
+    /// `Shard::lookup_hop`'s DO-aware filtering, which enforces this at
+    /// cache-hit time). A DO=false reader may be served regardless of this
+    /// flag, since DO=false readers never need/emit RRSIGs anyway.
+    pub dnssec_complete: bool,
 }
 
 /// A single stored resource record, minus anything request-specific
@@ -133,13 +146,74 @@ pub struct NegativeEntry {
     /// positive side).
     pub(crate) soa_rrsig: Option<StoredRecord>,
     /// NSEC/NSEC3 (+ their RRSIGs) proving the negative result, if
-    /// fetched. Empty today (no DNSSEC validation is implemented) — the
-    /// field exists so RFC 8198 aggressive negative caching doesn't
-    /// require another reshape later.
-    pub(crate) proof_records: Vec<StoredRecord>,
+    /// fetched, paired with each record's own owner name. Unlike
+    /// `RRsetEntry`'s records (whose owner is always the domain the entry
+    /// is stored under), NSEC/NSEC3 proof records are frequently owned by
+    /// names *other than* the covered/queried name or the SOA zone apex
+    /// (e.g. an NSEC bracketing the queried name with the adjacent
+    /// existing name in the zone) — `StoredRecord` itself carries no owner
+    /// field, so it must be paired here instead of written blanket-style
+    /// under `soa_owner` at assemble time (`assemble::write_negative_authority`'s
+    /// call site).
+    pub(crate) proof_records: Vec<(String, StoredRecord)>,
     pub(crate) stored_at: SystemTime,
     pub(crate) expires_at: SystemTime,
     pub(crate) cache_namespace: String,
+    /// Same DO-completeness contract as `RRsetEntry::dnssec_complete`,
+    /// applied to `soa_rrsig`/`proof_records`: `true` only when this entry
+    /// was populated from a backend response fetched with the storing
+    /// request's own DO flag set, so empty/absent DNSSEC material means
+    /// "confirmed absent" rather than "never asked". A DO=true reader must
+    /// never be served from a negative entry with `dnssec_complete ==
+    /// false`. Note this flag alone is *not* sufficient to gate a DO=true
+    /// hit — it says nothing about whether the individually-TTLed records
+    /// it vouches for (`soa_rrsig`, `proof_records`) are still within
+    /// their own TTL as of read time; see `dnssec_proof_material_fresh`
+    /// for that complementary check.
+    pub(crate) dnssec_complete: bool,
+}
+
+impl NegativeEntry {
+    /// Whether every DNSSEC-relevant record stored in this entry — the SOA
+    /// record itself, `soa_rrsig` (if present), and each `proof_records`
+    /// entry — still has positive remaining TTL as of `now`, computed from
+    /// that specific record's own `ttl_at_store` aged by elapsed time since
+    /// `stored_at`. This is deliberately independent of `expires_at`, which
+    /// is derived solely from the covering SOA's negative-caching TTL/
+    /// minimum (RFC 2308) and says nothing about how long the SOA's RRSIG
+    /// or any NSEC/NSEC3 proof record individually remains valid — those
+    /// can (and often do) carry a materially shorter TTL than the negative
+    /// TTL they're bundled with.
+    ///
+    /// `dnssec_complete` (this type's other DNSSEC gate) answers a
+    /// different question — "was this entry's DNSSEC material ever
+    /// confirmed at all" — and stays `true` for this entry's entire
+    /// `expires_at` lifetime once set. Without this method, a DO=true
+    /// reader arriving after an individual proof record's own TTL elapsed
+    /// (but before the overall negative TTL elapsed) would still pass the
+    /// `dnssec_complete` gate and be served that record aged to wire TTL 0
+    /// by `compute_wire_ttl` — stale material silently masquerading as
+    /// fresh. Callers must check both: `dnssec_complete` for "was this
+    /// asked for", this method for "is what was returned still usable".
+    /// Only meaningful for DO=true cache-hit gating (see
+    /// `Shard::lookup_hop`'s doc comment) — a DO=false reader neither
+    /// needs nor emits any of this material, so it is unaffected either
+    /// way, mirroring `dnssec_complete`'s own DO=false carve-out.
+    pub(crate) fn dnssec_proof_material_fresh(&self, now: SystemTime) -> bool {
+        let record_fresh =
+            |ttl_at_store: u32| self.stored_at + Duration::from_secs(u64::from(ttl_at_store)) > now;
+        if !record_fresh(self.soa_record.ttl_at_store) {
+            return false;
+        }
+        if let Some(rrsig) = &self.soa_rrsig
+            && !record_fresh(rrsig.ttl_at_store)
+        {
+            return false;
+        }
+        self.proof_records
+            .iter()
+            .all(|(_, record)| record_fresh(record.ttl_at_store))
+    }
 }
 
 #[cfg(test)]
@@ -171,6 +245,7 @@ mod tests {
             expires_at: now + minimum_ttl,
             dnssec_state: DnssecState::default(),
             cache_namespace: "ns-1".to_string(),
+            dnssec_complete: true,
         }
     }
 
@@ -241,6 +316,7 @@ mod tests {
             stored_at: now,
             expires_at: now + Duration::from_secs(3600),
             cache_namespace: "ns-1".to_string(),
+            dnssec_complete: true,
         };
 
         assert_eq!(entry.soa_record, soa_record);
@@ -273,6 +349,7 @@ mod tests {
             stored_at: now,
             expires_at: now + Duration::from_secs(3600),
             cache_namespace: "ns-1".to_string(),
+            dnssec_complete: true,
         };
 
         let mut domain = DomainNegativeEntries::default();
@@ -317,9 +394,149 @@ mod tests {
             stored_at: now,
             expires_at: now + Duration::from_secs(3600),
             cache_namespace: "ns-1".to_string(),
+            dnssec_complete: true,
         };
 
         assert_eq!(entry.soa_rrsig, None);
         assert_eq!(entry.proof_records, Vec::new());
+    }
+
+    #[test]
+    fn rrset_entry_dnssec_complete_defaults_false_for_do_false_populated_entries() {
+        // Regression test for the stale-DO-false-entry bug: an entry
+        // populated by a DO=false-driven fetch must be constructible with
+        // `dnssec_complete: false` (meaning "never asked", not "confirmed
+        // no RRSIGs") so a later DO=true reader can distinguish it from a
+        // DO=true-confirmed entry with genuinely empty `rrsigs`.
+        let mut entry = rrset_entry(vec![stored_record(300)], Duration::from_secs(300));
+        entry.dnssec_complete = false;
+
+        assert!(entry.rrsigs.is_empty());
+        assert!(
+            !entry.dnssec_complete,
+            "a DO=false-populated entry must not report its DNSSEC state as confirmed"
+        );
+    }
+
+    #[test]
+    fn negative_entry_dnssec_complete_defaults_false_for_do_false_populated_entries() {
+        let now = SystemTime::now();
+        let entry = NegativeEntry {
+            kind: NegativeCacheKind::NxDomain,
+            soa_owner: "example.com".to_string(),
+            soa_record: stored_record(3600),
+            soa_rrsig: None,
+            proof_records: Vec::new(),
+            stored_at: now,
+            expires_at: now + Duration::from_secs(3600),
+            cache_namespace: "ns-1".to_string(),
+            dnssec_complete: false,
+        };
+
+        assert!(
+            !entry.dnssec_complete,
+            "a DO=false-populated negative entry must not report its DNSSEC state as confirmed"
+        );
+    }
+
+    // Regression tests for the negative-entry DNSSEC-proof-TTL bug:
+    // `dnssec_proof_material_fresh` must independently bound usability by
+    // each stored DNSSEC-relevant record's own TTL, not just the entry's
+    // SOA-derived overall `expires_at`.
+
+    fn negative_entry_with_dnssec(
+        stored_at: SystemTime,
+        overall_ttl: Duration,
+        soa_ttl: u32,
+        soa_rrsig_ttl: Option<u32>,
+        proof_ttls: Vec<u32>,
+    ) -> NegativeEntry {
+        NegativeEntry {
+            kind: NegativeCacheKind::NxDomain,
+            soa_owner: "example.com".to_string(),
+            soa_record: stored_record(soa_ttl),
+            soa_rrsig: soa_rrsig_ttl.map(stored_record),
+            proof_records: proof_ttls
+                .into_iter()
+                .map(|ttl| ("proof.example.com".to_string(), stored_record(ttl)))
+                .collect(),
+            stored_at,
+            expires_at: stored_at + overall_ttl,
+            cache_namespace: "ns-1".to_string(),
+            dnssec_complete: true,
+        }
+    }
+
+    #[test]
+    fn dnssec_proof_material_fresh_true_when_every_record_still_within_its_own_ttl() {
+        let stored_at = SystemTime::now() - Duration::from_secs(100);
+        let entry = negative_entry_with_dnssec(
+            stored_at,
+            Duration::from_secs(3600),
+            3600,
+            Some(3600),
+            vec![3600, 3600],
+        );
+
+        assert!(entry.dnssec_proof_material_fresh(SystemTime::now()));
+    }
+
+    #[test]
+    fn dnssec_proof_material_fresh_false_once_a_proof_records_own_ttl_elapses() {
+        // Overall SOA-derived negative TTL is a full hour, but one NSEC
+        // proof record's own TTL is only 300s. 301s after storage, the
+        // overall entry is still unexpired (`expires_at` unaffected), but
+        // the proof record itself is stale and must not be reported fresh.
+        let stored_at = SystemTime::now() - Duration::from_secs(301);
+        let entry = negative_entry_with_dnssec(
+            stored_at,
+            Duration::from_secs(3600),
+            3600,
+            Some(3600),
+            vec![300],
+        );
+
+        assert!(
+            entry.expires_at > SystemTime::now(),
+            "overall negative TTL must still be unexpired for this test to be meaningful"
+        );
+        assert!(!entry.dnssec_proof_material_fresh(SystemTime::now()));
+    }
+
+    #[test]
+    fn dnssec_proof_material_fresh_false_once_soa_rrsig_ttl_elapses() {
+        let stored_at = SystemTime::now() - Duration::from_secs(301);
+        let entry = negative_entry_with_dnssec(
+            stored_at,
+            Duration::from_secs(3600),
+            3600,
+            Some(300),
+            Vec::new(),
+        );
+
+        assert!(!entry.dnssec_proof_material_fresh(SystemTime::now()));
+    }
+
+    #[test]
+    fn dnssec_proof_material_fresh_false_once_soa_records_own_ttl_elapses() {
+        let stored_at = SystemTime::now() - Duration::from_secs(301);
+        let entry =
+            negative_entry_with_dnssec(stored_at, Duration::from_secs(3600), 300, None, Vec::new());
+
+        assert!(!entry.dnssec_proof_material_fresh(SystemTime::now()));
+    }
+
+    #[test]
+    fn dnssec_proof_material_fresh_true_with_no_dnssec_material_present() {
+        let stored_at = SystemTime::now() - Duration::from_secs(301);
+        let entry = negative_entry_with_dnssec(
+            stored_at,
+            Duration::from_secs(3600),
+            3600,
+            None,
+            Vec::new(),
+        );
+
+        assert!(entry.dnssec_proof_material_fresh(SystemTime::now()));
     }
 }
