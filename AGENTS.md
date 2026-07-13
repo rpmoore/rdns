@@ -6,6 +6,8 @@ Guidance for Codex and other coding agents working in this repository.
 
 `rdns` is a Rust DNS resolver/proxy. It uses Tokio for async networking, keeps DNS protocol logic in explicit domain modules, and uses traits at important boundaries so resolver behavior can be tested without real network I/O. See `RUST.md` for Rust-specific standards (formatting, linting, testing, error handling, dependencies).
 
+Before working on a subsystem, check `docs/knowledge/` for its architecture and behavior. It's an [OKF](https://github.com/GoogleCloudPlatform/knowledge-catalog/blob/main/okf/SPEC.md)-conformant bundle: `docs/knowledge/index.md` is the root, each area has its own `index.md`, and each concept doc is grounded with `file:line` references to the code it describes. This documents *current, implemented* behavior — for point-in-time design history (why a decision was made, what alternatives were rejected), see `docs/plans/` instead.
+
 ## Automatic Triggers
 
 These run without being asked, no explicit request needed:
@@ -15,6 +17,7 @@ These run without being asked, no explicit request needed:
 - Nontrivial code change done → run `verify` skill before reporting done (Change Workflow).
 - PR touches auth/untrusted-input/network code → run `/security-review` before opening PR (Change Workflow).
 - PR feedback reviewed → mark resolved or state why not (Change Workflow).
+- Code change complete → update `docs/knowledge/` for the affected code, creating a new concept doc if none exists yet (Knowledge Bundle).
 - Code change complete → log entry to Obsidian daily note, if available (Change Logging).
 
 ## Caveman Tooling
@@ -59,6 +62,29 @@ See `RUST.md` for Rust-specific formatting, linting, testing, and code-standard 
 - Before reporting any Rust change done, satisfy the fmt/clippy/test gates in `RUST.md`.
 - Before opening a PR that touches auth, parsing of untrusted input, or network-facing code, auto-run `/security-review`.
 - After changes, summarize what changed and which verification commands were run.
+
+## Knowledge Bundle (`docs/knowledge/`)
+
+After a nontrivial code change, before reporting the task done: check
+whether any concept doc under `docs/knowledge/` describes the code just
+touched, and bring it up to date in the same change.
+
+- If a concept doc exists for that area and the change made it stale
+  (behavior, invariant, file/line reference, or code snippet no longer
+  matches), update it. Don't leave a doc describing pre-change behavior.
+- If no concept doc exists yet for that section of code, add one,
+  following the structure of existing docs under `docs/knowledge/`
+  (frontmatter with `type`/`title`/`description`/`resource`/`tags`,
+  `file:line`-grounded claims, an index entry linking to it from that
+  area's `index.md`). Use judgment on granularity — a small helper
+  doesn't need its own concept doc; a subsystem with real invariants
+  (invalidation, concurrency, protocol behavior) does.
+- Skip this for test-only, doc-only, or purely mechanical changes
+  (renames, formatting) that don't change documented behavior.
+- This is separate from directory-local `AGENTS.md` summaries (see
+  Directory Summary Instructions below): those are terse orientation
+  notes; `docs/knowledge/` is the deeper, OKF-structured behavioral
+  record. Updating one doesn't substitute for the other.
 
 ## Change Logging
 
