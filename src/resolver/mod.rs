@@ -18389,7 +18389,7 @@ mod tests {
         // end-to-end through `resolve()`. `publish_reload` runs its sweep
         // synchronously before returning here, so this alone doesn't
         // isolate lookup-time epoch rejection from sweep-based removal --
-        // `resolve_from_cache_rejects_stale_namespace_independent_of_sweep`
+        // `resolve_from_cache_rejects_stale_epoch_independent_of_sweep`
         // (`cache::assemble`'s tests) covers that property directly,
         // against a hand-seeded shard a sweep never touched.
         service.publish_reload(

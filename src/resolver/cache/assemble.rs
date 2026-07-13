@@ -2316,7 +2316,7 @@ mod tests {
     }
 
     #[test]
-    fn resolve_from_cache_rejects_stale_namespace_independent_of_sweep() {
+    fn resolve_from_cache_rejects_stale_epoch_independent_of_sweep() {
         let cache = cache_with_shard_count(1);
         let now = SystemTime::now();
         let entry = rrset_entry(vec![a_record(300, 1)], Duration::from_secs(300), now);
@@ -2324,15 +2324,15 @@ mod tests {
         // `rrset_entry`) that no longer matches the current epoch (2) —
         // must be treated as a miss without requiring section-05's sweep to
         // have run.
-        cache.shard_for("stale-ns.example.com").store_positive(
-            "stale-ns.example.com",
+        cache.shard_for("stale-epoch.example.com").store_positive(
+            "stale-epoch.example.com",
             (A_QTYPE, IN_QCLASS),
             entry,
         );
 
         let result = resolve_from_cache(
             &cache,
-            "stale-ns.example.com",
+            "stale-epoch.example.com",
             A_QTYPE,
             IN_QCLASS,
             false,

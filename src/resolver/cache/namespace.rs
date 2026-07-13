@@ -106,7 +106,7 @@ mod tests {
     }
 
     #[test]
-    fn sweep_removes_only_entries_from_stale_namespace() {
+    fn sweep_removes_only_entries_from_stale_epoch() {
         let shard = Shard::new(4);
         shard.store_positive("stale.example.com", (A_QTYPE, IN_QCLASS), rrset_entry(0));
         shard.store_positive("current.example.com", (A_QTYPE, IN_QCLASS), rrset_entry(1));
@@ -177,7 +177,7 @@ mod tests {
     }
 
     #[test]
-    fn sweep_stale_namespace_walks_every_shard_in_the_slice() {
+    fn sweep_stale_epoch_walks_every_shard_in_the_slice() {
         let shard_a = Shard::new(4);
         let shard_b = Shard::new(4);
         let shard_c = Shard::new(4);
