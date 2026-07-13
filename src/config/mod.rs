@@ -190,6 +190,8 @@ impl RuntimeConfig {
             });
         }
 
+        self.cache.validate()?;
+
         Ok(())
     }
 
@@ -363,6 +365,30 @@ impl CacheConfig {
         let base = self.max_entries / shard_count;
         let remainder = self.max_entries % shard_count;
         if index < remainder { base + 1 } else { base }
+    }
+
+    /// Rejects an explicit `shard_count` large enough to make
+    /// `ShardedDnsCache::new`'s `Vec<Shard>` allocation a startup-time
+    /// footgun. `resolved_shard_count()` only caps `shard_count` against
+    /// `max_entries` when `max_entries > 0` (deliberately -- see that
+    /// method's doc comment); a config with `max_entries = 0` (caching
+    /// disabled) plus a large explicit `shard_count` sails through
+    /// uncapped, since every shard is correctly zero-capacity either way.
+    /// That combination is a plausible typo (e.g. an extra digit) rather
+    /// than a deliberate choice, and can turn into an oversized allocation
+    /// at startup with no caching benefit to show for it. This cap applies
+    /// regardless of `max_entries` for the same reason `resolved_shard_count`
+    /// doesn't special-case it further: one bound, one place to check it.
+    pub fn validate(&self) -> Result<(), ConfigError> {
+        if let Some(shard_count) = self.shard_count
+            && shard_count > MAX_CACHE_SHARD_COUNT
+        {
+            return Err(ConfigError::InvalidCacheShardCount {
+                value: shard_count,
+                max: MAX_CACHE_SHARD_COUNT,
+            });
+        }
+        Ok(())
     }
 }
 
@@ -1260,6 +1286,10 @@ pub enum ConfigError {
     InvalidMaxTcpConnections {
         value: usize,
     },
+    InvalidCacheShardCount {
+        value: usize,
+        max: usize,
+    },
 }
 
 #[derive(Debug, Deserialize)]
@@ -1681,6 +1711,13 @@ const MAX_RECURSION_DEPTH: u8 = 64;
 const MAX_CNAME_RESTARTS: u8 = 16;
 const MIN_UDP_PAYLOAD_SIZE: usize = 512;
 const MAX_UDP_PAYLOAD_SIZE: usize = 4096;
+/// Generous upper bound on `CacheConfig::shard_count` -- far beyond any
+/// real deployment's parallelism, but small enough that a `Vec<Shard>` of
+/// this size is a trivial allocation. Exists solely to catch fat-finger
+/// config mistakes (an extra digit) before they turn into an oversized
+/// startup allocation, particularly since `max_entries = 0` (caching
+/// disabled) leaves `shard_count` otherwise uncapped.
+const MAX_CACHE_SHARD_COUNT: usize = 65_536;
 const FNV1A64_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
 const FNV1A64_PRIME: u64 = 0x0000_0100_0000_01b3;
 
@@ -2558,6 +2595,43 @@ a.root-servers.net.      3600000      Aaaa  2001:503:ba3e::2:30
         let error = RuntimeConfig::from_toml_str(&toml).unwrap_err();
 
         assert_eq!(error, ConfigError::InvalidMaxTcpConnections { value: 0 });
+    }
+
+    #[test]
+    fn config_rejects_oversized_cache_shard_count() {
+        let mut toml = valid_toml();
+        toml.push_str(
+            r#"
+            [cache]
+            max_entries = 0
+            shard_count = 100000000
+            "#,
+        );
+
+        let error = RuntimeConfig::from_toml_str(&toml).unwrap_err();
+
+        assert_eq!(
+            error,
+            ConfigError::InvalidCacheShardCount {
+                value: 100_000_000,
+                max: MAX_CACHE_SHARD_COUNT,
+            }
+        );
+    }
+
+    #[test]
+    fn config_allows_cache_shard_count_at_the_cap() {
+        let mut toml = valid_toml();
+        toml.push_str(&format!(
+            "\n            [cache]\n            shard_count = {MAX_CACHE_SHARD_COUNT}\n            "
+        ));
+
+        RuntimeConfig::from_toml_str(&toml).expect("shard_count at the cap must be accepted");
+    }
+
+    #[test]
+    fn cache_config_validate_accepts_default() {
+        assert_eq!(CacheConfig::default().validate(), Ok(()));
     }
 
     #[test]

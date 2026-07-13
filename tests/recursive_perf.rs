@@ -140,12 +140,14 @@ fn resolver_without_cache(config: &RuntimeConfig) -> ResolveQuery {
 }
 
 fn resolver_with_cache(config: &RuntimeConfig) -> ResolveQuery {
+    let cache = Arc::new(ShardedDnsCache::new(&CacheConfig {
+        max_entries: 256,
+        shard_count: None,
+    }));
+    let shard_count = cache.shard_count();
     ResolveQuery::with_cache(
         Arc::new(StandardProtocolCodec::new(config.max_udp_payload_size)),
-        Arc::new(ShardedDnsCache::new(&CacheConfig {
-            max_entries: 256,
-            shard_count: None,
-        })),
+        cache,
         CacheTtlPolicy::default(),
         recursive_backend(config),
         Arc::new(BasicResponseFactory),
@@ -153,6 +155,7 @@ fn resolver_with_cache(config: &RuntimeConfig) -> ResolveQuery {
         Arc::new(NoopEvents),
         Arc::new(NoopMetrics),
     )
+    .with_single_flight_shard_count(shard_count)
 }
 
 struct IterationResult {
