@@ -63,6 +63,7 @@ fn seed_entry(now: SystemTime) -> RRsetEntry {
         // never actually read, but every field must be supplied.
         cache_namespace: NAMESPACE.to_string(),
         dnssec_complete: true,
+        authoritative: false,
     }
 }
 

@@ -6,9 +6,9 @@ Generate content for section `section-01-foundation` (filename: `section-01-foun
 
 Read these files first to understand the full implementation plan:
 
-1. `/home/rpmoore/code/rdns/docs/plans/cache_rework/claude-plan.md` - Full implementation plan
-2. `/home/rpmoore/code/rdns/docs/plans/cache_rework/claude-plan-tdd.md` - Test stubs for each section
-3. `/home/rpmoore/code/rdns/docs/plans/cache_rework/sections/index.md` - Section manifest and descriptions
+1. `docs/plans/cache_rework/claude-plan.md` - Full implementation plan
+2. `docs/plans/cache_rework/claude-plan-tdd.md` - Test stubs for each section
+3. `docs/plans/cache_rework/sections/index.md` - Section manifest and descriptions
 
 ## Your Section
 
@@ -21,7 +21,7 @@ Output ONLY the markdown content for this section. No JSON wrapper, no code
 blocks around the output. Just the raw markdown content.
 
 The hook system will automatically write your output to:
-`/home/rpmoore/code/rdns/docs/plans/cache_rework/sections/section-01-foundation.md`
+`docs/plans/cache_rework/sections/section-01-foundation.md`
 
 ## Content Requirements
 

@@ -65,6 +65,14 @@ pub struct RRsetEntry {
     /// cache-hit time). A DO=false reader may be served regardless of this
     /// flag, since DO=false readers never need/emit RRSIGs anyway.
     pub dnssec_complete: bool,
+    /// The backend response's own AA (Authoritative Answer) bit, captured
+    /// at store time (`build_rrset_entry`) so a later cache-hit response
+    /// can reproduce it instead of always serving AA=0. A cached copy of an
+    /// authoritative answer is still describing an authoritative answer —
+    /// serving it back as AA=0 would be a real semantic change for clients
+    /// that check this bit (see `assemble::assemble_response`'s header
+    /// write).
+    pub authoritative: bool,
 }
 
 /// A single stored resource record, minus anything request-specific
@@ -171,6 +179,16 @@ pub struct NegativeEntry {
     /// their own TTL as of read time; see `dnssec_proof_material_fresh`
     /// for that complementary check.
     pub(crate) dnssec_complete: bool,
+    /// Mirrors `RRsetEntry::dnssec_state`: the validation state of this
+    /// negative result (NXDOMAIN/NODATA), starting and staying
+    /// `Unvalidated` until real DNSSEC validation is implemented. Wired
+    /// into AD-bit computation the same way as the positive side (see
+    /// `assemble::dnssec_ad_bit`'s call sites for `ResolvedNegative`).
+    pub(crate) dnssec_state: DnssecState,
+    /// The backend response's own AA (Authoritative Answer) bit, captured
+    /// at store time (`build_negative_entry`) — same contract as
+    /// `RRsetEntry::authoritative`.
+    pub(crate) authoritative: bool,
 }
 
 impl NegativeEntry {
@@ -246,6 +264,7 @@ mod tests {
             dnssec_state: DnssecState::default(),
             cache_namespace: "ns-1".to_string(),
             dnssec_complete: true,
+            authoritative: false,
         }
     }
 
@@ -317,6 +336,8 @@ mod tests {
             expires_at: now + Duration::from_secs(3600),
             cache_namespace: "ns-1".to_string(),
             dnssec_complete: true,
+            dnssec_state: DnssecState::default(),
+            authoritative: false,
         };
 
         assert_eq!(entry.soa_record, soa_record);
@@ -350,6 +371,8 @@ mod tests {
             expires_at: now + Duration::from_secs(3600),
             cache_namespace: "ns-1".to_string(),
             dnssec_complete: true,
+            dnssec_state: DnssecState::default(),
+            authoritative: false,
         };
 
         let mut domain = DomainNegativeEntries::default();
@@ -395,6 +418,8 @@ mod tests {
             expires_at: now + Duration::from_secs(3600),
             cache_namespace: "ns-1".to_string(),
             dnssec_complete: true,
+            dnssec_state: DnssecState::default(),
+            authoritative: false,
         };
 
         assert_eq!(entry.soa_rrsig, None);
@@ -431,12 +456,34 @@ mod tests {
             expires_at: now + Duration::from_secs(3600),
             cache_namespace: "ns-1".to_string(),
             dnssec_complete: false,
+            dnssec_state: DnssecState::default(),
+            authoritative: false,
         };
 
         assert!(
             !entry.dnssec_complete,
             "a DO=false-populated negative entry must not report its DNSSEC state as confirmed"
         );
+    }
+
+    #[test]
+    fn negative_entry_dnssec_state_defaults_to_unvalidated() {
+        let now = SystemTime::now();
+        let entry = NegativeEntry {
+            kind: NegativeCacheKind::NxDomain,
+            soa_owner: "example.com".to_string(),
+            soa_record: stored_record(3600),
+            soa_rrsig: None,
+            proof_records: Vec::new(),
+            stored_at: now,
+            expires_at: now + Duration::from_secs(3600),
+            cache_namespace: "ns-1".to_string(),
+            dnssec_complete: true,
+            dnssec_state: DnssecState::default(),
+            authoritative: false,
+        };
+
+        assert_eq!(entry.dnssec_state, DnssecState::Unvalidated);
     }
 
     // Regression tests for the negative-entry DNSSEC-proof-TTL bug:
@@ -464,6 +511,8 @@ mod tests {
             expires_at: stored_at + overall_ttl,
             cache_namespace: "ns-1".to_string(),
             dnssec_complete: true,
+            dnssec_state: DnssecState::default(),
+            authoritative: false,
         }
     }
 

@@ -5,7 +5,7 @@
   "state_dir": "/home/rpmoore/code/rdns/docs/plans/cache_rework/implementation",
   "git_root": "/home/rpmoore/code/rdns",
   "commit_style": "simple",
-  "test_command": "uv run pytest",
+  "test_command": "cargo test --locked",
   "sections": [
     "section-01-foundation",
     "section-02-data-model",

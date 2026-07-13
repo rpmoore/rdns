@@ -33,7 +33,7 @@ use crate::protocol::{
     ResponseCode, build_a_answers_response, build_a_block_response, build_aaaa_answers_response,
     build_aaaa_block_response, build_nodata_response, build_nxdomain_response,
     build_question_aware_error_response, build_refused_response, build_servfail_response,
-    message_question_wire, rewrite_response_id,
+    message_question_wire, rewrite_response_id, rewrite_response_request_fields,
 };
 
 mod cache;
@@ -790,6 +790,19 @@ fn name_is_at_or_below(name: &str, zone: &str) -> bool {
 /// for. Stamped onto every produced entry's `dnssec_complete` field (see
 /// `RRsetEntry`/`NegativeEntry`'s doc comments) — this is the fix for the
 /// stale-DO-false-entry bug.
+///
+/// `store_authoritative` is the AA bit to stamp onto every produced
+/// entry's `authoritative` field — *not* simply `response.header.aa()`.
+/// Per RFC 1035 §4.1.1, AA describes the *responding server's* own
+/// authority over the zone, not whatever server this resolver happened to
+/// fetch the answer from. For a recursive fetch, `response` is an upstream
+/// authority's answer, not this resolver's own — rdns is never itself
+/// authoritative when recursing, so the caller must always pass `false`
+/// here for `ResolutionMode::Recursive`. Only `ResolutionMode::Forward`
+/// (a transparent proxy, which may legitimately relay a forwarder that
+/// really is authoritative for the zone) may pass the response's real AA
+/// bit through. See `prepare_backend_result`'s `store_authoritative`
+/// computation, which mirrors `store_dnssec_ok`'s existing per-mode gate.
 fn decompose_response_for_store(
     response: &Message,
     question: &QuestionKey,
@@ -797,6 +810,7 @@ fn decompose_response_for_store(
     negative_meta: Option<&NegativeCacheMetadata>,
     stored_at: SystemTime,
     dnssec_ok: bool,
+    store_authoritative: bool,
 ) -> DecomposedResponse {
     let mut positive = Vec::new();
     let mut current_name = question.qname.clone();
@@ -831,6 +845,7 @@ fn decompose_response_for_store(
                     ttl,
                     stored_at,
                     dnssec_ok,
+                    store_authoritative,
                 );
                 positive.push((current_name, question.qtype, question.qclass, entry));
                 return DecomposedResponse {
@@ -864,6 +879,7 @@ fn decompose_response_for_store(
             ttl,
             stored_at,
             dnssec_ok,
+            store_authoritative,
         );
         positive.push((current_name, CNAME_RECORD_TYPE, question.qclass, entry));
         current_name = target;
@@ -877,7 +893,14 @@ fn decompose_response_for_store(
             },
             qclass: question.qclass,
         };
-        let entry = build_negative_entry(response, metadata, ttl, stored_at, dnssec_ok);
+        let entry = build_negative_entry(
+            response,
+            metadata,
+            ttl,
+            stored_at,
+            dnssec_ok,
+            store_authoritative,
+        );
         (current_name.clone(), key, entry)
     });
 
@@ -970,6 +993,10 @@ fn negative_proof_records(authorities: &[Record], qclass: u16) -> Vec<(String, S
 /// produced entry's `dnssec_complete` field: only a DO=true-driven fetch's
 /// `rrsigs` (empty or not) can be trusted as the confirmed DNSSEC state —
 /// see `RRsetEntry::dnssec_complete`'s doc comment.
+///
+/// `store_authoritative` is stamped verbatim onto the produced entry's
+/// `authoritative` field — see `decompose_response_for_store`'s doc
+/// comment for why this must not simply be `response.header.aa()`.
 fn build_rrset_entry(
     response: &Message,
     records: &[&Record],
@@ -977,6 +1004,7 @@ fn build_rrset_entry(
     ttl: Duration,
     stored_at: SystemTime,
     dnssec_ok: bool,
+    store_authoritative: bool,
 ) -> RRsetEntry {
     let rtype = records.first().map_or(0, |record| record.rtype);
     let rclass = records.first().map_or(0, |record| record.rclass);
@@ -993,6 +1021,7 @@ fn build_rrset_entry(
         // here.
         cache_namespace: String::new(),
         dnssec_complete: dnssec_ok,
+        authoritative: store_authoritative,
     }
 }
 
@@ -1007,13 +1036,16 @@ fn build_rrset_entry(
 /// as `build_rrset_entry`; `dnssec_ok` (the storing request's own DO flag)
 /// is stamped onto `dnssec_complete` for the same reason as
 /// `build_rrset_entry` — see `NegativeEntry::dnssec_complete`'s doc
-/// comment.
+/// comment. `store_authoritative` is stamped onto `authoritative` for the
+/// same reason as `build_rrset_entry` — see
+/// `decompose_response_for_store`'s doc comment.
 fn build_negative_entry(
     response: &Message,
     metadata: &NegativeCacheMetadata,
     ttl: Duration,
     stored_at: SystemTime,
     dnssec_ok: bool,
+    store_authoritative: bool,
 ) -> NegativeEntry {
     let soa_record = response
         .authorities
@@ -1044,6 +1076,8 @@ fn build_negative_entry(
         expires_at: stored_at + ttl,
         cache_namespace: String::new(),
         dnssec_complete: dnssec_ok,
+        dnssec_state: Default::default(),
+        authoritative: store_authoritative,
     }
 }
 
@@ -1378,6 +1412,33 @@ fn reset_filter_response_for_requester_calls() {
     FILTER_RESPONSE_FOR_REQUESTER_CALLS.with(|calls| calls.set(0));
 }
 
+// Test-only call counter for `rebuild_recursive_response_with_own_framing`
+// -- `prepare_backend_result`'s two fast paths (DO=false no-op-filter, and
+// DO=true) now only pay for this clone-heavy reserialize when
+// `recursive_synthesis_reused_own_framing` has actually detected a
+// framing mismatch (a coalesced follower whose own EDNS presence/DO/
+// question-casing differs from whichever request originally synthesized
+// the shared response), not unconditionally on every non-truncated
+// recursive-synthesis response. This counter is the only way to prove the
+// ordinary, non-coalesced hot path really skips the rebuild rather than
+// running it every time. `#[cfg(test)]`-gated, compiled out of release
+// builds.
+#[cfg(test)]
+thread_local! {
+    static REBUILD_RECURSIVE_RESPONSE_WITH_OWN_FRAMING_CALLS: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+fn reset_rebuild_recursive_response_with_own_framing_calls() {
+    REBUILD_RECURSIVE_RESPONSE_WITH_OWN_FRAMING_CALLS.with(|calls| calls.set(0));
+}
+
+#[cfg(test)]
+fn rebuild_recursive_response_with_own_framing_call_count() -> usize {
+    REBUILD_RECURSIVE_RESPONSE_WITH_OWN_FRAMING_CALLS.with(|calls| calls.get())
+}
+
 #[cfg(test)]
 fn filter_response_for_requester_call_count() -> usize {
     FILTER_RESPONSE_FOR_REQUESTER_CALLS.with(|calls| calls.get())
@@ -1547,6 +1608,73 @@ fn mirrored_client_opt_record(
     crate::protocol::message_edns_opt_record(original_query, configured_max_udp_payload_size)
 }
 
+/// Rebuilds client-facing bytes for a recursive-synthesis response
+/// (`response.recursive_synthesis.is_some()`) using *this requester's own*
+/// header/echoed-question/OPT, sourced from `decoded.message` -- never
+/// from whichever query originally synthesized `response_message` via
+/// `synthesize_recursive_cname_response`.
+///
+/// Used by `prepare_backend_result`'s two "nothing to filter" fast paths
+/// (DO=true, and DO=false-but-nothing-DNSSEC-specific-present), both of
+/// which used to just reuse `response.bytes`/`response_message`'s own
+/// baked-in additionals verbatim (after only rewriting ID/RD/CD). On a
+/// coalesced-follower fallback (leader's fetch result wasn't cacheable, or
+/// the cache entry didn't land, so there's no fresh cache-hit reassembly
+/// to build a follower-specific response from -- see
+/// `resolve_coalesced_follower` -> `finish_backend_result` ->
+/// `prepare_backend_result`), `response_message`'s OPT reflects
+/// `synthesis.original_query`'s own EDNS presence/DO/UDP-bufsize
+/// (`synthesize_recursive_cname_response` builds it via
+/// `mirrored_client_opt_record(original_query, ...)`), which is whichever
+/// request happened to synthesize this particular shared response -- not
+/// necessarily this follower's own. `MissKey` coalesces on
+/// name/type/class/namespace/DO only, not EDNS presence, UDP payload size,
+/// or question-name casing, so a follower's own request can legitimately
+/// differ from `synthesis.original_query` on any of those (RFC 6891
+/// §6.1.1/§7, RFC 4035 §3.2.1, RFC 1035 §4.1.2).
+///
+/// `answers`/`authorities` need no content filtering here -- both call
+/// sites only reach this function when nothing DNSSEC-specific would be
+/// stripped (DO=true keeps everything by construction; DO=false already
+/// proved via `filtering_would_change_response` that there's nothing to
+/// remove) -- so they're reused by reference straight off
+/// `response_message`, with no clone-heavy `filter_response_for_requester`
+/// pass. Only `additionals` needs work: any existing `RecordData::OPT` is
+/// stripped out (defensively -- `recursive_response_record_supported`
+/// already excludes OPT from anything `filter_response_for_requester`
+/// would produce, but `response_message.additionals` itself still carries
+/// the leader-synthesized OPT verbatim) and a fresh
+/// `mirrored_client_opt_record` for *this* requester is appended in its
+/// place.
+fn rebuild_recursive_response_with_own_framing(
+    decoded: &DecodedQuery,
+    response_message: &Message,
+    rcode: ResponseCode,
+    configured_max_udp_payload_size: usize,
+) -> Result<Vec<u8>, ResolutionBackendError> {
+    #[cfg(test)]
+    REBUILD_RECURSIVE_RESPONSE_WITH_OWN_FRAMING_CALLS.with(|calls| calls.set(calls.get() + 1));
+
+    let mut additionals: Vec<Record> = response_message
+        .additionals
+        .iter()
+        .filter(|record| !matches!(record.record, RecordData::OPT(_)))
+        .cloned()
+        .collect();
+    if let Some(opt) = mirrored_client_opt_record(&decoded.message, configured_max_udp_payload_size)
+    {
+        additionals.push(opt);
+    }
+    serialize_recursive_response(
+        &decoded.message,
+        rcode,
+        false,
+        &response_message.answers,
+        &response_message.authorities,
+        &additionals,
+    )
+}
+
 /// Builds a truncated (TC=1) response for `decoded`'s original query:
 /// header + question + a mirrored OPT record (RFC 6891 §7) if the query
 /// carried EDNS, no answer/authority/other additional records, and CD
@@ -1573,11 +1701,91 @@ fn truncated_response_for_query(
     crate::protocol::build_truncated_wire_response(
         decoded.message.header.id,
         decoded.message.header.rd(),
+        false, // no resolved backend answer at this point to be authoritative about
         decoded.message.header.cd(),
         response_code,
         &decoded.question_wire,
         opt.as_ref(),
     )
+}
+
+/// Whether `decoded`'s own request would already produce byte-identical
+/// question-echo and OPT framing to what `synthesis.original_query` (the
+/// request that actually synthesized the shared recursive response) baked
+/// into it -- i.e. whether this really is the ordinary, non-coalesced
+/// path (or a coalesced follower whose own framing happens to exactly
+/// match the leader's), where `rebuild_recursive_response_with_own_framing`
+/// would just reproduce `response_bytes` byte-for-byte and is pure waste,
+/// as opposed to a coalesced follower whose own EDNS presence, DO flag,
+/// or question-name casing genuinely differs from whoever synthesized
+/// this shared response and therefore needs the rebuild.
+///
+/// Only two things ever differ between the two requests' framing here:
+/// the echoed question (RFC 1035 §4.1.2 requires it be copied back
+/// verbatim, including case -- `MissKey` normalizes case away, so
+/// coalesced requests can legitimately differ here) and the OPT record
+/// (`mirrored_client_opt_record`/`message_edns_opt_record` derive it from
+/// only two things about the *request*: whether EDNS is present at all,
+/// and the DO flag -- the UDP payload size it writes is this resolver's
+/// own configured/effective size, identical across every response
+/// regardless of which request is asking, so it never needs comparing
+/// here). ID/RD/CD are handled generically and cheaply by the earlier
+/// `rewrite_response_request_fields` call in `prepare_backend_result` and
+/// don't need rebuilding at all, matching or not.
+fn recursive_synthesis_reused_own_framing(
+    decoded: &DecodedQuery,
+    synthesis: &RecursiveSynthesisContext,
+) -> bool {
+    let original_query = &synthesis.original_query;
+
+    let question_matches = decoded.message.questions.first() == original_query.questions.first();
+
+    let opt_matches = match (decoded.message.edns.as_ref(), original_query.edns.as_ref()) {
+        (None, None) => true,
+        (Some(this), Some(original)) => this.dnssec_ok == original.dnssec_ok,
+        _ => false,
+    };
+
+    question_matches && opt_matches
+}
+
+/// Final over-the-wire size guard applied to *any* bytes built by a
+/// per-requester reserialization pass in `prepare_backend_result`
+/// (`rebuild_recursive_response_with_own_framing`'s two call sites, and
+/// the DO=false filtered-response `serialize_recursive_response` call).
+/// `exceeds_unfiltered`, computed once early in `prepare_backend_result`,
+/// only measures the shared/leader-framed `response_bytes` -- *before*
+/// any of this requester's own framing is rebuilt in. Appending this
+/// requester's own OPT record (see
+/// `recursive_synthesis_reused_own_framing`'s doc comment on what can
+/// differ) can grow a response that fit under the leader's framing past
+/// *this* requester's own UDP payload limit; trusting the stale,
+/// pre-rebuild `exceeds_unfiltered` value instead of re-measuring the
+/// actual bytes about to be sent would ship an oversized response with
+/// TC=0 -- an RFC 6891 §6.2.3/§7 + RFC 1035 §4.1.1 truncation-semantics
+/// violation. Both of Codex's independent adversarial reviews (a
+/// performance-focused pass and a DNS-compliance-focused pass) flagged
+/// this same gap independently.
+///
+/// `is_udp_response` mirrors the same TCP gate `exceeds_unfiltered`
+/// itself uses (`!request.observed_source.is_tcp()`) -- a TCP response is
+/// never truncated this way, matching the rest of this function.
+fn enforce_udp_payload_limit_after_reserialize(
+    decoded: &DecodedQuery,
+    is_udp_response: bool,
+    bytes: Vec<u8>,
+    rcode: ResponseCode,
+    configured_max_udp_payload_size: usize,
+) -> Vec<u8> {
+    if is_udp_response
+        && decoded
+            .message
+            .response_exceeds_udp_payload(bytes.len(), configured_max_udp_payload_size)
+    {
+        truncated_response_for_query(decoded, rcode, configured_max_udp_payload_size)
+    } else {
+        bytes
+    }
 }
 
 fn serialize_recursive_response(
@@ -4218,9 +4426,18 @@ impl ResolveQuery {
         }
 
         let mut response_bytes = response.bytes;
+        // This response may be the coalescing leader's own fetch result,
+        // reused verbatim for a follower whose request wasn't identical to
+        // the leader's (see `resolve_coalesced_follower` ->
+        // `finish_backend_result` -> here) -- `MissKey` coalesces on
+        // name/type/class/namespace/DO only, not RD or casing, so the
+        // leader's RD bit is not necessarily this request's own. Rewriting
+        // both the ID and RD bit from `decoded.message` (rather than just
+        // the ID) keeps a follower's own reported RD flag accurate even
+        // when this is a shared/reused backend result.
         if self
             .protocol
-            .rewrite_response_id(&mut response_bytes, decoded.message.header.id)
+            .rewrite_response_request_fields(&mut response_bytes, &decoded.message)
             .is_err()
         {
             return self.backend_failure_response(request, decoded, decoded.question.clone());
@@ -4246,12 +4463,29 @@ impl ResolveQuery {
                     ResolutionMode::Recursive => true,
                     ResolutionMode::Forward => decoded.features.dnssec_ok,
                 };
+                // AA (RFC 1035 §4.1.1) describes *this resolver's* own
+                // authority over the zone, not whichever upstream server
+                // this response happened to come from. For a recursive
+                // fetch, `response_message` is an upstream authority's
+                // answer, not rdns's own -- rdns is never itself
+                // authoritative while recursing, so a recursive cache hit
+                // must never claim AA=1 (this must stay consistent with the
+                // recursive miss path, which already always serializes its
+                // synthesized responses with AA=false). The forwarding
+                // backend is a transparent proxy and may legitimately relay
+                // an answer from a forwarder that really is authoritative
+                // for the zone, so its real AA bit is preserved.
+                let store_authoritative = match backend_mode {
+                    ResolutionMode::Recursive => false,
+                    ResolutionMode::Forward => response_message.header.aa(),
+                };
                 self.store_cache_response(
                     cache_namespace.unwrap_or_default(),
                     &response_message,
                     &question,
                     request,
                     store_dnssec_ok,
+                    store_authoritative,
                 )
                 .await;
             } else {
@@ -4281,8 +4515,14 @@ impl ResolveQuery {
         // `filter_response_for_requester` + a second full
         // `serialize_recursive_response` pass would be pure waste.
         let configured_max_udp_payload_size = self.protocol.configured_max_udp_payload_size();
+        // Shared by `exceeds_unfiltered` below and by
+        // `enforce_udp_payload_limit_after_reserialize` further down --
+        // TCP responses are never truncated this way, regardless of
+        // whether the size check runs against the pre-rebuild leader
+        // framing or the actual per-requester reserialized bytes.
+        let is_udp_response = !request.observed_source.is_tcp();
         let exceeds_unfiltered = backend_mode == ResolutionMode::Recursive
-            && !request.observed_source.is_tcp()
+            && is_udp_response
             && decoded.message.response_exceeds_udp_payload(
                 response_bytes.len(),
                 configured_max_udp_payload_size,
@@ -4323,36 +4563,95 @@ impl ResolveQuery {
             // byte-for-byte identical to what filtering would produce.
             // `filtering_would_change_response` doesn't look at size at
             // all, so this check is valid regardless of whether the
-            // unfiltered bytes fit:
+            // unfiltered bytes fit: cloning every record and reserializing
+            // only to reproduce (or fail to shrink) the same content is
+            // pure waste either way. This is distinct from the case below
+            // where filtering *would* change something: there, the
+            // filtered size genuinely has to be measured before truncation
+            // can be decided, since filtering may be exactly what brings
+            // it back under the limit.
             //
-            //   * unfiltered fits (`!exceeds_unfiltered`): the already-built
-            //     `response_bytes` (== `response.bytes`) is that exact
-            //     response, mirrored client OPT included -- reuse it
-            //     unchanged.
-            //   * unfiltered doesn't fit (`exceeds_unfiltered`): filtering
-            //     is proven ahead of time to remove nothing, so the
-            //     filtered result would *also* be oversized -- there is no
-            //     need to pay for the clone-heavy filter pass and a second
-            //     full `serialize_recursive_response` just to discover
-            //     that; go straight to truncation.
-            //
-            // Either way, cloning every record and reserializing only to
-            // reproduce (or fail to shrink) the same bytes is pure waste.
-            // This is distinct from the case below where filtering *would*
-            // change something: there, the filtered size genuinely has to
-            // be measured before truncation can be decided, since
-            // filtering may be exactly what brings it back under the
-            // limit.
+            // Content is settled either way, but *framing* (question-echo
+            // casing, OPT presence) is not: `exceeds_unfiltered` was
+            // measured once, early, against the leader/synthesizer-framed
+            // `response_bytes` -- only trustworthy for *this* requester if
+            // `recursive_synthesis_reused_own_framing` says its own framing
+            // is the same framing that measurement was taken against. When
+            // it differs (a coalesced follower whose own EDNS
+            // presence/DO/question casing doesn't match whoever actually
+            // synthesized this shared response), the requester's own
+            // framing must be rebuilt and *re-measured* before truncation
+            // can be decided -- rebuilding can push a leader-fitting
+            // response over the requester's own limit (e.g. a larger own
+            // OPT record) just as easily as it can pull a leader-oversized
+            // one back under it (e.g. dropping the leader's OPT entirely),
+            // so the stale `exceeds_unfiltered` verdict cannot be trusted
+            // in either direction once framing differs.
             if !filtering_would_change_response(&response_message, &questions) {
-                if exceeds_unfiltered {
-                    response_bytes = truncated_response_for_query(
+                if recursive_synthesis_reused_own_framing(decoded, synthesis) {
+                    // This requester's own question-echo/OPT framing
+                    // already matches whatever `response_bytes` (==
+                    // `response.bytes`) has baked in -- the ordinary,
+                    // non-coalesced path, or a coalesced follower whose
+                    // framing happens to exactly match the leader's.
+                    // `rebuild_recursive_response_with_own_framing` would
+                    // just reproduce the same bytes; skip the clone-heavy
+                    // reserialize entirely. `response_bytes` is unchanged
+                    // and *is* this requester's own framing, so
+                    // `exceeds_unfiltered` (measured against those same
+                    // bytes) is a trustworthy, non-stale size verdict here.
+                    if exceeds_unfiltered {
+                        response_bytes = truncated_response_for_query(
+                            decoded,
+                            response_code(&response_message).unwrap_or(ResponseCode::ServFail),
+                            configured_max_udp_payload_size,
+                        );
+                    }
+                } else if let Ok(bytes) = rebuild_recursive_response_with_own_framing(
+                    decoded,
+                    &response_message,
+                    response_code(&response_message).unwrap_or(ResponseCode::ServFail),
+                    configured_max_udp_payload_size,
+                ) {
+                    // There's nothing DNSSEC-specific for a DO=false filter
+                    // pass to remove, so the content of `response_bytes` (==
+                    // `response.bytes`) is already right -- but its baked-in
+                    // OPT record and echoed question still reflect whichever
+                    // request originally synthesized this response
+                    // (`synthesis.original_query`), not necessarily *this*
+                    // requester's own (a coalesced follower can legitimately
+                    // differ from the leader on EDNS presence or question-name
+                    // casing even though both share the same DO=false
+                    // `MissKey` dimension -- see
+                    // `rebuild_recursive_response_with_own_framing`'s doc
+                    // comment). Rebuild header/question/OPT from
+                    // `decoded.message` cheaply, without paying for a
+                    // clone-heavy `filter_response_for_requester` pass that
+                    // would just reproduce the same answers/authorities.
+                    //
+                    // This requester's own framing can move the size either
+                    // direction relative to the stale, pre-rebuild
+                    // `exceeds_unfiltered` measurement of the leader-framed
+                    // bytes -- appending this requester's own (larger) OPT
+                    // record can push a leader-fitting response over the
+                    // limit, and dropping/shrinking it relative to the
+                    // leader's can just as easily pull a leader-oversized
+                    // response back under it (e.g. an EDNS leader with a
+                    // non-EDNS follower: the leader-framed bytes may exceed
+                    // the limit purely due to the leader's own OPT record,
+                    // while the follower's own OPT-less framing genuinely
+                    // fits). Always re-check the *actual* rebuilt bytes
+                    // about to be sent, regardless of what
+                    // `exceeds_unfiltered` said about the leader's framing
+                    // (RFC 6891 §6.2.3/§7, RFC 1035 §4.1.1).
+                    response_bytes = enforce_udp_payload_limit_after_reserialize(
                         decoded,
+                        is_udp_response,
+                        bytes,
                         response_code(&response_message).unwrap_or(ResponseCode::ServFail),
                         configured_max_udp_payload_size,
                     );
                 }
-                // else: `response_bytes` is already exactly right -- fall
-                // through with it unchanged.
             } else {
                 // Client-facing filter: storage above always saw the full,
                 // DNSSEC-complete `response_message`. The bytes actually
@@ -4373,38 +4672,103 @@ impl ResolveQuery {
                 // `synthesize_recursive_cname_response` does, or a DO=false
                 // client's filtered response would silently lose EDNS (UDP
                 // payload size negotiation, etc.).
-                if let Some(opt) = mirrored_client_opt_record(
-                    &synthesis.original_query,
-                    configured_max_udp_payload_size,
-                ) {
+                // Header fields (ID/RD/CD) and the echoed question must
+                // come from *this* requester's own query, not
+                // `synthesis.original_query` -- that's whichever request
+                // originally synthesized this response, which on a
+                // coalesced-follower fallback (leader's result wasn't
+                // cacheable, so no cache-hit path reran per-follower) is
+                // the leader's request, not this follower's. Using it here
+                // would put the leader's transaction ID/RD/CD back on this
+                // follower's response (RFC 1035 §4.1.1, RFC 4035 §3.2.2).
+                // `synthesis.original_question`/`final_question` (via
+                // `questions` above) are still the right source for *which*
+                // records match during filtering -- that's about content,
+                // not header framing.
+                if let Some(opt) =
+                    mirrored_client_opt_record(&decoded.message, configured_max_udp_payload_size)
+                {
                     additionals.push(opt);
                 }
                 if let Ok(filtered_bytes) = serialize_recursive_response(
-                    &synthesis.original_query,
+                    &decoded.message,
                     response_code(&response_message).unwrap_or(ResponseCode::ServFail),
                     false,
                     &answers,
                     &authorities,
                     &additionals,
                 ) {
-                    if exceeds_unfiltered
-                        && decoded.message.response_exceeds_udp_payload(
-                            filtered_bytes.len(),
-                            configured_max_udp_payload_size,
-                        )
-                    {
-                        // Stripping DNSSEC material wasn't enough -- the
-                        // filtered response still doesn't fit, so
-                        // truncation is genuinely unavoidable here.
-                        response_bytes = truncated_response_for_query(
-                            decoded,
-                            response_code(&response_message).unwrap_or(ResponseCode::ServFail),
-                            configured_max_udp_payload_size,
-                        );
-                    } else {
-                        response_bytes = filtered_bytes;
-                    }
+                    // Re-check the *actual* filtered-and-reframed bytes
+                    // against this requester's own UDP payload limit,
+                    // unconditionally -- not just when the earlier,
+                    // pre-rebuild `exceeds_unfiltered` (measured from the
+                    // leader-framed `response_bytes`) was already true.
+                    // `exceeds_unfiltered` being false only proves the
+                    // *leader's* framing fit; this requester's own OPT (or
+                    // the leader having had none at all) can still push
+                    // `filtered_bytes` past the limit even though
+                    // `exceeds_unfiltered` was false, since filtering can
+                    // both remove DNSSEC material *and* add this
+                    // requester's own (possibly larger) OPT record. Trusting
+                    // the stale flag here was the second half of the same
+                    // RFC 6891 §6.2.3/§7 + RFC 1035 §4.1.1 gap the DO=false
+                    // and DO=true fast paths had.
+                    response_bytes = enforce_udp_payload_limit_after_reserialize(
+                        decoded,
+                        is_udp_response,
+                        filtered_bytes,
+                        response_code(&response_message).unwrap_or(ResponseCode::ServFail),
+                        configured_max_udp_payload_size,
+                    );
                 }
+            }
+        } else if let Some(synthesis) = response
+            .recursive_synthesis
+            .as_ref()
+            .filter(|_| backend_mode == ResolutionMode::Recursive)
+        {
+            // DO=true (the only way to reach here with a recursive-synthesis
+            // response and `filterable == false`, since `filterable` only
+            // excludes DO=true and non-recursive/non-synthesis responses,
+            // and the non-recursive/no-synthesis case has no baked-in-OPT
+            // problem to begin with -- see this branch's doc comment on
+            // `rebuild_recursive_response_with_own_framing`). Filtering is a
+            // genuine no-op for DO=true (it keeps every DNSSEC record), and
+            // the unfiltered bytes already fit
+            // (`!exceeds_unfiltered`), so the content of `response_bytes`
+            // (== `response.bytes`) needs no changes -- but same as the
+            // DO=false no-op case above, its OPT record and echoed question
+            // still reflect whichever request originally synthesized this
+            // response, not necessarily this requester's own, on a
+            // coalesced-follower fallback. Rebuild header/question/OPT from
+            // `decoded.message` cheaply rather than leaving the leader's
+            // framing on this follower's response -- but only when that
+            // framing has actually been detected to differ; the ordinary,
+            // non-coalesced path (or a coalesced follower whose framing
+            // happens to exactly match) needs no reserialize at all, and
+            // `response_bytes` unchanged is still covered by the
+            // `exceeds_unfiltered` check above.
+            if !recursive_synthesis_reused_own_framing(decoded, synthesis)
+                && let Ok(bytes) = rebuild_recursive_response_with_own_framing(
+                    decoded,
+                    &response_message,
+                    response_code(&response_message).unwrap_or(ResponseCode::ServFail),
+                    configured_max_udp_payload_size,
+                )
+            {
+                // Same growth risk as the DO=false fast path above:
+                // appending this requester's own OPT record can push the
+                // rebuilt response past its UDP payload limit even though
+                // the leader-framed bytes fit -- re-check the actual
+                // bytes, not the stale pre-rebuild `exceeds_unfiltered`
+                // measurement.
+                response_bytes = enforce_udp_payload_limit_after_reserialize(
+                    decoded,
+                    is_udp_response,
+                    bytes,
+                    response_code(&response_message).unwrap_or(ResponseCode::ServFail),
+                    configured_max_udp_payload_size,
+                );
             }
         }
 
@@ -4463,10 +4827,15 @@ impl ResolveQuery {
         question: &QuestionKey,
         request: &ResolveRequest,
         dnssec_ok: bool,
+        store_authoritative: bool,
     ) {
-        if let Some(decomposed) =
-            self.cache_store_for_response(response, question, request.received_at.0, dnssec_ok)
-        {
+        if let Some(decomposed) = self.cache_store_for_response(
+            response,
+            question,
+            request.received_at.0,
+            dnssec_ok,
+            store_authoritative,
+        ) {
             if decomposed.negative.is_some() {
                 self.metrics.increment(ResolverMetric::CacheNegativeStore);
             }
@@ -4491,6 +4860,7 @@ impl ResolveQuery {
         question: &QuestionKey,
         stored_at: SystemTime,
         dnssec_ok: bool,
+        store_authoritative: bool,
     ) -> Option<DecomposedResponse> {
         if !response.header.qr()
             || response.questions.len() != 1
@@ -4506,6 +4876,7 @@ impl ResolveQuery {
             negative_meta.as_ref(),
             stored_at,
             dnssec_ok,
+            store_authoritative,
         ))
     }
 
@@ -4922,6 +5293,14 @@ impl ProtocolCodec for StandardProtocolCodec {
     ) -> crate::protocol::Result<()> {
         rewrite_response_id(response_bytes, request_id)
     }
+
+    fn rewrite_response_request_fields(
+        &self,
+        response_bytes: &mut [u8],
+        request: &Message,
+    ) -> crate::protocol::Result<()> {
+        rewrite_response_request_fields(response_bytes, request)
+    }
 }
 
 pub struct BasicResponseFactory;
@@ -5128,6 +5507,23 @@ pub trait ProtocolCodec: Send + Sync {
         &self,
         response_bytes: &mut [u8],
         request_id: u16,
+    ) -> crate::protocol::Result<()>;
+
+    /// Rewrites both the transaction ID and the RD bit of `response_bytes`
+    /// to match `request`. Unlike `rewrite_response_id` alone, this is
+    /// needed whenever `response_bytes` was built for a *different*
+    /// request than the one it's about to be served to — the single-flight
+    /// follower fallback path (`prepare_backend_result`) is the one caller:
+    /// a follower's own request can differ from the coalescing leader's in
+    /// its RD flag (and casing, though casing is handled separately), since
+    /// `MissKey` coalesces on name/type/class/namespace/DO only, not RD.
+    /// Serving the leader's raw RD bit back to a follower that asked with a
+    /// different RD would silently misreport what the follower itself
+    /// requested.
+    fn rewrite_response_request_fields(
+        &self,
+        response_bytes: &mut [u8],
+        request: &Message,
     ) -> crate::protocol::Result<()>;
 }
 
@@ -7207,6 +7603,22 @@ mod tests {
         bytes
     }
 
+    /// Sets or clears the AA bit (0x0400) on an already-built response's
+    /// wire bytes -- used to simulate an upstream backend response that
+    /// claims to be an authoritative answer, since the shared response
+    /// builders used elsewhere in these tests don't expose an `aa`
+    /// parameter of their own.
+    fn set_response_aa(mut bytes: Vec<u8>, aa: bool) -> Vec<u8> {
+        let mut flags = u16::from_be_bytes([bytes[2], bytes[3]]);
+        if aa {
+            flags |= 0x0400;
+        } else {
+            flags &= !0x0400;
+        }
+        bytes[2..4].copy_from_slice(&flags.to_be_bytes());
+        bytes
+    }
+
     fn a_query_with_checking_disabled(id: u16, name: &str) -> Vec<u8> {
         let mut bytes = a_query(id, name);
         let flags = u16::from_be_bytes([bytes[2], bytes[3]]) | 0x0010;
@@ -8831,6 +9243,14 @@ mod tests {
             request_id: u16,
         ) -> crate::protocol::Result<()> {
             rewrite_response_id(response_bytes, request_id)
+        }
+
+        fn rewrite_response_request_fields(
+            &self,
+            response_bytes: &mut [u8],
+            request: &Message,
+        ) -> crate::protocol::Result<()> {
+            rewrite_response_request_fields(response_bytes, request)
         }
     }
 
@@ -13315,6 +13735,7 @@ mod tests {
             negative_meta.as_ref(),
             SystemTime::UNIX_EPOCH,
             true,
+            true,
         );
 
         assert!(
@@ -13353,6 +13774,7 @@ mod tests {
             ttl,
             negative_meta.as_ref(),
             SystemTime::UNIX_EPOCH,
+            true,
             true,
         );
 
@@ -13404,6 +13826,7 @@ mod tests {
             negative_meta.as_ref(),
             SystemTime::UNIX_EPOCH,
             true,
+            true,
         );
 
         assert_eq!(decomposed.positive.len(), 2);
@@ -13453,6 +13876,7 @@ mod tests {
             ttl,
             negative_meta.as_ref(),
             SystemTime::UNIX_EPOCH,
+            true,
             true,
         );
 
@@ -15014,6 +15438,7 @@ mod tests {
             dnssec_state: Default::default(),
             cache_namespace: namespace.to_string(),
             dnssec_complete: true,
+            authoritative: false,
         }
     }
 
@@ -15494,6 +15919,7 @@ mod tests {
             dnssec_state: Default::default(),
             cache_namespace: namespace,
             dnssec_complete: true,
+            authoritative: false,
         };
         let resolved = cache::ResolvedAnswer {
             chain: vec![("example.com".to_string(), entry)],
@@ -15638,6 +16064,1196 @@ mod tests {
         assert_eq!(
             metrics.duration_count(ResolverMetric::CacheMissQueryDuration),
             2
+        );
+    }
+
+    /// Regression test for the single-flight follower fallback bug: when
+    /// the leader's fetch result isn't cacheable, a follower falls back to
+    /// `prepare_backend_result` reusing the leader's raw backend response
+    /// bytes (`resolve_coalesced_follower` -> `finish_backend_result` ->
+    /// `prepare_backend_result`, no fresh `cache_hit_after_coalesced_miss`
+    /// hit to reassemble from). `MissKey` coalesces on
+    /// name/type/class/namespace/DO only, not RD, so a follower whose own
+    /// request set a *different* RD bit than the leader's must still get
+    /// its own RD bit back, not the leader's raw one.
+    #[tokio::test]
+    async fn resolve_coalesced_follower_fallback_preserves_its_own_rd_bit() {
+        let cache = Arc::new(ShardedDnsCache::new(&CacheConfig {
+            max_entries: 16,
+            shard_count: Some(1),
+        }));
+        let mut response = upstream_response(a_response_with_answer(0xaaaa, "example.com", 60));
+        // Not cacheable, so the follower can't get a fresh cache-hit
+        // reassembly and must fall back to the leader's raw response bytes.
+        response.cache_directive =
+            ResolutionCacheDirective::DoNotCache(ResolutionNoCacheReason::BackendPolicy);
+        let upstream = Arc::new(BlockingUpstream::new(Ok(response)));
+        let events = Arc::new(RecordingEvents::default());
+        let metrics = Arc::new(RecordingMetrics::default());
+        let service = Arc::new(resolve_service_with_cache(
+            upstream.clone(),
+            cache,
+            events,
+            metrics.clone(),
+            1232,
+        ));
+
+        // Leader: RD=1.
+        let leader = {
+            let service = Arc::clone(&service);
+            tokio::spawn(async move {
+                service
+                    .resolve(ResolveRequest::new(
+                        "192.0.2.10".parse().unwrap(),
+                        SystemTime::UNIX_EPOCH,
+                        a_query(0x1111, "example.com"),
+                    ))
+                    .await
+            })
+        };
+        upstream.wait_for_requests(1).await;
+
+        // Follower: same name/type/class, but RD=0 -- differs from the
+        // leader's own request, which `MissKey` doesn't distinguish on.
+        let follower = {
+            let service = Arc::clone(&service);
+            tokio::spawn(async move {
+                service
+                    .resolve(ResolveRequest::new(
+                        "192.0.2.11".parse().unwrap(),
+                        SystemTime::UNIX_EPOCH,
+                        a_query_without_rd(0x2222, "example.com"),
+                    ))
+                    .await
+            })
+        };
+
+        tokio::task::yield_now().await;
+        assert_eq!(
+            upstream.requests.lock().unwrap().len(),
+            1,
+            "the follower must coalesce onto the leader's single in-flight fetch"
+        );
+        upstream.release.notify_waiters();
+        let leader = leader.await.unwrap();
+        let follower = follower.await.unwrap();
+
+        assert_eq!(metrics.count(ResolverMetric::CacheCoalescedMiss), 1);
+
+        let leader_message = Message::parse(&leader.response_bytes).unwrap();
+        let follower_message = Message::parse(&follower.response_bytes).unwrap();
+        assert!(
+            leader_message.header.rd(),
+            "the leader's own request set RD=1"
+        );
+        assert!(
+            !follower_message.header.rd(),
+            "the follower's own request set RD=0 -- it must not be overwritten with the \
+             leader's RD=1 from the shared/reused backend response bytes"
+        );
+        assert_eq!(follower_message.header.id, 0x2222);
+    }
+
+    /// Regression test for RFC 4035 §3.2.2: same fallback path as
+    /// `resolve_coalesced_follower_fallback_preserves_its_own_rd_bit`, but
+    /// for the CD (checking disabled) bit. `MissKey` coalesces on
+    /// name/type/class/namespace/DO only, not CD, so a follower whose own
+    /// request set a *different* CD bit than the leader's must still get
+    /// its own CD bit back in the shared/reused backend response bytes, not
+    /// the leader's.
+    #[tokio::test]
+    async fn resolve_coalesced_follower_fallback_preserves_its_own_cd_bit() {
+        let cache = Arc::new(ShardedDnsCache::new(&CacheConfig {
+            max_entries: 16,
+            shard_count: Some(1),
+        }));
+        let mut response = upstream_response(a_response_with_answer(0xaaaa, "example.com", 60));
+        // Not cacheable, so the follower can't get a fresh cache-hit
+        // reassembly and must fall back to the leader's raw response bytes.
+        response.cache_directive =
+            ResolutionCacheDirective::DoNotCache(ResolutionNoCacheReason::BackendPolicy);
+        let upstream = Arc::new(BlockingUpstream::new(Ok(response)));
+        let events = Arc::new(RecordingEvents::default());
+        let metrics = Arc::new(RecordingMetrics::default());
+        let service = Arc::new(resolve_service_with_cache(
+            upstream.clone(),
+            cache,
+            events,
+            metrics.clone(),
+            1232,
+        ));
+
+        // Leader: CD=0.
+        let leader = {
+            let service = Arc::clone(&service);
+            tokio::spawn(async move {
+                service
+                    .resolve(ResolveRequest::new(
+                        "192.0.2.10".parse().unwrap(),
+                        SystemTime::UNIX_EPOCH,
+                        a_query(0x1111, "example.com"),
+                    ))
+                    .await
+            })
+        };
+        upstream.wait_for_requests(1).await;
+
+        // Follower: same name/type/class, but CD=1 -- differs from the
+        // leader's own request, which `MissKey` doesn't distinguish on.
+        let follower = {
+            let service = Arc::clone(&service);
+            tokio::spawn(async move {
+                service
+                    .resolve(ResolveRequest::new(
+                        "192.0.2.11".parse().unwrap(),
+                        SystemTime::UNIX_EPOCH,
+                        a_query_with_checking_disabled(0x2222, "example.com"),
+                    ))
+                    .await
+            })
+        };
+
+        tokio::task::yield_now().await;
+        assert_eq!(
+            upstream.requests.lock().unwrap().len(),
+            1,
+            "the follower must coalesce onto the leader's single in-flight fetch"
+        );
+        upstream.release.notify_waiters();
+        let leader = leader.await.unwrap();
+        let follower = follower.await.unwrap();
+
+        assert_eq!(metrics.count(ResolverMetric::CacheCoalescedMiss), 1);
+
+        let leader_message = Message::parse(&leader.response_bytes).unwrap();
+        let follower_message = Message::parse(&follower.response_bytes).unwrap();
+        assert!(
+            !leader_message.header.cd(),
+            "the leader's own request set CD=0"
+        );
+        assert!(
+            follower_message.header.cd(),
+            "the follower's own request set CD=1 -- it must not be overwritten with the \
+             leader's CD=0 from the shared/reused backend response bytes"
+        );
+        assert_eq!(follower_message.header.id, 0x2222);
+    }
+
+    /// Regression test for the recursive-mode filtered-fallback header bug:
+    /// unlike the two tests above (which use a generic `ResolutionBackend`
+    /// mock with no `recursive_synthesis`, so `prepare_backend_result`'s
+    /// DO=false filter branch never runs), this exercises the *real*
+    /// recursive backend with a DNSSEC-bearing response, forcing a
+    /// coalesced follower down the filtered-fallback path
+    /// (`response.recursive_synthesis.is_some()` and
+    /// `filtering_would_change_response` both true). A zero-capacity cache
+    /// makes `store_cache_response` a silent no-op (`Shard::store_*`
+    /// early-returns when `capacity == 0`), so the follower's
+    /// `cache_hit_after_coalesced_miss` finds nothing and falls back to
+    /// `prepare_backend_result` reusing the leader's synthesized response --
+    /// exactly the scenario where the filtered branch used to reserialize
+    /// with `synthesis.original_query` (the *leader's* request) instead of
+    /// this follower's own `decoded.message`, putting the leader's ID/RD/CD
+    /// on the follower's response (RFC 1035 §4.1.1, RFC 4035 §3.2.2).
+    #[tokio::test]
+    async fn resolve_coalesced_follower_filtered_fallback_preserves_its_own_header_fields() {
+        let cache = Arc::new(ShardedDnsCache::new(&CacheConfig {
+            max_entries: 0,
+            shard_count: Some(1),
+        }));
+        let question = QuestionKey::new("example.com", A_RECORD_TYPE, 1);
+        let response_with_do = response_message_for_question(
+            question,
+            ResponseCode::NoError,
+            vec![
+                a_record("example.com", 60),
+                rrsig_record("example.com", 60, A_RECORD_TYPE),
+            ],
+            Vec::new(),
+            Vec::new(),
+            true,
+        );
+        // Only the `dnssec_ok = true` branch is ever exercised --
+        // `resolve_one_hop` always requests DNSSEC from upstream now,
+        // regardless of either requester's own DO flag.
+        let transport = Arc::new(DnssecAwareBlockingAuthorityTransport::new(
+            response_with_do.clone(),
+            response_with_do,
+        ));
+        let backend: Arc<dyn ResolutionBackend> = Arc::new(RecursiveResolutionBackend::new(
+            RecursiveResolverConfig {
+                root_hints: vec![RecursiveRootHint {
+                    name: "a.root-servers.example".to_string(),
+                    endpoints: vec!["198.51.100.53:53".parse().unwrap()],
+                }],
+                per_authority_timeout: Duration::from_millis(500),
+                per_query_deadline: Duration::from_secs(2),
+                max_recursion_depth: 8,
+                max_cname_restarts: 4,
+                configured_max_udp_payload_size: 1232,
+            },
+            transport.clone(),
+        ));
+        let events = Arc::new(RecordingEvents::default());
+        let metrics = Arc::new(RecordingMetrics::default());
+        let service = Arc::new(resolve_service_with_recursive_cache(
+            backend,
+            cache,
+            events,
+            metrics.clone(),
+            1232,
+        ));
+
+        // Leader: ID=0x1111, RD=1, CD=0, DO=false.
+        let leader_query = a_query_with_edns(0x1111, "example.com", 1232, false);
+        // Follower: same name/type/class (so it coalesces onto the same
+        // `MissKey`), but a different ID, RD=0, and CD=1 -- none of which
+        // `MissKey` distinguishes on, and none of which the leader's own
+        // request shares.
+        let mut follower_query = a_query_with_edns(0x2222, "example.com", 1232, false);
+        let follower_flags =
+            (u16::from_be_bytes([follower_query[2], follower_query[3]]) | 0x0010) & !0x0100;
+        follower_query[2..4].copy_from_slice(&follower_flags.to_be_bytes());
+
+        let leader = {
+            let service = Arc::clone(&service);
+            tokio::spawn(async move {
+                service
+                    .resolve(ResolveRequest::new(
+                        "192.0.2.10".parse().unwrap(),
+                        SystemTime::UNIX_EPOCH,
+                        leader_query,
+                    ))
+                    .await
+            })
+        };
+        transport.wait_for_requests(1).await;
+
+        let follower = {
+            let service = Arc::clone(&service);
+            tokio::spawn(async move {
+                service
+                    .resolve(ResolveRequest::new(
+                        "192.0.2.11".parse().unwrap(),
+                        SystemTime::UNIX_EPOCH,
+                        follower_query,
+                    ))
+                    .await
+            })
+        };
+        tokio::task::yield_now().await;
+        assert_eq!(
+            transport.requests.lock().unwrap().len(),
+            1,
+            "the follower must coalesce onto the leader's single in-flight fetch"
+        );
+
+        transport.release.notify_waiters();
+        let leader = leader.await.unwrap();
+        let follower = follower.await.unwrap();
+
+        assert_eq!(metrics.count(ResolverMetric::CacheCoalescedMiss), 1);
+
+        assert!(
+            !response_contains_rrsig(&leader.response_bytes),
+            "the leader is DO=false and must not receive RRSIGs"
+        );
+        assert!(
+            !response_contains_rrsig(&follower.response_bytes),
+            "the follower is DO=false and must not receive RRSIGs either"
+        );
+
+        let leader_message = Message::parse(&leader.response_bytes).unwrap();
+        let follower_message = Message::parse(&follower.response_bytes).unwrap();
+
+        assert_eq!(leader_message.header.id, 0x1111);
+        assert!(leader_message.header.rd(), "leader's own request set RD=1");
+        assert!(!leader_message.header.cd(), "leader's own request set CD=0");
+
+        assert_eq!(
+            follower_message.header.id, 0x2222,
+            "the follower's own transaction ID must survive the filtered fallback, \
+             not the leader's"
+        );
+        assert!(
+            !follower_message.header.rd(),
+            "the follower's own request set RD=0 -- it must not be overwritten with the \
+             leader's RD=1 by the filtered-fallback reserialization path"
+        );
+        assert!(
+            follower_message.header.cd(),
+            "the follower's own request set CD=1 -- it must not be overwritten with the \
+             leader's CD=0 by the filtered-fallback reserialization path"
+        );
+    }
+
+    /// Regression test for the recursive-mode DO=true "nothing to filter"
+    /// fast path (the third Codex adversarial-review finding in this area,
+    /// after the ID/RD/CD-rewrite fix and the DO=false filtered-fallback
+    /// header fix above): `prepare_backend_result` used to just reuse
+    /// `response.bytes` -- built by `synthesize_recursive_cname_response`
+    /// from whichever query happened to synthesize this shared response --
+    /// for a DO=true requester whenever the unfiltered response already fit
+    /// the UDP payload size, after only rewriting ID/RD/CD. On a
+    /// coalesced-follower fallback (this test's zero-capacity cache forces
+    /// one, same as the test above), that means a follower's own echoed
+    /// question and OPT record could silently be the *leader's*, not its
+    /// own: `MissKey` coalesces on name/type/class/namespace only for the
+    /// recursive backend (its DO dimension is always canonicalized to
+    /// `true` -- see `probe_cache`), not question-name casing, so a
+    /// follower can legitimately send a differently-cased qname than the
+    /// leader's and still coalesce onto the same in-flight fetch. Exercises
+    /// the fix in `rebuild_recursive_response_with_own_framing`, invoked
+    /// from `prepare_backend_result`'s final
+    /// `else if backend_mode == ResolutionMode::Recursive && ...` branch.
+    #[tokio::test]
+    async fn resolve_coalesced_follower_do_true_fast_path_preserves_its_own_question_and_opt() {
+        let cache = Arc::new(ShardedDnsCache::new(&CacheConfig {
+            max_entries: 0,
+            shard_count: Some(1),
+        }));
+        let question = QuestionKey::new("example.com", A_RECORD_TYPE, 1);
+        let response_with_do = response_message_for_question(
+            question,
+            ResponseCode::NoError,
+            vec![
+                a_record("example.com", 60),
+                rrsig_record("example.com", 60, A_RECORD_TYPE),
+            ],
+            Vec::new(),
+            Vec::new(),
+            true,
+        );
+        let transport = Arc::new(DnssecAwareBlockingAuthorityTransport::new(
+            response_with_do.clone(),
+            response_with_do,
+        ));
+        let backend: Arc<dyn ResolutionBackend> = Arc::new(RecursiveResolutionBackend::new(
+            RecursiveResolverConfig {
+                root_hints: vec![RecursiveRootHint {
+                    name: "a.root-servers.example".to_string(),
+                    endpoints: vec!["198.51.100.53:53".parse().unwrap()],
+                }],
+                per_authority_timeout: Duration::from_millis(500),
+                per_query_deadline: Duration::from_secs(2),
+                max_recursion_depth: 8,
+                max_cname_restarts: 4,
+                configured_max_udp_payload_size: 1232,
+            },
+            transport.clone(),
+        ));
+        let events = Arc::new(RecordingEvents::default());
+        let metrics = Arc::new(RecordingMetrics::default());
+        let service = Arc::new(resolve_service_with_recursive_cache(
+            backend,
+            cache,
+            events,
+            metrics.clone(),
+            1232,
+        ));
+
+        // Leader: DO=true, lowercase qname.
+        let leader_query = a_query_with_edns(0x1111, "example.com", 1232, true);
+        // Follower: also DO=true (both requests land in the same
+        // `MissKey` bucket for the recursive backend regardless of DO, but
+        // keeping both DO=true here isolates this test to the DO=true
+        // fast path rather than the DO=false filtered-fallback path
+        // already covered above) and the same name/type/class, but a
+        // differently-cased qname -- `MissKey` never distinguishes on
+        // casing, so this still coalesces onto the leader's single
+        // in-flight fetch.
+        let follower_query = a_query_with_edns(0x2222, "EXAMPLE.com", 1232, true);
+
+        let leader = {
+            let service = Arc::clone(&service);
+            tokio::spawn(async move {
+                service
+                    .resolve(ResolveRequest::new(
+                        "192.0.2.10".parse().unwrap(),
+                        SystemTime::UNIX_EPOCH,
+                        leader_query,
+                    ))
+                    .await
+            })
+        };
+        transport.wait_for_requests(1).await;
+
+        let follower = {
+            let service = Arc::clone(&service);
+            tokio::spawn(async move {
+                service
+                    .resolve(ResolveRequest::new(
+                        "192.0.2.11".parse().unwrap(),
+                        SystemTime::UNIX_EPOCH,
+                        follower_query,
+                    ))
+                    .await
+            })
+        };
+        tokio::task::yield_now().await;
+        assert_eq!(
+            transport.requests.lock().unwrap().len(),
+            1,
+            "the follower must coalesce onto the leader's single in-flight fetch"
+        );
+
+        transport.release.notify_waiters();
+        let leader = leader.await.unwrap();
+        let follower = follower.await.unwrap();
+
+        assert_eq!(metrics.count(ResolverMetric::CacheCoalescedMiss), 1);
+
+        let leader_message = Message::parse(&leader.response_bytes).unwrap();
+        let follower_message = Message::parse(&follower.response_bytes).unwrap();
+
+        assert_eq!(leader_message.questions[0].qname, "example.com");
+        assert_eq!(
+            follower_message.questions[0].qname, "EXAMPLE.com",
+            "the follower's own echoed question casing must survive the DO=true \
+             fast path, not the leader's -- the echoed question must be sourced \
+             from `decoded.message`, not `response.bytes`/`response_message`"
+        );
+
+        let follower_opt = follower_message
+            .additionals
+            .iter()
+            .find(|record| matches!(record.record, RecordData::OPT(_)))
+            .expect("the DO=true follower's own response must carry an OPT record");
+        let RecordData::OPT(follower_edns) = &follower_opt.record else {
+            unreachable!();
+        };
+        assert!(
+            follower_edns.dnssec_ok,
+            "the follower's own request set DO=1"
+        );
+    }
+
+    /// Regression test for the exact scenario Codex's third adversarial
+    /// review called out: an EDNS follower (DO=false, but it did advertise
+    /// EDNS) coalescing behind a leader whose own request carried no EDNS
+    /// OPT record at all, where the shared response contains nothing
+    /// DNSSEC-specific for a DO=false filter pass to remove
+    /// (`filtering_would_change_response` is false, landing in
+    /// `prepare_backend_result`'s DO=false "nothing to filter" fast path).
+    /// Before the fix, that path reused `response.bytes` verbatim -- built
+    /// by `synthesize_recursive_cname_response` from the *leader's*
+    /// non-EDNS query -- so the follower's own advertised EDNS silently
+    /// vanished from its response even though it asked for it (RFC 6891
+    /// §6.1.1/§7).
+    #[tokio::test]
+    async fn resolve_coalesced_edns_follower_behind_non_edns_leader_keeps_its_own_opt() {
+        let cache = Arc::new(ShardedDnsCache::new(&CacheConfig {
+            max_entries: 0,
+            shard_count: Some(1),
+        }));
+        let question = QuestionKey::new("example.com", A_RECORD_TYPE, 1);
+        // No DNSSEC-type records at all, so a DO=false filter pass is
+        // proven to be a no-op (`filtering_would_change_response` false)
+        // regardless of which requester's `dnssec_ok` it runs under.
+        let response = response_message_for_question(
+            question,
+            ResponseCode::NoError,
+            vec![a_record("example.com", 60)],
+            Vec::new(),
+            Vec::new(),
+            true,
+        );
+        let transport = Arc::new(DnssecAwareBlockingAuthorityTransport::new(
+            response.clone(),
+            response,
+        ));
+        let backend: Arc<dyn ResolutionBackend> = Arc::new(RecursiveResolutionBackend::new(
+            RecursiveResolverConfig {
+                root_hints: vec![RecursiveRootHint {
+                    name: "a.root-servers.example".to_string(),
+                    endpoints: vec!["198.51.100.53:53".parse().unwrap()],
+                }],
+                per_authority_timeout: Duration::from_millis(500),
+                per_query_deadline: Duration::from_secs(2),
+                max_recursion_depth: 8,
+                max_cname_restarts: 4,
+                configured_max_udp_payload_size: 1232,
+            },
+            transport.clone(),
+        ));
+        let events = Arc::new(RecordingEvents::default());
+        let metrics = Arc::new(RecordingMetrics::default());
+        let service = Arc::new(resolve_service_with_recursive_cache(
+            backend,
+            cache,
+            events,
+            metrics.clone(),
+            1232,
+        ));
+
+        // Leader: no EDNS at all -- no OPT record in its own request.
+        let leader_query = a_query(0x1111, "example.com");
+        // Follower: same name/type/class (coalesces onto the leader's
+        // single in-flight fetch), but its own request *does* carry EDNS
+        // (DO=false).
+        let follower_query = a_query_with_edns(0x2222, "example.com", 1232, false);
+
+        let leader = {
+            let service = Arc::clone(&service);
+            tokio::spawn(async move {
+                service
+                    .resolve(ResolveRequest::new(
+                        "192.0.2.10".parse().unwrap(),
+                        SystemTime::UNIX_EPOCH,
+                        leader_query,
+                    ))
+                    .await
+            })
+        };
+        transport.wait_for_requests(1).await;
+
+        let follower = {
+            let service = Arc::clone(&service);
+            tokio::spawn(async move {
+                service
+                    .resolve(ResolveRequest::new(
+                        "192.0.2.11".parse().unwrap(),
+                        SystemTime::UNIX_EPOCH,
+                        follower_query,
+                    ))
+                    .await
+            })
+        };
+        tokio::task::yield_now().await;
+        assert_eq!(
+            transport.requests.lock().unwrap().len(),
+            1,
+            "the follower must coalesce onto the leader's single in-flight fetch"
+        );
+
+        transport.release.notify_waiters();
+        let leader = leader.await.unwrap();
+        let follower = follower.await.unwrap();
+
+        assert_eq!(metrics.count(ResolverMetric::CacheCoalescedMiss), 1);
+
+        let leader_message = Message::parse(&leader.response_bytes).unwrap();
+        assert!(
+            !leader_message
+                .additionals
+                .iter()
+                .any(|record| matches!(record.record, RecordData::OPT(_))),
+            "sanity check: the leader's own request carried no EDNS, so its own \
+             response must carry no OPT record either"
+        );
+
+        let follower_message = Message::parse(&follower.response_bytes).unwrap();
+        let follower_opt = follower_message
+            .additionals
+            .iter()
+            .find(|record| matches!(record.record, RecordData::OPT(_)))
+            .expect(
+                "the follower advertised EDNS itself and must get its own OPT record \
+                 back, not silently lose it just because the leader's synthesizing \
+                 query had none",
+            );
+        let RecordData::OPT(follower_edns) = &follower_opt.record else {
+            unreachable!();
+        };
+        assert!(
+            !follower_edns.dnssec_ok,
+            "the follower's own request set DO=0"
+        );
+    }
+
+    /// The reverse of the test above: a non-EDNS follower coalescing
+    /// behind an EDNS leader must not get an unsolicited OPT record it
+    /// never asked for.
+    #[tokio::test]
+    async fn resolve_coalesced_non_edns_follower_behind_edns_leader_gets_no_opt() {
+        let cache = Arc::new(ShardedDnsCache::new(&CacheConfig {
+            max_entries: 0,
+            shard_count: Some(1),
+        }));
+        let question = QuestionKey::new("example.com", A_RECORD_TYPE, 1);
+        let response = response_message_for_question(
+            question,
+            ResponseCode::NoError,
+            vec![a_record("example.com", 60)],
+            Vec::new(),
+            Vec::new(),
+            true,
+        );
+        let transport = Arc::new(DnssecAwareBlockingAuthorityTransport::new(
+            response.clone(),
+            response,
+        ));
+        let backend: Arc<dyn ResolutionBackend> = Arc::new(RecursiveResolutionBackend::new(
+            RecursiveResolverConfig {
+                root_hints: vec![RecursiveRootHint {
+                    name: "a.root-servers.example".to_string(),
+                    endpoints: vec!["198.51.100.53:53".parse().unwrap()],
+                }],
+                per_authority_timeout: Duration::from_millis(500),
+                per_query_deadline: Duration::from_secs(2),
+                max_recursion_depth: 8,
+                max_cname_restarts: 4,
+                configured_max_udp_payload_size: 1232,
+            },
+            transport.clone(),
+        ));
+        let events = Arc::new(RecordingEvents::default());
+        let metrics = Arc::new(RecordingMetrics::default());
+        let service = Arc::new(resolve_service_with_recursive_cache(
+            backend,
+            cache,
+            events,
+            metrics.clone(),
+            1232,
+        ));
+
+        // Leader: EDNS, DO=false.
+        let leader_query = a_query_with_edns(0x1111, "example.com", 1232, false);
+        // Follower: no EDNS at all.
+        let follower_query = a_query(0x2222, "example.com");
+
+        let leader = {
+            let service = Arc::clone(&service);
+            tokio::spawn(async move {
+                service
+                    .resolve(ResolveRequest::new(
+                        "192.0.2.10".parse().unwrap(),
+                        SystemTime::UNIX_EPOCH,
+                        leader_query,
+                    ))
+                    .await
+            })
+        };
+        transport.wait_for_requests(1).await;
+
+        let follower = {
+            let service = Arc::clone(&service);
+            tokio::spawn(async move {
+                service
+                    .resolve(ResolveRequest::new(
+                        "192.0.2.11".parse().unwrap(),
+                        SystemTime::UNIX_EPOCH,
+                        follower_query,
+                    ))
+                    .await
+            })
+        };
+        tokio::task::yield_now().await;
+        assert_eq!(
+            transport.requests.lock().unwrap().len(),
+            1,
+            "the follower must coalesce onto the leader's single in-flight fetch"
+        );
+
+        transport.release.notify_waiters();
+        let leader = leader.await.unwrap();
+        let follower = follower.await.unwrap();
+
+        assert_eq!(metrics.count(ResolverMetric::CacheCoalescedMiss), 1);
+
+        let leader_message = Message::parse(&leader.response_bytes).unwrap();
+        assert!(
+            leader_message
+                .additionals
+                .iter()
+                .any(|record| matches!(record.record, RecordData::OPT(_))),
+            "sanity check: the leader's own request carried EDNS, so its own \
+             response must carry an OPT record"
+        );
+
+        let follower_message = Message::parse(&follower.response_bytes).unwrap();
+        assert!(
+            !follower_message
+                .additionals
+                .iter()
+                .any(|record| matches!(record.record, RecordData::OPT(_))),
+            "the follower's own request carried no EDNS -- it must not get an \
+             unsolicited OPT record just because the leader's synthesizing query \
+             had one"
+        );
+    }
+
+    /// Regression test for both independent Codex adversarial reviews'
+    /// shared finding: `exceeds_unfiltered` is computed once, early, from
+    /// the shared/leader-framed `response_bytes` -- *before* the DO=false
+    /// "nothing to filter" fast path rebuilds this requester's own
+    /// question/OPT framing via `rebuild_recursive_response_with_own_framing`.
+    /// Reuses the exact leader/follower shape of
+    /// `resolve_coalesced_edns_follower_behind_non_edns_leader_keeps_its_own_opt`
+    /// above (non-EDNS leader, EDNS DO=false follower, no DNSSEC-only
+    /// material so `filtering_would_change_response` is false and this
+    /// really does land in the DO=false fast path), but with a
+    /// `configured_max_udp_payload_size` chosen so the leader-framed bytes
+    /// (no OPT at all) fit under it while appending the follower's own
+    /// 11-byte OPT record tips the rebuilt response over: the leader's 13
+    /// A-record response is 237 bytes with no OPT, comfortably under the
+    /// 240-byte limit here (`exceeds_unfiltered` false), but 237 + 11 = 248
+    /// bytes once the follower's own OPT is appended -- over the limit.
+    /// Before the fix, the rebuilt-but-oversized bytes were shipped
+    /// straight to the wire with TC=0, an RFC 6891 §6.2.3/§7 + RFC 1035
+    /// §4.1.1 violation; the follower must instead receive a genuinely
+    /// truncated (TC=1) response.
+    #[tokio::test]
+    async fn resolve_coalesced_edns_follower_do_false_fast_path_truncates_when_own_opt_overflows_limit()
+     {
+        let cache = Arc::new(ShardedDnsCache::new(&CacheConfig {
+            max_entries: 0,
+            shard_count: Some(1),
+        }));
+        let question = QuestionKey::new("example.com", A_RECORD_TYPE, 1);
+        // 13 A records, no DNSSEC-type records at all (so a DO=false
+        // filter pass is proven to be a no-op regardless of who runs it):
+        // header (12) + question (17) + 13 * 16-byte answers = 237 bytes
+        // with no OPT record.
+        let answers = (0..13)
+            .map(|_| a_record("example.com", 60))
+            .collect::<Vec<_>>();
+        let response = response_message_for_question(
+            question,
+            ResponseCode::NoError,
+            answers,
+            Vec::new(),
+            Vec::new(),
+            true,
+        );
+        let transport = Arc::new(DnssecAwareBlockingAuthorityTransport::new(
+            response.clone(),
+            response,
+        ));
+        const CONFIGURED_MAX_UDP_PAYLOAD_SIZE: usize = 240;
+        let backend: Arc<dyn ResolutionBackend> = Arc::new(RecursiveResolutionBackend::new(
+            RecursiveResolverConfig {
+                root_hints: vec![RecursiveRootHint {
+                    name: "a.root-servers.example".to_string(),
+                    endpoints: vec!["198.51.100.53:53".parse().unwrap()],
+                }],
+                per_authority_timeout: Duration::from_millis(500),
+                per_query_deadline: Duration::from_secs(2),
+                max_recursion_depth: 8,
+                max_cname_restarts: 4,
+                configured_max_udp_payload_size: CONFIGURED_MAX_UDP_PAYLOAD_SIZE,
+            },
+            transport.clone(),
+        ));
+        let events = Arc::new(RecordingEvents::default());
+        let metrics = Arc::new(RecordingMetrics::default());
+        let service = Arc::new(resolve_service_with_recursive_cache(
+            backend,
+            cache,
+            events,
+            metrics.clone(),
+            CONFIGURED_MAX_UDP_PAYLOAD_SIZE,
+        ));
+
+        // Leader: no EDNS at all -- no OPT record in its own request, so
+        // the shared response it synthesizes has none either.
+        let leader_query = a_query(0x1111, "example.com");
+        // Follower: same name/type/class (coalesces onto the leader's
+        // single in-flight fetch), but its own request *does* carry EDNS
+        // (DO=false) -- its own rebuilt OPT record is what tips the
+        // response over the limit.
+        let follower_query = a_query_with_edns(
+            0x2222,
+            "example.com",
+            CONFIGURED_MAX_UDP_PAYLOAD_SIZE as u16,
+            false,
+        );
+
+        let leader = {
+            let service = Arc::clone(&service);
+            tokio::spawn(async move {
+                service
+                    .resolve(ResolveRequest::new(
+                        "192.0.2.10".parse().unwrap(),
+                        SystemTime::UNIX_EPOCH,
+                        leader_query,
+                    ))
+                    .await
+            })
+        };
+        transport.wait_for_requests(1).await;
+
+        let follower = {
+            let service = Arc::clone(&service);
+            tokio::spawn(async move {
+                service
+                    .resolve(ResolveRequest::new(
+                        "192.0.2.11".parse().unwrap(),
+                        SystemTime::UNIX_EPOCH,
+                        follower_query,
+                    ))
+                    .await
+            })
+        };
+        tokio::task::yield_now().await;
+        assert_eq!(
+            transport.requests.lock().unwrap().len(),
+            1,
+            "the follower must coalesce onto the leader's single in-flight fetch"
+        );
+
+        transport.release.notify_waiters();
+        let leader = leader.await.unwrap();
+        let follower = follower.await.unwrap();
+
+        assert_eq!(metrics.count(ResolverMetric::CacheCoalescedMiss), 1);
+
+        let leader_message = Message::parse(&leader.response_bytes).unwrap();
+        assert!(
+            !leader_message.header.tc(),
+            "sanity check: the leader-framed (no-OPT) response must fit comfortably \
+             under the configured limit and not truncate"
+        );
+        assert!(
+            leader.response_bytes.len() <= CONFIGURED_MAX_UDP_PAYLOAD_SIZE,
+            "sanity check: leader-framed bytes ({}) must actually fit under the \
+             configured limit ({}) for this test to exercise the intended gap",
+            leader.response_bytes.len(),
+            CONFIGURED_MAX_UDP_PAYLOAD_SIZE
+        );
+
+        let follower_message = Message::parse(&follower.response_bytes).unwrap();
+        assert!(
+            follower_message.header.tc(),
+            "the follower's own OPT record grows the rebuilt response past its own \
+             UDP payload limit even though the leader-framed bytes fit -- it must \
+             receive a truncated (TC=1) response, not an oversized TC=0 one \
+             (found: {} bytes, limit {})",
+            follower.response_bytes.len(),
+            CONFIGURED_MAX_UDP_PAYLOAD_SIZE
+        );
+        assert!(
+            follower.response_bytes.len() <= CONFIGURED_MAX_UDP_PAYLOAD_SIZE,
+            "a truncated response must itself still fit under the payload limit"
+        );
+        assert!(
+            follower_message.answers.is_empty(),
+            "a truncated response carries no answer records"
+        );
+        let follower_opt = follower_message
+            .additionals
+            .iter()
+            .find(|record| matches!(record.record, RecordData::OPT(_)))
+            .expect(
+                "the follower advertised EDNS itself and must still get an OPT \
+                 record back on its truncated response",
+            );
+        let RecordData::OPT(follower_edns) = &follower_opt.record else {
+            unreachable!();
+        };
+        assert!(
+            !follower_edns.dnssec_ok,
+            "the follower's own request set DO=0"
+        );
+    }
+
+    /// The inverse of the test above, and a regression test for the same
+    /// shared finding from both independent Codex adversarial reviews, on
+    /// the other side of the bug: in the no-op-filter fast path, when
+    /// `exceeds_unfiltered` (measured against the leader-framed bytes) is
+    /// true, the code used to truncate immediately without ever checking
+    /// `recursive_synthesis_reused_own_framing` first. A coalesced
+    /// follower's own framing can be *smaller* than the leader's -- not
+    /// just larger, as in the test above -- e.g. a non-EDNS follower behind
+    /// an EDNS leader, where the leader-framed bytes (OPT included) exceed
+    /// the limit purely because of the leader's own ~11-byte OPT record,
+    /// but the follower-framed rebuild (no OPT at all) genuinely fits. The
+    /// bug sent that follower an unnecessary TC=1, forcing an avoidable TCP
+    /// retry, even though a fitting UDP response was achievable.
+    ///
+    /// Reuses the exact leader/follower record shape as
+    /// `resolve_coalesced_edns_follower_do_false_fast_path_truncates_when_own_opt_overflows_limit`
+    /// above (13 A records, no DNSSEC-only material, so
+    /// `filtering_would_change_response` is false and this lands in the
+    /// no-op-filter fast path, not the content-filtering branch): 237 bytes
+    /// with no OPT, 248 bytes with the leader's own 11-byte OPT record
+    /// appended. With the same 240-byte `configured_max_udp_payload_size`,
+    /// the leader-framed (with-OPT) bytes exceed the limit while the
+    /// follower-framed (no-OPT) bytes fit comfortably under it.
+    #[tokio::test]
+    async fn resolve_coalesced_non_edns_follower_do_false_fast_path_fits_when_leader_opt_overflows_limit()
+     {
+        let cache = Arc::new(ShardedDnsCache::new(&CacheConfig {
+            max_entries: 0,
+            shard_count: Some(1),
+        }));
+        let question = QuestionKey::new("example.com", A_RECORD_TYPE, 1);
+        // 13 A records, no DNSSEC-type records at all (so a DO=false
+        // filter pass is proven to be a no-op regardless of who runs it):
+        // header (12) + question (17) + 13 * 16-byte answers = 237 bytes
+        // with no OPT record, 248 bytes with one.
+        let answers = (0..13)
+            .map(|_| a_record("example.com", 60))
+            .collect::<Vec<_>>();
+        let response = response_message_for_question(
+            question,
+            ResponseCode::NoError,
+            answers,
+            Vec::new(),
+            Vec::new(),
+            true,
+        );
+        let transport = Arc::new(DnssecAwareBlockingAuthorityTransport::new(
+            response.clone(),
+            response,
+        ));
+        const CONFIGURED_MAX_UDP_PAYLOAD_SIZE: usize = 240;
+        let backend: Arc<dyn ResolutionBackend> = Arc::new(RecursiveResolutionBackend::new(
+            RecursiveResolverConfig {
+                root_hints: vec![RecursiveRootHint {
+                    name: "a.root-servers.example".to_string(),
+                    endpoints: vec!["198.51.100.53:53".parse().unwrap()],
+                }],
+                per_authority_timeout: Duration::from_millis(500),
+                per_query_deadline: Duration::from_secs(2),
+                max_recursion_depth: 8,
+                max_cname_restarts: 4,
+                configured_max_udp_payload_size: CONFIGURED_MAX_UDP_PAYLOAD_SIZE,
+            },
+            transport.clone(),
+        ));
+        let events = Arc::new(RecordingEvents::default());
+        let metrics = Arc::new(RecordingMetrics::default());
+        let service = Arc::new(resolve_service_with_recursive_cache(
+            backend,
+            cache,
+            events,
+            metrics.clone(),
+            CONFIGURED_MAX_UDP_PAYLOAD_SIZE,
+        ));
+
+        // Leader: EDNS, DO=false -- its own OPT record is what's baked
+        // into the shared response and is what tips the leader-framed
+        // bytes over the limit.
+        let leader_query = a_query_with_edns(
+            0x1111,
+            "example.com",
+            CONFIGURED_MAX_UDP_PAYLOAD_SIZE as u16,
+            false,
+        );
+        // Follower: same name/type/class (coalesces onto the leader's
+        // single in-flight fetch), but its own request carries no EDNS at
+        // all -- its own rebuilt (OPT-less) framing is what genuinely fits
+        // under the limit.
+        let follower_query = a_query(0x2222, "example.com");
+
+        let leader = {
+            let service = Arc::clone(&service);
+            tokio::spawn(async move {
+                service
+                    .resolve(ResolveRequest::new(
+                        "192.0.2.10".parse().unwrap(),
+                        SystemTime::UNIX_EPOCH,
+                        leader_query,
+                    ))
+                    .await
+            })
+        };
+        transport.wait_for_requests(1).await;
+
+        let follower = {
+            let service = Arc::clone(&service);
+            tokio::spawn(async move {
+                service
+                    .resolve(ResolveRequest::new(
+                        "192.0.2.11".parse().unwrap(),
+                        SystemTime::UNIX_EPOCH,
+                        follower_query,
+                    ))
+                    .await
+            })
+        };
+        tokio::task::yield_now().await;
+        assert_eq!(
+            transport.requests.lock().unwrap().len(),
+            1,
+            "the follower must coalesce onto the leader's single in-flight fetch"
+        );
+
+        transport.release.notify_waiters();
+        let leader = leader.await.unwrap();
+        let follower = follower.await.unwrap();
+
+        assert_eq!(metrics.count(ResolverMetric::CacheCoalescedMiss), 1);
+
+        let leader_message = Message::parse(&leader.response_bytes).unwrap();
+        assert!(
+            leader_message
+                .additionals
+                .iter()
+                .any(|record| matches!(record.record, RecordData::OPT(_)))
+                || leader_message.header.tc(),
+            "sanity check: the leader's own request carried EDNS, so its own \
+             (oversized) response must either carry an OPT record or have \
+             been truncated"
+        );
+        assert!(
+            leader_message.header.tc(),
+            "sanity check: the leader-framed (with-OPT) bytes must actually \
+             exceed the configured limit for this test to exercise the \
+             intended gap"
+        );
+
+        let follower_message = Message::parse(&follower.response_bytes).unwrap();
+        assert!(
+            !follower_message.header.tc(),
+            "the follower's own (OPT-less) framing genuinely fits under the \
+             configured limit even though the leader-framed bytes (OPT \
+             included) don't -- it must receive a non-truncated (TC=0) \
+             response, not an unnecessary TC=1 (found: {} bytes, limit {})",
+            follower.response_bytes.len(),
+            CONFIGURED_MAX_UDP_PAYLOAD_SIZE
+        );
+        assert!(
+            follower.response_bytes.len() <= CONFIGURED_MAX_UDP_PAYLOAD_SIZE,
+            "sanity check: the follower's response must actually fit under \
+             the configured limit ({}) for the TC=0 assertion above to mean \
+             anything (found: {})",
+            CONFIGURED_MAX_UDP_PAYLOAD_SIZE,
+            follower.response_bytes.len()
+        );
+        assert_eq!(
+            follower_message.answers.len(),
+            13,
+            "the follower must receive the full, non-truncated 13-record \
+             answer set"
+        );
+        assert!(
+            !follower_message
+                .additionals
+                .iter()
+                .any(|record| matches!(record.record, RecordData::OPT(_))),
+            "the follower's own request carried no EDNS -- it must not get \
+             an unsolicited OPT record just because the leader's \
+             synthesizing query had one"
+        );
+    }
+
+    /// Regression test for the performance-focused Codex adversarial
+    /// review's finding: `rebuild_recursive_response_with_own_framing`
+    /// must only run when this requester's own framing has actually been
+    /// detected to differ from whichever request synthesized the shared
+    /// response -- not unconditionally on every non-truncated
+    /// recursive-synthesis response. This is the overwhelmingly common
+    /// case: a single, non-coalesced DO=true recursive resolve, where
+    /// `decoded` IS the request that synthesized `response_message` by
+    /// construction, so the rebuild would just reproduce the same bytes.
+    #[tokio::test]
+    async fn resolve_single_recursive_do_true_request_skips_own_framing_rebuild() {
+        reset_rebuild_recursive_response_with_own_framing_calls();
+
+        let question = QuestionKey::new("example.com", 1, 1);
+        let answers = vec![
+            a_record("example.com", 60),
+            rrsig_record("example.com", 60, A_RECORD_TYPE),
+        ];
+        let transport = Arc::new(ScriptedAuthorityTransport::new([Ok(
+            response_message_for_question_with_id(
+                0xbeef,
+                question,
+                ResponseCode::NoError,
+                answers,
+                Vec::new(),
+                Vec::new(),
+                true,
+            ),
+        )]));
+        let backend = Arc::new(recursive_backend(transport));
+        let service = ResolveQuery::with_cache_and_backend_snapshot(
+            Arc::new(StandardProtocolCodec::new(1232)),
+            Arc::new(NoopDnsCache),
+            CacheTtlPolicy::default(),
+            BackendSnapshot::new(
+                backend,
+                ResolutionMode::Recursive,
+                7,
+                BackendHealth::Healthy,
+                Some("mode:recursive;generation:7".to_string()),
+            ),
+            Arc::new(BasicResponseFactory),
+            Arc::new(FixedClock(SystemTime::UNIX_EPOCH)),
+            Arc::new(RecordingEvents::default()),
+            Arc::new(RecordingMetrics::default()),
+        );
+
+        let outcome = service
+            .resolve(ResolveRequest::new(
+                "192.0.2.10".parse().unwrap(),
+                SystemTime::UNIX_EPOCH,
+                a_query_with_edns(0x1234, "example.com", 1232, true),
+            ))
+            .await;
+
+        assert_eq!(outcome.decision.kind, ResolveDecisionKind::Allowed);
+        let response = Message::parse(&outcome.response_bytes).unwrap();
+        assert!(!response.header.tc());
+        assert_eq!(
+            rebuild_recursive_response_with_own_framing_call_count(),
+            0,
+            "a single, non-coalesced request's own framing already matches what \
+             synthesized the response -- the expensive rebuild must be skipped \
+             entirely, not run unconditionally on every DO=true recursive response"
+        );
+    }
+
+    /// Companion to the DO=true test above, covering the DO=false
+    /// "nothing to filter" fast path instead: a single, non-coalesced
+    /// DO=false recursive resolve whose response has nothing DNSSEC-only
+    /// for a filter pass to remove must also skip the rebuild entirely.
+    #[tokio::test]
+    async fn resolve_single_recursive_do_false_request_skips_own_framing_rebuild() {
+        reset_rebuild_recursive_response_with_own_framing_calls();
+
+        let question = QuestionKey::new("example.com", 1, 1);
+        let answers = vec![a_record("example.com", 60)];
+        let transport = Arc::new(ScriptedAuthorityTransport::new([Ok(
+            response_message_for_question_with_id(
+                0xbeef,
+                question,
+                ResponseCode::NoError,
+                answers,
+                Vec::new(),
+                Vec::new(),
+                true,
+            ),
+        )]));
+        let backend = Arc::new(recursive_backend(transport));
+        let service = ResolveQuery::with_cache_and_backend_snapshot(
+            Arc::new(StandardProtocolCodec::new(1232)),
+            Arc::new(NoopDnsCache),
+            CacheTtlPolicy::default(),
+            BackendSnapshot::new(
+                backend,
+                ResolutionMode::Recursive,
+                7,
+                BackendHealth::Healthy,
+                Some("mode:recursive;generation:7".to_string()),
+            ),
+            Arc::new(BasicResponseFactory),
+            Arc::new(FixedClock(SystemTime::UNIX_EPOCH)),
+            Arc::new(RecordingEvents::default()),
+            Arc::new(RecordingMetrics::default()),
+        );
+
+        let outcome = service
+            .resolve(ResolveRequest::new(
+                "192.0.2.10".parse().unwrap(),
+                SystemTime::UNIX_EPOCH,
+                a_query_with_edns(0x1234, "example.com", 1232, false),
+            ))
+            .await;
+
+        assert_eq!(outcome.decision.kind, ResolveDecisionKind::Allowed);
+        let response = Message::parse(&outcome.response_bytes).unwrap();
+        assert!(!response.header.tc());
+        assert!(!response_contains_rrsig(&outcome.response_bytes));
+        assert_eq!(
+            rebuild_recursive_response_with_own_framing_call_count(),
+            0,
+            "a single, non-coalesced DO=false request's own framing already matches \
+             what synthesized the response -- the expensive rebuild must be skipped \
+             entirely, not run unconditionally on every DO=false no-op-filter \
+             recursive response"
         );
     }
 
@@ -16403,6 +18019,86 @@ mod tests {
         drop(stores);
         assert_eq!(metrics.count(ResolverMetric::CacheMiss), 1);
         assert_eq!(metrics.count(ResolverMetric::CacheStore), 1);
+    }
+
+    /// Regression test: the backend response's own AA bit must be captured
+    /// onto the stored `RRsetEntry` (`build_rrset_entry`), not silently
+    /// dropped -- this is what lets a later cache-hit response
+    /// (`assemble_response`) reproduce AA instead of always claiming AA=0.
+    #[tokio::test]
+    async fn resolve_stores_upstream_response_authoritative_bit_on_decomposed_entry() {
+        let cache = Arc::new(RecordingCache::with_lookup(ChainLookup::Miss));
+        let upstream = Arc::new(StaticUpstream::new(Ok(upstream_response(set_response_aa(
+            a_response_with_answer(0xbeef, "example.com", 45),
+            true,
+        )))));
+        let events = Arc::new(RecordingEvents::default());
+        let metrics = Arc::new(RecordingMetrics::default());
+        let service =
+            resolve_service_with_cache(upstream, cache.clone(), events, metrics.clone(), 1232);
+
+        service
+            .resolve(ResolveRequest::new(
+                "192.0.2.10".parse().unwrap(),
+                SystemTime::UNIX_EPOCH,
+                a_query(0x4444, "example.com"),
+            ))
+            .await;
+
+        let stores = cache.stores.lock().unwrap();
+        assert_eq!(stores.len(), 1);
+        let (decomposed, _namespace) = &stores[0];
+        let (_, _, _, entry) = &decomposed.positive[0];
+        assert!(
+            entry.authoritative,
+            "an AA=1 backend response must be stored with authoritative: true"
+        );
+    }
+
+    /// Regression test for RFC 1035 §4.1.1: AA describes *this resolver's*
+    /// own authority over the zone, not the upstream authority server's.
+    /// For a `ResolutionMode::Recursive` backend, the fetched response's
+    /// AA=1 describes the upstream authority, not rdns -- rdns is never
+    /// itself authoritative while recursing, so the stored entry (and every
+    /// later recursive cache hit assembled from it) must always be
+    /// `authoritative: false`, regardless of the upstream's own AA bit.
+    /// Contrast with `resolve_stores_upstream_response_authoritative_bit_on_decomposed_entry`
+    /// above, which covers the forwarding backend (a transparent proxy)
+    /// legitimately preserving a real AA=1 from its own backend.
+    #[tokio::test]
+    async fn resolve_recursive_backend_never_stores_upstreams_authoritative_bit() {
+        let cache = Arc::new(RecordingCache::with_lookup(ChainLookup::Miss));
+        let upstream = Arc::new(StaticUpstream::new(Ok(upstream_response(set_response_aa(
+            a_response_with_answer(0xbeef, "example.com", 45),
+            true,
+        )))));
+        let events = Arc::new(RecordingEvents::default());
+        let metrics = Arc::new(RecordingMetrics::default());
+        let service = resolve_service_with_recursive_cache(
+            upstream,
+            cache.clone(),
+            events,
+            metrics.clone(),
+            1232,
+        );
+
+        service
+            .resolve(ResolveRequest::new(
+                "192.0.2.10".parse().unwrap(),
+                SystemTime::UNIX_EPOCH,
+                a_query(0x4444, "example.com"),
+            ))
+            .await;
+
+        let stores = cache.stores.lock().unwrap();
+        assert_eq!(stores.len(), 1);
+        let (decomposed, _namespace) = &stores[0];
+        let (_, _, _, entry) = &decomposed.positive[0];
+        assert!(
+            !entry.authoritative,
+            "a recursive backend's AA=1 upstream response must still be stored with \
+             authoritative: false -- rdns is never itself authoritative while recursing"
+        );
     }
 
     #[tokio::test]

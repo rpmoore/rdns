@@ -28,6 +28,7 @@ use rdns::config::CacheConfig;
 use rdns::resolver::{DomainDnsCache, ShardedDnsCache};
 
 let cache = ShardedDnsCache::new(&CacheConfig::default());
+let single_flight_shard_count = cache.shard_count();
 
 // Used as a trait object everywhere ResolveQuery expects a cache:
 let resolver = ResolveQuery::with_cache_policy_and_backend_snapshot(
@@ -35,14 +36,16 @@ let resolver = ResolveQuery::with_cache_policy_and_backend_snapshot(
     Arc::new(cache) as Arc<dyn DomainDnsCache>,
     // ...
 )
-.with_max_chain_depth(8)              // bounds CNAME-chain walks
-.with_single_flight_shard_count(16);  // match the cache's own shard count
+.with_max_chain_depth(8)                                   // bounds CNAME-chain walks
+.with_single_flight_shard_count(single_flight_shard_count); // match the cache's own shard count
 ```
 
 `main.rs` does exactly this: `ShardedDnsCache::new(&config.cache)`, with
 `max_chain_depth` sourced from
 `config.resolution.recursive.max_cname_restarts` and
-`with_single_flight_shard_count` from the cache's own `shard_count()`.
+`with_single_flight_shard_count` from the cache's own `shard_count()` —
+read *after* construction, the same instance passed to `ResolveQuery`, so
+the two structures always agree on what "shard N" means.
 
 ## What changed, from a caller's perspective
 
@@ -51,8 +54,11 @@ let resolver = ResolveQuery::with_cache_policy_and_backend_snapshot(
   response per request (`assemble_response`/`assemble_negative_response`),
   echoing back whatever casing/bufsize *that* requester used.
 - **One entry per domain, not per (name, qtype, flags-combination,
-  namespace).** A domain can hold many cached record sets
-  (`RRsetEntry`s) plus at most one negative result.
+  namespace).** A domain can hold many cached record sets (`RRsetEntry`s,
+  one per `(qtype, qclass)`) plus multiple negative results, keyed by
+  `NegativeKey`: at most one whole-name NXDOMAIN (`qtype: None`) and at
+  most one NODATA entry per queried `qtype` (`qtype: Some(t)`) — not just a
+  single negative result per domain.
 - **Reload-time cleanup is explicit, not incidental.** Where the old
   design let the cache key itself change on reload (silently orphaning
   stale entries), this design stores `cache_namespace` on every entry and

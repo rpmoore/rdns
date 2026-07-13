@@ -352,21 +352,21 @@ exactly — no path deviations.
 
 ## Relevant file paths
 
-- `/home/rpmoore/code/rdns/src/resolver/mod.rs` (add `mod cache;`
+- `src/resolver/mod.rs` (add `mod cache;`
   declaration; existing `normalize_question_name` at line 189 for later
   sections' reference)
-- `/home/rpmoore/code/rdns/src/resolver/cache/mod.rs` (new — `shard_index`
+- `src/resolver/cache/mod.rs` (new — `shard_index`
   + submodule declarations)
-- `/home/rpmoore/code/rdns/src/resolver/cache/shard.rs` (new — stub)
-- `/home/rpmoore/code/rdns/src/resolver/cache/lru.rs` (new — stub)
-- `/home/rpmoore/code/rdns/src/resolver/cache/entry.rs` (new — stub)
-- `/home/rpmoore/code/rdns/src/resolver/cache/singleflight.rs` (new — stub)
-- `/home/rpmoore/code/rdns/src/resolver/cache/assemble.rs` (new — stub)
-- `/home/rpmoore/code/rdns/src/resolver/cache/namespace.rs` (new — stub)
-- `/home/rpmoore/code/rdns/src/config/mod.rs` (add `CacheConfig` struct +
+- `src/resolver/cache/shard.rs` (new — stub)
+- `src/resolver/cache/lru.rs` (new — stub)
+- `src/resolver/cache/entry.rs` (new — stub)
+- `src/resolver/cache/singleflight.rs` (new — stub)
+- `src/resolver/cache/assemble.rs` (new — stub)
+- `src/resolver/cache/namespace.rs` (new — stub)
+- `src/config/mod.rs` (add `CacheConfig` struct +
   methods + tests; existing `RuntimeConfig` at line 30, existing test
   module starting around line 1606 — do not modify `RuntimeConfig` or
   `RawRuntimeConfig` in this section)
-- `/home/rpmoore/code/rdns/src/main.rs` (reference only — `DEFAULT_CACHE_ENTRIES`
+- `src/main.rs` (reference only — `DEFAULT_CACHE_ENTRIES`
   at line 46 is what `CacheConfig::max_entries`'s default replaces; not
   modified until `section-07`)

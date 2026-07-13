@@ -111,6 +111,164 @@ impl ShardState {
     fn domain_is_tracked(&self, domain: &str) -> bool {
         self.lru.contains(domain)
     }
+
+    /// Removes exactly one positive record set (`domain`, `key`) — e.g. an
+    /// expired entry encountered during a lookup — and drops `domain`'s LRU
+    /// token too if that leaves it with no positive or negative data left
+    /// in this shard. Mirrors `evict_domain`/`sweep_stale_namespace`'s
+    /// empty-domain cleanup, just scoped to a single record set instead of
+    /// every entry for a domain or every stale-namespace entry shard-wide.
+    fn remove_positive_entry(&mut self, domain: &str, key: (u16, u16)) {
+        if let Some(record_sets) = self.positive.domains.get_mut(domain) {
+            record_sets.record_sets.remove(&key);
+            if record_sets.record_sets.is_empty() {
+                self.positive.domains.remove(domain);
+            }
+        }
+        self.drop_lru_if_domain_now_empty(domain);
+    }
+
+    /// Removes exactly one negative-cache entry (`domain`, `key`) — same
+    /// contract as `remove_positive_entry`, for the negative-cache side.
+    fn remove_negative_entry(&mut self, domain: &str, key: &NegativeKey) {
+        if let Some(entries) = self.negative.domains.get_mut(domain) {
+            entries.entries.remove(key);
+            if entries.entries.is_empty() {
+                self.negative.domains.remove(domain);
+            }
+        }
+        self.drop_lru_if_domain_now_empty(domain);
+    }
+
+    fn drop_lru_if_domain_now_empty(&mut self, domain: &str) {
+        if !self.positive.domains.contains_key(domain)
+            && !self.negative.domains.contains_key(domain)
+        {
+            self.lru.remove(domain);
+        }
+    }
+
+    /// Single-probe positive-answer lookup for `Shard::lookup_hop`: probes
+    /// `domain`/`key` in the positive map exactly once and, from that one
+    /// borrow, decides in-place whether the candidate is expired (removing
+    /// it via `remove_positive_entry` and returning `None`), live and
+    /// usable (cloning it out and returning `Some`), or neither (a
+    /// namespace mismatch or DO-incompleteness, left in place for other
+    /// requesters/namespaces — returning `None` without removing anything).
+    /// Replaces the previous two-probe shape (an `is_some_and` expiry
+    /// precheck followed by a second, independent `.filter(..).cloned()`
+    /// lookup) that double-locked-and-hashed the common cache-hit path just
+    /// to support the uncommon expired-entry-eviction case.
+    fn take_live_positive(
+        &mut self,
+        domain: &str,
+        key: (u16, u16),
+        dnssec_ok: bool,
+        current_namespace: &str,
+        now: SystemTime,
+    ) -> Option<RRsetEntry> {
+        let expired = match self
+            .positive
+            .domains
+            .get(domain)
+            .and_then(|record_sets| record_sets.record_sets.get(&key))
+        {
+            None => return None,
+            Some(entry) if entry.expires_at <= now => true,
+            Some(entry) => {
+                if entry.cache_namespace == current_namespace
+                    && (!dnssec_ok || entry.dnssec_complete)
+                {
+                    return Some(entry.clone());
+                }
+                false
+            }
+        };
+        if expired {
+            self.remove_positive_entry(domain, key);
+        }
+        None
+    }
+
+    /// `take_live_positive`'s sibling for the CNAME-hop candidate: same
+    /// single-probe expired/live/absent decision, plus extracting the
+    /// CNAME's target name from the live entry's records. A live entry
+    /// whose records don't actually contain a CNAME (unexpected/corrupt
+    /// data) is treated as absent for this call — same as before — without
+    /// being removed, since only genuine TTL expiry warrants removal here.
+    fn take_live_cname_hop(
+        &mut self,
+        domain: &str,
+        key: (u16, u16),
+        dnssec_ok: bool,
+        current_namespace: &str,
+        now: SystemTime,
+    ) -> Option<(RRsetEntry, String)> {
+        let expired = match self
+            .positive
+            .domains
+            .get(domain)
+            .and_then(|record_sets| record_sets.record_sets.get(&key))
+        {
+            None => return None,
+            Some(entry) if entry.expires_at <= now => true,
+            Some(entry) => {
+                if entry.cache_namespace == current_namespace
+                    && (!dnssec_ok || entry.dnssec_complete)
+                {
+                    let target = entry.records.iter().find_map(|record| match &record.rdata {
+                        RecordData::CNAME(target) => Some(target.clone()),
+                        _ => None,
+                    });
+                    if let Some(target) = target {
+                        return Some((entry.clone(), target));
+                    }
+                }
+                false
+            }
+        };
+        if expired {
+            self.remove_positive_entry(domain, key);
+        }
+        None
+    }
+
+    /// `take_live_positive`'s sibling for negative-cache candidates
+    /// (NODATA and NXDOMAIN share this — callers pass the appropriate
+    /// `NegativeKey`): same single-probe expired/live/absent decision, with
+    /// the negative-entry-specific DNSSEC-proof-freshness check folded into
+    /// the "live" condition.
+    fn take_live_negative(
+        &mut self,
+        domain: &str,
+        key: &NegativeKey,
+        dnssec_ok: bool,
+        current_namespace: &str,
+        now: SystemTime,
+    ) -> Option<NegativeEntry> {
+        let expired = match self
+            .negative
+            .domains
+            .get(domain)
+            .and_then(|entries| entries.entries.get(key))
+        {
+            None => return None,
+            Some(entry) if entry.expires_at <= now => true,
+            Some(entry) => {
+                if entry.cache_namespace == current_namespace
+                    && (!dnssec_ok
+                        || (entry.dnssec_complete && entry.dnssec_proof_material_fresh(now)))
+                {
+                    return Some(entry.clone());
+                }
+                false
+            }
+        };
+        if expired {
+            self.remove_negative_entry(domain, key);
+        }
+        None
+    }
 }
 
 /// One shard of the sharded DNS cache: its own lock, its own share of the
@@ -201,6 +359,23 @@ impl Shard {
     /// releases this shard's lock for the duration of this one hop only —
     /// callers must not hold it across hops.
     ///
+    /// Any candidate entry found *expired* (`expires_at <= now`) — whether
+    /// it would otherwise have been the answer, a CNAME hop, a NODATA, or
+    /// an NXDOMAIN — is removed from this shard's map immediately, right
+    /// here at lookup time, rather than merely being filtered out of this
+    /// one call's result. Left alone, an expired entry would otherwise sit
+    /// in the map (and hold its domain's LRU token) until an unrelated
+    /// capacity eviction or the next namespace sweep happened to catch it.
+    /// Removal drops the domain's LRU token too, but only once that domain
+    /// has no other live positive or negative entry left in this shard
+    /// (`ShardState::remove_positive_entry`/`remove_negative_entry`,
+    /// mirroring `evict_domain`/`sweep_stale_namespace`'s own empty-domain
+    /// cleanup). By contrast, a namespace mismatch or (for a DO=true
+    /// lookup) a `dnssec_complete`/proof-freshness miss is *not* grounds
+    /// for removal here — that entry may still be perfectly valid for a
+    /// different namespace or a DO=false requester, so only genuine TTL
+    /// expiry triggers eviction at this call site.
+    ///
     /// `dnssec_ok` is the *reading* requester's own DO flag — not to be
     /// confused with any entry's own `dnssec_complete` (whether the entry
     /// was itself populated by a DO=true fetch). When `dnssec_ok` is true,
@@ -240,45 +415,26 @@ impl Shard {
         now: SystemTime,
     ) -> HopResult {
         let mut state = self.state.lock().unwrap();
+        let answer_key = (qtype, qclass);
 
-        let answer = state
-            .positive
-            .domains
-            .get(domain)
-            .and_then(|record_sets| record_sets.record_sets.get(&(qtype, qclass)))
-            .filter(|entry| {
-                entry.expires_at > now
-                    && entry.cache_namespace == current_namespace
-                    && (!dnssec_ok || entry.dnssec_complete)
-            })
-            .cloned();
-        if let Some(entry) = answer {
+        // Each candidate below probes its map exactly once, via
+        // `take_live_positive`/`take_live_cname_hop`/`take_live_negative`:
+        // one borrow decides expired-vs-live-vs-absent in a single pass
+        // (expired candidates are removed from `state` from inside that
+        // same call), rather than a separate expiry precheck followed by a
+        // second, independent lookup for the live/filtered case.
+        if let Some(entry) =
+            state.take_live_positive(domain, answer_key, dnssec_ok, current_namespace, now)
+        {
             state.lru.touch(domain);
             return HopResult::Answer(entry);
         }
 
         if qtype != CNAME_RECORD_TYPE {
-            let cname_hop = state
-                .positive
-                .domains
-                .get(domain)
-                .and_then(|record_sets| record_sets.record_sets.get(&(CNAME_RECORD_TYPE, qclass)))
-                .filter(|entry| {
-                    entry.expires_at > now
-                        && entry.cache_namespace == current_namespace
-                        && (!dnssec_ok || entry.dnssec_complete)
-                })
-                .and_then(|entry| {
-                    entry
-                        .records
-                        .iter()
-                        .find_map(|record| match &record.rdata {
-                            RecordData::CNAME(target) => Some(target.clone()),
-                            _ => None,
-                        })
-                        .map(|target| (entry.clone(), target))
-                });
-            if let Some((entry, target)) = cname_hop {
+            let cname_key = (CNAME_RECORD_TYPE, qclass);
+            if let Some((entry, target)) =
+                state.take_live_cname_hop(domain, cname_key, dnssec_ok, current_namespace, now)
+            {
                 state.lru.touch(domain);
                 return HopResult::CnameHop(entry, target);
             }
@@ -288,19 +444,9 @@ impl Shard {
             qtype: Some(qtype),
             qclass,
         };
-        let nodata = state
-            .negative
-            .domains
-            .get(domain)
-            .and_then(|entries| entries.entries.get(&nodata_key))
-            .filter(|entry| {
-                entry.expires_at > now
-                    && entry.cache_namespace == current_namespace
-                    && (!dnssec_ok
-                        || (entry.dnssec_complete && entry.dnssec_proof_material_fresh(now)))
-            })
-            .cloned();
-        if let Some(entry) = nodata {
+        if let Some(entry) =
+            state.take_live_negative(domain, &nodata_key, dnssec_ok, current_namespace, now)
+        {
             state.lru.touch(domain);
             return HopResult::NoData(entry);
         }
@@ -309,19 +455,9 @@ impl Shard {
             qtype: None,
             qclass,
         };
-        let nxdomain = state
-            .negative
-            .domains
-            .get(domain)
-            .and_then(|entries| entries.entries.get(&nxdomain_key))
-            .filter(|entry| {
-                entry.expires_at > now
-                    && entry.cache_namespace == current_namespace
-                    && (!dnssec_ok
-                        || (entry.dnssec_complete && entry.dnssec_proof_material_fresh(now)))
-            })
-            .cloned();
-        if let Some(entry) = nxdomain {
+        if let Some(entry) =
+            state.take_live_negative(domain, &nxdomain_key, dnssec_ok, current_namespace, now)
+        {
             state.lru.touch(domain);
             return HopResult::NxDomain(entry);
         }
@@ -458,6 +594,7 @@ mod tests {
             dnssec_state: Default::default(),
             cache_namespace: "ns-1".to_string(),
             dnssec_complete: true,
+            authoritative: false,
         }
     }
 
@@ -473,6 +610,8 @@ mod tests {
             expires_at: now + Duration::from_secs(3600),
             cache_namespace: "ns-1".to_string(),
             dnssec_complete: true,
+            dnssec_state: Default::default(),
+            authoritative: false,
         }
     }
 
@@ -737,6 +876,8 @@ mod tests {
             expires_at: stored_at + Duration::from_secs(3600),
             cache_namespace: "ns-1".to_string(),
             dnssec_complete: true,
+            dnssec_state: Default::default(),
+            authoritative: false,
         }
     }
 
@@ -814,5 +955,142 @@ mod tests {
             matches!(do_true_result, HopResult::NxDomain(_)),
             "a DO=true reader must still be served while every stored record remains within its own TTL, got {do_true_result:?}"
         );
+    }
+
+    // Regression tests for the expired-entry-not-evicted bug: `lookup_hop`
+    // must actually remove an expired candidate entry from this shard's
+    // internal state the moment it's encountered, not merely filter it out
+    // of that one call's `HopResult`.
+
+    fn expired_rrset_entry(now: SystemTime) -> RRsetEntry {
+        let mut entry = rrset_entry();
+        entry.stored_at = now - Duration::from_secs(600);
+        entry.expires_at = now - Duration::from_secs(300); // expired 300s ago
+        entry
+    }
+
+    fn expired_negative_entry(now: SystemTime) -> NegativeEntry {
+        let mut entry = negative_entry();
+        entry.stored_at = now - Duration::from_secs(7200);
+        entry.expires_at = now - Duration::from_secs(3600); // expired an hour ago
+        entry
+    }
+
+    #[test]
+    fn lookup_hop_evicts_expired_positive_answer_from_shard_state() {
+        let shard = Shard::new(4);
+        let domain = "expired-answer.example.com";
+        let now = SystemTime::now();
+        shard.store_positive(domain, (A_QTYPE, IN_QCLASS), expired_rrset_entry(now));
+        assert_eq!(shard.domain_count(), 1);
+
+        let result = shard.lookup_hop(domain, A_QTYPE, IN_QCLASS, false, "ns-1", now);
+
+        assert!(matches!(result, HopResult::Miss));
+        assert!(
+            !shard.contains_positive(domain, (A_QTYPE, IN_QCLASS)),
+            "an expired positive entry must be removed from the shard's map, not just filtered out"
+        );
+        assert!(!shard.has_any_data(domain));
+        assert_eq!(
+            shard.domain_count(),
+            0,
+            "the domain's LRU token must be dropped once its only entry expires"
+        );
+    }
+
+    #[test]
+    fn lookup_hop_evicts_expired_cname_hop_from_shard_state() {
+        let shard = Shard::new(4);
+        let domain = "expired-cname.example.com";
+        let now = SystemTime::now();
+        let mut entry = expired_rrset_entry(now);
+        entry.records = vec![StoredRecord {
+            rtype: CNAME_RECORD_TYPE,
+            rclass: IN_QCLASS,
+            ttl_at_store: 300,
+            rdata: RecordData::CNAME("target.example.com".to_string()),
+        }];
+        shard.store_positive(domain, (CNAME_RECORD_TYPE, IN_QCLASS), entry);
+        assert_eq!(shard.domain_count(), 1);
+
+        let result = shard.lookup_hop(domain, A_QTYPE, IN_QCLASS, false, "ns-1", now);
+
+        assert!(matches!(result, HopResult::Miss));
+        assert!(!shard.contains_positive(domain, (CNAME_RECORD_TYPE, IN_QCLASS)));
+        assert!(!shard.has_any_data(domain));
+        assert_eq!(shard.domain_count(), 0);
+    }
+
+    #[test]
+    fn lookup_hop_evicts_expired_nodata_entry_from_shard_state() {
+        let shard = Shard::new(4);
+        let domain = "expired-nodata.example.com";
+        let now = SystemTime::now();
+        let nodata_key = NegativeKey {
+            qtype: Some(A_QTYPE),
+            qclass: IN_QCLASS,
+        };
+        shard.store_negative(domain, nodata_key.clone(), expired_negative_entry(now));
+        assert_eq!(shard.domain_count(), 1);
+
+        let result = shard.lookup_hop(domain, A_QTYPE, IN_QCLASS, false, "ns-1", now);
+
+        assert!(matches!(result, HopResult::Miss));
+        assert!(
+            !shard.contains_negative(domain, &nodata_key),
+            "an expired NODATA entry must be removed from the shard's map, not just filtered out"
+        );
+        assert!(!shard.has_any_data(domain));
+        assert_eq!(shard.domain_count(), 0);
+    }
+
+    #[test]
+    fn lookup_hop_evicts_expired_nxdomain_entry_from_shard_state() {
+        let shard = Shard::new(4);
+        let domain = "expired-nxdomain.example.com";
+        let now = SystemTime::now();
+        let nxdomain_key = NegativeKey {
+            qtype: None,
+            qclass: IN_QCLASS,
+        };
+        shard.store_negative(domain, nxdomain_key.clone(), expired_negative_entry(now));
+        assert_eq!(shard.domain_count(), 1);
+
+        let result = shard.lookup_hop(domain, A_QTYPE, IN_QCLASS, false, "ns-1", now);
+
+        assert!(matches!(result, HopResult::Miss));
+        assert!(!shard.contains_negative(domain, &nxdomain_key));
+        assert!(!shard.has_any_data(domain));
+        assert_eq!(shard.domain_count(), 0);
+    }
+
+    #[test]
+    fn lookup_hop_expired_entry_eviction_leaves_domain_tracked_when_other_live_data_remains() {
+        // A domain with both an expired A entry and a still-live AAAA
+        // entry: encountering the expired A entry during an A lookup must
+        // remove only that record set, not the domain's LRU token (since
+        // the AAAA entry is still live).
+        let shard = Shard::new(4);
+        let domain = "partially-expired.example.com";
+        let now = SystemTime::now();
+        const AAAA_QTYPE: u16 = 28;
+        shard.store_positive(domain, (A_QTYPE, IN_QCLASS), expired_rrset_entry(now));
+        shard.store_positive(domain, (AAAA_QTYPE, IN_QCLASS), rrset_entry());
+        assert_eq!(shard.domain_count(), 1);
+
+        let result = shard.lookup_hop(domain, A_QTYPE, IN_QCLASS, false, "ns-1", now);
+
+        assert!(matches!(result, HopResult::Miss));
+        assert!(!shard.contains_positive(domain, (A_QTYPE, IN_QCLASS)));
+        assert!(
+            shard.contains_positive(domain, (AAAA_QTYPE, IN_QCLASS)),
+            "the still-live AAAA entry must survive the A entry's expiry-triggered eviction"
+        );
+        assert!(
+            shard.has_any_data(domain),
+            "the domain must remain tracked since it still has live data"
+        );
+        assert_eq!(shard.domain_count(), 1);
     }
 }

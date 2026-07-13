@@ -84,6 +84,7 @@ mod tests {
             dnssec_state: Default::default(),
             cache_namespace: namespace.to_string(),
             dnssec_complete: true,
+            authoritative: false,
         }
     }
 
@@ -99,6 +100,8 @@ mod tests {
             expires_at: now + Duration::from_secs(3600),
             cache_namespace: namespace.to_string(),
             dnssec_complete: true,
+            dnssec_state: Default::default(),
+            authoritative: false,
         }
     }
 

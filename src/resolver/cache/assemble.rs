@@ -126,7 +126,21 @@ pub(crate) fn resolve_from_cache(
     let mut visited: HashSet<String> = HashSet::new();
 
     loop {
-        if chain.len() as u8 >= max_chain_depth || visited.contains(&current) {
+        // `chain.len()` here is the number of CNAME hops already followed
+        // (not counting the not-yet-looked-up `current` name), so a chain
+        // that has used exactly `max_chain_depth` CNAME restarts must still
+        // be allowed one more lookup at `current` to reach its terminal
+        // answer — hence `>`, not `>=`. `max_chain_depth` restarts means up
+        // to that many hops succeed before giving up, not
+        // `max_chain_depth - 1`.
+        //
+        // Compared without narrowing `chain.len()` (a `usize`) down to
+        // `u8` first: casting first would wrap a chain that reaches exactly
+        // 256 hops back to 0, silently defeating this guard for any
+        // `max_chain_depth` the wrapped value still compares less than
+        // (e.g. `max_chain_depth` near 255) until a cycle or genuine miss
+        // happens to end the walk some other way.
+        if chain.len() > usize::from(max_chain_depth) || visited.contains(&current) {
             return ChainLookup::Miss;
         }
         visited.insert(current.clone());
@@ -183,6 +197,16 @@ fn compute_wire_ttl(
         .unwrap_or(Duration::ZERO)
         .as_secs();
     aged.min(remaining_secs.min(u64::from(u32::MAX)) as u32)
+}
+
+/// Whether every hop in `chain` was itself sourced from an authoritative
+/// backend answer (`RRsetEntry::authoritative`) — vacuously `true` for an
+/// empty chain, since `assemble_negative_response` combines this with the
+/// terminal `NegativeEntry`'s own `authoritative` bit, and a negative
+/// result with zero CNAME hops must not have its AA bit forced false just
+/// because `chain` happened to be empty.
+fn chain_authoritative(chain: &[(String, RRsetEntry)]) -> bool {
+    chain.iter().all(|(_, entry)| entry.authoritative)
 }
 
 fn chain_answer_count(chain: &[(String, RRsetEntry)], dnssec_ok: bool) -> u16 {
@@ -308,7 +332,13 @@ fn negative_authority_count(negative: &NegativeEntry, dnssec_ok: bool) -> u16 {
 
 /// SERVFAIL per RFC 6840 §5.9: if `checking_disabled` is false and any
 /// relevant chain entry is `Bogus`, serve SERVFAIL instead of the cached
-/// data (checked across every hop, not just the terminal one).
+/// data (checked across every hop, not just the terminal one). Used for
+/// `ResolvedAnswer`, whose chain is the complete set of entries backing the
+/// response. For `ResolvedNegative`, whose terminal result is a
+/// `NegativeEntry` not part of `chain`, see `negative_dnssec_servfail_check`
+/// below instead — using this function alone for a negative result would
+/// only ever inspect its CNAME hops, never the terminal NXDOMAIN/NODATA
+/// entry's own `dnssec_state`.
 fn dnssec_servfail_check(chain: &[(String, RRsetEntry)], features: &QueryFeatures) -> bool {
     if features.checking_disabled {
         return false;
@@ -318,17 +348,66 @@ fn dnssec_servfail_check(chain: &[(String, RRsetEntry)], features: &QueryFeature
         .any(|(_, entry)| matches!(entry.dnssec_state, DnssecState::Bogus(_)))
 }
 
+/// `dnssec_servfail_check`'s sibling for `ResolvedNegative` results (mirrors
+/// `negative_dnssec_ad_bit`'s relationship to `dnssec_ad_bit`): forces
+/// SERVFAIL per RFC 6840 §5.9 when `checking_disabled` is false and either a
+/// CNAME hop in `chain` *or* the terminal `negative` entry's own
+/// `dnssec_state` is `Bogus`. Without this, a `NegativeEntry` marked
+/// `Bogus` would be served as an ordinary NXDOMAIN/NODATA to a CD=0
+/// requester instead of SERVFAIL — the same RFC 6840 §5.9 protection
+/// `dnssec_servfail_check` already gives positive chains, just missing on
+/// the negative-result path. `checking_disabled = true` (CD=1) still
+/// overrides this and serves the cached data as-is, same as the positive
+/// path — a CD=1 requester has explicitly asked to see potentially-bogus
+/// data itself.
+fn negative_dnssec_servfail_check(
+    chain: &[(String, RRsetEntry)],
+    negative: &NegativeEntry,
+    features: &QueryFeatures,
+) -> bool {
+    if features.checking_disabled {
+        return false;
+    }
+    matches!(negative.dnssec_state, DnssecState::Bogus(_))
+        || chain
+            .iter()
+            .any(|(_, entry)| matches!(entry.dnssec_state, DnssecState::Bogus(_)))
+}
+
 /// AD bit set only if every relevant chain entry is `Secure` and the
 /// requester set DO or AD. `Unvalidated`/`Insecure` never produce AD=1.
 /// An empty chain never produces AD=1 either — there's nothing to have
-/// validated (relevant for `ResolvedNegative`, whose own `NegativeEntry`
-/// carries no `dnssec_state` of its own to check; see `ResolvedNegative`'s
-/// doc comment).
+/// validated. Used for `ResolvedAnswer`, whose chain always ends in the
+/// terminal `RRsetEntry` itself (see `resolve_from_cache`), so the chain
+/// alone is the complete set of entries to check. For `ResolvedNegative`,
+/// whose terminal result is a `NegativeEntry` (with its own `dnssec_state`,
+/// not part of `chain`), see `negative_dnssec_ad_bit` below instead.
 fn dnssec_ad_bit(chain: &[(String, RRsetEntry)], features: &QueryFeatures) -> bool {
     if !(features.dnssec_ok || features.authenticated_data) {
         return false;
     }
     !chain.is_empty()
+        && chain
+            .iter()
+            .all(|(_, entry)| entry.dnssec_state == DnssecState::Secure)
+}
+
+/// `dnssec_ad_bit`'s sibling for `ResolvedNegative` results: AD=1 only if
+/// every CNAME hop in `chain` is `Secure` *and* the terminal `negative`
+/// entry's own `dnssec_state` is `Secure`. Unlike `dnssec_ad_bit`, an empty
+/// `chain` does not by itself prevent AD=1 here — a negative result with no
+/// CNAME hops at all (the common case) still has `negative` itself to
+/// validate, so the "nothing to have validated" rule that empty-guards
+/// `dnssec_ad_bit` doesn't apply.
+fn negative_dnssec_ad_bit(
+    chain: &[(String, RRsetEntry)],
+    negative: &NegativeEntry,
+    features: &QueryFeatures,
+) -> bool {
+    if !(features.dnssec_ok || features.authenticated_data) {
+        return false;
+    }
+    negative.dnssec_state == DnssecState::Secure
         && chain
             .iter()
             .all(|(_, entry)| entry.dnssec_state == DnssecState::Secure)
@@ -376,6 +455,7 @@ fn build_servfail(
         request_id,
         requester_features.recursion_desired,
         false,
+        false, // SERVFAIL carries no validated answer data to be authoritative about
         false,
         requester_features.checking_disabled,
         ResponseCode::ServFail,
@@ -411,12 +491,19 @@ fn build_servfail(
 /// an OPT record if the requester's original query had one — so the
 /// additional section is not unconditionally empty; it holds exactly the
 /// mirrored OPT record when the requester used EDNS, nothing otherwise.
+///
+/// `authoritative` is the same AA bit the untruncated response would have
+/// carried (see `chain_authoritative`/`RRsetEntry::authoritative`) — a
+/// truncated response is still describing the same underlying answer, so
+/// its AA bit must agree with what the full response would have said.
+#[allow(clippy::too_many_arguments)]
 fn finish_with_truncation_check(
     response: Vec<u8>,
     request_id: u16,
     requester_question_wire: &[u8],
     requester_features: &QueryFeatures,
     response_code: ResponseCode,
+    authoritative: bool,
     allow_udp_truncation: bool,
     configured_max_udp_payload_size: usize,
 ) -> Vec<u8> {
@@ -437,6 +524,7 @@ fn finish_with_truncation_check(
     build_truncated_wire_response(
         request_id,
         requester_features.recursion_desired,
+        authoritative,
         requester_features.checking_disabled,
         response_code,
         requester_question_wire,
@@ -471,6 +559,7 @@ pub(crate) fn assemble_response(
 
     let dnssec_ok = requester_features.dnssec_ok;
     let ad = dnssec_ad_bit(&resolved.chain, requester_features);
+    let authoritative = chain_authoritative(&resolved.chain);
     let an_count = chain_answer_count(&resolved.chain, dnssec_ok);
     let opt = requester_opt_record(requester_features, configured_max_udp_payload_size);
 
@@ -480,6 +569,7 @@ pub(crate) fn assemble_response(
         request_id,
         requester_features.recursion_desired,
         false,
+        authoritative,
         ad,
         requester_features.checking_disabled,
         ResponseCode::NoError,
@@ -504,6 +594,7 @@ pub(crate) fn assemble_response(
         requester_question_wire,
         requester_features,
         ResponseCode::NoError,
+        authoritative,
         allow_udp_truncation,
         configured_max_udp_payload_size,
     )
@@ -527,7 +618,7 @@ pub(crate) fn assemble_negative_response(
     allow_udp_truncation: bool,
     configured_max_udp_payload_size: usize,
 ) -> Vec<u8> {
-    if dnssec_servfail_check(&resolved.chain, requester_features) {
+    if negative_dnssec_servfail_check(&resolved.chain, &resolved.negative, requester_features) {
         return build_servfail(
             request_id,
             requester_question_wire,
@@ -537,7 +628,8 @@ pub(crate) fn assemble_negative_response(
     }
 
     let dnssec_ok = requester_features.dnssec_ok;
-    let ad = dnssec_ad_bit(&resolved.chain, requester_features);
+    let ad = negative_dnssec_ad_bit(&resolved.chain, &resolved.negative, requester_features);
+    let authoritative = chain_authoritative(&resolved.chain) && resolved.negative.authoritative;
     let an_count = chain_answer_count(&resolved.chain, dnssec_ok);
     let ns_count = negative_authority_count(&resolved.negative, dnssec_ok);
     let opt = requester_opt_record(requester_features, configured_max_udp_payload_size);
@@ -548,6 +640,7 @@ pub(crate) fn assemble_negative_response(
         request_id,
         requester_features.recursion_desired,
         false,
+        authoritative,
         ad,
         requester_features.checking_disabled,
         response_code,
@@ -580,6 +673,7 @@ pub(crate) fn assemble_negative_response(
         requester_question_wire,
         requester_features,
         response_code,
+        authoritative,
         allow_udp_truncation,
         configured_max_udp_payload_size,
     )
@@ -641,6 +735,7 @@ mod tests {
             dnssec_state: DnssecState::Unvalidated,
             cache_namespace: "ns-1".to_string(),
             dnssec_complete: true,
+            authoritative: false,
         }
     }
 
@@ -807,6 +902,94 @@ mod tests {
         let no_edns_parsed = Message::parse(&no_edns_response).unwrap();
         assert_eq!(no_edns_parsed.header.ar_count, 0);
         assert!(no_edns_parsed.edns.is_none());
+    }
+
+    // Regression test: a cache-hit response must preserve the *original
+    // backend response's* own AA bit (`RRsetEntry::authoritative`), not
+    // always claim AA=0. Before this fix, `write_message_header` never set
+    // AA at all, so a cached copy of an authoritative answer was silently
+    // downgraded to AA=0 on every subsequent cache hit.
+    #[test]
+    fn assemble_response_preserves_authoritative_bit_from_stored_entry() {
+        let now = SystemTime::now();
+        let wire = question_wire("example.com", A_QTYPE, IN_QCLASS);
+
+        let mut authoritative_entry =
+            rrset_entry(vec![a_record(300, 1)], Duration::from_secs(300), now);
+        authoritative_entry.authoritative = true;
+        let authoritative_resolved = ResolvedAnswer {
+            chain: vec![("example.com".to_string(), authoritative_entry)],
+        };
+        let aa_response = assemble_response(
+            1,
+            &wire,
+            &features(false),
+            &authoritative_resolved,
+            now,
+            false,
+            4096,
+        );
+        assert!(
+            Message::parse(&aa_response).unwrap().header.aa(),
+            "a cached entry stored from an AA=1 backend response must be served back as AA=1"
+        );
+
+        let mut non_authoritative_entry =
+            rrset_entry(vec![a_record(300, 1)], Duration::from_secs(300), now);
+        non_authoritative_entry.authoritative = false;
+        let non_authoritative_resolved = ResolvedAnswer {
+            chain: vec![("example.com".to_string(), non_authoritative_entry)],
+        };
+        let no_aa_response = assemble_response(
+            1,
+            &wire,
+            &features(false),
+            &non_authoritative_resolved,
+            now,
+            false,
+            4096,
+        );
+        assert!(
+            !Message::parse(&no_aa_response).unwrap().header.aa(),
+            "a cached entry stored from an AA=0 backend response must stay AA=0"
+        );
+
+        // A CNAME chain must only be reported AA=1 if every hop (not just
+        // the terminal entry) came from an authoritative backend response.
+        let mut authoritative_cname = rrset_entry(
+            vec![StoredRecord {
+                rtype: CNAME_RECORD_TYPE,
+                rclass: IN_QCLASS,
+                ttl_at_store: 300,
+                rdata: RecordData::CNAME("target.example.com".to_string()),
+            }],
+            Duration::from_secs(300),
+            now,
+        );
+        authoritative_cname.authoritative = true;
+        let mut non_authoritative_terminal =
+            rrset_entry(vec![a_record(300, 1)], Duration::from_secs(300), now);
+        non_authoritative_terminal.authoritative = false;
+        let mixed_resolved = ResolvedAnswer {
+            chain: vec![
+                ("alias.example.com".to_string(), authoritative_cname),
+                ("target.example.com".to_string(), non_authoritative_terminal),
+            ],
+        };
+        let mixed_wire = question_wire("alias.example.com", A_QTYPE, IN_QCLASS);
+        let mixed_response = assemble_response(
+            1,
+            &mixed_wire,
+            &features(false),
+            &mixed_resolved,
+            now,
+            false,
+            4096,
+        );
+        assert!(
+            !Message::parse(&mixed_response).unwrap().header.aa(),
+            "AA=1 requires every hop in the chain to be authoritative, not just the terminal one"
+        );
     }
 
     // Regression test for RFC 4035 §3.2.2: a security-aware recursive name
@@ -981,6 +1164,8 @@ mod tests {
             expires_at: now + Duration::from_secs(ttl as u64),
             cache_namespace: "ns-1".to_string(),
             dnssec_complete: true,
+            dnssec_state: DnssecState::Unvalidated,
+            authoritative: false,
         }
     }
 
@@ -1025,6 +1210,121 @@ mod tests {
             Message::parse(&nodata_response).unwrap().header.r_code(),
             ResponseCode::NoError as u8
         );
+    }
+
+    // Regression tests for RFC 6840 §5.9: a `NegativeEntry` whose own
+    // `dnssec_state` is `Bogus` must be served as SERVFAIL, not as an
+    // ordinary NXDOMAIN/NODATA, when the requester's CD bit is 0 -- mirrors
+    // `assemble_response_servfails_on_bogus_when_checking_enabled`'s
+    // coverage for positive chains, which `dnssec_servfail_check` already
+    // handled; `negative_dnssec_servfail_check` is the negative-result
+    // sibling this test locks in. A CD=1 requester still gets the cached
+    // data served normally, same as the positive-chain case.
+    #[test]
+    fn assemble_negative_response_servfails_on_bogus_nxdomain_when_checking_enabled() {
+        let now = SystemTime::now();
+        let mut bogus_negative = negative_entry(now, 3600, None, Vec::new());
+        bogus_negative.dnssec_state =
+            DnssecState::Bogus("signature verification failed".to_string());
+        let resolved = ResolvedNegative {
+            chain: Vec::new(),
+            terminal_name: "nx.example.com".to_string(),
+            negative: bogus_negative,
+        };
+        let wire = question_wire("nx.example.com", A_QTYPE, IN_QCLASS);
+
+        let checking_enabled = features(false);
+        let servfail_response = assemble_negative_response(
+            1,
+            &wire,
+            &checking_enabled,
+            &resolved,
+            ResponseCode::NxDomain,
+            now,
+            false,
+            4096,
+        );
+        let servfail_parsed = Message::parse(&servfail_response).unwrap();
+        assert_eq!(
+            servfail_parsed.header.r_code(),
+            ResponseCode::ServFail as u8,
+            "a Bogus NegativeEntry must be served as SERVFAIL when CD=0"
+        );
+        assert_eq!(servfail_parsed.authorities.len(), 0);
+
+        let mut checking_disabled = features(false);
+        checking_disabled.checking_disabled = true;
+        let served_response = assemble_negative_response(
+            1,
+            &wire,
+            &checking_disabled,
+            &resolved,
+            ResponseCode::NxDomain,
+            now,
+            false,
+            4096,
+        );
+        let served_parsed = Message::parse(&served_response).unwrap();
+        assert_eq!(
+            served_parsed.header.r_code(),
+            ResponseCode::NxDomain as u8,
+            "CD=1 must still serve the cached NXDOMAIN despite the Bogus state"
+        );
+        assert_eq!(served_parsed.authorities.len(), 1);
+    }
+
+    #[test]
+    fn assemble_negative_response_servfails_on_bogus_nodata_when_checking_enabled() {
+        let now = SystemTime::now();
+        let mut bogus_negative = negative_entry(now, 3600, None, Vec::new());
+        bogus_negative.kind = NegativeCacheKind::NoData;
+        bogus_negative.dnssec_state =
+            DnssecState::Bogus("signature verification failed".to_string());
+        let resolved = ResolvedNegative {
+            chain: Vec::new(),
+            terminal_name: "example.com".to_string(),
+            negative: bogus_negative,
+        };
+        let wire = question_wire("example.com", A_QTYPE, IN_QCLASS);
+
+        let checking_enabled = features(false);
+        let servfail_response = assemble_negative_response(
+            1,
+            &wire,
+            &checking_enabled,
+            &resolved,
+            ResponseCode::NoError,
+            now,
+            false,
+            4096,
+        );
+        let servfail_parsed = Message::parse(&servfail_response).unwrap();
+        assert_eq!(
+            servfail_parsed.header.r_code(),
+            ResponseCode::ServFail as u8,
+            "a Bogus NegativeEntry must be served as SERVFAIL when CD=0, even for NODATA"
+        );
+        assert_eq!(servfail_parsed.authorities.len(), 0);
+
+        let mut checking_disabled = features(false);
+        checking_disabled.checking_disabled = true;
+        let served_response = assemble_negative_response(
+            1,
+            &wire,
+            &checking_disabled,
+            &resolved,
+            ResponseCode::NoError,
+            now,
+            false,
+            4096,
+        );
+        let served_parsed = Message::parse(&served_response).unwrap();
+        assert_eq!(
+            served_parsed.header.r_code(),
+            ResponseCode::NoError as u8,
+            "CD=1 must still serve the cached NODATA despite the Bogus state"
+        );
+        assert_eq!(served_parsed.authorities.len(), 1);
     }
 
     // Regression test for the negative-cache SOA-owner bug: the SOA in the
@@ -1453,6 +1753,148 @@ mod tests {
     }
 
     #[test]
+    fn assemble_negative_response_sets_ad_only_when_negative_entry_secure_and_requested() {
+        let now = SystemTime::now();
+
+        // A secure negative entry, no CNAME chain: AD=1 with DO, AD=0
+        // without DO/AD, mirroring the positive-side
+        // `assemble_response_sets_ad_only_when_secure_and_requested` test.
+        let mut secure_negative = negative_entry(now, 3600, None, Vec::new());
+        secure_negative.dnssec_state = DnssecState::Secure;
+        let resolved = ResolvedNegative {
+            chain: Vec::new(),
+            terminal_name: "nx.example.com".to_string(),
+            negative: secure_negative,
+        };
+        let wire = question_wire("nx.example.com", A_QTYPE, IN_QCLASS);
+
+        let mut do_features = features(true);
+        let with_do = assemble_negative_response(
+            1,
+            &wire,
+            &do_features,
+            &resolved,
+            ResponseCode::NxDomain,
+            now,
+            false,
+            4096,
+        );
+        assert!(
+            Message::parse(&with_do).unwrap().header.ad(),
+            "a Secure negative entry must produce AD=1 when the requester set DO"
+        );
+
+        do_features.dnssec_ok = false;
+        let without_do_or_ad = assemble_negative_response(
+            1,
+            &wire,
+            &do_features,
+            &resolved,
+            ResponseCode::NxDomain,
+            now,
+            false,
+            4096,
+        );
+        assert!(
+            !Message::parse(&without_do_or_ad).unwrap().header.ad(),
+            "AD must stay 0 when the requester set neither DO nor AD"
+        );
+
+        // Unvalidated never produces AD=1, same as the positive side.
+        let unvalidated_negative = negative_entry(now, 3600, None, Vec::new());
+        let unvalidated_resolved = ResolvedNegative {
+            chain: Vec::new(),
+            terminal_name: "nx.example.com".to_string(),
+            negative: unvalidated_negative,
+        };
+        let unvalidated_response = assemble_negative_response(
+            1,
+            &wire,
+            &features(true),
+            &unvalidated_resolved,
+            ResponseCode::NxDomain,
+            now,
+            false,
+            4096,
+        );
+        assert!(
+            !Message::parse(&unvalidated_response).unwrap().header.ad(),
+            "an Unvalidated negative entry must never produce AD=1"
+        );
+
+        // A secure negative entry preceded by a CNAME chain: AD=1 requires
+        // every chain hop to also be Secure, not just the terminal negative
+        // entry.
+        let mut secure_cname = rrset_entry(
+            vec![StoredRecord {
+                rtype: CNAME_RECORD_TYPE,
+                rclass: IN_QCLASS,
+                ttl_at_store: 300,
+                rdata: RecordData::CNAME("target.example.com".to_string()),
+            }],
+            Duration::from_secs(300),
+            now,
+        );
+        secure_cname.dnssec_state = DnssecState::Secure;
+        let mut secure_negative_with_chain = negative_entry(now, 3600, None, Vec::new());
+        secure_negative_with_chain.dnssec_state = DnssecState::Secure;
+        let resolved_with_secure_chain = ResolvedNegative {
+            chain: vec![("alias.example.com".to_string(), secure_cname)],
+            terminal_name: "target.example.com".to_string(),
+            negative: secure_negative_with_chain,
+        };
+        let chain_wire = question_wire("alias.example.com", A_QTYPE, IN_QCLASS);
+        let secure_chain_response = assemble_negative_response(
+            1,
+            &chain_wire,
+            &features(true),
+            &resolved_with_secure_chain,
+            ResponseCode::NxDomain,
+            now,
+            false,
+            4096,
+        );
+        assert!(
+            Message::parse(&secure_chain_response).unwrap().header.ad(),
+            "AD=1 requires every CNAME hop to be Secure too, and here they all are"
+        );
+
+        let mut unvalidated_cname = rrset_entry(
+            vec![StoredRecord {
+                rtype: CNAME_RECORD_TYPE,
+                rclass: IN_QCLASS,
+                ttl_at_store: 300,
+                rdata: RecordData::CNAME("target.example.com".to_string()),
+            }],
+            Duration::from_secs(300),
+            now,
+        );
+        unvalidated_cname.dnssec_state = DnssecState::Unvalidated;
+        let mut secure_negative_after_unvalidated_hop = negative_entry(now, 3600, None, Vec::new());
+        secure_negative_after_unvalidated_hop.dnssec_state = DnssecState::Secure;
+        let resolved_with_unvalidated_hop = ResolvedNegative {
+            chain: vec![("alias.example.com".to_string(), unvalidated_cname)],
+            terminal_name: "target.example.com".to_string(),
+            negative: secure_negative_after_unvalidated_hop,
+        };
+        let mixed_response = assemble_negative_response(
+            1,
+            &chain_wire,
+            &features(true),
+            &resolved_with_unvalidated_hop,
+            ResponseCode::NxDomain,
+            now,
+            false,
+            4096,
+        );
+        assert!(
+            !Message::parse(&mixed_response).unwrap().header.ad(),
+            "an Unvalidated CNAME hop must prevent AD=1 even when the terminal negative entry \
+             is Secure"
+        );
+    }
+
+    #[test]
     fn resolve_from_cache_finds_nodata_before_nxdomain_when_both_keys_present() {
         let cache = cache_with_shard_count(1);
         let now = SystemTime::now();
@@ -1549,6 +1991,164 @@ mod tests {
     }
 
     #[test]
+    fn resolve_from_cache_allows_terminal_hop_at_exact_max_chain_depth_boundary() {
+        let cache = cache_with_shard_count(1);
+        let now = SystemTime::now();
+        // a -> b -> c -> d (3 CNAME restarts), terminal answer at "d".
+        let hops = [
+            ("a.example.com", "b.example.com"),
+            ("b.example.com", "c.example.com"),
+            ("c.example.com", "d.example.com"),
+        ];
+        for (name, target) in hops {
+            let entry = rrset_entry(
+                vec![StoredRecord {
+                    rtype: CNAME_RECORD_TYPE,
+                    rclass: IN_QCLASS,
+                    ttl_at_store: 300,
+                    rdata: RecordData::CNAME(target.to_string()),
+                }],
+                Duration::from_secs(300),
+                now,
+            );
+            cache
+                .shard_for(name)
+                .store_positive(name, (CNAME_RECORD_TYPE, IN_QCLASS), entry);
+        }
+        let terminal = rrset_entry(vec![a_record(300, 1)], Duration::from_secs(300), now);
+        cache.shard_for("d.example.com").store_positive(
+            "d.example.com",
+            (A_QTYPE, IN_QCLASS),
+            terminal,
+        );
+
+        // A chain using exactly 3 CNAME restarts must succeed when
+        // max_chain_depth is exactly 3 — "up to max_chain_depth restarts"
+        // must mean the boundary itself is allowed, not
+        // max_chain_depth - 1.
+        let exact_boundary = resolve_from_cache(
+            &cache,
+            "a.example.com",
+            A_QTYPE,
+            IN_QCLASS,
+            false,
+            "ns-1",
+            3,
+            now,
+        );
+        match exact_boundary {
+            ChainLookup::Answered(resolved) => {
+                assert_eq!(resolved.chain.len(), 4, "3 CNAME hops + terminal answer");
+            }
+            other => {
+                panic!("expected Answered at the exact max_chain_depth boundary, got {other:?}")
+            }
+        }
+
+        // A chain needing 4 CNAME restarts (one more than max_chain_depth)
+        // must still fail — a distinct chain, so no intermediate hop has a
+        // shortcut direct answer that would mask the depth bound.
+        let hops_of_four = [
+            ("p.example.com", "q.example.com"),
+            ("q.example.com", "r.example.com"),
+            ("r.example.com", "s.example.com"),
+            ("s.example.com", "t.example.com"),
+        ];
+        for (name, target) in hops_of_four {
+            let entry = rrset_entry(
+                vec![StoredRecord {
+                    rtype: CNAME_RECORD_TYPE,
+                    rclass: IN_QCLASS,
+                    ttl_at_store: 300,
+                    rdata: RecordData::CNAME(target.to_string()),
+                }],
+                Duration::from_secs(300),
+                now,
+            );
+            cache
+                .shard_for(name)
+                .store_positive(name, (CNAME_RECORD_TYPE, IN_QCLASS), entry);
+        }
+        let terminal_t = rrset_entry(vec![a_record(300, 1)], Duration::from_secs(300), now);
+        cache.shard_for("t.example.com").store_positive(
+            "t.example.com",
+            (A_QTYPE, IN_QCLASS),
+            terminal_t,
+        );
+        let four_restarts_at_boundary = resolve_from_cache(
+            &cache,
+            "p.example.com",
+            A_QTYPE,
+            IN_QCLASS,
+            false,
+            "ns-1",
+            3,
+            now,
+        );
+        assert_eq!(
+            four_restarts_at_boundary,
+            ChainLookup::Miss,
+            "a chain needing max_chain_depth + 1 restarts must still fail"
+        );
+    }
+
+    /// Regression test: the depth guard used to compare
+    /// `chain.len() as u8 > max_chain_depth`, narrowing `chain.len()` (a
+    /// `usize`) down to `u8` *before* comparing. With `max_chain_depth`
+    /// near 255 and a chain reaching exactly 256 hops, `256 as u8` wraps
+    /// around to `0`, and `0 > 255` is false -- so the old guard would
+    /// silently let the walk continue right at the one point it should
+    /// have stopped, defeating the configured cap. This chain needs
+    /// exactly 256 CNAME restarts to reach its terminal answer, one more
+    /// than `max_chain_depth = 255` allows: the walk must give up with
+    /// `Miss`, not wrap around and serve the terminal answer anyway.
+    #[test]
+    fn resolve_from_cache_depth_guard_does_not_wrap_at_256_hops() {
+        let cache = cache_with_shard_count(1);
+        let now = SystemTime::now();
+        const HOP_COUNT: usize = 256;
+        let names: Vec<String> = (0..=HOP_COUNT)
+            .map(|i| format!("h{i}.example.com"))
+            .collect();
+        for window in names.windows(2) {
+            let (name, target) = (&window[0], &window[1]);
+            let entry = rrset_entry(
+                vec![StoredRecord {
+                    rtype: CNAME_RECORD_TYPE,
+                    rclass: IN_QCLASS,
+                    ttl_at_store: 300,
+                    rdata: RecordData::CNAME(target.clone()),
+                }],
+                Duration::from_secs(300),
+                now,
+            );
+            cache
+                .shard_for(name)
+                .store_positive(name, (CNAME_RECORD_TYPE, IN_QCLASS), entry);
+        }
+        let terminal_name = names.last().unwrap();
+        let terminal = rrset_entry(vec![a_record(300, 1)], Duration::from_secs(300), now);
+        cache.shard_for(terminal_name).store_positive(
+            terminal_name,
+            (A_QTYPE, IN_QCLASS),
+            terminal,
+        );
+
+        let result = resolve_from_cache(
+            &cache, &names[0], A_QTYPE, IN_QCLASS, false, "ns-1",
+            255, // max_chain_depth: one less than the 256 restarts this chain needs
+            now,
+        );
+
+        assert_eq!(
+            result,
+            ChainLookup::Miss,
+            "a chain needing exactly 256 restarts must still fail max_chain_depth = 255, \
+             not silently succeed because 256 wrapped to 0 under a narrowing u8 cast"
+        );
+    }
+
+    #[test]
     fn resolve_from_cache_treats_expired_entry_as_miss() {
         let cache = cache_with_shard_count(1);
         let now = SystemTime::now();
@@ -1620,6 +2220,8 @@ mod tests {
             expires_at: now + Duration::from_secs(3600),
             cache_namespace: "ns-1".to_string(),
             dnssec_complete: true,
+            dnssec_state: DnssecState::Unvalidated,
+            authoritative: false,
         };
         let neg_key = NegativeKey {
             qtype: None,

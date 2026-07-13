@@ -649,6 +649,18 @@ pub fn rewrite_response_id(response_bytes: &mut [u8], request_id: u16) -> Result
     Ok(())
 }
 
+/// Rewrites a raw wire response's transaction ID, RD bit, and CD bit to
+/// match `request`'s own — used when a shared/reused backend response
+/// (e.g. a single-flight follower falling back to its leader's raw fetch
+/// result) is being handed back to a requester whose own request fields may
+/// differ from whatever request originally produced these bytes.
+/// `MissKey` (`resolver::cache::singleflight`) coalesces on
+/// name/type/class/namespace/DO only, not RD or CD, so both must be
+/// rewritten here per requester rather than trusting the shared bytes'
+/// own flags. Per RFC 4035 §3.2.2, a security-aware recursive name server
+/// MUST copy the query's CD bit into the response, so leaving it as
+/// whichever coalesced requester's fetch happened to set it would be a
+/// spec violation for every other requester sharing that fetch.
 pub fn rewrite_response_request_fields(response_bytes: &mut [u8], request: &Message) -> Result<()> {
     rewrite_response_id(response_bytes, request.header.id)?;
     if response_bytes.len() < 4 {
@@ -660,6 +672,11 @@ pub fn rewrite_response_request_fields(response_bytes: &mut [u8], request: &Mess
         flags |= 0x0100;
     } else {
         flags &= !0x0100;
+    }
+    if request.header.cd() {
+        flags |= 0x0010;
+    } else {
+        flags &= !0x0010;
     }
     response_bytes[2..4].copy_from_slice(&flags.to_be_bytes());
     Ok(())
@@ -831,6 +848,7 @@ fn build_question_response(
         request.header.id,
         request.header.rd(),
         false,
+        false, // synthetic local response, never authoritative
         false,
         request.header.cd(),
         rcode,
@@ -977,12 +995,20 @@ pub(crate) fn write_u32(out: &mut Vec<u8>, value: u32) {
 /// `checking_disabled` copies the query's CD bit onto the response, per
 /// RFC 4035 §3.2.2 ("a security-aware recursive name server MUST copy the
 /// CD bit from a query to the corresponding response").
+///
+/// `authoritative` sets the AA bit — it must reflect the *original backend
+/// response's* own AA bit (see `RRsetEntry::authoritative`/
+/// `NegativeEntry::authoritative`) whenever this header is describing a
+/// cached copy of that answer; it is not something this resolver can claim
+/// on its own behalf. `RA` (recursion available) stays hardcoded true,
+/// since this resolver always performs recursion.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn write_message_header(
     out: &mut Vec<u8>,
     id: u16,
     recursion_desired: bool,
     truncated: bool,
+    authoritative: bool,
     authenticated_data: bool,
     checking_disabled: bool,
     rcode: ResponseCode,
@@ -998,6 +1024,9 @@ pub(crate) fn write_message_header(
     }
     if truncated {
         flags |= 0x0200;
+    }
+    if authoritative {
+        flags |= 0x0400; // AA
     }
     flags |= 0x0080; // RA = 1
     if authenticated_data {
@@ -1026,9 +1055,14 @@ pub(crate) fn write_message_header(
 /// backend miss and local-entry paths) so both truncation call sites build
 /// from the same primitives (`write_message_header` + `write_opt_record`)
 /// and can't drift out of RFC compliance independently of each other again.
+///
+/// `authoritative` is threaded straight to `write_message_header`'s AA bit
+/// — see that function's doc comment for the contract.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn build_truncated_wire_response(
     request_id: u16,
     recursion_desired: bool,
+    authoritative: bool,
     checking_disabled: bool,
     response_code: ResponseCode,
     question_wire: &[u8],
@@ -1040,6 +1074,7 @@ pub(crate) fn build_truncated_wire_response(
         request_id,
         recursion_desired,
         true,
+        authoritative,
         false,
         checking_disabled,
         response_code,
@@ -3918,6 +3953,7 @@ mod tests {
         let response = Message::parse(&build_truncated_wire_response(
             request.header.id,
             request.header.rd(),
+            false,
             true,
             ResponseCode::NxDomain,
             &question_wire,
@@ -3953,6 +3989,7 @@ mod tests {
             request.header.id,
             request.header.rd(),
             false,
+            false,
             ResponseCode::NoError,
             &question_wire,
             None,
@@ -3975,6 +4012,63 @@ mod tests {
             rewrite_response_id(&mut [0u8; 1], 0x3333),
             Err(DnsParseError::MessageTooShort)
         );
+    }
+
+    // Regression tests for RFC 4035 §3.2.2: `rewrite_response_request_fields`
+    // must copy the *rewriting request's own* CD bit onto a shared/reused
+    // backend response, not merely its RD bit -- a single-flight follower
+    // falling back to its leader's raw fetch result must never inherit the
+    // leader's CD bit when the two differ. Both directions are checked: a
+    // CD=1 follower behind a CD=0 leader's bytes, and the reverse.
+
+    fn request_with_flags(flags: u16) -> Message {
+        let mut request = Vec::new();
+        push_header_with_flags(&mut request, flags, 1, 0, 0, 0);
+        push_question(&mut request, "example.com", 1, 1);
+        Message::parse_standard_query(&request).unwrap()
+    }
+
+    #[test]
+    fn rewrite_response_request_fields_sets_cd_when_request_has_cd_but_response_does_not() {
+        // QR=1, CD=0 in the shared response bytes.
+        let mut response = Vec::new();
+        push_header_with_flags(&mut response, 0x8000, 1, 0, 0, 0);
+        push_question(&mut response, "example.com", 1, 1);
+
+        // The rewriting request has RD=0, CD=1 -- both differ from the
+        // shared response's current flags.
+        let request = request_with_flags(0x0010);
+
+        rewrite_response_request_fields(&mut response, &request).unwrap();
+
+        let parsed = Message::parse(&response).unwrap();
+        assert!(
+            parsed.header.cd(),
+            "the response must carry the rewriting request's own CD=1, not the shared bytes' CD=0"
+        );
+        assert!(!parsed.header.rd());
+        assert_eq!(parsed.header.id, request.header.id);
+    }
+
+    #[test]
+    fn rewrite_response_request_fields_clears_cd_when_request_has_no_cd_but_response_does() {
+        // QR=1, RD=1, CD=1 in the shared response bytes (e.g. built to
+        // satisfy a leader whose own request had CD=1).
+        let mut response = Vec::new();
+        push_header_with_flags(&mut response, 0x8110, 1, 0, 0, 0);
+        push_question(&mut response, "example.com", 1, 1);
+
+        // The rewriting (follower) request has RD=1, CD=0.
+        let request = request_with_flags(0x0100);
+
+        rewrite_response_request_fields(&mut response, &request).unwrap();
+
+        let parsed = Message::parse(&response).unwrap();
+        assert!(
+            !parsed.header.cd(),
+            "the response must carry the rewriting request's own CD=0, not the shared bytes' CD=1"
+        );
+        assert!(parsed.header.rd());
     }
 
     #[test]

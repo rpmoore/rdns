@@ -539,12 +539,18 @@ a backend, so it doesn't fit that file's `resolver_with_cache`/
 ## Summary for the parent orchestrator
 
 Files/paths most relevant to this task:
-- `/home/rpmoore/code/rdns/docs/plans/cache_rework/sections/section-08-test-migration-and-benchmark.md` (written by this invocation)
-- `/home/rpmoore/code/rdns/src/resolver/mod.rs` — the file this section edits almost exclusively (deleting `InMemoryDnsCache` at roughly `mod.rs:5322-5499` in the pre-rework file, the `#[cfg(test)] mod tests` block starting at `mod.rs:6533`, the `RecordingCache`/`OwnedOnlyProtocolCodec` doubles around `mod.rs:8156-8380`, and the ~23-test cache cluster around `mod.rs:12076-12352` plus the resolve-level integration tests scattered through `mod.rs:13700-14600`)
-- `/home/rpmoore/code/rdns/tests/recursive_perf.rs` and `/home/rpmoore/code/rdns/justfile` — referenced for the new concurrency benchmark's conventions and recipe wiring
-- Context read (not modified): `/home/rpmoore/code/rdns/docs/plans/cache_rework/claude-plan.md` §9-§12, `/home/rpmoore/code/rdns/docs/plans/cache_rework/claude-plan-tdd.md` §9 and §11, `/home/rpmoore/code/rdns/docs/plans/cache_rework/sections/index.md`, and the already-written `/home/rpmoore/code/rdns/docs/plans/cache_rework/sections/section-06-assembly-and-chains.md` and `section-07-call-site-migration.md` (to keep this section consistent with what they already committed to, e.g. `ChainLookup`/`ResolvedAnswer`/`ResolvedNegative` shapes and section-07's own "tests to write first" list, which this section explicitly does not duplicate)
+- `docs/plans/cache_rework/sections/section-08-test-migration-and-benchmark.md` (written by this invocation)
+- `src/resolver/mod.rs` — the file this section edits almost exclusively (deleting `InMemoryDnsCache` at roughly `mod.rs:5322-5499` in the pre-rework file, the `#[cfg(test)] mod tests` block starting at `mod.rs:6533`, the `RecordingCache`/`OwnedOnlyProtocolCodec` doubles around `mod.rs:8156-8380`, and the ~23-test cache cluster around `mod.rs:12076-12352` plus the resolve-level integration tests scattered through `mod.rs:13700-14600`)
+- `tests/recursive_perf.rs` and `justfile` — referenced for the new concurrency benchmark's conventions and recipe wiring
+- Context read (not modified): `docs/plans/cache_rework/claude-plan.md` §9-§12, `docs/plans/cache_rework/claude-plan-tdd.md` §9 and §11, `docs/plans/cache_rework/sections/index.md`, and the already-written `docs/plans/cache_rework/sections/section-06-assembly-and-chains.md` and `section-07-call-site-migration.md` (to keep this section consistent with what they already committed to, e.g. `ChainLookup`/`ResolvedAnswer`/`ResolvedNegative` shapes and section-07's own "tests to write first" list, which this section explicitly does not duplicate)
 
-No files outside the section-08 output were modified — this was a research-and-write task.
+This was primarily a research-and-write task, but implementing it also touched
+a few files beyond the section-08 output itself: the actual section-08 commit
+(`b4bd5b4`) additionally modified `justfile` (wiring the new benchmark into
+`just bench`), `src/resolver/cache/entry.rs` (widening `RRsetEntry`/
+`StoredRecord`/`DnssecState` to `pub`), `src/resolver/mod.rs` (re-exporting
+those types), and added `tests/cache_concurrency_bench.rs` (the new
+concurrency benchmark itself) — see the commit for the authoritative diff.
 
 ## Implementation notes (actual vs. planned)
 

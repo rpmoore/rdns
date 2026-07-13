@@ -22,8 +22,9 @@ mod namespace;
 mod shard;
 mod singleflight;
 
-use std::collections::hash_map::DefaultHasher;
-use std::hash::{Hash, Hasher};
+use std::collections::hash_map::RandomState;
+use std::hash::BuildHasher;
+use std::sync::OnceLock;
 use std::time::SystemTime;
 
 use shard::Shard;
@@ -210,14 +211,24 @@ impl DomainDnsCache for ShardedDnsCache {
 /// `CacheConfig::resolved_shard_count`); `shard_count == 0` is handled
 /// defensively (returns 0) rather than panicking, since this is a cheap
 /// routing function, not a place to enforce config invariants.
+///
+/// Hashes with a per-process-random `RandomState` (the same builder
+/// `std::collections::HashMap`'s own default uses), generated once and
+/// reused for every call via `PROCESS_SHARD_HASH_SEED` — not
+/// `DefaultHasher::new()`'s fixed, well-known seed, which would make shard
+/// routing predictable across restarts. Reusing one seed per process (
+/// rather than randomizing per call) is what keeps routing deterministic
+/// *within* one running resolver's lifetime: the same domain must always
+/// land in the same shard for as long as this process is up, or every
+/// lookup would miss its own just-stored entry.
 #[allow(dead_code)]
 pub(crate) fn shard_index(domain: &str, shard_count: usize) -> usize {
     if shard_count == 0 {
         return 0;
     }
-    let mut hasher = DefaultHasher::new();
-    domain.hash(&mut hasher);
-    (hasher.finish() % shard_count as u64) as usize
+    static PROCESS_SHARD_HASH_SEED: OnceLock<RandomState> = OnceLock::new();
+    let build_hasher = PROCESS_SHARD_HASH_SEED.get_or_init(RandomState::new);
+    (build_hasher.hash_one(domain) % shard_count as u64) as usize
 }
 
 #[cfg(test)]
