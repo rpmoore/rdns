@@ -177,9 +177,7 @@ impl ShardState {
             None => return None,
             Some(entry) if entry.expires_at <= now => true,
             Some(entry) => {
-                if entry.cache_epoch == current_epoch
-                    && (!dnssec_ok || entry.dnssec_complete)
-                {
+                if entry.cache_epoch == current_epoch && (!dnssec_ok || entry.dnssec_complete) {
                     return Some(entry.clone());
                 }
                 false
@@ -214,9 +212,7 @@ impl ShardState {
             None => return None,
             Some(entry) if entry.expires_at <= now => true,
             Some(entry) => {
-                if entry.cache_epoch == current_epoch
-                    && (!dnssec_ok || entry.dnssec_complete)
-                {
+                if entry.cache_epoch == current_epoch && (!dnssec_ok || entry.dnssec_complete) {
                     let target = entry.records.iter().find_map(|record| match &record.rdata {
                         RecordData::CNAME(target) => Some(target.clone()),
                         _ => None,
@@ -901,15 +897,13 @@ mod tests {
             negative_entry_with_short_lived_proof(stored_at),
         );
 
-        let do_false_result =
-            shard.lookup_hop(nxdomain_domain, A_QTYPE, IN_QCLASS, false, 1, now);
+        let do_false_result = shard.lookup_hop(nxdomain_domain, A_QTYPE, IN_QCLASS, false, 1, now);
         assert!(
             matches!(do_false_result, HopResult::NxDomain(_)),
             "a DO=false reader may still be served despite the stale proof record, got {do_false_result:?}"
         );
 
-        let do_true_result =
-            shard.lookup_hop(nxdomain_domain, A_QTYPE, IN_QCLASS, true, 1, now);
+        let do_true_result = shard.lookup_hop(nxdomain_domain, A_QTYPE, IN_QCLASS, true, 1, now);
         assert!(
             matches!(do_true_result, HopResult::Miss),
             "a DO=true reader must not be served an NXDOMAIN entry whose proof record TTL has elapsed, got {do_true_result:?}"

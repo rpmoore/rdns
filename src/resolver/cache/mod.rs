@@ -153,7 +153,16 @@ impl DomainDnsCache for ShardedDnsCache {
         max_chain_depth: u8,
         now: SystemTime,
     ) -> ChainLookup {
-        assemble::resolve_from_cache(self, qname, qtype, qclass, dnssec_ok, epoch, max_chain_depth, now)
+        assemble::resolve_from_cache(
+            self,
+            qname,
+            qtype,
+            qclass,
+            dnssec_ok,
+            epoch,
+            max_chain_depth,
+            now,
+        )
     }
 
     fn store_response(&self, decomposed: DecomposedResponse, epoch: u64) {

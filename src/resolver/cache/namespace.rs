@@ -108,16 +108,8 @@ mod tests {
     #[test]
     fn sweep_removes_only_entries_from_stale_namespace() {
         let shard = Shard::new(4);
-        shard.store_positive(
-            "stale.example.com",
-            (A_QTYPE, IN_QCLASS),
-            rrset_entry(0),
-        );
-        shard.store_positive(
-            "current.example.com",
-            (A_QTYPE, IN_QCLASS),
-            rrset_entry(1),
-        );
+        shard.store_positive("stale.example.com", (A_QTYPE, IN_QCLASS), rrset_entry(0));
+        shard.store_positive("current.example.com", (A_QTYPE, IN_QCLASS), rrset_entry(1));
         shard.store_positive(
             "also-current.example.com",
             (A_QTYPE, IN_QCLASS),
@@ -167,11 +159,7 @@ mod tests {
         let domain = "mixed.example.com";
         shard.store_positive(domain, (A_QTYPE, IN_QCLASS), rrset_entry(0));
         shard.store_positive(domain, (AAAA_QTYPE, IN_QCLASS), rrset_entry(1));
-        shard.store_positive(
-            "other.example.com",
-            (A_QTYPE, IN_QCLASS),
-            rrset_entry(1),
-        );
+        shard.store_positive("other.example.com", (A_QTYPE, IN_QCLASS), rrset_entry(1));
         let before = shard.lru_order_for_test();
 
         let removed = sweep_stale_namespace(std::slice::from_ref(&shard), 1);
@@ -195,11 +183,7 @@ mod tests {
         let shard_c = Shard::new(4);
         shard_a.store_positive("a.example.com", (A_QTYPE, IN_QCLASS), rrset_entry(0));
         shard_b.store_positive("b.example.com", (A_QTYPE, IN_QCLASS), rrset_entry(0));
-        shard_c.store_positive(
-            "c.example.com",
-            (A_QTYPE, IN_QCLASS),
-            rrset_entry(1),
-        );
+        shard_c.store_positive("c.example.com", (A_QTYPE, IN_QCLASS), rrset_entry(1));
         let shards = vec![shard_a, shard_b, shard_c];
 
         let removed = sweep_stale_namespace(&shards, 1);
@@ -236,11 +220,7 @@ mod tests {
         let shard_a = Shard::new(4);
         let shard_b = Shard::new(4);
         shard_a.store_positive("a.example.com", (A_QTYPE, IN_QCLASS), rrset_entry(0));
-        shard_b.store_positive(
-            "b.example.com",
-            (A_QTYPE, IN_QCLASS),
-            rrset_entry(1),
-        );
+        shard_b.store_positive("b.example.com", (A_QTYPE, IN_QCLASS), rrset_entry(1));
 
         // Hold shard A's lock in a background thread for well longer than
         // sweeping shard B alone should ever take, then assert sweeping

@@ -2444,8 +2444,7 @@ mod tests {
         std::thread::sleep(Duration::from_millis(50));
 
         let start = std::time::Instant::now();
-        let result =
-            resolve_from_cache(&cache, &domain_b, A_QTYPE, IN_QCLASS, false, 1, 8, now);
+        let result = resolve_from_cache(&cache, &domain_b, A_QTYPE, IN_QCLASS, false, 1, 8, now);
         let elapsed = start.elapsed();
 
         handle.join().unwrap();
