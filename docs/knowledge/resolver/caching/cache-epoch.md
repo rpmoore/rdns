@@ -170,6 +170,23 @@ because:
   conservative operational choice, not something plain DNS TTL semantics
   strictly requires — but it's intentional, load-bearing for
   split-horizon/filtering setups, and unchanged by this mechanism.
+- A request that captured the previous, epoch-changing snapshot can still
+  be in flight when that reload's sweep runs, and store an old-epoch entry
+  *after* the sweep already passed. Not a correctness issue (an epoch
+  mismatch is still an unconditional miss at lookup time), but a run of
+  subsequent same-namespace reloads won't sweep it away either — only the
+  next actual epoch-changing reload's sweep will, since it removes anything
+  not matching its new epoch. Until then it sits invisible, occupying one
+  domain slot, reclaimed eventually by ordinary LRU pressure.
+- Two independently-constructed `BackendSnapshot`s (e.g. via
+  `BackendSnapshot::new` directly, never linked through one
+  `ResolverHandle`'s `publish_reload`/`publish_backend_snapshot`) both
+  start at `cache_epoch: 0` — safe only because production always has
+  exactly one long-lived `ResolverHandle` observing backend changes
+  relative to its own previous snapshot. Sharing one `ShardedDnsCache`
+  across two independently-built snapshots would collide at epoch 0
+  regardless of `generation`; see
+  `backend_generation_separates_cache_entries` in `resolver/mod.rs`.
 
 # See also
 

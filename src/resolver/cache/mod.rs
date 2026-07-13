@@ -132,7 +132,13 @@ pub trait DomainDnsCache: Send + Sync {
     /// storing the already-decomposed `RRsetEntry`/`NegativeEntry` values.
     fn store_response(&self, decomposed: DecomposedResponse, epoch: u64);
 
-    /// Runs the section-05 sweep; called from the reload path.
+    /// Reclaims entries whose stored `cache_epoch` no longer equals
+    /// `current_epoch` — pure memory reclamation, not a correctness
+    /// dependency, since `lookup_chain` already treats an epoch mismatch as
+    /// a miss regardless of whether this has run. Called from the reload
+    /// path (`ResolverHandle::publish_reload`). The name is retained from
+    /// the pre-epoch string-namespace design; it no longer compares
+    /// namespaces.
     fn sweep_stale_namespace(&self, current_epoch: u64);
 
     /// Approximate (sum-across-shards, no single lock) domain count, for

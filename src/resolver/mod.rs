@@ -2231,6 +2231,21 @@ pub struct BackendSnapshot {
 }
 
 impl BackendSnapshot {
+    /// Every freshly-constructed snapshot starts at `cache_epoch: 0`,
+    /// regardless of `generation` or `cache_namespace` — the epoch carries
+    /// no content-derived uniqueness of its own; only `next_cache_epoch`,
+    /// called from `publish_reload`/`publish_backend_snapshot` relative to
+    /// a *previously-published* snapshot, ever bumps it. This is safe only
+    /// because production has exactly one long-lived `ResolverHandle`
+    /// backed by one `ShardedDnsCache`, so "backend changed" is always
+    /// observed by comparing against that one handle's own previous
+    /// snapshot (see `main.rs`'s single `ShardedDnsCache::new` /
+    /// `ResolveQuery::with_cache_policy_and_backend_snapshot` call sites).
+    /// Two independently-constructed `BackendSnapshot`s that were never
+    /// linked through that same handle both start at epoch 0 and would
+    /// collide if made to share one cache — see
+    /// `backend_generation_separates_cache_entries`'s doc comment for the
+    /// regression test covering this distinction.
     pub fn new(
         backend: Arc<dyn ResolutionBackend>,
         mode: ResolutionMode,
@@ -2281,8 +2296,12 @@ impl BackendSnapshot {
 /// previously-published snapshot: unchanged if `new_snapshot.cache_namespace`
 /// matches `previous`'s (an unrelated reload leaves every existing cache
 /// entry's epoch matching, so the sweep can be skipped entirely — see
-/// callers), or `previous.cache_epoch + 1` if the descriptive fingerprint
-/// actually changed. Shared by `publish_reload` and `publish_backend_snapshot`
+/// callers), or `previous.cache_epoch.wrapping_add(1)` if the descriptive
+/// fingerprint actually changed. Wrapping, not checked/saturating, is
+/// deliberate: a `u64` only wraps after ~1.8e19 reloads, which is not a
+/// reachable count for a long-lived process reloaded on SIGHUP, so treating
+/// overflow as an error case would add handling for something that cannot
+/// occur in practice. Shared by `publish_reload` and `publish_backend_snapshot`
 /// so both publishers apply the exact same cache-identity semantics — the
 /// single-flight-only publisher must never let a caller-supplied
 /// `BackendSnapshot`'s default `cache_epoch: 0` silently roll the epoch
@@ -3513,11 +3532,23 @@ impl ResolveQuery {
     /// always sees a `cache_epoch` paired with the backend it was actually
     /// bumped for — never an old backend with a new epoch or vice versa.
     /// The sweep only runs when the epoch actually changed: an unrelated
-    /// reload (e.g. a metrics-only config edit) leaves every existing
-    /// entry's epoch matching, so the O(n) walk would find nothing to
-    /// remove anyway — skipping it entirely is strictly cheaper than
-    /// today's unconditional sweep-every-reload behavior, not just an
-    /// equivalent no-op.
+    /// reload (e.g. a metrics-only config edit) leaves every entry stored
+    /// *before this reload* matching, so sweeping now would find nothing new
+    /// to remove for those — skipping it is strictly cheaper than today's
+    /// unconditional sweep-every-reload behavior.
+    ///
+    /// One bounded exception: a request that captured the *previous*,
+    /// epoch-changing snapshot can still be in flight when that reload's
+    /// sweep runs, and store an old-epoch entry after the sweep already
+    /// passed over it. Such an entry is never a correctness problem (an
+    /// epoch mismatch is already an unconditional miss at lookup time, see
+    /// `sweep_stale_namespace`'s doc), and it will still be swept by
+    /// whichever *next* reload actually changes the epoch again — but a
+    /// long run of unrelated, same-namespace reloads won't sweep it away
+    /// itself. It sits invisible, occupying one domain slot, until ordinary
+    /// LRU pressure reclaims it. This is the same trade-off described in
+    /// `ResolveQuery::resolve`'s per-request snapshot pinning: correctness
+    /// doesn't depend on the sweep, only prompt memory reclamation does.
     pub fn publish_reload(&self, mut snapshot: BackendSnapshot, entries: Arc<dyn LocalDnsEntries>) {
         let new_epoch;
         let epoch_changed;
