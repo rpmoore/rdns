@@ -110,3 +110,18 @@ jobs:
 
       - name: Check bundled IANA data freshness
         run: make check-bundled-data-freshness
+
+  okf-lint:
+    name: Lint OKF knowledge docs
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Run okf-lint
+        run: |
+          docker run --rm -v "$PWD/docs/knowledge":/data:ro \
+            rpmoore/okf-lint:latest /data
