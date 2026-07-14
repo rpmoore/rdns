@@ -1,7 +1,9 @@
 ---
 type: System
 title: rdns Overview
-description: What rdns is, its four-layer architecture, and how a query flows from socket to response.
+description: >
+          What rdns is, its four-layer architecture, and how a query
+          flows from socket to response.
 resource: src/lib.rs
 tags: [architecture, overview, dns, resolver, delivery, protocol, config]
 timestamp: 2026-07-14T00:00:00Z
