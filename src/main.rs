@@ -840,6 +840,7 @@ struct OpenTelemetryMetrics {
     root_hints_age_seconds: Gauge<f64>,
     dnssec_validation_disabled: Gauge<u64>,
     protocol_error_total: Counter<u64>,
+    recursion_refused_total: Counter<u64>,
     query_duration_seconds: Histogram<f64>,
     recursive_query_duration_seconds: Histogram<f64>,
     cache_hit_query_duration_seconds: Histogram<f64>,
@@ -944,6 +945,7 @@ impl OpenTelemetryMetrics {
             root_hints_age_seconds: meter.f64_gauge("root_hints_age_seconds").build(),
             dnssec_validation_disabled: meter.u64_gauge("dnssec_validation_disabled").build(),
             protocol_error_total: meter.u64_counter("protocol_error_total").build(),
+            recursion_refused_total: meter.u64_counter("recursion_refused_total").build(),
             query_duration_seconds: meter.f64_histogram("query_duration_seconds").build(),
             recursive_query_duration_seconds: meter
                 .f64_histogram("recursive_query_duration_seconds")
@@ -1021,6 +1023,7 @@ impl MetricsSink for OpenTelemetryMetrics {
                 self.recursive_tcp_fallback_timeout_total.add(1, &[])
             }
             ResolverMetric::ProtocolError => self.protocol_error_total.add(1, &[]),
+            ResolverMetric::RecursionRefused => self.recursion_refused_total.add(1, &[]),
             ResolverMetric::QueryDuration
             | ResolverMetric::RecursiveQueryDuration
             | ResolverMetric::CacheHitQueryDuration

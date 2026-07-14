@@ -31,9 +31,10 @@ use tokio::time::{self, Instant};
 use crate::protocol::{
     Message, NameCompressor, QueryDecodeFailure, QueryValidationError, Record, RecordData,
     ResponseCode, build_a_answers_response, build_a_block_response, build_aaaa_answers_response,
-    build_aaaa_block_response, build_nodata_response, build_nxdomain_response,
-    build_question_aware_error_response, build_refused_response, build_servfail_response,
-    message_question_wire, rewrite_response_id, rewrite_response_request_fields,
+    build_aaaa_block_response, build_badvers_response, build_nodata_response,
+    build_nxdomain_response, build_question_aware_error_response, build_refused_response,
+    build_servfail_response, message_question_wire, rewrite_response_id,
+    rewrite_response_request_fields,
 };
 
 mod cache;
@@ -228,6 +229,17 @@ fn normalize_question_name(name: &str) -> String {
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct QueryFeatures {
+    /// RFC 1035 §4.1.1: RD is copied from query to response regardless of
+    /// its value (unconditional mirroring, handled separately at
+    /// serialization time). It's *also* read in `ResolveQuery::resolve`
+    /// to gate resolution itself: RD=0 restricts a query to data rdns
+    /// already has (a local entry or an existing cache hit) and refuses
+    /// with SERVFAIL rather than doing fresh backend work for a miss --
+    /// see `refuse_recursion` and `docs/knowledge/resolver/rd-bit-handling.md`.
+    /// Pinned down by `rd_zero_query_is_refused_on_a_cache_miss` and
+    /// `resolve_rewrites_rd_flag_for_current_request_on_cache_hit`
+    /// (resolver tests), and `rd_zero_still_serves_a_local_entry` /
+    /// `rd_zero_query_is_refused_on_a_cache_miss` (`tests/e2e_config_toml.rs`).
     pub recursion_desired: bool,
     pub authenticated_data: bool,
     pub checking_disabled: bool,
@@ -2627,6 +2639,14 @@ pub enum ResolveDecisionKind {
     CacheMiss,
     ProtocolError(ResponseCode),
     BackendFailure,
+    /// RFC 1035 §4.1.1: RD=0 asks rdns not to pursue the query on the
+    /// client's behalf. rdns still answers from local entries and from
+    /// cache (that's data it already has, not new work), but a genuine
+    /// cache miss under RD=0 is refused with SERVFAIL rather than
+    /// triggering a fresh upstream fetch or recursive resolution --
+    /// matching how a public recursive resolver like 1.1.1.1 treats RD=0
+    /// as "cache-only".
+    RecursionRefused,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2757,6 +2777,7 @@ pub enum QueryEventOutcome {
     Blocked(BlockReason),
     ProtocolError(ResponseCode),
     BackendFailure,
+    RecursionRefused,
 }
 
 impl QueryEventOutcome {
@@ -2769,6 +2790,7 @@ impl QueryEventOutcome {
             ResolveDecisionKind::CacheMiss => Self::AllowedFromBackend,
             ResolveDecisionKind::ProtocolError(code) => Self::ProtocolError(*code),
             ResolveDecisionKind::BackendFailure => Self::BackendFailure,
+            ResolveDecisionKind::RecursionRefused => Self::RecursionRefused,
         }
     }
 }
@@ -3743,6 +3765,19 @@ impl ResolveQuery {
                 .await;
         }
 
+        if !decoded.features.recursion_desired {
+            return self
+                .refuse_recursion(
+                    started_at,
+                    &request,
+                    &decoded,
+                    question,
+                    cache_probe.event_cache_result,
+                    &backend_snapshot,
+                )
+                .await;
+        }
+
         if let (Some(miss_key), true) = (cache_probe.miss_key.take(), cache_probe.store_allowed) {
             return self
                 .resolve_coalesced_miss(
@@ -3905,6 +3940,53 @@ impl ResolveQuery {
             )
             .await,
         )
+    }
+
+    /// RFC 1035 §4.1.1: RD=0 asks rdns not to pursue the query on the
+    /// client's behalf. Reached only once local entries and cache have
+    /// both already missed (see `resolve`'s ordering) -- serving those is
+    /// "data rdns already has", not new work, so they still answer under
+    /// RD=0. A genuine miss past that point would require a fresh
+    /// upstream fetch or recursive resolution, which RD=0 declines; rdns
+    /// answers SERVFAIL instead, the same way a public resolver like
+    /// 1.1.1.1 refuses a cold RD=0 lookup rather than silently promoting
+    /// it to a recursive one.
+    ///
+    /// SERVFAIL vs. REFUSED here is a real, deliberately-made choice, not
+    /// an oversight: some resolvers (e.g. PowerDNS's `allow-no-rd`,
+    /// Unbound's `allow_snoop`) refuse non-recursive cache-only queries
+    /// with REFUSED by default. rdns follows 1.1.1.1's observed behavior
+    /// (SERVFAIL) instead, since that's the concrete reference behavior
+    /// this feature was modeled on.
+    async fn refuse_recursion(
+        &self,
+        started_at: SystemTime,
+        request: &ResolveRequest,
+        decoded: &DecodedQuery,
+        question: QuestionKey,
+        event_cache_result: Option<QueryEventCacheResult>,
+        backend_snapshot: &BackendSnapshot,
+    ) -> ResolveOutcome {
+        self.metrics.increment(ResolverMetric::RecursionRefused);
+        let decision = ResolveDecision {
+            client_ip: request.client_ip,
+            question: Some(question),
+            kind: ResolveDecisionKind::RecursionRefused,
+        };
+        let response_bytes = self.responses.servfail(
+            Some(decoded),
+            self.protocol.configured_max_udp_payload_size(),
+        );
+        self.finish_uniform(
+            started_at,
+            request,
+            decoded_original_question_name(decoded),
+            decision,
+            response_bytes,
+            event_cache_result,
+            Some(QueryEventBackend::from_snapshot(backend_snapshot)),
+        )
+        .await
     }
 
     /// Finishes a cache-probe hit: applies the response-bytes block policy,
@@ -5407,6 +5489,24 @@ impl ResponseFactory for BasicResponseFactory {
         request: Option<&Message>,
         configured_max_udp_payload_size: usize,
     ) -> Vec<u8> {
+        // BADVERS (RFC 6891 §6.1.3) doesn't fit `ResponseCode` (a plain
+        // 4-bit header RCODE) -- it's a 12-bit extended code split across
+        // the header's RCODE nibble and the OPT record's extended-RCODE
+        // byte, so it's special-cased here via `build_badvers_response`
+        // rather than going through `response_code()`/
+        // `build_question_aware_error_response` like every other protocol
+        // error. `request` is always `Some` when this variant occurs: it
+        // can only be produced by `validate_standard_query_body` after a
+        // full, successful parse (see that function and
+        // `QueryValidationError::UnsupportedEdnsVersion`'s doc comment),
+        // so there's always a recovered/parsed message to build the
+        // BADVERS response from.
+        if let (QueryValidationError::UnsupportedEdnsVersion { .. }, Some(request)) =
+            (error, request)
+        {
+            return build_badvers_response(request, configured_max_udp_payload_size);
+        }
+
         // `QueryValidationError::response_code()` only ever actually
         // returns `FormErr` or `NotImp`; `ServFail`/`Refused`/`NxDomain`/
         // `NoError` are unreachable here today (kept only so this match
@@ -7632,6 +7732,7 @@ pub enum ResolverMetric {
     CacheHitQueryDuration,
     CacheMissQueryDuration,
     ProtocolError,
+    RecursionRefused,
 }
 
 #[cfg(test)]
@@ -13560,6 +13661,35 @@ mod tests {
     }
 
     #[test]
+    fn ttl_policy_uses_soa_minimum_when_lower_than_soa_ttl() {
+        // RFC 2308 §5: negative-cache TTL is min(SOA record TTL, SOA
+        // MINIMUM field) -- the sibling test above only ever exercises SOA
+        // TTL < MINIMUM, where that min is a no-op. Pin down the other
+        // bound too, where MINIMUM is actually the binding constraint.
+        let policy = CacheTtlPolicy::default();
+        let response = response_message(
+            ResponseCode::NxDomain,
+            Vec::new(),
+            vec![soa_record("example.com", 300, 90)],
+        );
+
+        let (ttl, metadata) = policy.ttl_for_response(&response).unwrap();
+
+        assert_eq!(ttl, Duration::from_secs(90));
+        assert_eq!(
+            metadata,
+            Some(negative_metadata(
+                "example.com",
+                "example.com",
+                1,
+                1,
+                NegativeCacheKind::NxDomain,
+                Duration::from_secs(90)
+            ))
+        );
+    }
+
+    #[test]
     fn ttl_policy_rejects_negative_cache_when_soa_does_not_cover_name() {
         let policy = CacheTtlPolicy::default();
         let response = response_message(
@@ -16152,26 +16282,20 @@ mod tests {
         );
     }
 
-    /// Regression test for the single-flight follower fallback bug: when
-    /// the leader's fetch result isn't cacheable, a follower falls back to
-    /// `prepare_backend_result` reusing the leader's raw backend response
-    /// bytes (`resolve_coalesced_follower` -> `finish_backend_result` ->
-    /// `prepare_backend_result`, no fresh `cache_hit_after_coalesced_miss`
-    /// hit to reassemble from). `MissKey` coalesces on
-    /// name/type/class/namespace/DO only, not RD, so a follower whose own
-    /// request set a *different* RD bit than the leader's must still get
-    /// its own RD bit back, not the leader's raw one.
+    /// RFC 1035 §4.1.1: RD=0's cache-only gate (`refuse_recursion`) is
+    /// checked before a query would ever join an in-flight coalesced
+    /// fetch, not just before a cold fetch would be started from scratch.
+    /// An RD=0 query for a name another (RD=1) requester is already
+    /// fetching must still be refused immediately -- it must not
+    /// piggyback on the leader's in-flight work, and the leader's own
+    /// fetch must be unaffected (still exactly one upstream request).
     #[tokio::test]
-    async fn resolve_coalesced_follower_fallback_preserves_its_own_rd_bit() {
+    async fn rd_zero_follower_is_refused_even_while_leaders_fetch_is_in_flight() {
         let cache = Arc::new(ShardedDnsCache::new(&CacheConfig {
             max_entries: 16,
             shard_count: Some(1),
         }));
-        let mut response = upstream_response(a_response_with_answer(0xaaaa, "example.com", 60));
-        // Not cacheable, so the follower can't get a fresh cache-hit
-        // reassembly and must fall back to the leader's raw response bytes.
-        response.cache_directive =
-            ResolutionCacheDirective::DoNotCache(ResolutionNoCacheReason::BackendPolicy);
+        let response = upstream_response(a_response_with_answer(0xaaaa, "example.com", 60));
         let upstream = Arc::new(BlockingUpstream::new(Ok(response)));
         let events = Arc::new(RecordingEvents::default());
         let metrics = Arc::new(RecordingMetrics::default());
@@ -16183,7 +16307,7 @@ mod tests {
             1232,
         ));
 
-        // Leader: RD=1.
+        // Leader: RD=1, blocked on the upstream until released below.
         let leader = {
             let service = Arc::clone(&service);
             tokio::spawn(async move {
@@ -16198,45 +16322,40 @@ mod tests {
         };
         upstream.wait_for_requests(1).await;
 
-        // Follower: same name/type/class, but RD=0 -- differs from the
-        // leader's own request, which `MissKey` doesn't distinguish on.
-        let follower = {
-            let service = Arc::clone(&service);
-            tokio::spawn(async move {
-                service
-                    .resolve(ResolveRequest::new(
-                        "192.0.2.11".parse().unwrap(),
-                        SystemTime::UNIX_EPOCH,
-                        a_query_without_rd(0x2222, "example.com"),
-                    ))
-                    .await
-            })
-        };
+        // Follower: same name/type/class as the in-flight leader fetch,
+        // but RD=0 -- must be refused, not coalesced onto it.
+        let follower = service
+            .resolve(ResolveRequest::new(
+                "192.0.2.11".parse().unwrap(),
+                SystemTime::UNIX_EPOCH,
+                a_query_without_rd(0x2222, "example.com"),
+            ))
+            .await;
 
-        tokio::task::yield_now().await;
+        assert_eq!(
+            follower.decision.kind,
+            ResolveDecisionKind::RecursionRefused
+        );
         assert_eq!(
             upstream.requests.lock().unwrap().len(),
             1,
-            "the follower must coalesce onto the leader's single in-flight fetch"
+            "the RD=0 follower must not add a second upstream request, and must not have \
+             joined the leader's in-flight fetch either"
         );
+        assert_eq!(metrics.count(ResolverMetric::RecursionRefused), 1);
+        assert_eq!(metrics.count(ResolverMetric::CacheCoalescedMiss), 0);
+
+        let follower_message = Message::parse(&follower.response_bytes).unwrap();
+        assert_eq!(follower_message.header.id, 0x2222);
+        assert!(!follower_message.header.rd(), "RD=0 must echo RD=0");
+        assert_eq!(
+            follower_message.header.r_code(),
+            ResponseCode::ServFail as u8
+        );
+
         upstream.release.notify_waiters();
         let leader = leader.await.unwrap();
-        let follower = follower.await.unwrap();
-
-        assert_eq!(metrics.count(ResolverMetric::CacheCoalescedMiss), 1);
-
-        let leader_message = Message::parse(&leader.response_bytes).unwrap();
-        let follower_message = Message::parse(&follower.response_bytes).unwrap();
-        assert!(
-            leader_message.header.rd(),
-            "the leader's own request set RD=1"
-        );
-        assert!(
-            !follower_message.header.rd(),
-            "the follower's own request set RD=0 -- it must not be overwritten with the \
-             leader's RD=1 from the shared/reused backend response bytes"
-        );
-        assert_eq!(follower_message.header.id, 0x2222);
+        assert_eq!(leader.decision.kind, ResolveDecisionKind::Allowed);
     }
 
     /// Regression test for RFC 4035 §3.2.2: same fallback path as
@@ -16392,12 +16511,14 @@ mod tests {
         // Leader: ID=0x1111, RD=1, CD=0, DO=false.
         let leader_query = a_query_with_edns(0x1111, "example.com", 1232, false);
         // Follower: same name/type/class (so it coalesces onto the same
-        // `MissKey`), but a different ID, RD=0, and CD=1 -- none of which
-        // `MissKey` distinguishes on, and none of which the leader's own
-        // request shares.
+        // `MissKey`), but a different ID and CD=1 -- neither of which
+        // `MissKey` distinguishes on, and neither of which the leader's own
+        // request shares. RD stays 1 here (unlike an earlier version of
+        // this test): RD=0 now short-circuits to `RecursionRefused` before
+        // ever reaching the coalescing path under test -- see
+        // `rd_zero_still_gets_a_full_answer_but_echoes_rd_zero`.
         let mut follower_query = a_query_with_edns(0x2222, "example.com", 1232, false);
-        let follower_flags =
-            (u16::from_be_bytes([follower_query[2], follower_query[3]]) | 0x0010) & !0x0100;
+        let follower_flags = u16::from_be_bytes([follower_query[2], follower_query[3]]) | 0x0010;
         follower_query[2..4].copy_from_slice(&follower_flags.to_be_bytes());
 
         let leader = {
@@ -16461,9 +16582,8 @@ mod tests {
              not the leader's"
         );
         assert!(
-            !follower_message.header.rd(),
-            "the follower's own request set RD=0 -- it must not be overwritten with the \
-             leader's RD=1 by the filtered-fallback reserialization path"
+            follower_message.header.rd(),
+            "the follower's own request set RD=1"
         );
         assert!(
             follower_message.header.cd(),
@@ -18725,6 +18845,115 @@ mod tests {
             "the OPT record must advertise this resolver's own configured UDP payload size, not the requester's"
         );
         assert!(upstream.requests.lock().unwrap().is_empty());
+    }
+
+    /// End-to-end regression test for RFC 6891 §6.1.3 BADVERS: a query
+    /// advertising an EDNS version rdns doesn't support (rdns implements
+    /// version 0 only) must never reach the backend, and the response must
+    /// carry the 12-bit extended RCODE 16 (split across the header's RCODE
+    /// nibble and the OPT record's extended-RCODE byte) with CD still
+    /// copied and the OPT record still present, mirroring the same
+    /// EDNS/CD-preservation behavior already covered for NOTIMP above.
+    #[tokio::test]
+    async fn resolve_protocol_error_for_unsupported_edns_version_returns_badvers() {
+        let upstream = Arc::new(StaticUpstream::new(Err(UpstreamError::Timeout)));
+        let events = Arc::new(RecordingEvents::default());
+        let metrics = Arc::new(RecordingMetrics::default());
+        let service = resolve_service(upstream.clone(), events.clone(), metrics.clone());
+
+        let request = a_query_with_edns_details(0x9abd, "example.com", 4096, true, 0, 7, &[]);
+        let flags = u16::from_be_bytes([request[2], request[3]]) | 0x0010; // CD=1
+        let mut request = request;
+        request[2..4].copy_from_slice(&flags.to_be_bytes());
+
+        let outcome = service
+            .resolve(ResolveRequest::new(
+                "192.0.2.10".parse().unwrap(),
+                SystemTime::UNIX_EPOCH,
+                request,
+            ))
+            .await;
+
+        assert_eq!(
+            outcome.decision.kind,
+            ResolveDecisionKind::ProtocolError(ResponseCode::FormErr),
+            "response_code() buckets BADVERS as FormErr for metrics purposes -- see its doc comment"
+        );
+        let response = Message::parse(&outcome.response_bytes).unwrap();
+        assert_eq!(response.header.id, 0x9abd);
+        assert_eq!(response.questions.len(), 1);
+        assert!(
+            response.header.cd(),
+            "CD must be copied from the request per RFC 4035 §3.2.2"
+        );
+        let opt = response
+            .additionals
+            .iter()
+            .find_map(|record| match &record.record {
+                RecordData::OPT(edns) => Some(edns),
+                _ => None,
+            })
+            .expect("an EDNS requester must get exactly one OPT record back per RFC 6891 §6.1.1");
+        let combined_extended_rcode =
+            (u16::from(opt.extended_rcode) << 4) | u16::from(response.header.r_code());
+        assert_eq!(combined_extended_rcode, 16, "16 == BADVERS");
+        assert_eq!(
+            opt.version, 0,
+            "the response OPT must advertise the version rdns actually supports"
+        );
+        assert_eq!(
+            opt.udp_payload_size, 1232,
+            "the OPT record must advertise this resolver's own configured UDP payload size, not the requester's"
+        );
+        assert!(upstream.requests.lock().unwrap().is_empty());
+    }
+
+    /// RFC 1035 §4.1.1: RD=0 asks rdns not to pursue the query on the
+    /// client's behalf. rdns has no authoritative-only mode with
+    /// delegation data to hand back as a referral, so it implements this
+    /// as "cache-only" -- matching how a public recursive resolver like
+    /// 1.1.1.1 treats RD=0 (confirmed by hand: `dig +norecurse` gets
+    /// NOERROR for an already-cached name but SERVFAIL for a cold one).
+    /// A cache miss under RD=0 must be refused with SERVFAIL rather than
+    /// triggering a fresh backend fetch. The cache-*hit* side of this is
+    /// already covered by `resolve_rewrites_rd_flag_for_current_request_on_cache_hit`
+    /// above; the in-flight-coalescing edge case is covered by
+    /// `rd_zero_follower_is_refused_even_while_leaders_fetch_is_in_flight`
+    /// below.
+    #[tokio::test]
+    async fn rd_zero_query_is_refused_on_a_cache_miss() {
+        let cache = Arc::new(ShardedDnsCache::new(&CacheConfig {
+            max_entries: 16,
+            shard_count: Some(1),
+        }));
+        let upstream = Arc::new(StaticUpstream::new(Err(UpstreamError::Timeout)));
+        let events = Arc::new(RecordingEvents::default());
+        let metrics = Arc::new(RecordingMetrics::default());
+        let service =
+            resolve_service_with_cache(upstream.clone(), cache, events, metrics.clone(), 1232);
+
+        let outcome = service
+            .resolve(ResolveRequest::new(
+                "192.0.2.10".parse().unwrap(),
+                SystemTime::UNIX_EPOCH,
+                a_query_without_rd(0xbeef, "example.com"),
+            ))
+            .await;
+
+        assert_eq!(outcome.decision.kind, ResolveDecisionKind::RecursionRefused);
+        let response = Message::parse(&outcome.response_bytes).unwrap();
+        assert_eq!(response.header.id, 0xbeef);
+        assert!(!response.header.rd(), "RD=0 on the query must echo RD=0");
+        assert_eq!(response.header.r_code(), ResponseCode::ServFail as u8);
+        assert!(
+            response.answers.is_empty(),
+            "a refused RD=0 query must not carry an answer"
+        );
+        assert!(
+            upstream.requests.lock().unwrap().is_empty(),
+            "RD=0 on a cache miss must not trigger a fresh backend fetch"
+        );
+        assert_eq!(metrics.count(ResolverMetric::RecursionRefused), 1);
     }
 
     /// Regression test for the recovery path (see
