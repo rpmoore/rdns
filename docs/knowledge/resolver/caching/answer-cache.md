@@ -20,7 +20,8 @@ structure entirely.
 ShardedDnsCache { shards: Vec<Shard> }
 Shard { state: Mutex<ShardState>, capacity: usize }
 ShardState {
-    positive: HashMap<domain, DomainRecordSets>,   // DomainRecordSets: HashMap<(qtype, qclass), RRsetEntry>
+    // DomainRecordSets: HashMap<(qtype, qclass), RRsetEntry>
+    positive: HashMap<domain, DomainRecordSets>,
     negative: HashMap<domain, DomainNegativeEntries>,
     lru: ShardLru,
 }
@@ -74,4 +75,5 @@ split across shards by `CacheConfig::shard_capacity` (see
 
 - [cache-epoch](cache-epoch.md) — how a SIGHUP reload invalidates entries here.
 - [sharding](sharding.md) — how domains route to shards, and what else shares this routing scheme.
-- [local-dns-entries](local-dns-entries.md) — the separate, non-cached structure for manually-loaded answers.
+- [local-dns-entries](local-dns-entries.md) — the separate, non-cached structure for manually-loaded
+  answers.

@@ -1,7 +1,9 @@
 ---
 type: System
 title: RD Bit Handling (RFC 1035 §4.1.1)
-description: Why RD=0 gets cache-only treatment instead of full resolution, and where that's enforced.
+description: >
+          Why RD=0 gets cache-only treatment instead of full resolution,
+          and where that's enforced.
 resource: src/resolver/mod.rs
 tags: [dns, resolver, rd, rfc1035, cache]
 timestamp: 2026-07-13T00:00:00Z

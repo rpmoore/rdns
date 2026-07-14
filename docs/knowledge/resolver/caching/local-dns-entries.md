@@ -1,7 +1,9 @@
 ---
 type: System
 title: Local DNS Entries
-description: Manually-loaded DNS data (BIND zone files, config TOML), and why it's not in the answer cache at all.
+description: >
+          Manually-loaded DNS data (BIND zone files, config TOML),
+          and why it's not in the answer cache at all.
 resource: src/resolver/mod.rs
 tags: [cache, dns, resolver, local-entries]
 timestamp: 2026-07-13T00:00:00Z
@@ -53,4 +55,5 @@ fresh lookup for that name.
 # See also
 
 - [answer-cache](answer-cache.md) — the structure this document is contrasted with.
-- [cache-epoch](cache-epoch.md) — the invalidation mechanism that only applies to the other structure.
+- [cache-epoch](cache-epoch.md) — the invalidation mechanism that only applies to the other
+  structure.
