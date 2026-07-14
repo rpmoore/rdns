@@ -12,18 +12,21 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Network-dependent DNS protocol-conformance suite: real recursive
-//! resolution against real root/TLD/authority servers and well-known
-//! domains. Every test is `#[ignore]`d (same convention as
-//! `tests/live_dns.rs`/`tests/recursive_perf.rs`) since it needs outbound
+//! Network-dependent DNS protocol-conformance suite: real recursive and
+//! forward-mode resolution against real root/TLD/authority servers, real
+//! public upstreams, and well-known domains. Every test is `#[ignore]`d
+//! (same convention as `tests/recursive_perf.rs`) since it needs outbound
 //! UDP/TCP DNS access; run explicitly with
 //! `cargo test --test e2e_upstream_live -- --ignored`.
 //!
 //! Deliberately small: this suite's job is confidence that the protocol
 //! rules `tests/e2e_config_toml.rs` already pins down against a
 //! synthetic fixture also hold against real, independently-operated DNS
-//! infrastructure -- not to add new protocol-rule coverage, which all
-//! lives in the offline suite.
+//! infrastructure -- not to add new protocol-rule coverage. The two
+//! exceptions are `forward_mode_resolves_a_record_through_a_real_public_upstream`
+//! and `recursive_response_excludes_echoed_ns_authority_section`, ported
+//! from the now-removed `tests/live_dns.rs` because they covered forward
+//! mode and an AUTHORITY-section regression this suite otherwise didn't.
 
 #[path = "support/mod.rs"]
 mod support;
@@ -43,6 +46,71 @@ async fn recursive_config() -> RuntimeConfig {
         1232,
     )
     .unwrap()
+}
+
+// Forward mode (`ForwardingResolutionBackend`, proxying to a fixed
+// upstream) is a genuinely different code path from recursive mode (all
+// six tests above): it never walks root/TLD/authority itself, it just
+// relays to whatever's configured. A real public resolver as the upstream
+// is the live-network confidence check for that path specifically.
+fn forward_toml_for_live_upstream(name: &str, endpoint: &str) -> String {
+    format!(
+        r#"
+per_query_deadline_ms = 3000
+max_udp_payload_size = 1232
+
+[[upstreams]]
+name = "{name}"
+endpoint = "{endpoint}"
+protocol = "udp"
+enabled = true
+priority = 10
+timeout_ms = 2000
+"#
+    )
+}
+
+// RFC 1035 §4.1.1: forward mode must relay a real query to a real public
+// upstream and hand back its real answer, faithfully -- ported from the
+// old tests/live_dns.rs (forward-mode live tests), which this suite
+// otherwise didn't cover (every other test here is recursive-mode). Checks
+// the same answer-fidelity properties as the recursive-mode equivalent
+// below (`resolves_a_record_for_well_known_domain_recursively`): a
+// non-empty answer section alone wouldn't catch rdns silently relaying a
+// corrupted or mismatched record.
+#[tokio::test]
+#[ignore = "requires outbound UDP DNS access to a public resolver"]
+async fn forward_mode_resolves_a_record_through_a_real_public_upstream() {
+    let server =
+        start_forward_server(&forward_toml_for_live_upstream("cloudflare", "1.1.1.1:53")).await;
+
+    let request = RawQueryBuilder::new(0x6001, "example.com", 1).build();
+    let response = send_udp(server.udp_addr, &request).await;
+    let message = parse_response(&response);
+
+    assert_eq!(message.header.id, 0x6001);
+    assert!(message.header.qr());
+    assert_eq!(message.header.r_code(), NOERROR);
+    assert!(!message.answers.is_empty());
+    assert!(
+        message
+            .answers
+            .iter()
+            .all(|record| record.rtype == 1 && record.name.eq_ignore_ascii_case("example.com")),
+        "every answer RR relayed from the real upstream must be an A record owned by the \
+         queried name, got {:?}",
+        message.answers
+    );
+    assert!(
+        message
+            .answers
+            .iter()
+            .all(|record| matches!(record.record, RecordData::A(addr) if !addr.is_unspecified())),
+        "every relayed A record must carry a well-formed, non-zero address, got {:?}",
+        message.answers
+    );
+
+    server.shutdown().await;
 }
 
 // A well-known, long-lived domain must resolve to a real A record via
@@ -174,6 +242,47 @@ async fn ad_bit_never_set_even_for_a_real_dnssec_signed_domain() {
     let message = parse_response(&response);
 
     assert!(!message.header.ad());
+
+    server.shutdown().await;
+}
+
+// Live-network sanity check (ported from tests/live_dns.rs), NOT the
+// primary regression guard -- that's
+// `recursive_backend_strips_echoed_ns_from_authority_on_positive_answer`
+// in `src/resolver/mod.rs`, a synthetic/offline test that constructs the
+// exact NS-in-AUTHORITY shape directly and so can't silently pass for the
+// wrong reason. This test only proves the behavior still holds against a
+// real authority: github.com's authoritative servers (NS1/AWS DNS) echo
+// the zone's NS set in the AUTHORITY section alongside the A answer when
+// queried directly (confirmed via `dig github.com` against those
+// authorities) -- rdns's recursive backend used to forward that verbatim
+// to the client, matching what Cloudflare (dig github.com @1.1.1.1)
+// strips. If github.com's authoritative servers ever stop echoing NS
+// here, this test would pass trivially without exercising the stripping
+// code at all -- the offline test is what actually guards the behavior.
+#[tokio::test]
+#[ignore = "requires outbound UDP/TCP DNS access to public root/TLD/authority servers"]
+async fn recursive_response_excludes_echoed_ns_authority_section() {
+    let server = start_recursive_server(recursive_config().await).await;
+
+    let request = RawQueryBuilder::new(0x6002, "github.com", 1).build();
+    let response = send_udp(server.udp_addr, &request).await;
+    let message = parse_response(&response);
+
+    assert_eq!(message.header.id, 0x6002);
+    assert_eq!(message.header.r_code(), NOERROR);
+    assert!(
+        !message.answers.is_empty(),
+        "expected at least one A answer for github.com"
+    );
+    assert!(
+        message
+            .authorities
+            .iter()
+            .all(|record| !matches!(record.record, RecordData::NS(_))),
+        "expected no NS records in the AUTHORITY section, got {:?}",
+        message.authorities
+    );
 
     server.shutdown().await;
 }
