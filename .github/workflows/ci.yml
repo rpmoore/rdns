@@ -64,11 +64,16 @@ jobs:
         run: reuse lint
 
       - name: Run unit tests
-        run: cargo test --locked
+        run: cargo test --locked --lib --bins
 
-      - name: Run optional live DNS tests
-        continue-on-error: true
-        run: cargo test --locked --test live_dns -- --ignored
+      - name: Run integration tests
+        run: cargo test --locked --test forwarding --test recursive_perf --test cache_concurrency_bench
+
+      - name: Run e2e tests
+        run: cargo test --locked --test e2e_config_toml
+
+      - name: Run live e2e tests
+        run: cargo test --locked --test e2e_upstream_live -- --ignored --test-threads=1
 
   recursive-resolver-perf:
     name: Recursive resolver perf (manual)

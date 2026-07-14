@@ -1,0 +1,315 @@
+// Copyright 2026 Ryan Moore
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+//! Network-dependent DNS protocol-conformance suite: real recursive and
+//! forward-mode resolution against real root/TLD/authority servers, real
+//! public upstreams, and well-known domains. Every test is `#[ignore]`d
+//! (same convention as `tests/recursive_perf.rs`) since it needs outbound
+//! UDP/TCP DNS access; run explicitly with
+//! `cargo test --test e2e_upstream_live -- --ignored`.
+//!
+//! Deliberately small: this suite's job is confidence that the protocol
+//! rules `tests/e2e_config_toml.rs` already pins down against a
+//! synthetic fixture also hold against real, independently-operated DNS
+//! infrastructure -- not to add new protocol-rule coverage. The two
+//! exceptions are `forward_mode_resolves_a_record_through_a_real_public_upstream`
+//! and `recursive_response_excludes_echoed_ns_authority_section`, ported
+//! from the now-removed `tests/live_dns.rs` because they covered forward
+//! mode and an AUTHORITY-section regression this suite otherwise didn't.
+
+#[path = "support/mod.rs"]
+mod support;
+
+use rdns::config::{RecursiveResolutionConfig, ResolutionConfig, RuntimeConfig};
+use rdns::protocol::RecordData;
+use support::*;
+
+/// The shared `send_udp`/`send_tcp` helpers default to a 2s read timeout,
+/// tuned for the offline suite's near-instant synthetic fixtures. These
+/// live tests drive full root -> TLD -> authority recursion (or a real
+/// public upstream round trip) against a resolver configured with a 5s
+/// `per_query_deadline` -- the default would fail a slow-but-successful
+/// resolution before rdns's own deadline even elapses.
+const LIVE_UDP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(8);
+
+async fn recursive_config() -> RuntimeConfig {
+    let recursive = RecursiveResolutionConfig::bundled("e2e-live-test");
+    let port = free_loopback_port().await;
+    RuntimeConfig::new_with_resolution(
+        vec![format!("127.0.0.1:{port}").parse().unwrap()],
+        ResolutionConfig::recursive(0, recursive),
+        Vec::new(),
+        std::time::Duration::from_secs(5),
+        1232,
+    )
+    .unwrap()
+}
+
+// Forward mode (`ForwardingResolutionBackend`, proxying to a fixed
+// upstream) is a genuinely different code path from recursive mode (all
+// six tests above): it never walks root/TLD/authority itself, it just
+// relays to whatever's configured. A real public resolver as the upstream
+// is the live-network confidence check for that path specifically.
+fn forward_toml_for_live_upstream(name: &str, endpoint: &str) -> String {
+    format!(
+        r#"
+per_query_deadline_ms = 3000
+max_udp_payload_size = 1232
+
+[[upstreams]]
+name = "{name}"
+endpoint = "{endpoint}"
+protocol = "udp"
+enabled = true
+priority = 10
+timeout_ms = 2000
+"#
+    )
+}
+
+// RFC 1035 §4.1.1: forward mode must relay a real query to a real public
+// upstream and hand back its real answer, faithfully -- ported from the
+// old tests/live_dns.rs (forward-mode live tests), which this suite
+// otherwise didn't cover (every other test here is recursive-mode). Checks
+// the same answer-fidelity properties as the recursive-mode equivalent
+// below (`resolves_a_record_for_well_known_domain_recursively`): a
+// non-empty answer section alone wouldn't catch rdns silently relaying a
+// corrupted or mismatched record.
+#[tokio::test]
+#[ignore = "requires outbound UDP DNS access to a public resolver"]
+async fn forward_mode_resolves_a_record_through_a_real_public_upstream() {
+    let server =
+        start_forward_server(&forward_toml_for_live_upstream("cloudflare", "1.1.1.1:53")).await;
+
+    let request = RawQueryBuilder::new(0x6001, "example.com", 1).build();
+    let response = send_udp_with_timeout(server.udp_addr, &request, LIVE_UDP_TIMEOUT).await;
+    let message = parse_response(&response);
+
+    assert_eq!(message.header.id, 0x6001);
+    assert!(message.header.qr());
+    assert_eq!(message.header.r_code(), NOERROR);
+    assert!(!message.answers.is_empty());
+    assert!(
+        message
+            .answers
+            .iter()
+            .all(|record| record.rtype == 1 && record.name.eq_ignore_ascii_case("example.com")),
+        "every answer RR relayed from the real upstream must be an A record owned by the \
+         queried name, got {:?}",
+        message.answers
+    );
+    assert!(
+        message
+            .answers
+            .iter()
+            .all(|record| matches!(record.record, RecordData::A(addr) if !addr.is_unspecified())),
+        "every relayed A record must carry a well-formed, non-zero address, got {:?}",
+        message.answers
+    );
+
+    server.shutdown().await;
+}
+
+// A well-known, long-lived domain must resolve to a real A record via
+// full root -> TLD -> authority recursion. RFC 1034 §5.3.3 / RFC 1035
+// §4.1.2: the answer must actually correspond to the question asked --
+// same owner name, same type -- not merely be "some non-empty answer
+// section".
+#[tokio::test]
+#[ignore = "requires outbound UDP/TCP DNS access to public root/TLD/authority servers"]
+async fn resolves_a_record_for_well_known_domain_recursively() {
+    let server = start_recursive_server(recursive_config().await).await;
+
+    let request = RawQueryBuilder::new(0x5001, "example.com", 1).build();
+    let response = send_udp_with_timeout(server.udp_addr, &request, LIVE_UDP_TIMEOUT).await;
+    let message = parse_response(&response);
+
+    assert_eq!(message.header.id, 0x5001);
+    assert!(message.header.qr());
+    assert_eq!(message.header.r_code(), NOERROR);
+    assert!(!message.answers.is_empty());
+    assert!(
+        message
+            .answers
+            .iter()
+            .all(|record| record.rtype == 1 && record.name.eq_ignore_ascii_case("example.com")),
+        "every answer RR must be an A record owned by the queried name, got {:?}",
+        message.answers
+    );
+
+    server.shutdown().await;
+}
+
+// A name that is very unlikely to ever exist under a real, currently
+// delegated TLD must resolve to NXDOMAIN through real recursion, not
+// SERVFAIL or a false positive answer. RFC 2308 §2.2 / §5: an NXDOMAIN
+// response must carry the covering zone's SOA in the authority section so
+// the negative result is cacheable with a well-defined TTL -- rcode alone
+// doesn't prove that.
+#[tokio::test]
+#[ignore = "requires outbound UDP/TCP DNS access to public root/TLD/authority servers"]
+async fn nxdomain_for_nonexistent_name_under_a_real_tld() {
+    let server = start_recursive_server(recursive_config().await).await;
+
+    // A random, never-registered second-level domain under `.com` (not a
+    // subdomain of a real registered domain, which could have a wildcard
+    // record) -- effectively guaranteed NXDOMAIN.
+    let request =
+        RawQueryBuilder::new(0x5002, "rdns-e2e-conformance-suite-9f3a7c1d.com", 1).build();
+    let response = send_udp_with_timeout(server.udp_addr, &request, LIVE_UDP_TIMEOUT).await;
+    let message = parse_response(&response);
+
+    assert_eq!(message.header.id, 0x5002);
+    assert_eq!(message.header.r_code(), NXDOMAIN);
+    assert!(message.answers.is_empty(), "NXDOMAIN must carry no answers");
+    assert!(
+        message
+            .authorities
+            .iter()
+            .any(|record| matches!(record.record, RecordData::SOA { .. })),
+        "NXDOMAIN must carry the covering zone's SOA in authority for negative caching, got {:?}",
+        message.authorities
+    );
+
+    server.shutdown().await;
+}
+
+// RFC 4035 §3.2.1 / §4.5, confirmed against a real DNSSEC-signed zone
+// (cloudflare.com) rather than only the synthetic fixture in
+// tests/e2e_config_toml.rs: RRSIG is only handed back when the client's
+// own DO bit asked for it.
+#[tokio::test]
+#[ignore = "requires outbound UDP/TCP DNS access to public root/TLD/authority servers"]
+async fn dnssec_signed_domain_returns_rrsig_when_do_bit_set() {
+    let server = start_recursive_server(recursive_config().await).await;
+
+    let request = RawQueryBuilder::new(0x5003, "cloudflare.com", 1)
+        .edns(1232, true)
+        .build();
+    let response = send_udp_with_timeout(server.udp_addr, &request, LIVE_UDP_TIMEOUT).await;
+    let message = parse_response(&response);
+
+    assert_eq!(message.header.r_code(), NOERROR);
+    assert!(
+        message
+            .answers
+            .iter()
+            .any(|record| matches!(record.record, RecordData::RRSIG { .. })),
+        "expected an RRSIG in a DO=1 answer from a DNSSEC-signed real zone"
+    );
+
+    server.shutdown().await;
+}
+
+#[tokio::test]
+#[ignore = "requires outbound UDP/TCP DNS access to public root/TLD/authority servers"]
+async fn dnssec_signed_domain_omits_rrsig_when_do_bit_unset() {
+    let server = start_recursive_server(recursive_config().await).await;
+
+    let request = RawQueryBuilder::new(0x5004, "cloudflare.com", 1)
+        .edns(1232, false)
+        .build();
+    let response = send_udp_with_timeout(server.udp_addr, &request, LIVE_UDP_TIMEOUT).await;
+    let message = parse_response(&response);
+
+    assert_eq!(message.header.r_code(), NOERROR);
+    assert!(
+        !message
+            .answers
+            .iter()
+            .any(|record| matches!(record.record, RecordData::RRSIG { .. })),
+        "DO=0 must not receive the RRSIG, even from a real signed zone"
+    );
+
+    server.shutdown().await;
+}
+
+// RFC 4035 §3.2.3, confirmed against real recursion: rdns performs no
+// DNSSEC chain-of-trust validation (`DnssecValidationMode::Disabled`), so
+// AD must never be set, even for a genuinely signed real-world zone.
+#[tokio::test]
+#[ignore = "requires outbound UDP/TCP DNS access to public root/TLD/authority servers"]
+async fn ad_bit_never_set_even_for_a_real_dnssec_signed_domain() {
+    let server = start_recursive_server(recursive_config().await).await;
+
+    let request = RawQueryBuilder::new(0x5005, "cloudflare.com", 1)
+        .edns(1232, true)
+        .build();
+    let response = send_udp_with_timeout(server.udp_addr, &request, LIVE_UDP_TIMEOUT).await;
+    let message = parse_response(&response);
+
+    assert!(!message.header.ad());
+
+    server.shutdown().await;
+}
+
+// Live-network sanity check (ported from tests/live_dns.rs), NOT the
+// primary regression guard -- that's
+// `recursive_backend_strips_echoed_ns_from_authority_on_positive_answer`
+// in `src/resolver/mod.rs`, a synthetic/offline test that constructs the
+// exact NS-in-AUTHORITY shape directly and so can't silently pass for the
+// wrong reason. This test only proves the behavior still holds against a
+// real authority: github.com's authoritative servers (NS1/AWS DNS) echo
+// the zone's NS set in the AUTHORITY section alongside the A answer when
+// queried directly (confirmed via `dig github.com` against those
+// authorities) -- rdns's recursive backend used to forward that verbatim
+// to the client, matching what Cloudflare (dig github.com @1.1.1.1)
+// strips. If github.com's authoritative servers ever stop echoing NS
+// here, this test would pass trivially without exercising the stripping
+// code at all -- the offline test is what actually guards the behavior.
+#[tokio::test]
+#[ignore = "requires outbound UDP/TCP DNS access to public root/TLD/authority servers"]
+async fn recursive_response_excludes_echoed_ns_authority_section() {
+    let server = start_recursive_server(recursive_config().await).await;
+
+    let request = RawQueryBuilder::new(0x6002, "github.com", 1).build();
+    let response = send_udp_with_timeout(server.udp_addr, &request, LIVE_UDP_TIMEOUT).await;
+    let message = parse_response(&response);
+
+    assert_eq!(message.header.id, 0x6002);
+    assert_eq!(message.header.r_code(), NOERROR);
+    assert!(
+        !message.answers.is_empty(),
+        "expected at least one A answer for github.com"
+    );
+    assert!(
+        message
+            .authorities
+            .iter()
+            .all(|record| !matches!(record.record, RecordData::NS(_))),
+        "expected no NS records in the AUTHORITY section, got {:?}",
+        message.authorities
+    );
+
+    server.shutdown().await;
+}
+
+// RFC 1035 §4.2.2 / RFC 7766: rdns's own TCP listener must serve a
+// complete, correctly-framed answer for a real recursive resolution, not
+// just the UDP path exercised by the tests above.
+#[tokio::test]
+#[ignore = "requires outbound UDP/TCP DNS access to public root/TLD/authority servers"]
+async fn tcp_round_trip_against_real_recursive_resolution() {
+    let server = start_recursive_server(recursive_config().await).await;
+
+    let request = RawQueryBuilder::new(0x5006, "example.com", 1).build();
+    let response = send_tcp_with_timeout(server.tcp_addr, &request, LIVE_UDP_TIMEOUT).await;
+    let message = parse_response(&response);
+
+    assert_eq!(message.header.id, 0x5006);
+    assert_eq!(message.header.r_code(), NOERROR);
+    assert!(!message.answers.is_empty());
+
+    server.shutdown().await;
+}

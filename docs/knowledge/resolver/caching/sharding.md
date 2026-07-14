@@ -1,7 +1,9 @@
 ---
 type: Mechanism
 title: Cache Sharding
-description: How the answer cache splits into independently-locked shards, and what else shares that scheme.
+description: >
+          How the answer cache splits into independently-locked shards,
+          and what else shares that scheme.
 resource: src/resolver/cache/mod.rs
 tags: [cache, dns, resolver, sharding, concurrency]
 timestamp: 2026-07-13T00:00:00Z
@@ -108,4 +110,5 @@ under one lock" problem this sharding scheme exists to remove.
 # See also
 
 - [answer-cache](answer-cache.md) — what lives inside one shard.
-- [cache-epoch](cache-epoch.md) — the sweep this document's locking discipline is described in service of.
+- [cache-epoch](cache-epoch.md) — the sweep this document's locking discipline is described in
+  service of.

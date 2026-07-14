@@ -1,7 +1,9 @@
 ---
 type: Mechanism
 title: Cache-Identity Epoch
-description: How a SIGHUP reload invalidates the whole answer cache instantly, without a stop-the-world lock.
+description: >
+          How a SIGHUP reload invalidates the whole answer cache instantly,
+          without a stop-the-world lock.
 resource: src/resolver/mod.rs
 tags: [cache, dns, resolver, epoch, invalidation, sighup]
 timestamp: 2026-07-13T00:00:00Z
@@ -19,13 +21,12 @@ tagging pass, and no lock held over the whole cache.
 descriptive fingerprint string once per reload — **not** stored per
 entry, only used to decide whether to bump:
 
-- Forward mode: `mode:forward;generation:{n};upstreams:{hash}` — the
-  hash covers name/endpoint/protocol/priority/timeout of every enabled
-  UDP upstream.
-- Recursive mode: `mode:recursive;generation:{n};root-hints:{version};dnssec:{label};authorities:{hash}`.
-- `generation` is an operator-set integer (`ResolutionConfig::generation`)
-  — bumping it by itself is the manual "flush everything" lever, with no
-  other config change required.
+- Forward mode: `mode:forward;generation:{n};upstreams:{hash}` — the hash covers
+  name/endpoint/protocol/priority/timeout of every enabled UDP upstream.
+- Recursive mode:
+  `mode:recursive;generation:{n};root-hints:{version};dnssec:{label};authorities:{hash}`.
+- `generation` is an operator-set integer (`ResolutionConfig::generation`) — bumping it by itself is
+  the manual "flush everything" lever, with no other config change required.
 
 `next_cache_epoch` (`src/resolver/mod.rs:2309`) compares this reload's
 fingerprint against the previous one:
@@ -191,4 +192,5 @@ because:
 # See also
 
 - [answer-cache](answer-cache.md) — where `cache_epoch` lives on the entry.
-- [sharding](sharding.md) — the sweep walks shards one lock at a time; this is where that structure is described.
+- [sharding](sharding.md) — the sweep walks shards one lock at a time; this is where that structure
+  is described.

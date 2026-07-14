@@ -61,6 +61,13 @@ pub enum QueryValidationError {
     },
     InvalidEdns,
     NotQuery,
+    /// RFC 6891 §6.1.3: rdns implements EDNS version 0 only. A query
+    /// advertising any other version must be answered BADVERS (extended
+    /// RCODE 16), not treated as a generic FORMERR -- see
+    /// `build_badvers_response`.
+    UnsupportedEdnsVersion {
+        version: u8,
+    },
 }
 
 impl From<DnsParseError> for QueryValidationError {
@@ -96,6 +103,16 @@ impl ResponseCode {
 }
 
 impl QueryValidationError {
+    /// Coarse classifier used for metrics/event bucketing
+    /// (`ResolveDecisionKind::ProtocolError`) -- `ResponseCode` only models
+    /// the header's 4-bit RCODE field, so it cannot represent BADVERS
+    /// (extended RCODE 16, split across the header's RCODE nibble and the
+    /// OPT record's extended-RCODE byte). `UnsupportedEdnsVersion` is
+    /// bucketed here as `FormErr` for that reason; the actual wire response
+    /// is still correctly BADVERS -- see
+    /// `resolver::BasicResponseFactory::protocol_error`, which special-cases
+    /// this variant before ever consulting `response_code()`, and
+    /// `build_badvers_response`.
     pub fn response_code(&self) -> ResponseCode {
         match self {
             Self::UnsupportedOpcode { .. } => ResponseCode::NotImp,
@@ -103,7 +120,8 @@ impl QueryValidationError {
             | Self::InvalidQuestionCount { .. }
             | Self::UnexpectedSectionRecords { .. }
             | Self::InvalidEdns
-            | Self::NotQuery => ResponseCode::FormErr,
+            | Self::NotQuery
+            | Self::UnsupportedEdnsVersion { .. } => ResponseCode::FormErr,
         }
     }
 }
@@ -583,6 +601,53 @@ pub fn build_nodata_response(request: &Message, configured_max_udp_payload_size:
         &[],
         configured_max_udp_payload_size,
     )
+}
+
+/// Builds a BADVERS response (RFC 6891 §6.1.3: extended RCODE 16) for an
+/// EDNS query advertising a version rdns doesn't support (rdns implements
+/// version 0 only). The header's own RCODE nibble stays `NoError` (0) --
+/// "16" only exists once that nibble and the OPT record's extended-RCODE
+/// byte are combined, per §6.1.3's 12-bit extended-RCODE encoding -- and
+/// the response OPT record advertises version 0, telling the client the
+/// version rdns actually supports (RFC 6891 §6.1.3: "the version of EDNS
+/// which the resolver supports"). Always carries an OPT record: this
+/// response only ever exists because `request` had one --
+/// `QueryValidationError::UnsupportedEdnsVersion` can't be produced by a
+/// non-EDNS query in the first place. Doesn't reuse
+/// `build_question_response` (used by every other generic error/policy
+/// response) since that always zeroes the OPT's extended-RCODE byte.
+pub fn build_badvers_response(
+    request: &Message,
+    configured_max_udp_payload_size: usize,
+) -> Vec<u8> {
+    let mut response = Vec::new();
+    let question_count = u16::from(!request.questions.is_empty());
+    let dnssec_ok = request.edns.as_ref().is_some_and(|edns| edns.dnssec_ok);
+    let udp_payload_size = configured_max_udp_payload_size.min(u16::MAX as usize) as u16;
+    let opt = build_opt_record_with_extended_rcode(udp_payload_size, dnssec_ok, 1);
+
+    write_message_header(
+        &mut response,
+        request.header.id,
+        request.header.rd(),
+        false, // truncated
+        false, // synthetic local response, never authoritative
+        false, // authenticated_data
+        request.header.cd(),
+        ResponseCode::NoError,
+        question_count,
+        0,
+        0,
+        1,
+    );
+
+    if let Some(question) = request.questions.first() {
+        let mut compressor = NameCompressor::new();
+        write_question(&mut response, &mut compressor, question);
+    }
+    write_opt_record(&mut response, &opt);
+
+    response
 }
 
 pub fn build_a_block_response(
@@ -1127,15 +1192,31 @@ fn from_hex(hex: &str) -> Vec<u8> {
 /// `Message` to read from at cache-hit serve time) so both build the exact
 /// same OPT shape rather than duplicating this construction.
 pub(crate) fn build_opt_record(udp_payload_size: u16, dnssec_ok: bool) -> Record {
+    build_opt_record_with_extended_rcode(udp_payload_size, dnssec_ok, 0)
+}
+
+/// `build_opt_record`, with an explicit extended-RCODE byte (the upper 8
+/// bits of the 12-bit extended RCODE; the header's own 4-bit RCODE field
+/// carries the rest -- RFC 6891 §6.1.3) instead of always zeroing it.
+/// Exists only for `build_badvers_response`, which needs extended RCODE 1
+/// (BADVERS's upper byte) on its OPT record; every other response is a
+/// plain success/error code that fits entirely in the header's RCODE
+/// field, so `build_opt_record` keeps zeroing it by default.
+fn build_opt_record_with_extended_rcode(
+    udp_payload_size: u16,
+    dnssec_ok: bool,
+    extended_rcode: u8,
+) -> Record {
     let flags = if dnssec_ok { EDNS_DO_FLAG } else { 0 };
+    let ttl = (u32::from(extended_rcode) << 24) | u32::from(flags);
     Record {
         name: String::new(),
         rtype: OPT_RECORD_TYPE,
         rclass: udp_payload_size,
-        ttl: u32::from(flags),
+        ttl,
         record: RecordData::OPT(EdnsInfo {
             udp_payload_size,
-            extended_rcode: 0,
+            extended_rcode,
             version: 0,
             flags,
             dnssec_ok,
@@ -1889,7 +1970,12 @@ fn validate_standard_query_body(
         return Err(QueryValidationError::InvalidEdns);
     }
 
-    match message.additionals[0].record {
+    match &message.additionals[0].record {
+        RecordData::OPT(info) if info.version != 0 => {
+            Err(QueryValidationError::UnsupportedEdnsVersion {
+                version: info.version,
+            })
+        }
         RecordData::OPT(_) => Ok(()),
         _ => Err(QueryValidationError::InvalidEdns),
     }
@@ -2712,11 +2798,21 @@ mod tests {
     }
 
     fn push_opt_record(out: &mut Vec<u8>, udp_payload_size: u16, dnssec_ok: bool, options: &[u8]) {
+        push_opt_record_with_version(out, udp_payload_size, dnssec_ok, 0, options);
+    }
+
+    fn push_opt_record_with_version(
+        out: &mut Vec<u8>,
+        udp_payload_size: u16,
+        dnssec_ok: bool,
+        version: u8,
+        options: &[u8],
+    ) {
         out.push(0);
         push_u16(out, OPT_RECORD_TYPE);
         push_u16(out, udp_payload_size);
         let flags = if dnssec_ok { EDNS_DO_FLAG as u32 } else { 0 };
-        push_u32(out, flags);
+        push_u32(out, (u32::from(version) << 16) | flags);
         push_u16(out, options.len() as u16);
         out.extend_from_slice(options);
     }
@@ -3688,6 +3784,29 @@ mod tests {
         );
     }
 
+    /// RFC 6891 §6.1.3: rdns implements EDNS version 0 only. A query
+    /// advertising a nonzero version must be rejected distinctly from a
+    /// generic malformed-EDNS query, so the resolver layer can answer
+    /// BADVERS instead of FORMERR (see `build_badvers_response` and
+    /// `resolver::BasicResponseFactory::protocol_error`). The coarse
+    /// `response_code()` classifier still buckets it as `FormErr` --
+    /// that's a metrics/event simplification, not the actual wire
+    /// behavior; see that method's doc comment.
+    #[test]
+    fn parse_standard_query_rejects_unsupported_edns_version() {
+        let mut message = Vec::new();
+        push_header(&mut message, 1, 0, 0, 1);
+        push_question(&mut message, "example.com", 1, 1);
+        push_opt_record_with_version(&mut message, 1232, false, 7, &[]);
+
+        let error = Message::parse_standard_query(&message).unwrap_err();
+        assert_eq!(
+            error,
+            QueryValidationError::UnsupportedEdnsVersion { version: 7 }
+        );
+        assert_eq!(error.response_code(), ResponseCode::FormErr);
+    }
+
     #[test]
     fn parse_standard_query_validates_shape_before_body() {
         let mut message = Vec::new();
@@ -3875,6 +3994,60 @@ mod tests {
             );
             assert_eq!(parsed.header.ar_count, 0);
         }
+    }
+
+    /// RFC 6891 §6.1.3: BADVERS is extended RCODE 16, a 12-bit value split
+    /// across the header's 4-bit RCODE field (the low nibble, which must be
+    /// 0 here) and the OPT record's 8-bit extended-RCODE byte (which must
+    /// be 1). This asserts the *combined* value rather than either half in
+    /// isolation, since checking only the header nibble (always 0) or only
+    /// the OPT byte would each pass even if the split were wrong.
+    #[test]
+    fn build_badvers_response_encodes_extended_rcode_and_mirrors_opt_and_cd() {
+        let mut request = Vec::new();
+        push_header_with_flags(&mut request, 0x0110, 1, 0, 0, 1); // RD=1, CD=1
+        push_question(&mut request, "example.com", 1, 1);
+        push_opt_record_with_version(&mut request, 4096, true, 7, &[]);
+        let request = Message::parse(&request).unwrap();
+        assert!(request.header.cd());
+
+        let configured_max_udp_payload_size = 700;
+        let response = Message::parse(&build_badvers_response(
+            &request,
+            configured_max_udp_payload_size,
+        ))
+        .unwrap();
+
+        assert_eq!(response.header.id, request.header.id);
+        assert_eq!(response.questions[0], request.questions[0]);
+        assert!(
+            response.header.cd(),
+            "CD must be copied from the request per RFC 4035 §3.2.2"
+        );
+
+        let opt = response
+            .additionals
+            .iter()
+            .find_map(|record| match &record.record {
+                RecordData::OPT(info) => Some(info),
+                _ => None,
+            })
+            .expect("expected an OPT record in the BADVERS response");
+        let combined_extended_rcode =
+            (u16::from(opt.extended_rcode) << 4) | u16::from(response.header.r_code());
+        assert_eq!(combined_extended_rcode, 16, "16 == BADVERS");
+        assert_eq!(
+            opt.version, 0,
+            "the response OPT must advertise the version rdns actually supports"
+        );
+        assert_eq!(
+            opt.udp_payload_size, 700,
+            "OPT must advertise this responder's own UDP payload size, not echo the requester's 4096"
+        );
+        assert!(
+            opt.dnssec_ok,
+            "DO should still be mirrored on a BADVERS response"
+        );
     }
 
     #[test]
