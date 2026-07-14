@@ -124,4 +124,4 @@ jobs:
       - name: Run okf-lint
         run: |
           docker run --rm -v "$PWD/docs/knowledge":/data:ro \
-            rpmoore/okf-lint:latest /data
+            rpmoore/okf-lint:4d94edd0bd98627a16b2cf5758c2baddd0563bd3 /data
