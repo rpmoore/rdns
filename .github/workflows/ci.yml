@@ -67,7 +67,7 @@ jobs:
         run: cargo test --locked --lib --bins
 
       - name: Run integration tests
-        run: cargo test --locked --test forwarding --test recursive_perf
+        run: cargo test --locked --test forwarding --test recursive_perf --test cache_concurrency_bench
 
       - name: Run e2e tests
         run: cargo test --locked --test e2e_config_toml

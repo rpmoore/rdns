@@ -600,7 +600,26 @@ pub fn opt_record(message: &Message) -> Option<&Record> {
         .find(|record| matches!(record.record, RecordData::OPT(_)))
 }
 
+/// Offline suites (synthetic fixtures, loopback-only) resolve near
+/// instantly, so a short default keeps a genuine hang failing fast. Live
+/// suites need real headroom above whatever `per_query_deadline` the
+/// resolver under test is configured with -- see `send_udp_with_timeout`.
+const DEFAULT_UDP_TIMEOUT: Duration = Duration::from_secs(2);
+
 pub async fn send_udp(target: SocketAddr, request: &[u8]) -> Vec<u8> {
+    send_udp_with_timeout(target, request, DEFAULT_UDP_TIMEOUT).await
+}
+
+/// Like `send_udp`, but with an explicit read timeout -- for live-network
+/// tests whose resolver-under-test may legitimately take several seconds
+/// (full root -> TLD -> authority recursion), where `send_udp`'s short
+/// default would fail the test before rdns's own `per_query_deadline` even
+/// elapses.
+pub async fn send_udp_with_timeout(
+    target: SocketAddr,
+    request: &[u8],
+    timeout: Duration,
+) -> Vec<u8> {
     let client = UdpSocket::bind("127.0.0.1:0")
         .await
         .expect("bind udp test client");
@@ -609,7 +628,7 @@ pub async fn send_udp(target: SocketAddr, request: &[u8]) -> Vec<u8> {
         .await
         .expect("send udp query");
     let mut buf = [0u8; 4096];
-    let (len, source) = time::timeout(Duration::from_secs(2), client.recv_from(&mut buf))
+    let (len, source) = time::timeout(timeout, client.recv_from(&mut buf))
         .await
         .expect("udp response timed out")
         .expect("recv udp response");
@@ -638,11 +657,22 @@ pub async fn expect_no_udp_response(target: SocketAddr, request: &[u8], wait: Du
 }
 
 pub async fn send_tcp(target: SocketAddr, request: &[u8]) -> Vec<u8> {
+    send_tcp_with_timeout(target, request, DEFAULT_UDP_TIMEOUT).await
+}
+
+/// Like `send_tcp`, but with an explicit read timeout -- see
+/// `send_udp_with_timeout`'s doc comment for why live-network tests need
+/// one separate from the offline suites' fast default.
+pub async fn send_tcp_with_timeout(
+    target: SocketAddr,
+    request: &[u8],
+    timeout: Duration,
+) -> Vec<u8> {
     let mut stream = TcpStream::connect(target)
         .await
         .expect("connect tcp test client");
     send_tcp_query(&mut stream, request).await;
-    read_tcp_response(&mut stream).await
+    read_tcp_response_with_timeout(&mut stream, timeout).await
 }
 
 pub async fn send_tcp_query(stream: &mut TcpStream, request: &[u8]) {
@@ -651,16 +681,24 @@ pub async fn send_tcp_query(stream: &mut TcpStream, request: &[u8]) {
 }
 
 pub async fn read_tcp_response(stream: &mut TcpStream) -> Vec<u8> {
+    read_tcp_response_with_timeout(stream, DEFAULT_UDP_TIMEOUT).await
+}
+
+/// Like `read_tcp_response`, but bounds both the length-prefix read and
+/// the body read with `timeout` instead of waiting indefinitely -- a
+/// regression that drops or stalls a TCP response must fail the test
+/// promptly, not hang the test process.
+pub async fn read_tcp_response_with_timeout(stream: &mut TcpStream, timeout: Duration) -> Vec<u8> {
     let mut length_prefix = [0u8; 2];
-    stream
-        .read_exact(&mut length_prefix)
+    time::timeout(timeout, stream.read_exact(&mut length_prefix))
         .await
+        .expect("read tcp response length prefix timed out")
         .expect("read tcp response length prefix");
     let len = u16::from_be_bytes(length_prefix) as usize;
     let mut response = vec![0u8; len];
-    stream
-        .read_exact(&mut response)
+    time::timeout(timeout, stream.read_exact(&mut response))
         .await
+        .expect("read tcp response body timed out")
         .expect("read tcp response body");
     response
 }

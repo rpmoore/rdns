@@ -3977,13 +3977,20 @@ impl ResolveQuery {
             Some(decoded),
             self.protocol.configured_max_udp_payload_size(),
         );
-        self.finish_uniform(
+        // `finish`, not `finish_uniform`: this refusal never performs a
+        // backend miss/fetch -- it returns SERVFAIL immediately -- so its
+        // latency must not land in `CacheMissQueryDuration` (that bucket
+        // means "how long a real backend round trip took"), even though
+        // the query event itself should still honestly report the cache
+        // state that led to the refusal.
+        self.finish(
             started_at,
             request,
             decoded_original_question_name(decoded),
             decision,
             response_bytes,
             event_cache_result,
+            None,
             Some(QueryEventBackend::from_snapshot(backend_snapshot)),
         )
         .await
@@ -18954,6 +18961,12 @@ mod tests {
             "RD=0 on a cache miss must not trigger a fresh backend fetch"
         );
         assert_eq!(metrics.count(ResolverMetric::RecursionRefused), 1);
+        assert_eq!(
+            metrics.duration_count(ResolverMetric::CacheMissQueryDuration),
+            0,
+            "a refused RD=0 query never performs a real backend miss/fetch, so its latency \
+             must not land in the cache-miss/backend-round-trip latency bucket"
+        );
     }
 
     /// Regression test for the recovery path (see

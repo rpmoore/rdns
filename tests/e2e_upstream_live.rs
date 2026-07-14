@@ -35,6 +35,14 @@ use rdns::config::{RecursiveResolutionConfig, ResolutionConfig, RuntimeConfig};
 use rdns::protocol::RecordData;
 use support::*;
 
+/// The shared `send_udp`/`send_tcp` helpers default to a 2s read timeout,
+/// tuned for the offline suite's near-instant synthetic fixtures. These
+/// live tests drive full root -> TLD -> authority recursion (or a real
+/// public upstream round trip) against a resolver configured with a 5s
+/// `per_query_deadline` -- the default would fail a slow-but-successful
+/// resolution before rdns's own deadline even elapses.
+const LIVE_UDP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(8);
+
 async fn recursive_config() -> RuntimeConfig {
     let recursive = RecursiveResolutionConfig::bundled("e2e-live-test");
     let port = free_loopback_port().await;
@@ -85,7 +93,7 @@ async fn forward_mode_resolves_a_record_through_a_real_public_upstream() {
         start_forward_server(&forward_toml_for_live_upstream("cloudflare", "1.1.1.1:53")).await;
 
     let request = RawQueryBuilder::new(0x6001, "example.com", 1).build();
-    let response = send_udp(server.udp_addr, &request).await;
+    let response = send_udp_with_timeout(server.udp_addr, &request, LIVE_UDP_TIMEOUT).await;
     let message = parse_response(&response);
 
     assert_eq!(message.header.id, 0x6001);
@@ -124,7 +132,7 @@ async fn resolves_a_record_for_well_known_domain_recursively() {
     let server = start_recursive_server(recursive_config().await).await;
 
     let request = RawQueryBuilder::new(0x5001, "example.com", 1).build();
-    let response = send_udp(server.udp_addr, &request).await;
+    let response = send_udp_with_timeout(server.udp_addr, &request, LIVE_UDP_TIMEOUT).await;
     let message = parse_response(&response);
 
     assert_eq!(message.header.id, 0x5001);
@@ -159,7 +167,7 @@ async fn nxdomain_for_nonexistent_name_under_a_real_tld() {
     // record) -- effectively guaranteed NXDOMAIN.
     let request =
         RawQueryBuilder::new(0x5002, "rdns-e2e-conformance-suite-9f3a7c1d.com", 1).build();
-    let response = send_udp(server.udp_addr, &request).await;
+    let response = send_udp_with_timeout(server.udp_addr, &request, LIVE_UDP_TIMEOUT).await;
     let message = parse_response(&response);
 
     assert_eq!(message.header.id, 0x5002);
@@ -189,7 +197,7 @@ async fn dnssec_signed_domain_returns_rrsig_when_do_bit_set() {
     let request = RawQueryBuilder::new(0x5003, "cloudflare.com", 1)
         .edns(1232, true)
         .build();
-    let response = send_udp(server.udp_addr, &request).await;
+    let response = send_udp_with_timeout(server.udp_addr, &request, LIVE_UDP_TIMEOUT).await;
     let message = parse_response(&response);
 
     assert_eq!(message.header.r_code(), NOERROR);
@@ -212,7 +220,7 @@ async fn dnssec_signed_domain_omits_rrsig_when_do_bit_unset() {
     let request = RawQueryBuilder::new(0x5004, "cloudflare.com", 1)
         .edns(1232, false)
         .build();
-    let response = send_udp(server.udp_addr, &request).await;
+    let response = send_udp_with_timeout(server.udp_addr, &request, LIVE_UDP_TIMEOUT).await;
     let message = parse_response(&response);
 
     assert_eq!(message.header.r_code(), NOERROR);
@@ -238,7 +246,7 @@ async fn ad_bit_never_set_even_for_a_real_dnssec_signed_domain() {
     let request = RawQueryBuilder::new(0x5005, "cloudflare.com", 1)
         .edns(1232, true)
         .build();
-    let response = send_udp(server.udp_addr, &request).await;
+    let response = send_udp_with_timeout(server.udp_addr, &request, LIVE_UDP_TIMEOUT).await;
     let message = parse_response(&response);
 
     assert!(!message.header.ad());
@@ -266,7 +274,7 @@ async fn recursive_response_excludes_echoed_ns_authority_section() {
     let server = start_recursive_server(recursive_config().await).await;
 
     let request = RawQueryBuilder::new(0x6002, "github.com", 1).build();
-    let response = send_udp(server.udp_addr, &request).await;
+    let response = send_udp_with_timeout(server.udp_addr, &request, LIVE_UDP_TIMEOUT).await;
     let message = parse_response(&response);
 
     assert_eq!(message.header.id, 0x6002);
@@ -296,7 +304,7 @@ async fn tcp_round_trip_against_real_recursive_resolution() {
     let server = start_recursive_server(recursive_config().await).await;
 
     let request = RawQueryBuilder::new(0x5006, "example.com", 1).build();
-    let response = send_tcp(server.tcp_addr, &request).await;
+    let response = send_tcp_with_timeout(server.tcp_addr, &request, LIVE_UDP_TIMEOUT).await;
     let message = parse_response(&response);
 
     assert_eq!(message.header.id, 0x5006);
