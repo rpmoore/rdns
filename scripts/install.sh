@@ -31,6 +31,14 @@ version_lt() {
   [ "$(printf '%s\n%s\n' "$1" "$2" | sort -V | head -n1)" = "$1" ]
 }
 
+# True (0) if $1 is a plain dotted-numeric version (e.g. "0.1.4") that's
+# safe to feed to version_lt.
+looks_like_version() {
+  case "$1" in
+    ''|*[!0-9.]*) return 1 ;;
+  esac
+}
+
 usage() {
   cat <<'EOF'
 Usage: install.sh [--yes] [--no-service] [--version <tag>] [--help]
@@ -127,7 +135,8 @@ esac
 
 installed_version=""
 # Reject a symlink at this path outright rather than executing whatever it
-# points to as root; only run a plain, installer-owned regular file.
+# points to as root; only run a plain, non-symlink, executable regular file
+# (this does not check ownership/permissions beyond that).
 if [ -f "$INSTALL_DIR/$BIN_NAME" ] && [ ! -L "$INSTALL_DIR/$BIN_NAME" ] && [ -x "$INSTALL_DIR/$BIN_NAME" ]; then
   # `timeout` guards against a pre-`version`-subcommand binary that would
   # otherwise ignore the "version" arg and start serving DNS/metrics forever,
@@ -138,18 +147,13 @@ fi
 target_version="${TAG#v}"
 installed_version="${installed_version#v}"
 
-# Reject anything that isn't a plain dotted-numeric token (e.g. stray log
-# output or a usage message's second word from a binary that doesn't
-# understand the "version" arg) so garbage never reaches version_lt.
-case "$installed_version" in
-  ''|*[!0-9.]*) installed_version="" ;;
-esac
-
-# installed_version is empty for a fresh install, if the existing binary
-# predates the `version` subcommand, if querying it timed out, or if its
-# output didn't look like a version — either way there's nothing usable to
-# compare.
-if [ -n "$installed_version" ] && version_lt "$target_version" "$installed_version"; then
+# installed_version fails to look like a version for a fresh install, if the
+# existing binary predates the `version` subcommand, if querying it timed
+# out, or if its output was garbage. target_version fails to look like one
+# for a non-semver tag (e.g. "latest" or "v0.1.0-rc1"). Either way, skip the
+# downgrade check rather than risk a wrong verdict from version_lt.
+if looks_like_version "$installed_version" && looks_like_version "$target_version" \
+  && version_lt "$target_version" "$installed_version"; then
   warn "downgrading rdns: installed version is ${installed_version}, requested is ${target_version} (${TAG})."
   warn "an older binary may not understand config/state written by ${installed_version}."
   if [ "$AUTO_YES" -eq 1 ]; then
