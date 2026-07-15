@@ -25,13 +25,30 @@ log() { printf '==> %s\n' "$*"; }
 warn() { printf 'warning: %s\n' "$*" >&2; }
 die() { printf 'error: %s\n' "$*" >&2; exit 1; }
 
+# True (0) if $1 is a strictly lower dotted version than $2.
+version_lt() {
+  [ "$1" = "$2" ] && return 1
+  [ "$(printf '%s\n%s\n' "$1" "$2" | sort -V | head -n1)" = "$1" ]
+}
+
+# True (0) if $1 is a plain dotted-numeric version (e.g. "0.1.4") that's
+# safe to feed to version_lt.
+looks_like_version() {
+  case "$1" in
+    ''|*[!0-9.]*) return 1 ;;
+  esac
+}
+
 usage() {
   cat <<'EOF'
 Usage: install.sh [--yes] [--no-service] [--version <tag>] [--help]
 
   --yes, -y          Install and enable the systemd service without prompting.
   --no-service       Install the binary only; skip the systemd service setup.
-  --version <tag>    Install a specific release tag (e.g. v0.1.2) instead of latest.
+  --version <tag>    Install a specific release tag (e.g. v0.1.2) instead of
+                     latest — this can also downgrade an existing install.
+                     Downgrading prompts for confirmation unless --yes (or
+                     RDNS_INSTALL_YES=1) is given.
   --help             Show this help.
 
 Environment variable equivalents (useful for scripted/CI installs):
@@ -76,7 +93,7 @@ if command -v ldd >/dev/null 2>&1 && ldd --version 2>&1 | grep -qi musl; then
   die "rdns installer's release binary is glibc-linked and will not run on musl-based systems (e.g. Alpine); detected musl libc"
 fi
 
-for tool in curl tar sha256sum grep sed head install mktemp; do
+for tool in curl tar sha256sum grep sed head install mktemp sort awk timeout; do
   command -v "$tool" >/dev/null 2>&1 || die "required tool '$tool' not found; install it and re-run"
 done
 
@@ -113,6 +130,46 @@ fi
 case "$TAG" in
   *[!A-Za-z0-9._-]*|"") die "invalid release tag: '$TAG'" ;;
 esac
+
+# --- Warn/confirm on downgrade ----------------------------------------------
+
+installed_version=""
+# Reject a symlink at this path outright rather than executing whatever it
+# points to as root; only run a plain, non-symlink, executable regular file
+# (this does not check ownership/permissions beyond that).
+if [ -f "$INSTALL_DIR/$BIN_NAME" ] && [ ! -L "$INSTALL_DIR/$BIN_NAME" ] && [ -x "$INSTALL_DIR/$BIN_NAME" ]; then
+  # `timeout` guards against a pre-`version`-subcommand binary that would
+  # otherwise ignore the "version" arg and start serving DNS/metrics forever,
+  # hanging the installer instead of just failing the version query.
+  installed_version="$(timeout 5s "$INSTALL_DIR/$BIN_NAME" version 2>/dev/null | awk '{print $2}')" || true
+fi
+
+target_version="${TAG#v}"
+installed_version="${installed_version#v}"
+
+# installed_version fails to look like a version for a fresh install, if the
+# existing binary predates the `version` subcommand, if querying it timed
+# out, or if its output was garbage. target_version fails to look like one
+# for a non-semver tag (e.g. "latest" or "v0.1.0-rc1"). Either way, skip the
+# downgrade check rather than risk a wrong verdict from version_lt.
+if looks_like_version "$installed_version" && looks_like_version "$target_version" \
+  && version_lt "$target_version" "$installed_version"; then
+  warn "downgrading rdns: installed version is ${installed_version}, requested is ${target_version} (${TAG})."
+  warn "an older binary may not understand config/state written by ${installed_version}."
+  if [ "$AUTO_YES" -eq 1 ]; then
+    log "proceeding with downgrade (--yes/RDNS_INSTALL_YES set)."
+  elif [ -r /dev/tty ] && { exec 3<>/dev/tty; } 2>/dev/null; then
+    printf 'Continue with downgrade to %s? [y/N] ' "$TAG" >&3
+    read -r reply <&3
+    exec 3<&-
+    case "$reply" in
+      [yY]|[yY][eE][sS]) ;;
+      *) die "downgrade cancelled" ;;
+    esac
+  else
+    die "downgrading from ${installed_version} to ${target_version} requires confirmation; re-run interactively, or pass --yes (or RDNS_INSTALL_YES=1) to confirm non-interactively."
+  fi
+fi
 
 log "Installing rdns ${TAG} (linux-x86_64)"
 
