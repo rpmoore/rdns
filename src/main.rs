@@ -143,7 +143,8 @@ async fn main() -> io::Result<()> {
             metrics,
         )
         .with_max_chain_depth(max_chain_depth)
-        .with_single_flight_shard_count(cache.shard_count()),
+        .with_single_flight_shard_count(cache.shard_count())
+        .with_chaos_config(config.chaos.clone()),
     );
 
     let sighup_task =

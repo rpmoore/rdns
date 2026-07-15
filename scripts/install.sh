@@ -274,9 +274,9 @@ if [ "$setup_service" -eq 1 ]; then
 # rdns runtime configuration — installed default.
 #
 # Loaded on startup, and re-loaded on SIGHUP (resolution, upstreams, and
-# local_dns_entries hot-reload — dns_listen and [metrics] changes require
-# `systemctl restart rdns`). Override the path with the RDNS_CONFIG
-# environment variable.
+# local_dns_entries hot-reload — dns_listen, [metrics], and [chaos] changes
+# require `systemctl restart rdns`). Override the path with the
+# RDNS_CONFIG environment variable.
 #
 # Installed once; re-running the installer never overwrites this file.
 #
@@ -328,6 +328,14 @@ root_hints_version = "bundled:v1"
 #
 # Changes to local_dns_entries hot-reload on `systemctl reload rdns` —
 # no restart needed.
+
+# Answers `version.bind. CH TXT` (BIND's classic operator-fingerprint
+# query, e.g. `dig version.bind chaos txt`) with a fixed string instead of
+# resolving it like a normal query. On by default; set enabled = false to
+# opt out.
+[chaos]
+enabled = true
+version_bind = "rdns"
 RDNS_DEFAULT_CONFIG_EOF
     chmod 0644 "$CONFIG_FILE"
     config_freshly_installed=1

@@ -26,6 +26,7 @@ pub const DNS_DEFAULT_UDP_PAYLOAD_SIZE: usize = 512;
 const MAX_LABEL_LEN: usize = 63;
 const MAX_NAME_LEN: usize = 255;
 const OPT_RECORD_TYPE: u16 = 41;
+const TXT_RECORD_TYPE: u16 = 16;
 const EDNS_DO_FLAG: u16 = 0x8000;
 
 pub type Result<T> = std::result::Result<T, DnsParseError>;
@@ -704,6 +705,57 @@ pub fn build_aaaa_answers_response(
         &answers,
         configured_max_udp_payload_size,
     )
+}
+
+/// Builds a single-answer TXT response, echoing the question's own class
+/// onto the answer record (CHAOS-class questions get a CHAOS-class
+/// answer). Used for synthetic CHAOS-class replies (e.g. `version.bind.`)
+/// -- unlike `build_a_answers_response`/`build_aaaa_answers_response`,
+/// which go through `AddressAnswer`/`write_sinkhole_answer` since those
+/// only ever answer in the question's IN class, this goes through the
+/// generic `write_record` path because the answer class isn't fixed to IN.
+pub fn build_txt_answer_response(
+    request: &Message,
+    text: &str,
+    ttl: u32,
+    configured_max_udp_payload_size: usize,
+) -> Vec<u8> {
+    let mut response = Vec::new();
+    let question_count = u16::from(!request.questions.is_empty());
+    let opt = message_edns_opt_record(request, configured_max_udp_payload_size);
+    write_message_header(
+        &mut response,
+        request.header.id,
+        request.header.rd(),
+        false,
+        false, // synthetic local response, never authoritative
+        false,
+        request.header.cd(),
+        ResponseCode::NoError,
+        question_count,
+        question_count,
+        0,
+        u16::from(opt.is_some()),
+    );
+
+    if let Some(question) = request.questions.first() {
+        let mut compressor = NameCompressor::new();
+        write_question(&mut response, &mut compressor, question);
+        write_record(
+            &mut response,
+            &mut compressor,
+            &question.qname,
+            TXT_RECORD_TYPE,
+            question.qclass,
+            ttl,
+            &RecordData::TXT(text.to_string()),
+        );
+    }
+    if let Some(opt) = &opt {
+        write_opt_record(&mut response, opt);
+    }
+
+    response
 }
 
 pub fn rewrite_response_id(response_bytes: &mut [u8], request_id: u16) -> Result<()> {

@@ -1,7 +1,8 @@
 # rdns runtime configuration.
 #
 # Loaded on startup, and re-loaded on SIGHUP (resolution, upstreams, and
-# local_dns_entries — dns_listen and [metrics] changes require a restart).
+# local_dns_entries — dns_listen, [metrics], and [chaos] changes require a
+# restart).
 # Override the path with the RDNS_CONFIG environment variable; if neither
 # RDNS_CONFIG nor this file is present, rdns falls back to built-in
 # loopback development defaults.
@@ -53,3 +54,11 @@ ipv4 = ["192.168.1.20"]
 ttl = 300
 enabled = false
 public_address_acknowledged = false
+
+# Answers `version.bind. CH TXT` (BIND's classic operator-fingerprint
+# query, e.g. `dig version.bind chaos txt`) with a fixed string instead of
+# resolving it like a normal query. On by default; set enabled = false to
+# opt out.
+[chaos]
+enabled = true
+version_bind = "rdns"
