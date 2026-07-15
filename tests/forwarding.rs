@@ -113,7 +113,12 @@ async fn run_server(
 ) {
     let resolver = resolver_from_config(config);
     let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
-    let server = UdpDnsServer::new(socket, resolver, config.max_udp_payload_size);
+    let server = UdpDnsServer::new(
+        socket,
+        resolver,
+        Arc::new(FixedClock),
+        config.max_udp_payload_size,
+    );
     let server_addr = server.local_addr().unwrap();
     let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
     let server_task = tokio::spawn(async move {

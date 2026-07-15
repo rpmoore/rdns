@@ -126,6 +126,7 @@ async fn main() -> io::Result<()> {
         .as_ref()
         .map(|recursive| recursive.max_cname_restarts)
         .unwrap_or(8);
+    let clock: Arc<dyn Clock> = Arc::new(SystemClock);
     let resolver = Arc::new(
         ResolveQuery::with_cache_policy_and_backend_snapshot(
             Arc::new(StandardProtocolCodec::new(config.max_udp_payload_size)),
@@ -135,7 +136,7 @@ async fn main() -> io::Result<()> {
             CacheTtlPolicy::default(),
             backend_snapshot,
             Arc::new(BasicResponseFactory),
-            Arc::new(SystemClock),
+            Arc::clone(&clock),
             Arc::new(StoreRecordingQueryEventSink::new(
                 ChannelQueryEventSink::new(event_tx),
                 Arc::clone(&query_event_store),
@@ -150,7 +151,8 @@ async fn main() -> io::Result<()> {
     let sighup_task =
         spawn_sighup_reload_task(Arc::clone(&resolver), reload_metrics, config_path.clone());
 
-    let servers = UdpDnsServer::bind_configured(&config, Arc::clone(&resolver)).await?;
+    let servers =
+        UdpDnsServer::bind_configured(&config, Arc::clone(&resolver), Arc::clone(&clock)).await?;
     if servers.is_empty() {
         return Err(io::Error::other("no DNS listeners configured"));
     }
@@ -158,7 +160,8 @@ async fn main() -> io::Result<()> {
     // clients may connect over TCP directly, and a UDP response we truncate
     // (`TC=1`) is a promise that the same query will succeed over TCP, so a
     // bind failure here is as fatal as a UDP bind failure.
-    let tcp_servers = TcpDnsServer::bind_configured(&config, Arc::clone(&resolver)).await?;
+    let tcp_servers =
+        TcpDnsServer::bind_configured(&config, Arc::clone(&resolver), Arc::clone(&clock)).await?;
     // A metrics-listener bind failure (e.g. the configured port is already in
     // use by something else on the host) must not prevent the DNS resolver
     // itself from starting — metrics are optional observability, not a core

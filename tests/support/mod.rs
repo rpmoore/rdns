@@ -138,9 +138,11 @@ async fn spawn_servers(config: &RuntimeConfig, resolver: Arc<ResolveQuery>) -> R
     let udp_socket = UdpSocket::bind("127.0.0.1:0")
         .await
         .expect("bind loopback udp socket");
+    let clock: Arc<dyn Clock> = Arc::new(SystemClock);
     let udp_server = UdpDnsServer::new(
         udp_socket,
         Arc::clone(&resolver),
+        Arc::clone(&clock),
         config.max_udp_payload_size,
     );
     let udp_addr = udp_server.local_addr().expect("udp server local addr");
@@ -153,7 +155,7 @@ async fn spawn_servers(config: &RuntimeConfig, resolver: Arc<ResolveQuery>) -> R
             .await
     });
 
-    let mut tcp_servers = TcpDnsServer::bind_configured(config, resolver)
+    let mut tcp_servers = TcpDnsServer::bind_configured(config, resolver, clock)
         .await
         .expect("bind configured tcp listener(s)");
     assert_eq!(
