@@ -19,8 +19,16 @@ curl -fsSL https://raw.githubusercontent.com/rpmoore/rdns/main/scripts/install.s
 ```
 
 Pass `--yes` to install and start the service without prompting, `--no-service`
-to install only the binary, or `--version <tag>` to pin a specific release.
-See `./scripts/install.sh --help` for details (from a repo checkout).
+to install only the binary, or `--version <tag>` to pin a specific release —
+including an older one, to downgrade (the installer prompts for confirmation
+before downgrading unless `--yes` is given). See `./scripts/install.sh --help`
+for details (from a repo checkout).
+
+To install (or downgrade to) a specific version, e.g. `v0.1.4`:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/rpmoore/rdns/main/scripts/install.sh | sudo bash -s -- --version v0.1.4
+```
 
 ## Run it
 
