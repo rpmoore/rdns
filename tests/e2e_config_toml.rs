@@ -109,6 +109,109 @@ async fn query_for_local_entry_returns_noerror_with_answer() {
     server.shutdown().await;
 }
 
+// BIND's classic operator-fingerprint query (`dig version.bind chaos txt`):
+// when `[chaos]` is enabled, rdns answers it directly with the configured
+// string -- via `spawn_silent_upstream` (never responds), so this also
+// proves the query never reaches the backend.
+#[tokio::test]
+async fn version_bind_chaos_query_returns_configured_string_when_enabled() {
+    let (upstream_addr, _upstream_task) = spawn_silent_upstream().await;
+    let mut toml = forward_toml(upstream_addr.port());
+    toml.push_str(
+        r#"
+[chaos]
+enabled = true
+version_bind = "rdns-e2e-test"
+"#,
+    );
+    let server = start_forward_server(&toml).await;
+
+    let request = RawQueryBuilder::new(0x4001, "version.bind", 16)
+        .qclass(3)
+        .build();
+    let response = send_udp(server.udp_addr, &request).await;
+    let message = parse_response(&response);
+
+    assert_eq!(message.header.id, 0x4001);
+    assert_eq!(message.header.r_code(), NOERROR);
+    assert_eq!(message.answers.len(), 1);
+    assert_eq!(message.answers[0].rclass, 3);
+    assert_eq!(
+        message.answers[0].record,
+        RecordData::TXT("rdns-e2e-test".to_string())
+    );
+
+    server.shutdown().await;
+}
+
+// On by default: an unconfigured rdns (no `[chaos]` table at all) must
+// already answer `version.bind. CH TXT` with "rdns" -- via
+// `spawn_silent_upstream` (never responds), proving the query never
+// reaches the backend.
+#[tokio::test]
+async fn version_bind_chaos_query_answers_rdns_by_default() {
+    let (upstream_addr, _upstream_task) = spawn_silent_upstream().await;
+    let server = start_forward_server(&forward_toml(upstream_addr.port())).await;
+
+    let request = RawQueryBuilder::new(0x4002, "version.bind", 16)
+        .qclass(3)
+        .build();
+    let response = send_udp(server.udp_addr, &request).await;
+    let message = parse_response(&response);
+
+    assert_eq!(message.header.id, 0x4002);
+    assert_eq!(message.header.r_code(), NOERROR);
+    assert_eq!(message.answers.len(), 1);
+    assert_eq!(message.answers[0].rclass, 3);
+    assert_eq!(
+        message.answers[0].record,
+        RecordData::TXT("rdns".to_string())
+    );
+
+    server.shutdown().await;
+}
+
+// `[chaos].enabled = false` must opt back out to normal resolution (query
+// forwarded upstream, not answered directly). Uses
+// `spawn_silent_upstream`'s `JoinHandle` (resolves once the fake upstream
+// actually receives bytes) rather than waiting for a full round trip/
+// SERVFAIL timeout, so this stays fast and doesn't depend on
+// `per_query_deadline_ms`.
+#[tokio::test]
+async fn version_bind_chaos_query_forwards_upstream_when_explicitly_disabled() {
+    let (upstream_addr, upstream_task) = spawn_silent_upstream().await;
+    let mut toml = forward_toml(upstream_addr.port());
+    toml.push_str(
+        r#"
+[chaos]
+enabled = false
+"#,
+    );
+    let server = start_forward_server(&toml).await;
+
+    let request = RawQueryBuilder::new(0x4003, "version.bind", 16)
+        .qclass(3)
+        .build();
+    let client = UdpSocket::bind("127.0.0.1:0")
+        .await
+        .expect("bind udp test client");
+    client
+        .send_to(&request, server.udp_addr)
+        .await
+        .expect("send udp query");
+
+    let received = tokio::time::timeout(Duration::from_secs(2), upstream_task)
+        .await
+        .expect(
+            "chaos.enabled = false must forward version.bind upstream like any other query, \
+             not get intercepted before reaching the backend",
+        )
+        .expect("fake upstream task panicked");
+    assert!(!received.is_empty());
+
+    server.shutdown().await;
+}
+
 // RFC 1035 §4.1.1: RD is copied from query to response, nothing more --
 // but rdns *does* gate on it (see the two tests below for the cache-miss
 // and cache-hit cases). Local entries are the exception: they're

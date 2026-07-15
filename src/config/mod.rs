@@ -38,6 +38,7 @@ pub struct RuntimeConfig {
     pub local_zones: Vec<LocalZoneConfig>,
     pub metrics: MetricsConfig,
     pub cache: CacheConfig,
+    pub chaos: ChaosConfig,
 }
 
 /// Default ceiling on concurrent TCP DNS connections per listener. Shared
@@ -79,6 +80,7 @@ impl RuntimeConfig {
             local_zones: Vec::new(),
             metrics: MetricsConfig::default_enabled(),
             cache: CacheConfig::default(),
+            chaos: ChaosConfig::default(),
         };
         config.validate()?;
         Ok(config)
@@ -106,6 +108,7 @@ impl RuntimeConfig {
             local_zones: Vec::new(),
             metrics: MetricsConfig::default_enabled(),
             cache: CacheConfig::default(),
+            chaos: ChaosConfig::default(),
         }
     }
 
@@ -191,6 +194,10 @@ impl RuntimeConfig {
         }
 
         self.cache.validate()?;
+
+        if self.chaos.enabled && self.chaos.version_bind.is_empty() {
+            return Err(ConfigError::ChaosVersionBindEmpty);
+        }
 
         Ok(())
     }
@@ -288,6 +295,29 @@ const DEFAULT_METRICS_MAX_CONNECTIONS: usize = 32;
 
 fn default_metrics_listen_addr() -> SocketAddr {
     SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 9090)
+}
+
+/// Controls rdns's answer to `version.bind. CH TXT` -- BIND's classic
+/// operator-fingerprint query (`dig version.bind chaos txt`). On by
+/// default, answering `"rdns"` -- set `enabled = false` to opt out and
+/// resolve it like any other query instead.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChaosConfig {
+    pub enabled: bool,
+    pub version_bind: String,
+}
+
+impl Default for ChaosConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            version_bind: default_chaos_version_bind(),
+        }
+    }
+}
+
+fn default_chaos_version_bind() -> String {
+    "rdns".to_string()
 }
 
 /// Configuration for the sharded answer cache (`resolver::cache`).
@@ -1290,6 +1320,7 @@ pub enum ConfigError {
         value: usize,
         max: usize,
     },
+    ChaosVersionBindEmpty,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1312,6 +1343,8 @@ struct RawRuntimeConfig {
     metrics: Option<RawMetricsConfig>,
     #[serde(default)]
     cache: Option<RawCacheConfig>,
+    #[serde(default)]
+    chaos: Option<RawChaosConfig>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1365,6 +1398,24 @@ impl RawMetricsConfig {
             enabled: self.enabled,
             listen: parse_socket_addr(&self.listen)?,
             max_connections: self.max_connections,
+        })
+    }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawChaosConfig {
+    #[serde(default = "default_true")]
+    enabled: bool,
+    #[serde(default = "default_chaos_version_bind")]
+    version_bind: String,
+}
+
+impl RawChaosConfig {
+    fn try_into_chaos_config(self) -> Result<ChaosConfig, ConfigError> {
+        Ok(ChaosConfig {
+            enabled: self.enabled,
+            version_bind: self.version_bind,
         })
     }
 }
@@ -1664,6 +1715,11 @@ impl TryFrom<RawRuntimeConfig> for RuntimeConfig {
             .map(RawCacheConfig::try_into_cache_config)
             .transpose()?
             .unwrap_or_default();
+        let chaos = raw
+            .chaos
+            .map(RawChaosConfig::try_into_chaos_config)
+            .transpose()?
+            .unwrap_or_default();
 
         let config = RuntimeConfig {
             dns_listen,
@@ -1676,6 +1732,7 @@ impl TryFrom<RawRuntimeConfig> for RuntimeConfig {
             local_zones,
             metrics,
             cache,
+            chaos,
         };
         config.validate()?;
         Ok(config)
@@ -2703,6 +2760,63 @@ a.root-servers.net.      3600000      Aaaa  2001:503:ba3e::2:30
         let config = RuntimeConfig::from_toml_str(&toml).unwrap();
 
         assert!(config.local_zones[0].enabled);
+    }
+
+    #[test]
+    fn toml_config_chaos_defaults_to_enabled_with_rdns_string() {
+        let config = RuntimeConfig::from_toml_str(&valid_toml()).unwrap();
+
+        assert!(config.chaos.enabled);
+        assert_eq!(config.chaos.version_bind, "rdns");
+    }
+
+    #[test]
+    fn toml_config_chaos_table_without_enabled_key_defaults_to_enabled() {
+        let mut toml = valid_toml();
+        toml.push_str(
+            r#"
+            [chaos]
+            version_bind = "totally-not-rdns"
+            "#,
+        );
+
+        let config = RuntimeConfig::from_toml_str(&toml).unwrap();
+
+        assert!(config.chaos.enabled);
+        assert_eq!(config.chaos.version_bind, "totally-not-rdns");
+    }
+
+    #[test]
+    fn toml_config_round_trip_loads_chaos() {
+        let mut toml = valid_toml();
+        toml.push_str(
+            r#"
+            [chaos]
+            enabled = false
+            version_bind = "totally-not-rdns"
+            "#,
+        );
+
+        let config = RuntimeConfig::from_toml_str(&toml).unwrap();
+
+        assert!(!config.chaos.enabled);
+        assert_eq!(config.chaos.version_bind, "totally-not-rdns");
+    }
+
+    #[test]
+    fn toml_config_rejects_chaos_enabled_with_empty_version_bind() {
+        let mut toml = valid_toml();
+        toml.push_str(
+            r#"
+            [chaos]
+            enabled = true
+            version_bind = ""
+            "#,
+        );
+
+        let error = RuntimeConfig::from_toml_str(&toml).unwrap_err();
+
+        assert!(matches!(error, ConfigError::ChaosVersionBindEmpty));
     }
 
     #[test]

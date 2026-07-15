@@ -268,18 +268,21 @@ async fn start_forward_server_with_local_entries(
         BackendHealth::Healthy,
         Some(config.backend_cache_namespace()),
     );
-    let resolver = Arc::new(ResolveQuery::with_cache_policy_and_backend_snapshot(
-        Arc::new(StandardProtocolCodec::new(config.max_udp_payload_size)),
-        Arc::new(NoopDnsCache),
-        Arc::new(NoopPolicyEvaluator),
-        local_entries,
-        CacheTtlPolicy::default(),
-        snapshot,
-        Arc::new(BasicResponseFactory),
-        Arc::new(SystemClock),
-        Arc::new(NoopEvents),
-        Arc::new(NoopMetrics),
-    ));
+    let resolver = Arc::new(
+        ResolveQuery::with_cache_policy_and_backend_snapshot(
+            Arc::new(StandardProtocolCodec::new(config.max_udp_payload_size)),
+            Arc::new(NoopDnsCache),
+            Arc::new(NoopPolicyEvaluator),
+            local_entries,
+            CacheTtlPolicy::default(),
+            snapshot,
+            Arc::new(BasicResponseFactory),
+            Arc::new(SystemClock),
+            Arc::new(NoopEvents),
+            Arc::new(NoopMetrics),
+        )
+        .with_chaos_config(config.chaos.clone()),
+    );
     spawn_servers(&config, resolver).await
 }
 
@@ -540,6 +543,11 @@ impl RawQueryBuilder {
 
     pub fn cd(mut self, cd: bool) -> Self {
         self.cd = cd;
+        self
+    }
+
+    pub fn qclass(mut self, qclass: u16) -> Self {
+        self.qclass = qclass;
         self
     }
 

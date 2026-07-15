@@ -33,7 +33,7 @@ use crate::protocol::{
     ResponseCode, build_a_answers_response, build_a_block_response, build_aaaa_answers_response,
     build_aaaa_block_response, build_badvers_response, build_nodata_response,
     build_nxdomain_response, build_question_aware_error_response, build_refused_response,
-    build_servfail_response, message_question_wire, rewrite_response_id,
+    build_servfail_response, build_txt_answer_response, message_question_wire, rewrite_response_id,
     rewrite_response_request_fields,
 };
 
@@ -86,6 +86,16 @@ const NSEC3_RECORD_TYPE: u16 = 50;
 const NSEC3PARAM_RECORD_TYPE: u16 = 51;
 const RRSIG_RECORD_TYPE: u16 = 46;
 const SOA_RECORD_TYPE: u16 = 6;
+const TXT_RECORD_TYPE: u16 = 16;
+/// RFC 1035 §3.2.4 CLASS value for CHAOS, the class BIND's operator-info
+/// pseudo-zone (`version.bind.`, `hostname.bind.`) is conventionally
+/// queried under -- never IN. See `ResolveQuery::try_chaos_lookup`.
+const CHAOS_CLASS: u16 = 3;
+/// TTL rdns answers `version.bind.` with -- 0, matching BIND's own
+/// convention for CHAOS-class operator-info answers (never cached).
+const CHAOS_ANSWER_TTL: u32 = 0;
+/// Normalized (`normalize_question_name`) form of `version.bind.`.
+const VERSION_BIND_QNAME: &str = "version.bind";
 
 pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 
@@ -2635,6 +2645,10 @@ pub enum ResolveDecisionKind {
     Allowed,
     Blocked(PolicyBlock),
     LocalAnswer(LocalAnswerMetadata),
+    /// A synthetic CHAOS-class answer (currently only `version.bind. CH
+    /// TXT`) served from `[chaos]` config -- see
+    /// `ResolveQuery::try_chaos_lookup`.
+    ChaosAnswer,
     CacheHit,
     CacheMiss,
     ProtocolError(ResponseCode),
@@ -2786,6 +2800,7 @@ impl QueryEventOutcome {
             ResolveDecisionKind::Allowed => Self::AllowedFromBackend,
             ResolveDecisionKind::Blocked(block) => Self::Blocked(block.reason.clone()),
             ResolveDecisionKind::LocalAnswer(_) => Self::AllowedFromLocal,
+            ResolveDecisionKind::ChaosAnswer => Self::AllowedFromLocal,
             ResolveDecisionKind::CacheHit => Self::AllowedFromCache,
             ResolveDecisionKind::CacheMiss => Self::AllowedFromBackend,
             ResolveDecisionKind::ProtocolError(code) => Self::ProtocolError(*code),
@@ -3348,6 +3363,13 @@ pub struct ResolveQuery {
     events: Arc<dyn QueryEventSink>,
     event_sequence: AtomicU64,
     metrics: Arc<dyn MetricsSink>,
+    // Not part of any constructor's parameter list by default (defaults to
+    // `ChaosConfig::default()`, i.e. enabled) -- same reasoning as
+    // `max_chain_depth` above: `main.rs` overrides it via
+    // `with_chaos_config` once real config is available, rather than
+    // threading yet another parameter through every `with_cache*`
+    // constructor.
+    chaos: crate::config::ChaosConfig,
 }
 
 impl ResolveQuery {
@@ -3478,6 +3500,7 @@ impl ResolveQuery {
             events,
             event_sequence: AtomicU64::new(0),
             metrics,
+            chaos: crate::config::ChaosConfig::default(),
         }
     }
 
@@ -3604,6 +3627,17 @@ impl ResolveQuery {
         self
     }
 
+    /// Overrides the default CHAOS-class config set by every constructor
+    /// (enabled, answering `"rdns"`). `main.rs` calls this with the real
+    /// `[chaos]` config
+    /// once available -- see `ResolveQuery.chaos`'s doc comment for why
+    /// this is a post-construction override rather than a parameter
+    /// threaded through every `with_cache*` constructor.
+    pub fn with_chaos_config(mut self, chaos: crate::config::ChaosConfig) -> Self {
+        self.chaos = chaos;
+        self
+    }
+
     /// Overrides the default `ShardedSingleFlight` shard count set by
     /// every constructor. `main.rs` calls this with the real
     /// `ShardedDnsCache`'s own `shard_count()` once both are constructed,
@@ -3669,6 +3703,7 @@ impl ResolveQuery {
             events,
             event_sequence: AtomicU64::new(0),
             metrics,
+            chaos: crate::config::ChaosConfig::default(),
         }
     }
 
@@ -3729,6 +3764,13 @@ impl ResolveQuery {
         let question = decoded.question.clone();
         if let Some(outcome) = self
             .try_policy_block(started_at, &request, &decoded, &question, &backend_snapshot)
+            .await
+        {
+            return outcome;
+        }
+
+        if let Some(outcome) = self
+            .try_chaos_lookup(started_at, &request, &decoded, &question, &backend_snapshot)
             .await
         {
             return outcome;
@@ -3874,6 +3916,53 @@ impl ResolveQuery {
             &block,
             self.protocol.configured_max_udp_payload_size(),
         );
+        Some(
+            self.finish_uniform(
+                started_at,
+                request,
+                decoded_original_question_name(decoded),
+                decision,
+                response_bytes,
+                None,
+                Some(QueryEventBackend::from_snapshot(backend_snapshot)),
+            )
+            .await,
+        )
+    }
+
+    /// Answers `version.bind. CH TXT` -- BIND's classic operator-info
+    /// query -- with the operator-configured `[chaos].version_bind` string
+    /// when `[chaos].enabled` is set, rather than letting it fall through
+    /// to the cache/backend like any other query. Returns `None` (falling
+    /// through as normal) when CHAOS support is disabled, or the question
+    /// doesn't match class CHAOS / type TXT / name `version.bind.` exactly.
+    async fn try_chaos_lookup(
+        &self,
+        started_at: SystemTime,
+        request: &ResolveRequest,
+        decoded: &DecodedQuery,
+        question: &QuestionKey,
+        backend_snapshot: &BackendSnapshot,
+    ) -> Option<ResolveOutcome> {
+        if !self.chaos.enabled
+            || question.qclass != CHAOS_CLASS
+            || question.qtype != TXT_RECORD_TYPE
+            || question.qname != VERSION_BIND_QNAME
+        {
+            return None;
+        }
+        let response_bytes = build_txt_answer_response(
+            &decoded.message,
+            &self.chaos.version_bind,
+            CHAOS_ANSWER_TTL,
+            self.protocol.configured_max_udp_payload_size(),
+        );
+        self.metrics.increment(ResolverMetric::QueryAllowed);
+        let decision = ResolveDecision {
+            client_ip: request.client_ip,
+            question: Some(question.clone()),
+            kind: ResolveDecisionKind::ChaosAnswer,
+        };
         Some(
             self.finish_uniform(
                 started_at,
@@ -14919,6 +15008,161 @@ mod tests {
         assert_eq!(
             recorded_events[0].block_response_mode,
             Some(BlockResponseMode::NoData)
+        );
+    }
+
+    #[tokio::test]
+    async fn chaos_lookup_answers_version_bind_when_enabled() {
+        let cache = Arc::new(RecordingCache::with_lookup(ChainLookup::Miss));
+        let upstream = Arc::new(StaticUpstream::new(Err(UpstreamError::Timeout)));
+        let chaos = crate::config::ChaosConfig {
+            enabled: true,
+            version_bind: "rdns-test-build".to_string(),
+        };
+        let service = ResolveQuery::with_cache(
+            Arc::new(StandardProtocolCodec::new(1232)),
+            cache,
+            CacheTtlPolicy::default(),
+            upstream.clone(),
+            Arc::new(BasicResponseFactory),
+            Arc::new(FixedClock(SystemTime::UNIX_EPOCH)),
+            Arc::new(RecordingEvents::default()),
+            Arc::new(RecordingMetrics::default()),
+        )
+        .with_chaos_config(chaos);
+
+        let outcome = service
+            .resolve(ResolveRequest::new(
+                "192.0.2.10".parse().unwrap(),
+                SystemTime::UNIX_EPOCH,
+                query(0x2222, "version.bind", TXT_RECORD_TYPE, CHAOS_CLASS),
+            ))
+            .await;
+
+        let response = Message::parse(&outcome.response_bytes).unwrap();
+        assert_eq!(response.header.r_code(), ResponseCode::NoError as u8);
+        assert_eq!(response.answers.len(), 1);
+        assert_eq!(response.answers[0].rclass, CHAOS_CLASS);
+        assert_eq!(
+            response.answers[0].record,
+            RecordData::TXT("rdns-test-build".to_string())
+        );
+        assert!(
+            upstream.requests.lock().unwrap().is_empty(),
+            "an enabled chaos answer must not touch the backend"
+        );
+    }
+
+    #[tokio::test]
+    async fn chaos_lookup_answers_version_bind_with_rdns_by_default() {
+        let cache = Arc::new(RecordingCache::with_lookup(ChainLookup::Miss));
+        let upstream = Arc::new(StaticUpstream::new(Err(UpstreamError::Timeout)));
+        // No `with_chaos_config` call -- exercises the constructor default.
+        let service = ResolveQuery::with_cache(
+            Arc::new(StandardProtocolCodec::new(1232)),
+            cache,
+            CacheTtlPolicy::default(),
+            upstream.clone(),
+            Arc::new(BasicResponseFactory),
+            Arc::new(FixedClock(SystemTime::UNIX_EPOCH)),
+            Arc::new(RecordingEvents::default()),
+            Arc::new(RecordingMetrics::default()),
+        );
+
+        let outcome = service
+            .resolve(ResolveRequest::new(
+                "192.0.2.10".parse().unwrap(),
+                SystemTime::UNIX_EPOCH,
+                query(0x2223, "version.bind", TXT_RECORD_TYPE, CHAOS_CLASS),
+            ))
+            .await;
+
+        let response = Message::parse(&outcome.response_bytes).unwrap();
+        assert_eq!(response.header.r_code(), ResponseCode::NoError as u8);
+        assert_eq!(
+            response.answers.first().map(|answer| &answer.record),
+            Some(&RecordData::TXT("rdns".to_string())),
+            "chaos support is on by default, answering \"rdns\""
+        );
+        assert!(
+            upstream.requests.lock().unwrap().is_empty(),
+            "a default-enabled chaos answer must not touch the backend"
+        );
+    }
+
+    #[tokio::test]
+    async fn chaos_lookup_falls_through_to_backend_when_explicitly_disabled() {
+        let cache = Arc::new(RecordingCache::with_lookup(ChainLookup::Miss));
+        let upstream = Arc::new(StaticUpstream::new(Ok(upstream_response(
+            a_response_with_answer(0x2223, "version.bind", 60),
+        ))));
+        let chaos = crate::config::ChaosConfig {
+            enabled: false,
+            ..crate::config::ChaosConfig::default()
+        };
+        let service = ResolveQuery::with_cache(
+            Arc::new(StandardProtocolCodec::new(1232)),
+            cache,
+            CacheTtlPolicy::default(),
+            upstream.clone(),
+            Arc::new(BasicResponseFactory),
+            Arc::new(FixedClock(SystemTime::UNIX_EPOCH)),
+            Arc::new(RecordingEvents::default()),
+            Arc::new(RecordingMetrics::default()),
+        )
+        .with_chaos_config(chaos);
+
+        service
+            .resolve(ResolveRequest::new(
+                "192.0.2.10".parse().unwrap(),
+                SystemTime::UNIX_EPOCH,
+                query(0x2223, "version.bind", TXT_RECORD_TYPE, CHAOS_CLASS),
+            ))
+            .await;
+
+        assert_eq!(
+            upstream.requests.lock().unwrap().len(),
+            1,
+            "explicitly disabled chaos config must resolve version.bind normally"
+        );
+    }
+
+    #[tokio::test]
+    async fn chaos_lookup_ignores_non_chaos_class_even_when_enabled() {
+        let cache = Arc::new(RecordingCache::with_lookup(ChainLookup::Miss));
+        let upstream = Arc::new(StaticUpstream::new(Ok(upstream_response(
+            a_response_with_answer(0x2224, "version.bind", 60),
+        ))));
+        let chaos = crate::config::ChaosConfig {
+            enabled: true,
+            ..crate::config::ChaosConfig::default()
+        };
+        let service = ResolveQuery::with_cache(
+            Arc::new(StandardProtocolCodec::new(1232)),
+            cache,
+            CacheTtlPolicy::default(),
+            upstream.clone(),
+            Arc::new(BasicResponseFactory),
+            Arc::new(FixedClock(SystemTime::UNIX_EPOCH)),
+            Arc::new(RecordingEvents::default()),
+            Arc::new(RecordingMetrics::default()),
+        )
+        .with_chaos_config(chaos);
+
+        // Same qname/qtype as the CHAOS case, but class IN (1) -- must not
+        // be mistaken for the CHAOS-class version.bind query.
+        service
+            .resolve(ResolveRequest::new(
+                "192.0.2.10".parse().unwrap(),
+                SystemTime::UNIX_EPOCH,
+                query(0x2224, "version.bind", TXT_RECORD_TYPE, 1),
+            ))
+            .await;
+
+        assert_eq!(
+            upstream.requests.lock().unwrap().len(),
+            1,
+            "class IN version.bind must resolve normally, not hit the CHAOS answer"
         );
     }
 
