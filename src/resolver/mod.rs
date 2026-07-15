@@ -7760,8 +7760,8 @@ pub trait Clock: Send + Sync {
 }
 
 /// [`Clock`] backed by the OS wall clock. Library consumers constructing
-/// [`crate::delivery::UdpDnsServer`]/[`crate::delivery::TcpDnsServer`] outside
-/// this crate's `main.rs` can use this instead of writing their own.
+/// [`crate::delivery::dns::UdpDnsServer`]/[`crate::delivery::dns::TcpDnsServer`]
+/// outside this crate's `main.rs` can use this instead of writing their own.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct SystemClock;
 

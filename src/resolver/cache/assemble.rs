@@ -798,14 +798,14 @@ mod tests {
         // immediately by its own TTL.
         let now = SystemTime::now();
         let stored_at = now - Duration::from_secs(5);
-        let mut entry = rrset_entry(
+        // The 30s `minimum_ttl` here simulates a min_positive_ttl floor
+        // extending this entry's actual cache lifetime (`expires_at`) far
+        // past what the origin TTL of 0 implies.
+        let entry = rrset_entry(
             vec![a_record(0, 1)], // ttl_at_store = 0
             Duration::from_secs(30),
             stored_at,
         );
-        // Simulate a min_positive_ttl floor extending this entry's actual
-        // cache lifetime to 30s, far past what the origin TTL of 0 implies.
-        entry.expires_at = stored_at + Duration::from_secs(30);
         let resolved = ResolvedAnswer {
             chain: vec![("example.com".to_string(), entry)],
         };

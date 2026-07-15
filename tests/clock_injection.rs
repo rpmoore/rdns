@@ -195,11 +195,12 @@ async fn clock_injection_ages_cache_hit_ttl_end_to_end() {
     let upstream_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
     let upstream_addr = upstream_socket.local_addr().unwrap();
     let origin_ttl = 100u32;
-    // The fake upstream answers exactly once: if the second query below
-    // reached the backend instead of hitting the cache, this task would
-    // never see a second datagram and the test would hang until the
-    // outer harness times it out -- so a passing test also proves the
-    // second query was served from cache, not re-resolved.
+    // The fake upstream answers exactly once, then this task exits and
+    // drops the socket: if the second query below reached the backend
+    // instead of hitting the cache, nothing would be listening to answer
+    // it, so the resolver would time out (or hit a fast connection-refused)
+    // and return SERVFAIL instead of the aged TTL -- so a passing test also
+    // proves the second query was served from cache, not re-resolved.
     let upstream_task = tokio::spawn(async move {
         let mut request = [0u8; 512];
         let (request_len, source) = upstream_socket.recv_from(&mut request).await.unwrap();
