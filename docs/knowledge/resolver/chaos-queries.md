@@ -18,14 +18,15 @@ instead.
 
 # Config
 
-`ChaosConfig` (`src/config/mod.rs:305`): `enabled: bool` (default `true`)
+`ChaosConfig` (`src/config/mod.rs:318`): `enabled: bool` (default `true`)
 and `version_bind: String` (default `"rdns"`), parsed from a `[chaos]` TOML
 table via `RawChaosConfig` — including when the table is present but
 `enabled` is omitted (`RawChaosConfig.enabled` defaults via
 `default_true`, so a bare `[chaos]\nversion_bind = "..."` table stays
 enabled). `RuntimeConfig::validate` rejects `enabled = true` paired with
-an empty `version_bind` (`ConfigError::ChaosVersionBindEmpty`,
-`src/config/mod.rs:199`).
+an empty `version_bind` (`ConfigError::ChaosVersionBindEmpty`) or one
+longer than `MAX_CHAOS_VERSION_BIND_LEN` -- 64 bytes
+(`ConfigError::ChaosVersionBindTooLong`, `src/config/mod.rs:198-207`).
 
 Like `[metrics]` and `max_tcp_connections`, this is **not** part of
 SIGHUP hot-reload — it's read once at startup (`main.rs` calls

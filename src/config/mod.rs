@@ -195,8 +195,16 @@ impl RuntimeConfig {
 
         self.cache.validate()?;
 
-        if self.chaos.enabled && self.chaos.version_bind.is_empty() {
-            return Err(ConfigError::ChaosVersionBindEmpty);
+        if self.chaos.enabled {
+            if self.chaos.version_bind.is_empty() {
+                return Err(ConfigError::ChaosVersionBindEmpty);
+            }
+            if self.chaos.version_bind.len() > MAX_CHAOS_VERSION_BIND_LEN {
+                return Err(ConfigError::ChaosVersionBindTooLong {
+                    len: self.chaos.version_bind.len(),
+                    max: MAX_CHAOS_VERSION_BIND_LEN,
+                });
+            }
         }
 
         Ok(())
@@ -296,6 +304,11 @@ const DEFAULT_METRICS_MAX_CONNECTIONS: usize = 32;
 fn default_metrics_listen_addr() -> SocketAddr {
     SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 9090)
 }
+
+/// Byte-length ceiling on `[chaos].version_bind` -- generous for a
+/// human-readable operator label while keeping a misconfigured value from
+/// bloating the synthesized CHAOS TXT response.
+const MAX_CHAOS_VERSION_BIND_LEN: usize = 64;
 
 /// Controls rdns's answer to `version.bind. CH TXT` -- BIND's classic
 /// operator-fingerprint query (`dig version.bind chaos txt`). On by
@@ -1321,6 +1334,10 @@ pub enum ConfigError {
         max: usize,
     },
     ChaosVersionBindEmpty,
+    ChaosVersionBindTooLong {
+        len: usize,
+        max: usize,
+    },
 }
 
 #[derive(Debug, Deserialize)]
@@ -2817,6 +2834,43 @@ a.root-servers.net.      3600000      Aaaa  2001:503:ba3e::2:30
         let error = RuntimeConfig::from_toml_str(&toml).unwrap_err();
 
         assert!(matches!(error, ConfigError::ChaosVersionBindEmpty));
+    }
+
+    #[test]
+    fn toml_config_rejects_chaos_version_bind_over_64_bytes() {
+        let mut toml = valid_toml();
+        toml.push_str(&format!(
+            r#"
+            [chaos]
+            enabled = true
+            version_bind = "{}"
+            "#,
+            "a".repeat(65)
+        ));
+
+        let error = RuntimeConfig::from_toml_str(&toml).unwrap_err();
+
+        assert!(matches!(
+            error,
+            ConfigError::ChaosVersionBindTooLong { len: 65, max: 64 }
+        ));
+    }
+
+    #[test]
+    fn toml_config_accepts_chaos_version_bind_at_64_bytes() {
+        let mut toml = valid_toml();
+        toml.push_str(&format!(
+            r#"
+            [chaos]
+            enabled = true
+            version_bind = "{}"
+            "#,
+            "a".repeat(64)
+        ));
+
+        let config = RuntimeConfig::from_toml_str(&toml).unwrap();
+
+        assert_eq!(config.chaos.version_bind.len(), 64);
     }
 
     #[test]
