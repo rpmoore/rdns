@@ -7759,6 +7759,18 @@ pub trait Clock: Send + Sync {
     fn now(&self) -> SystemTime;
 }
 
+/// [`Clock`] backed by the OS wall clock. Library consumers constructing
+/// [`crate::delivery::UdpDnsServer`]/[`crate::delivery::TcpDnsServer`] outside
+/// this crate's `main.rs` can use this instead of writing their own.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct SystemClock;
+
+impl Clock for SystemClock {
+    fn now(&self) -> SystemTime {
+        SystemTime::now()
+    }
+}
+
 pub trait QueryEventSink: Send + Sync {
     fn record(&self, event: QueryEventV1) -> QueryEventRecordResult;
 }

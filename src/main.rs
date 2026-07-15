@@ -37,7 +37,7 @@ use rdns::resolver::{
     MetricsSink, NoopPolicyEvaluator, QueryEventRecordResult, QueryEventSink, QueryEventV1,
     RecursiveResolutionBackend, RecursiveResolverConfig, RecursiveRootHint,
     ResolutionMode as ResolverResolutionMode, ResolveQuery, ResolverMetric, ShardedDnsCache,
-    StandardProtocolCodec,
+    StandardProtocolCodec, SystemClock,
 };
 use tokio::task::{JoinError, JoinSet};
 use tracing::{error, info, warn};
@@ -738,14 +738,6 @@ fn root_hints_source_label(source: &ConfigRootHintsSource) -> &'static str {
 
 fn listener_task_result_to_io(result: Result<io::Result<()>, JoinError>) -> io::Result<()> {
     result.map_err(|error| io::Error::other(format!("dns listener task failed: {error}")))?
-}
-
-struct SystemClock;
-
-impl Clock for SystemClock {
-    fn now(&self) -> SystemTime {
-        SystemTime::now()
-    }
 }
 
 struct StdoutEvents;
