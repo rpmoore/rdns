@@ -138,9 +138,17 @@ fi
 target_version="${TAG#v}"
 installed_version="${installed_version#v}"
 
+# Reject anything that isn't a plain dotted-numeric token (e.g. stray log
+# output or a usage message's second word from a binary that doesn't
+# understand the "version" arg) so garbage never reaches version_lt.
+case "$installed_version" in
+  ''|*[!0-9.]*) installed_version="" ;;
+esac
+
 # installed_version is empty for a fresh install, if the existing binary
-# predates the `version` subcommand, or if querying it timed out — either
-# way there's nothing usable to compare.
+# predates the `version` subcommand, if querying it timed out, or if its
+# output didn't look like a version — either way there's nothing usable to
+# compare.
 if [ -n "$installed_version" ] && version_lt "$target_version" "$installed_version"; then
   warn "downgrading rdns: installed version is ${installed_version}, requested is ${target_version} (${TAG})."
   warn "an older binary may not understand config/state written by ${installed_version}."
