@@ -16365,6 +16365,71 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn resolve_caps_terminal_record_ttl_to_chain_wide_ceiling_on_standalone_lookup() {
+        let cache = Arc::new(ShardedDnsCache::new(&CacheConfig {
+            max_entries: 16,
+            shard_count: Some(1),
+        }));
+        let epoch = 0u64;
+        let now = SystemTime::UNIX_EPOCH;
+
+        // Chain-wide minimum origin TTL across the whole response is 60s (the
+        // intermediate hop's TTL) - this becomes every hop's `expires_at`
+        // ceiling, exactly as `decompose_response_for_store` computes it in
+        // production.
+        let chain_ceiling = Duration::from_secs(60);
+
+        let cname = cname_record("alias.example.com", 60, "target.example.com");
+        let terminal = a_record("target.example.com", 3600); // long origin TTL
+
+        cache.store_response(
+            DecomposedResponse {
+                positive: vec![
+                    (
+                        "alias.example.com".to_string(),
+                        CNAME_RECORD_TYPE,
+                        1,
+                        seed_rrset_entry(&cname, chain_ceiling, now, epoch),
+                    ),
+                    (
+                        "target.example.com".to_string(),
+                        A_RECORD_TYPE,
+                        1,
+                        // Same chain-wide ceiling applied here, even though
+                        // `terminal`'s own origin TTL is 3600 - mirrors
+                        // production `build_rrset_entry`'s single shared `ttl`.
+                        seed_rrset_entry(&terminal, chain_ceiling, now, epoch),
+                    ),
+                ],
+                negative: None,
+            },
+            epoch,
+        );
+
+        let upstream = Arc::new(StaticUpstream::new(Err(UpstreamError::Timeout)));
+        let events = Arc::new(RecordingEvents::default());
+        let metrics = Arc::new(RecordingMetrics::default());
+        let service = resolve_service_with_cache(upstream, cache, events, metrics, 1232);
+
+        // Second, independent query: look up the terminal name directly,
+        // NOT by re-resolving the alias.
+        let outcome = service
+            .resolve(ResolveRequest::new(
+                "192.0.2.10".parse().unwrap(),
+                now + Duration::from_secs(25),
+                a_query(0x2222, "target.example.com"),
+            ))
+            .await;
+
+        let parsed = Message::parse(&outcome.response_bytes).unwrap();
+        // Aged TTL from the terminal record's own 3600s origin TTL would be
+        // 3575 at t=25s - but the chain-wide ceiling (60s remaining lifetime,
+        // 35s left at t=25s) must win: min(3575, 35) == 35.
+        assert_eq!(parsed.answers[0].ttl, 35);
+        assert_eq!(outcome.decision.kind, ResolveDecisionKind::CacheHit);
+    }
+
+    #[tokio::test]
     async fn resolve_truncates_oversized_cached_response_for_current_request() {
         let now = SystemTime::UNIX_EPOCH;
         let records: Vec<StoredRecord> = (0..40u8)
