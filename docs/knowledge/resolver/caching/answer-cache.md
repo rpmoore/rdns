@@ -89,7 +89,7 @@ it correctly — hence per-record aging computed directly in Rust rather
 than reused from a buffer-level `age_response_ttls`/`cap_response_ttls`
 helper. This edge case is covered by a regression test,
 `resolve_caps_terminal_record_ttl_to_chain_wide_ceiling_on_standalone_lookup`
-in `src/resolver/mod.rs` (see `docs/plans/ttl_remaining/` section 03).
+in `src/resolver/mod.rs:16380-16442` (see `docs/plans/ttl_remaining/` section 03).
 
 Even when a `min_positive_ttl` floor extends an entry's actual cache
 lifetime (`expires_at`) well past what the record's own origin TTL
@@ -98,7 +98,7 @@ the record's own `ttl_at_store` — so the served wire TTL correctly goes
 to (and stays at) 0 once the origin TTL has elapsed, even though the
 entry itself is still servable under the floor. Covered by a regression
 test, `compute_wire_ttl_never_exceeds_origin_ttl_even_when_floor_extends_entry_lifetime`
-in `assemble.rs` (see `docs/plans/ttl_remaining/` section 03).
+in `src/resolver/cache/assemble.rs:796-822` (see `docs/plans/ttl_remaining/` section 03).
 
 `write_negative_authority`'s per-record `compute_wire_ttl` calls
 (`assemble.rs:265-324` — wire-TTL aging, what gets sent on the wire for
