@@ -1,0 +1,37 @@
+{
+  "plugin_root": "/home/rpmoore/.claude/plugins/cache/piercelamb-plugins/deep-implement/0.2.1",
+  "sections_dir": "/home/rpmoore/code/rdns/docs/plans/ttl_remaining/sections",
+  "target_dir": "/home/rpmoore/code/rdns",
+  "state_dir": "/home/rpmoore/code/rdns/docs/plans/ttl_remaining/implementation",
+  "git_root": "/home/rpmoore/code/rdns",
+  "commit_style": "simple",
+  "test_command": "uv run pytest",
+  "sections": [
+    "section-01-knowledge-bundle-docs",
+    "section-02-clock-dependency-injection",
+    "section-03-ttl-edge-case-tests"
+  ],
+  "sections_state": {
+    "section-01-knowledge-bundle-docs": {
+      "status": "complete",
+      "commit_hash": "06b4da1"
+    },
+    "section-02-clock-dependency-injection": {
+      "status": "complete",
+      "commit_hash": "0b834cd"
+    },
+    "section-03-ttl-edge-case-tests": {
+      "status": "complete",
+      "commit_hash": "01302409c4e5106b0047c234f848c7ae904bf0a6"
+    }
+  },
+  "pre_commit": {
+    "present": false,
+    "type": "none",
+    "config_file": null,
+    "native_hook": null,
+    "may_modify_files": false,
+    "detected_formatters": []
+  },
+  "created_at": "2026-07-15T21:48:15.645869+00:00"
+}
