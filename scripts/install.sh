@@ -85,7 +85,7 @@ if command -v ldd >/dev/null 2>&1 && ldd --version 2>&1 | grep -qi musl; then
   die "rdns installer's release binary is glibc-linked and will not run on musl-based systems (e.g. Alpine); detected musl libc"
 fi
 
-for tool in curl tar sha256sum grep sed head install mktemp sort; do
+for tool in curl tar sha256sum grep sed head install mktemp sort awk timeout; do
   command -v "$tool" >/dev/null 2>&1 || die "required tool '$tool' not found; install it and re-run"
 done
 
@@ -126,14 +126,21 @@ esac
 # --- Warn/confirm on downgrade ----------------------------------------------
 
 installed_version=""
-if [ -x "$INSTALL_DIR/$BIN_NAME" ]; then
-  installed_version="$("$INSTALL_DIR/$BIN_NAME" version 2>/dev/null | awk '{print $2}')" || true
+# Reject a symlink at this path outright rather than executing whatever it
+# points to as root; only run a plain, installer-owned regular file.
+if [ -f "$INSTALL_DIR/$BIN_NAME" ] && [ ! -L "$INSTALL_DIR/$BIN_NAME" ] && [ -x "$INSTALL_DIR/$BIN_NAME" ]; then
+  # `timeout` guards against a pre-`version`-subcommand binary that would
+  # otherwise ignore the "version" arg and start serving DNS/metrics forever,
+  # hanging the installer instead of just failing the version query.
+  installed_version="$(timeout 5s "$INSTALL_DIR/$BIN_NAME" version 2>/dev/null | awk '{print $2}')" || true
 fi
 
 target_version="${TAG#v}"
+installed_version="${installed_version#v}"
 
-# installed_version is empty for a fresh install, or if the existing binary
-# predates the `version` subcommand — either way there's nothing to compare.
+# installed_version is empty for a fresh install, if the existing binary
+# predates the `version` subcommand, or if querying it timed out — either
+# way there's nothing usable to compare.
 if [ -n "$installed_version" ] && version_lt "$target_version" "$installed_version"; then
   warn "downgrading rdns: installed version is ${installed_version}, requested is ${target_version} (${TAG})."
   warn "an older binary may not understand config/state written by ${installed_version}."
