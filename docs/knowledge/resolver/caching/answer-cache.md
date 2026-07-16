@@ -42,7 +42,7 @@ concurrency.
 | Field | Purpose |
 |---|---|
 | `records` / `soa_record` + proof records | The actual RRset or negative-cache proof material. |
-| `stored_at` / `expires_at` | TTL bookkeeping — `expires_at` is checked on every lookup and read-time expiry deletes the entry immediately (not just filters it out), see `Shard::lookup_hop`. |
+| `stored_at` / `expires_at` | TTL bookkeeping — `expires_at` is checked on every lookup; an expired entry is either served stale (within the [serve-stale](serve-stale.md) window, positive entries only) or deleted immediately at read time (not just filtered out), see `Shard::lookup_hop`/`stale_servability`. |
 | `dnssec_state` | RFC 6840 §3.1 validation state; stays `Unvalidated` until real DNSSEC validation exists — orthogonal to everything else in this document. |
 | `dnssec_complete` | Whether this entry was populated by a fetch that actually requested DNSSEC material (DO=1). A DO=1 reader must never be served an entry where this is `false`, even if TTL-valid — see `Shard::lookup_hop`'s DO-aware filtering. |
 | `authoritative` | The backend response's own AA bit, replayed on a cache hit. |
@@ -91,6 +91,14 @@ than reused from a buffer-level `age_response_ttls`/`cap_response_ttls`
 helper. This edge case is covered by a regression test,
 `resolve_caps_terminal_record_ttl_to_chain_wide_ceiling_on_standalone_lookup`
 in `src/resolver/mod.rs:16380-16442` (see `docs/plans/ttl_remaining/` section 03).
+
+`CacheTtlPolicy`'s bounds are operator-configurable since the
+serve-stale/TTL-config change: `[cache] max_positive_ttl_secs`,
+`min_positive_ttl_secs`, `max_negative_ttl_secs`, `min_negative_ttl_secs`,
+and opt-in `failure_ttl_secs` (`RawCacheConfig`, `src/config/mod.rs`;
+wired in `main.rs`, `cache_ttl_policy_from_config`). Defaults are pinned
+to `CacheTtlPolicy::default()` by
+`cache_config_default_ttls_match_cache_ttl_policy_default` (`src/main.rs`).
 
 Even when a `min_positive_ttl` floor extends an entry's actual cache
 lifetime (`expires_at`) well past what the record's own origin TTL

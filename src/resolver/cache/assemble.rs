@@ -283,6 +283,12 @@ fn chain_answer_count(chain: &[(String, RRsetEntry)], dnssec_ok: bool) -> u16 {
         .sum::<usize>() as u16
 }
 
+/// Wire TTL for records served from an expired (stale-served) entry —
+/// RFC 8767 §4: "The TTL to set on stale records... 30 seconds is
+/// RECOMMENDED", long enough for the client to use the answer, short
+/// enough that it re-asks soon after the background refresh lands.
+pub(crate) const STALE_WIRE_TTL_SECS: u32 = 30;
+
 fn write_rrset(
     out: &mut Vec<u8>,
     compressor: &mut NameCompressor,
@@ -291,28 +297,42 @@ fn write_rrset(
     dnssec_ok: bool,
     now: SystemTime,
 ) {
+    // An expired entry can only reach response assembly when the lookup
+    // admitted it as an RFC 8767 stale serve (`Shard::lookup_hop` — every
+    // other expired candidate is evicted or filtered there, and lookup and
+    // assembly share the same `now`, the request's received timestamp), so
+    // this check *is* the staleness signal — no separate flag threads
+    // through `ResolvedAnswer`. `compute_wire_ttl` would yield 0 for every
+    // such record; 0 is legal but makes busy clients hammer the resolver
+    // during the refresh window.
+    let stale = entry.expires_at <= now;
+    let wire_ttl = |ttl_at_store| {
+        if stale {
+            STALE_WIRE_TTL_SECS
+        } else {
+            compute_wire_ttl(ttl_at_store, entry.stored_at, entry.expires_at, now)
+        }
+    };
     for record in &entry.records {
-        let ttl = compute_wire_ttl(record.ttl_at_store, entry.stored_at, entry.expires_at, now);
         write_record(
             out,
             compressor,
             name,
             record.rtype,
             record.rclass,
-            ttl,
+            wire_ttl(record.ttl_at_store),
             &record.rdata,
         );
     }
     if dnssec_ok {
         for rrsig in &entry.rrsigs {
-            let ttl = compute_wire_ttl(rrsig.ttl_at_store, entry.stored_at, entry.expires_at, now);
             write_record(
                 out,
                 compressor,
                 name,
                 rrsig.rtype,
                 rrsig.rclass,
-                ttl,
+                wire_ttl(rrsig.ttl_at_store),
                 &rrsig.rdata,
             );
         }
@@ -891,6 +911,18 @@ mod tests {
         ShardedDnsCache::new(&CacheConfig {
             max_entries: 1_000,
             shard_count: Some(shard_count),
+            ..CacheConfig::default()
+        })
+    }
+
+    /// `cache_with_shard_count` with RFC 8767 serve-stale off, for tests
+    /// pinning the original expired-means-miss lookup behavior.
+    fn cache_without_serve_stale(shard_count: usize) -> ShardedDnsCache {
+        ShardedDnsCache::new(&CacheConfig {
+            max_entries: 1_000,
+            shard_count: Some(shard_count),
+            serve_stale_enabled: false,
+            ..CacheConfig::default()
         })
     }
 
@@ -2653,7 +2685,10 @@ mod tests {
 
     #[test]
     fn resolve_from_cache_treats_expired_entry_as_miss() {
-        let cache = cache_with_shard_count(1);
+        // Serve-stale disabled: expired entries are evicted at read time,
+        // the original behavior. The stale-serving counterpart is
+        // `resolve_from_cache_serves_expired_entry_stale_within_window`.
+        let cache = cache_without_serve_stale(1);
         let now = SystemTime::now();
         let stored_at = now - Duration::from_secs(600);
         let mut entry = rrset_entry(vec![a_record(300, 1)], Duration::from_secs(300), stored_at);
@@ -2677,6 +2712,86 @@ mod tests {
         );
 
         assert_eq!(result, ChainLookup::Miss);
+    }
+
+    #[test]
+    fn resolve_from_cache_serves_expired_entry_stale_within_window() {
+        // Default config: serve-stale on, one-day window. An entry expired
+        // 300s ago is answered stale, with an *unconditional* refresh hint
+        // (no popularity gate — stale data was served, refetch is
+        // mandatory), even though its domain has no popularity bucket.
+        let cache = cache_with_shard_count(1);
+        let now = SystemTime::now();
+        let stored_at = now - Duration::from_secs(600);
+        let mut entry = rrset_entry(vec![a_record(300, 1)], Duration::from_secs(300), stored_at);
+        entry.expires_at = stored_at + Duration::from_secs(300); // expired 300s ago
+        cache.shard_for("stale.example.com").store_positive(
+            "stale.example.com",
+            (A_QTYPE, IN_QCLASS),
+            entry.clone(),
+        );
+
+        let result = resolve_from_cache(
+            &cache,
+            "stale.example.com",
+            A_QTYPE,
+            IN_QCLASS,
+            false,
+            1,
+            8,
+            now,
+            &RefreshConfig::default(),
+        );
+
+        assert_eq!(
+            result,
+            ChainLookup::Answered(ResolvedAnswer {
+                chain: vec![("stale.example.com".to_string(), entry)],
+                refresh_hints: vec![RefreshHint {
+                    domain: "stale.example.com".to_string(),
+                    qtype: A_QTYPE,
+                    qclass: IN_QCLASS,
+                }],
+            })
+        );
+    }
+
+    #[test]
+    fn resolve_from_cache_treats_expired_entry_beyond_stale_window_as_miss() {
+        // Even with serve-stale on, an entry expired longer ago than
+        // `max_stale` is a genuine miss — and is evicted at read time,
+        // same as the serve-stale-disabled path.
+        let cache = cache_with_shard_count(1);
+        let now = SystemTime::now();
+        let window = CacheConfig::default().max_stale;
+        let stored_at = now - window - Duration::from_secs(600);
+        let mut entry = rrset_entry(vec![a_record(300, 1)], Duration::from_secs(300), stored_at);
+        entry.expires_at = stored_at + Duration::from_secs(300);
+        cache.shard_for("ancient.example.com").store_positive(
+            "ancient.example.com",
+            (A_QTYPE, IN_QCLASS),
+            entry,
+        );
+
+        let result = resolve_from_cache(
+            &cache,
+            "ancient.example.com",
+            A_QTYPE,
+            IN_QCLASS,
+            false,
+            1,
+            8,
+            now,
+            &RefreshConfig::default(),
+        );
+
+        assert_eq!(result, ChainLookup::Miss);
+        assert!(
+            !cache
+                .shard_for("ancient.example.com")
+                .contains_positive("ancient.example.com", (A_QTYPE, IN_QCLASS)),
+            "beyond-window expired entry should be evicted at read time"
+        );
     }
 
     #[test]

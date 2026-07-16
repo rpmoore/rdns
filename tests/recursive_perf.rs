@@ -147,6 +147,7 @@ fn resolver_with_cache(config: &RuntimeConfig) -> ResolveQuery {
         // across runs/hosts instead of depending on the machine's core
         // count.
         shard_count: Some(16),
+        ..CacheConfig::default()
     }));
     let shard_count = cache.shard_count();
     ResolveQuery::with_cache(
