@@ -482,3 +482,16 @@ the plan's single wiring test didn't reach), and
 
 All of `RUST.md`'s gates pass: `cargo fmt`, `cargo clippy --all-targets`
 (warning-free), `cargo test` (full suite, 619 lib tests passing).
+
+**Second follow-up deviation (from section-04's implementation):** the
+`DEFAULT_POPULARITY_LEAK_RATE`/`DEFAULT_POPULARITY_HIT_INCREMENT`/
+`DEFAULT_POPULARITY_BUCKET_CAPACITY` placeholder constants described above
+were removed. Section-04, forced to resolve a section-03 integration gap,
+threaded a real `&RefreshConfig` into `lookup_hop`'s signature — exactly the
+replacement this section's own doc comment anticipated ("these placeholders
+get replaced by real `RefreshConfig`-sourced values when section-03 changes
+`lookup_hop`'s signature" — it ended up being section-04, not section-03,
+that did this). `record_popularity_hit`'s call sites now read
+`refresh_config.enabled`/`.leak_rate`/`.hit_increment`/`.bucket_capacity`
+directly. See `section-04-chainlookup-plumbing.md`'s Implementation Notes
+for the full rationale.

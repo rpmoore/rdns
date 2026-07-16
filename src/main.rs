@@ -839,6 +839,8 @@ struct OpenTelemetryMetrics {
     dnssec_validation_disabled: Gauge<u64>,
     protocol_error_total: Counter<u64>,
     recursion_refused_total: Counter<u64>,
+    refresh_triggered_total: Counter<u64>,
+    refresh_queue_full_total: Counter<u64>,
     query_duration_seconds: Histogram<f64>,
     recursive_query_duration_seconds: Histogram<f64>,
     cache_hit_query_duration_seconds: Histogram<f64>,
@@ -944,6 +946,8 @@ impl OpenTelemetryMetrics {
             dnssec_validation_disabled: meter.u64_gauge("dnssec_validation_disabled").build(),
             protocol_error_total: meter.u64_counter("protocol_error_total").build(),
             recursion_refused_total: meter.u64_counter("recursion_refused_total").build(),
+            refresh_triggered_total: meter.u64_counter("refresh_triggered_total").build(),
+            refresh_queue_full_total: meter.u64_counter("refresh_queue_full_total").build(),
             query_duration_seconds: meter.f64_histogram("query_duration_seconds").build(),
             recursive_query_duration_seconds: meter
                 .f64_histogram("recursive_query_duration_seconds")
@@ -1022,6 +1026,8 @@ impl MetricsSink for OpenTelemetryMetrics {
             }
             ResolverMetric::ProtocolError => self.protocol_error_total.add(1, &[]),
             ResolverMetric::RecursionRefused => self.recursion_refused_total.add(1, &[]),
+            ResolverMetric::RefreshTriggered => self.refresh_triggered_total.add(1, &[]),
+            ResolverMetric::RefreshQueueFull => self.refresh_queue_full_total.add(1, &[]),
             ResolverMetric::QueryDuration
             | ResolverMetric::RecursiveQueryDuration
             | ResolverMetric::CacheHitQueryDuration

@@ -39,13 +39,6 @@ use crate::protocol::RecordData;
 
 const CNAME_RECORD_TYPE: u16 = 5;
 
-const DEFAULT_POPULARITY_LEAK_RATE: LeakRate = LeakRate {
-    units: 1,
-    per: Duration::from_secs(60),
-};
-const DEFAULT_POPULARITY_HIT_INCREMENT: u32 = 1;
-const DEFAULT_POPULARITY_BUCKET_CAPACITY: u32 = 10;
-
 /// Per-domain leaky-bucket popularity tracker. Created the first time a
 /// domain is stored (mirroring `ShardLru`'s own on-first-store creation),
 /// drained-then-incremented on every subsequent lookup hit, and removed
@@ -136,15 +129,21 @@ impl PopularityBucket {
 /// shard's lock.
 #[derive(Debug, Clone)]
 pub(crate) enum HopResult {
-    /// A record set matching the queried `(qtype, qclass)` directly.
-    Answer(RRsetEntry),
+    /// A record set matching the queried `(qtype, qclass)` directly, plus
+    /// whether this hop currently wants a proactive refresh
+    /// (`wants_refresh`, computed inside `lookup_hop` while the lock —
+    /// and this domain's popularity bucket — is already held).
+    Answer(RRsetEntry, bool),
     /// The queried type wasn't found, but a CNAME record set was — carries
-    /// the CNAME's own entry (for the response's answer section) plus the
-    /// extracted target name to continue the walk.
-    CnameHop(RRsetEntry, String),
-    /// NODATA for the queried type at this (existing) name.
+    /// the CNAME's own entry (for the response's answer section), the
+    /// extracted target name to continue the walk, and whether this hop
+    /// wants a proactive refresh.
+    CnameHop(RRsetEntry, String, bool),
+    /// NODATA for the queried type at this (existing) name. Negative
+    /// entries never carry a refresh signal (v1 scope is positive-entries
+    /// only), so there is no bool here.
     NoData(NegativeEntry),
-    /// Whole-name NXDOMAIN at this name.
+    /// Whole-name NXDOMAIN at this name. Same scope note as `NoData`.
     NxDomain(NegativeEntry),
     /// Nothing usable here: absent, expired, or stored under a stale
     /// namespace.
@@ -200,6 +199,36 @@ impl ShardState {
             .entry(domain.to_string())
             .or_insert_with(|| PopularityBucket::new(now))
             .drain_and_increment(now, leak_rate, hit_increment, bucket_capacity);
+    }
+
+    /// Shared by `lookup_hop`'s `Answer`/`CnameHop` branches: records this
+    /// hit against `domain`'s popularity bucket, then evaluates
+    /// `wants_refresh` against the just-updated bucket (so this same hit's
+    /// own increment counts toward its own hot-threshold determination —
+    /// deterministic read-after-write within one lock scope, not a race).
+    fn record_hit_and_check_refresh(
+        &mut self,
+        domain: &str,
+        entry_minimum_ttl: Duration,
+        entry_expires_at: SystemTime,
+        now: SystemTime,
+        refresh_config: &RefreshConfig,
+    ) -> bool {
+        self.record_popularity_hit(
+            domain,
+            now,
+            refresh_config.enabled,
+            refresh_config.leak_rate,
+            refresh_config.hit_increment,
+            refresh_config.bucket_capacity,
+        );
+        let remaining_ttl = entry_expires_at.duration_since(now).unwrap_or_default();
+        wants_refresh(
+            entry_minimum_ttl,
+            remaining_ttl,
+            self.popularity.get(domain),
+            refresh_config,
+        )
     }
 
     /// Evicts the least-recently-touched domain, if any is tracked.
@@ -410,6 +439,13 @@ impl ShardState {
 ///    threshold derived from `config.hot_threshold_fraction *
 ///    config.bucket_capacity` (rounded to the nearest `u32`); a missing
 ///    bucket (`None`) is never hot.
+///
+/// Callers in `lookup_hop` pass the bucket *after* recording the current
+/// hit (`record_hit_and_check_refresh`), so this same hit's own increment
+/// counts toward its own hot-threshold determination — a domain becomes
+/// "hot" and can produce a refresh hint on the very hit that pushes its
+/// bucket over the threshold, not only on a subsequent one. Deterministic
+/// (both happen under the same lock, back-to-back), not a race.
 pub(crate) fn wants_refresh(
     original_ttl: Duration,
     remaining_ttl: Duration,
@@ -562,6 +598,7 @@ impl Shard {
     /// live in the *authority* section and their TTLs play no part in the
     /// SOA-minimum-derived negative TTL computation, hence this dedicated
     /// read-time check.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn lookup_hop(
         &self,
         domain: &str,
@@ -570,6 +607,7 @@ impl Shard {
         dnssec_ok: bool,
         current_epoch: u64,
         now: SystemTime,
+        refresh_config: &RefreshConfig,
     ) -> HopResult {
         let mut state = self.state.lock().unwrap();
         let answer_key = (qtype, qclass);
@@ -584,15 +622,14 @@ impl Shard {
             state.take_live_positive(domain, answer_key, dnssec_ok, current_epoch, now)
         {
             state.lru.touch(domain);
-            state.record_popularity_hit(
+            let refresh_wanted = state.record_hit_and_check_refresh(
                 domain,
+                entry.minimum_ttl,
+                entry.expires_at,
                 now,
-                true,
-                DEFAULT_POPULARITY_LEAK_RATE,
-                DEFAULT_POPULARITY_HIT_INCREMENT,
-                DEFAULT_POPULARITY_BUCKET_CAPACITY,
+                refresh_config,
             );
-            return HopResult::Answer(entry);
+            return HopResult::Answer(entry, refresh_wanted);
         }
 
         if qtype != CNAME_RECORD_TYPE {
@@ -601,15 +638,14 @@ impl Shard {
                 state.take_live_cname_hop(domain, cname_key, dnssec_ok, current_epoch, now)
             {
                 state.lru.touch(domain);
-                state.record_popularity_hit(
+                let refresh_wanted = state.record_hit_and_check_refresh(
                     domain,
+                    entry.minimum_ttl,
+                    entry.expires_at,
                     now,
-                    true,
-                    DEFAULT_POPULARITY_LEAK_RATE,
-                    DEFAULT_POPULARITY_HIT_INCREMENT,
-                    DEFAULT_POPULARITY_BUCKET_CAPACITY,
+                    refresh_config,
                 );
-                return HopResult::CnameHop(entry, target);
+                return HopResult::CnameHop(entry, target, refresh_wanted);
             }
         }
 
@@ -624,10 +660,10 @@ impl Shard {
             state.record_popularity_hit(
                 domain,
                 now,
-                true,
-                DEFAULT_POPULARITY_LEAK_RATE,
-                DEFAULT_POPULARITY_HIT_INCREMENT,
-                DEFAULT_POPULARITY_BUCKET_CAPACITY,
+                refresh_config.enabled,
+                refresh_config.leak_rate,
+                refresh_config.hit_increment,
+                refresh_config.bucket_capacity,
             );
             return HopResult::NoData(entry);
         }
@@ -643,10 +679,10 @@ impl Shard {
             state.record_popularity_hit(
                 domain,
                 now,
-                true,
-                DEFAULT_POPULARITY_LEAK_RATE,
-                DEFAULT_POPULARITY_HIT_INCREMENT,
-                DEFAULT_POPULARITY_BUCKET_CAPACITY,
+                refresh_config.enabled,
+                refresh_config.leak_rate,
+                refresh_config.hit_increment,
+                refresh_config.bucket_capacity,
             );
             return HopResult::NxDomain(entry);
         }
@@ -956,13 +992,29 @@ mod tests {
         shard.store_positive(domain, (A_QTYPE, IN_QCLASS), entry);
         let now = SystemTime::now();
 
-        let do_false_result = shard.lookup_hop(domain, A_QTYPE, IN_QCLASS, false, 1, now);
+        let do_false_result = shard.lookup_hop(
+            domain,
+            A_QTYPE,
+            IN_QCLASS,
+            false,
+            1,
+            now,
+            &test_refresh_config(),
+        );
         assert!(
-            matches!(do_false_result, HopResult::Answer(_)),
+            matches!(do_false_result, HopResult::Answer(_, _)),
             "a DO=false reader may still be served from a dnssec-incomplete entry"
         );
 
-        let do_true_result = shard.lookup_hop(domain, A_QTYPE, IN_QCLASS, true, 1, now);
+        let do_true_result = shard.lookup_hop(
+            domain,
+            A_QTYPE,
+            IN_QCLASS,
+            true,
+            1,
+            now,
+            &test_refresh_config(),
+        );
         assert!(
             matches!(do_true_result, HopResult::Miss),
             "a DO=true reader must not be served from a dnssec-incomplete entry, got {do_true_result:?}"
@@ -978,8 +1030,16 @@ mod tests {
         shard.store_positive(domain, (A_QTYPE, IN_QCLASS), entry);
         let now = SystemTime::now();
 
-        let result = shard.lookup_hop(domain, A_QTYPE, IN_QCLASS, true, 1, now);
-        assert!(matches!(result, HopResult::Answer(_)));
+        let result = shard.lookup_hop(
+            domain,
+            A_QTYPE,
+            IN_QCLASS,
+            true,
+            1,
+            now,
+            &test_refresh_config(),
+        );
+        assert!(matches!(result, HopResult::Answer(_, _)));
     }
 
     #[test]
@@ -997,7 +1057,15 @@ mod tests {
         shard.store_positive(domain, (CNAME_RECORD_TYPE, IN_QCLASS), entry);
         let now = SystemTime::now();
 
-        let do_true_result = shard.lookup_hop(domain, A_QTYPE, IN_QCLASS, true, 1, now);
+        let do_true_result = shard.lookup_hop(
+            domain,
+            A_QTYPE,
+            IN_QCLASS,
+            true,
+            1,
+            now,
+            &test_refresh_config(),
+        );
         assert!(
             matches!(do_true_result, HopResult::Miss),
             "a DO=true reader must not follow a dnssec-incomplete CNAME hop, got {do_true_result:?}"
@@ -1017,10 +1085,26 @@ mod tests {
         shard.store_negative(domain, nxdomain_key, entry.clone());
         let now = SystemTime::now();
 
-        let do_false_result = shard.lookup_hop(domain, A_QTYPE, IN_QCLASS, false, 1, now);
+        let do_false_result = shard.lookup_hop(
+            domain,
+            A_QTYPE,
+            IN_QCLASS,
+            false,
+            1,
+            now,
+            &test_refresh_config(),
+        );
         assert!(matches!(do_false_result, HopResult::NxDomain(_)));
 
-        let do_true_result = shard.lookup_hop(domain, A_QTYPE, IN_QCLASS, true, 1, now);
+        let do_true_result = shard.lookup_hop(
+            domain,
+            A_QTYPE,
+            IN_QCLASS,
+            true,
+            1,
+            now,
+            &test_refresh_config(),
+        );
         assert!(
             matches!(do_true_result, HopResult::Miss),
             "a DO=true reader must not be served from a dnssec-incomplete NXDOMAIN entry, got {do_true_result:?}"
@@ -1032,7 +1116,15 @@ mod tests {
             qclass: IN_QCLASS,
         };
         shard.store_negative(domain2, nodata_key, entry);
-        let do_true_nodata = shard.lookup_hop(domain2, A_QTYPE, IN_QCLASS, true, 1, now);
+        let do_true_nodata = shard.lookup_hop(
+            domain2,
+            A_QTYPE,
+            IN_QCLASS,
+            true,
+            1,
+            now,
+            &test_refresh_config(),
+        );
         assert!(
             matches!(do_true_nodata, HopResult::Miss),
             "a DO=true reader must not be served from a dnssec-incomplete NODATA entry, got {do_true_nodata:?}"
@@ -1098,13 +1190,29 @@ mod tests {
             negative_entry_with_short_lived_proof(stored_at),
         );
 
-        let do_false_result = shard.lookup_hop(nxdomain_domain, A_QTYPE, IN_QCLASS, false, 1, now);
+        let do_false_result = shard.lookup_hop(
+            nxdomain_domain,
+            A_QTYPE,
+            IN_QCLASS,
+            false,
+            1,
+            now,
+            &test_refresh_config(),
+        );
         assert!(
             matches!(do_false_result, HopResult::NxDomain(_)),
             "a DO=false reader may still be served despite the stale proof record, got {do_false_result:?}"
         );
 
-        let do_true_result = shard.lookup_hop(nxdomain_domain, A_QTYPE, IN_QCLASS, true, 1, now);
+        let do_true_result = shard.lookup_hop(
+            nxdomain_domain,
+            A_QTYPE,
+            IN_QCLASS,
+            true,
+            1,
+            now,
+            &test_refresh_config(),
+        );
         assert!(
             matches!(do_true_result, HopResult::Miss),
             "a DO=true reader must not be served an NXDOMAIN entry whose proof record TTL has elapsed, got {do_true_result:?}"
@@ -1120,8 +1228,15 @@ mod tests {
             nodata_key,
             negative_entry_with_short_lived_proof(stored_at),
         );
-        let do_true_nodata_result =
-            shard.lookup_hop(nodata_domain, A_QTYPE, IN_QCLASS, true, 1, now);
+        let do_true_nodata_result = shard.lookup_hop(
+            nodata_domain,
+            A_QTYPE,
+            IN_QCLASS,
+            true,
+            1,
+            now,
+            &test_refresh_config(),
+        );
         assert!(
             matches!(do_true_nodata_result, HopResult::Miss),
             "a DO=true reader must not be served a NODATA entry whose proof record TTL has elapsed, got {do_true_nodata_result:?}"
@@ -1146,7 +1261,15 @@ mod tests {
             negative_entry_with_short_lived_proof(stored_at),
         );
 
-        let do_true_result = shard.lookup_hop(domain, A_QTYPE, IN_QCLASS, true, 1, now);
+        let do_true_result = shard.lookup_hop(
+            domain,
+            A_QTYPE,
+            IN_QCLASS,
+            true,
+            1,
+            now,
+            &test_refresh_config(),
+        );
         assert!(
             matches!(do_true_result, HopResult::NxDomain(_)),
             "a DO=true reader must still be served while every stored record remains within its own TTL, got {do_true_result:?}"
@@ -1180,7 +1303,15 @@ mod tests {
         shard.store_positive(domain, (A_QTYPE, IN_QCLASS), expired_rrset_entry(now));
         assert_eq!(shard.domain_count(), 1);
 
-        let result = shard.lookup_hop(domain, A_QTYPE, IN_QCLASS, false, 1, now);
+        let result = shard.lookup_hop(
+            domain,
+            A_QTYPE,
+            IN_QCLASS,
+            false,
+            1,
+            now,
+            &test_refresh_config(),
+        );
 
         assert!(matches!(result, HopResult::Miss));
         assert!(
@@ -1210,7 +1341,15 @@ mod tests {
         shard.store_positive(domain, (CNAME_RECORD_TYPE, IN_QCLASS), entry);
         assert_eq!(shard.domain_count(), 1);
 
-        let result = shard.lookup_hop(domain, A_QTYPE, IN_QCLASS, false, 1, now);
+        let result = shard.lookup_hop(
+            domain,
+            A_QTYPE,
+            IN_QCLASS,
+            false,
+            1,
+            now,
+            &test_refresh_config(),
+        );
 
         assert!(matches!(result, HopResult::Miss));
         assert!(!shard.contains_positive(domain, (CNAME_RECORD_TYPE, IN_QCLASS)));
@@ -1230,7 +1369,15 @@ mod tests {
         shard.store_negative(domain, nodata_key.clone(), expired_negative_entry(now));
         assert_eq!(shard.domain_count(), 1);
 
-        let result = shard.lookup_hop(domain, A_QTYPE, IN_QCLASS, false, 1, now);
+        let result = shard.lookup_hop(
+            domain,
+            A_QTYPE,
+            IN_QCLASS,
+            false,
+            1,
+            now,
+            &test_refresh_config(),
+        );
 
         assert!(matches!(result, HopResult::Miss));
         assert!(
@@ -1253,7 +1400,15 @@ mod tests {
         shard.store_negative(domain, nxdomain_key.clone(), expired_negative_entry(now));
         assert_eq!(shard.domain_count(), 1);
 
-        let result = shard.lookup_hop(domain, A_QTYPE, IN_QCLASS, false, 1, now);
+        let result = shard.lookup_hop(
+            domain,
+            A_QTYPE,
+            IN_QCLASS,
+            false,
+            1,
+            now,
+            &test_refresh_config(),
+        );
 
         assert!(matches!(result, HopResult::Miss));
         assert!(!shard.contains_negative(domain, &nxdomain_key));
@@ -1275,7 +1430,15 @@ mod tests {
         shard.store_positive(domain, (AAAA_QTYPE, IN_QCLASS), rrset_entry());
         assert_eq!(shard.domain_count(), 1);
 
-        let result = shard.lookup_hop(domain, A_QTYPE, IN_QCLASS, false, 1, now);
+        let result = shard.lookup_hop(
+            domain,
+            A_QTYPE,
+            IN_QCLASS,
+            false,
+            1,
+            now,
+            &test_refresh_config(),
+        );
 
         assert!(matches!(result, HopResult::Miss));
         assert!(!shard.contains_positive(domain, (A_QTYPE, IN_QCLASS)));
@@ -1388,7 +1551,15 @@ mod tests {
         let domain = "popular.example.com";
         shard.store_positive(domain, (A_QTYPE, IN_QCLASS), rrset_entry());
         let now = SystemTime::now();
-        shard.lookup_hop(domain, A_QTYPE, IN_QCLASS, false, 1, now);
+        shard.lookup_hop(
+            domain,
+            A_QTYPE,
+            IN_QCLASS,
+            false,
+            1,
+            now,
+            &test_refresh_config(),
+        );
         assert_eq!(shard.popularity_level(domain), Some(1));
 
         // Force eviction via capacity pressure.
@@ -1403,7 +1574,15 @@ mod tests {
         let domain = "solo-positive.example.com";
         shard.store_positive(domain, (A_QTYPE, IN_QCLASS), rrset_entry());
         let now = SystemTime::now();
-        shard.lookup_hop(domain, A_QTYPE, IN_QCLASS, false, 1, now);
+        shard.lookup_hop(
+            domain,
+            A_QTYPE,
+            IN_QCLASS,
+            false,
+            1,
+            now,
+            &test_refresh_config(),
+        );
         assert_eq!(shard.popularity_level(domain), Some(1));
 
         // Expire the only entry and look it up again, triggering removal
@@ -1411,7 +1590,15 @@ mod tests {
         let mut expired = rrset_entry();
         expired.expires_at = now - Duration::from_secs(1);
         shard.store_positive(domain, (A_QTYPE, IN_QCLASS), expired);
-        shard.lookup_hop(domain, A_QTYPE, IN_QCLASS, false, 1, now);
+        shard.lookup_hop(
+            domain,
+            A_QTYPE,
+            IN_QCLASS,
+            false,
+            1,
+            now,
+            &test_refresh_config(),
+        );
 
         assert_eq!(shard.popularity_level(domain), None);
     }
@@ -1453,9 +1640,25 @@ mod tests {
         let now = SystemTime::now();
 
         assert_eq!(shard.popularity_level(domain), None);
-        shard.lookup_hop(domain, A_QTYPE, IN_QCLASS, false, 1, now);
+        shard.lookup_hop(
+            domain,
+            A_QTYPE,
+            IN_QCLASS,
+            false,
+            1,
+            now,
+            &test_refresh_config(),
+        );
         assert_eq!(shard.popularity_level(domain), Some(1));
-        shard.lookup_hop(domain, A_QTYPE, IN_QCLASS, false, 1, now);
+        shard.lookup_hop(
+            domain,
+            A_QTYPE,
+            IN_QCLASS,
+            false,
+            1,
+            now,
+            &test_refresh_config(),
+        );
         assert_eq!(shard.popularity_level(domain), Some(2));
     }
 
@@ -1474,8 +1677,16 @@ mod tests {
         let now = SystemTime::now();
 
         assert_eq!(shard.popularity_level(domain), None);
-        let result = shard.lookup_hop(domain, A_QTYPE, IN_QCLASS, false, 1, now);
-        assert!(matches!(result, HopResult::CnameHop(_, _)));
+        let result = shard.lookup_hop(
+            domain,
+            A_QTYPE,
+            IN_QCLASS,
+            false,
+            1,
+            now,
+            &test_refresh_config(),
+        );
+        assert!(matches!(result, HopResult::CnameHop(_, _, _)));
         assert_eq!(shard.popularity_level(domain), Some(1));
     }
 
@@ -1493,7 +1704,15 @@ mod tests {
         let now = SystemTime::now();
 
         assert_eq!(shard.popularity_level(domain), None);
-        let result = shard.lookup_hop(domain, A_QTYPE, IN_QCLASS, false, 1, now);
+        let result = shard.lookup_hop(
+            domain,
+            A_QTYPE,
+            IN_QCLASS,
+            false,
+            1,
+            now,
+            &test_refresh_config(),
+        );
         assert!(matches!(result, HopResult::NoData(_)));
         assert_eq!(shard.popularity_level(domain), Some(1));
     }
@@ -1510,7 +1729,15 @@ mod tests {
         let now = SystemTime::now();
 
         assert_eq!(shard.popularity_level(domain), None);
-        let result = shard.lookup_hop(domain, A_QTYPE, IN_QCLASS, false, 1, now);
+        let result = shard.lookup_hop(
+            domain,
+            A_QTYPE,
+            IN_QCLASS,
+            false,
+            1,
+            now,
+            &test_refresh_config(),
+        );
         assert!(matches!(result, HopResult::NxDomain(_)));
         assert_eq!(shard.popularity_level(domain), Some(1));
     }

@@ -33,7 +33,7 @@ use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant, SystemTime};
 
-use rdns::config::CacheConfig;
+use rdns::config::{CacheConfig, RefreshConfig};
 use rdns::protocol::{RecordData, ResponseCode};
 use rdns::resolver::{
     DecomposedResponse, DomainDnsCache, RRsetEntry, ShardedDnsCache, StoredRecord,
@@ -101,6 +101,7 @@ fn run_workload(cache: &ShardedDnsCache, domains: &[String], operation_count: us
                 CACHE_EPOCH,
                 MAX_CHAIN_DEPTH,
                 now,
+                &RefreshConfig::default(),
             );
         }
     }

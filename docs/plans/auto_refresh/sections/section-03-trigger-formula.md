@@ -159,3 +159,21 @@ existing coverage rather than testing new behavior:
 
 All of `RUST.md`'s gates pass: `cargo fmt`, `cargo clippy --all-targets`
 (warning-free), `cargo test` (full suite, 642 lib tests passing).
+
+**Follow-up deviation (from section-04's implementation):** this section's
+plan explicitly scoped `wants_refresh` as fully standalone/unwired — "does
+not modify `lookup_hop`'s signature or return types." Section-04's own plan
+(written by a different, non-communicating parallel planning pass) assumed
+the opposite: that `HopResult` already carried a per-hop bool computed
+inside `lookup_hop`. This turned out to be a real, blocking integration gap
+between the two section plans, not just a documentation mismatch — the
+popularity bucket `wants_refresh` needs is private, shard-internal, lock-held
+data, so the only clean place to call it is inside `lookup_hop` itself.
+Resolved in section-04 (with the user's explicit approval to "do the full
+fix" rather than a workaround): `lookup_hop`'s signature now takes
+`&RefreshConfig`, `HopResult::Answer`/`CnameHop` carry the computed bool, and
+`wants_refresh` itself is called from a new `ShardState::record_hit_and_check_refresh`
+helper. `wants_refresh`'s own formula/tests (this section's actual scope)
+are unaffected — only its call site changed. See
+`section-04-chainlookup-plumbing.md`'s Implementation Notes for the full
+rationale.

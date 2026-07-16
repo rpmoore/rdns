@@ -3549,6 +3549,35 @@ struct CacheProbe {
     event_cache_result: Option<QueryEventCacheResult>,
 }
 
+/// Named return shape for `evaluate_cache_lookup`, matching this file's
+/// existing `CacheProbe` convention -- avoids a positional 4-tuple at the
+/// call site, where an accidental field reorder would compile but silently
+/// swap meanings.
+struct CacheLookupEvaluation {
+    store_allowed: bool,
+    hit: Option<Vec<u8>>,
+    event_cache_result: QueryEventCacheResult,
+    refresh_hints: Vec<cache::RefreshHint>,
+}
+
+/// One background refresh attempt: a domain/qtype/qclass to refetch and
+/// re-store before its cached entry actually expires. Built from a
+/// `RefreshHint` at enqueue time (`ResolveQuery::probe_cache`); consumed by
+/// the worker pool (section-05) and processed by job-processing logic
+/// (section-06). `pub`, not `pub(crate)`: `main.rs` is a separate binary
+/// crate and needs to name this type to construct the channel
+/// (`with_refresh_sender`) once the worker pool exists.
+///
+/// Fields are inert (never read) until section-06's job-processing logic
+/// consumes them — `#[allow(dead_code)]` until then.
+#[allow(dead_code)]
+#[derive(Debug, Clone)]
+pub struct RefreshJob {
+    domain: String,
+    qtype: u16,
+    qclass: u16,
+}
+
 pub struct ResolveQuery {
     protocol: Arc<dyn ProtocolCodec>,
     policy: Arc<dyn PolicyEvaluator>,
@@ -3591,6 +3620,23 @@ pub struct ResolveQuery {
     // every existing test call site. `main.rs` overrides it with a real,
     // process-lifetime secret once available.
     cookie_secret: Arc<CookieSecret>,
+    // Not part of any constructor's parameter list by default (defaults to
+    // `RefreshConfig::default()`) -- same reasoning as `max_chain_depth`/
+    // `chaos`/`cookie_secret` above. Threaded into every `self.cache.lookup_chain(...)`
+    // call so `Shard::lookup_hop` (via `resolve_from_cache`) can compute the
+    // auto-refresh trigger formula (`docs/plans/auto_refresh/`) with real
+    // thresholds instead of a hardcoded default. `main.rs` overrides it via
+    // `with_refresh_config` once real config is available.
+    refresh_config: crate::config::RefreshConfig,
+    // Non-blocking enqueue point for background refresh jobs
+    // (`docs/plans/auto_refresh/claude-plan.md` §4.1). Every constructor
+    // defaults this to a sender whose paired receiver has already been
+    // dropped, so any enqueue attempt in an existing test (none currently
+    // configure a hot popularity bucket) simply counts as a dropped job
+    // (`ResolverMetric::RefreshQueueFull`) rather than panicking or
+    // blocking. `main.rs` overrides this via `with_refresh_sender` once the
+    // real worker pool's channel exists (section-05).
+    refresh_sender: tokio::sync::mpsc::Sender<RefreshJob>,
 }
 
 impl ResolveQuery {
@@ -3706,6 +3752,7 @@ impl ResolveQuery {
         metrics: Arc<dyn MetricsSink>,
     ) -> Self {
         metrics.record_backend_status(&backend_snapshot.status());
+        let (refresh_sender, _dropped_refresh_receiver) = tokio::sync::mpsc::channel(1);
         Self {
             protocol,
             policy,
@@ -3723,6 +3770,8 @@ impl ResolveQuery {
             metrics,
             chaos: crate::config::ChaosConfig::default(),
             cookie_secret: Arc::new(CookieSecret::generate()),
+            refresh_config: crate::config::RefreshConfig::default(),
+            refresh_sender,
         }
     }
 
@@ -3870,6 +3919,26 @@ impl ResolveQuery {
         self
     }
 
+    /// Overrides the default `RefreshConfig` set by every constructor.
+    /// `main.rs` calls this with the real `[refresh]` config once available
+    /// -- see `ResolveQuery.refresh_config`'s doc comment for why this is a
+    /// post-construction override rather than a parameter threaded through
+    /// every `with_cache*` constructor.
+    pub fn with_refresh_config(mut self, refresh_config: crate::config::RefreshConfig) -> Self {
+        self.refresh_config = refresh_config;
+        self
+    }
+
+    /// Wires the auto-refresh job sender into this resolver. Left at its
+    /// default (a sender whose receiver has already been dropped) when
+    /// `RefreshConfig::enabled` is `false`, or before the worker pool
+    /// (section-05) exists -- see `ResolveQuery.refresh_sender`'s doc
+    /// comment.
+    pub fn with_refresh_sender(mut self, sender: tokio::sync::mpsc::Sender<RefreshJob>) -> Self {
+        self.refresh_sender = sender;
+        self
+    }
+
     /// Overrides the default `ShardedSingleFlight` shard count set by
     /// every constructor. `main.rs` calls this with the real
     /// `ShardedDnsCache`'s own `shard_count()` once both are constructed,
@@ -3920,6 +3989,7 @@ impl ResolveQuery {
         metrics: Arc<dyn MetricsSink>,
     ) -> Self {
         metrics.record_backend_status(&backend_handle.status());
+        let (refresh_sender, _dropped_refresh_receiver) = tokio::sync::mpsc::channel(1);
         Self {
             protocol,
             policy,
@@ -3937,6 +4007,8 @@ impl ResolveQuery {
             metrics,
             chaos: crate::config::ChaosConfig::default(),
             cookie_secret: Arc::new(CookieSecret::generate()),
+            refresh_config: crate::config::RefreshConfig::default(),
+            refresh_sender,
         }
     }
 
@@ -4685,9 +4757,17 @@ impl ResolveQuery {
             epoch,
             self.max_chain_depth,
             request.received_at.0,
+            &self.refresh_config,
         );
-        let (store_allowed, hit, event_cache_result) =
-            self.evaluate_cache_lookup(lookup, decoded, request);
+        let CacheLookupEvaluation {
+            store_allowed,
+            hit,
+            event_cache_result,
+            refresh_hints,
+        } = self.evaluate_cache_lookup(lookup, decoded, request);
+        for hint in refresh_hints {
+            self.enqueue_refresh_job(hint);
+        }
 
         // The DO dimension of `MissKey` only needs to distinguish backend
         // fetches that can genuinely differ. The forwarding backend still
@@ -4743,12 +4823,18 @@ impl ResolveQuery {
         lookup: ChainLookup,
         decoded: &DecodedQuery,
         request: &ResolveRequest,
-    ) -> (bool, Option<Vec<u8>>, QueryEventCacheResult) {
+    ) -> CacheLookupEvaluation {
         match lookup {
             ChainLookup::Answered(resolved) => {
+                let refresh_hints = resolved.refresh_hints.clone();
                 let response_bytes = self.serialize_cache_hit_answer(decoded, &resolved, request);
                 self.record_cache_hit_metrics(&response_bytes, false);
-                (false, Some(response_bytes), QueryEventCacheResult::Hit)
+                CacheLookupEvaluation {
+                    store_allowed: false,
+                    hit: Some(response_bytes),
+                    event_cache_result: QueryEventCacheResult::Hit,
+                    refresh_hints,
+                }
             }
             ChainLookup::NxDomain(resolved) => {
                 let response_bytes = self.serialize_cache_hit_negative(
@@ -4758,7 +4844,12 @@ impl ResolveQuery {
                     request,
                 );
                 self.record_cache_hit_metrics(&response_bytes, true);
-                (false, Some(response_bytes), QueryEventCacheResult::Hit)
+                CacheLookupEvaluation {
+                    store_allowed: false,
+                    hit: Some(response_bytes),
+                    event_cache_result: QueryEventCacheResult::Hit,
+                    refresh_hints: Vec::new(),
+                }
             }
             ChainLookup::NoData(resolved) => {
                 let response_bytes = self.serialize_cache_hit_negative(
@@ -4768,12 +4859,40 @@ impl ResolveQuery {
                     request,
                 );
                 self.record_cache_hit_metrics(&response_bytes, true);
-                (false, Some(response_bytes), QueryEventCacheResult::Hit)
+                CacheLookupEvaluation {
+                    store_allowed: false,
+                    hit: Some(response_bytes),
+                    event_cache_result: QueryEventCacheResult::Hit,
+                    refresh_hints: Vec::new(),
+                }
             }
             ChainLookup::Miss => {
                 self.metrics.increment(ResolverMetric::CacheMiss);
-                (true, None, QueryEventCacheResult::Miss)
+                CacheLookupEvaluation {
+                    store_allowed: true,
+                    hit: None,
+                    event_cache_result: QueryEventCacheResult::Miss,
+                    refresh_hints: Vec::new(),
+                }
             }
+        }
+    }
+
+    /// Non-blocking, best-effort enqueue: a full (or closed, e.g. no
+    /// worker pool wired up yet) channel counts as a dropped trigger
+    /// (`RefreshQueueFull`), never blocks, never panics. Applies
+    /// independently per hint — one drop from a multi-hop chain doesn't
+    /// affect the others, each already enqueued in its own loop iteration
+    /// by the caller.
+    fn enqueue_refresh_job(&self, hint: cache::RefreshHint) {
+        let job = RefreshJob {
+            domain: hint.domain,
+            qtype: hint.qtype,
+            qclass: hint.qclass,
+        };
+        match self.refresh_sender.try_send(job) {
+            Ok(()) => self.metrics.increment(ResolverMetric::RefreshTriggered),
+            Err(_) => self.metrics.increment(ResolverMetric::RefreshQueueFull),
         }
     }
 
@@ -4844,9 +4963,17 @@ impl ResolveQuery {
             epoch,
             self.max_chain_depth,
             request.received_at.0,
+            &self.refresh_config,
         );
         match lookup {
             ChainLookup::Answered(resolved) => {
+                // This is the single-flight *follower* path -- exactly the
+                // concurrent/hot-domain scenario the refresh feature
+                // targets, so hints from here must be enqueued too, the
+                // same as `probe_cache`'s leader-side path.
+                for hint in resolved.refresh_hints.clone() {
+                    self.enqueue_refresh_job(hint);
+                }
                 let response_bytes = self.serialize_cache_hit_answer(decoded, &resolved, request);
                 self.record_cache_hit_metrics(&response_bytes, false);
                 Some(response_bytes)
@@ -6175,6 +6302,7 @@ impl DomainDnsCache for NoopDnsCache {
         _epoch: u64,
         _max_chain_depth: u8,
         _now: SystemTime,
+        _refresh_config: &crate::config::RefreshConfig,
     ) -> ChainLookup {
         ChainLookup::Miss
     }
@@ -8148,6 +8276,17 @@ pub enum ResolverMetric {
     CacheMissQueryDuration,
     ProtocolError,
     RecursionRefused,
+    /// A hot, near-expiry entry was seen and a `RefreshJob` was enqueued
+    /// (`docs/plans/auto_refresh/`). Pulled forward from section-05's
+    /// scope: needed here since section-04's enqueue path must compile,
+    /// even though the worker pool that consumes these jobs doesn't exist
+    /// yet.
+    RefreshTriggered,
+    /// A refresh trigger fired but the channel was full (or, before
+    /// section-05's worker pool exists, always — every `ResolveQuery` has
+    /// no live receiver until `main.rs` wires one up), so the job was
+    /// dropped. Best-effort by design; no correctness impact.
+    RefreshQueueFull,
 }
 
 #[cfg(test)]
@@ -9824,6 +9963,86 @@ mod tests {
         }
     }
 
+    // Job enqueue tests: section-04-chainlookup-plumbing (`claude-plan-tdd.md` §4.1).
+
+    fn resolver_for_enqueue_tests(metrics: Arc<RecordingMetrics>) -> ResolveQuery {
+        ResolveQuery::new(
+            Arc::new(StandardProtocolCodec::new(1232)),
+            Arc::new(StaticUpstream::new(Err(UpstreamError::Timeout))),
+            Arc::new(BasicResponseFactory),
+            Arc::new(FixedClock(SystemTime::UNIX_EPOCH)),
+            Arc::new(RecordingEvents::default()),
+            metrics,
+        )
+    }
+
+    fn test_refresh_hint(domain: &str) -> cache::RefreshHint {
+        cache::RefreshHint {
+            domain: domain.to_string(),
+            qtype: 1,
+            qclass: 1,
+        }
+    }
+
+    #[tokio::test]
+    async fn enqueue_try_send_succeeds_under_capacity() {
+        let metrics = Arc::new(RecordingMetrics::default());
+        let (sender, mut receiver) = tokio::sync::mpsc::channel(4);
+        let resolver = resolver_for_enqueue_tests(metrics.clone()).with_refresh_sender(sender);
+
+        resolver.enqueue_refresh_job(test_refresh_hint("hot.example.com"));
+
+        assert_eq!(metrics.count(ResolverMetric::RefreshTriggered), 1);
+        assert_eq!(metrics.count(ResolverMetric::RefreshQueueFull), 0);
+        let job = receiver.try_recv().expect("job should be enqueued");
+        assert_eq!(job.domain, "hot.example.com");
+    }
+
+    #[tokio::test]
+    async fn enqueue_drops_and_counts_on_full_channel() {
+        let metrics = Arc::new(RecordingMetrics::default());
+        // Capacity 1, pre-filled, so the next try_send is guaranteed to see
+        // a full channel.
+        let (sender, mut receiver) = tokio::sync::mpsc::channel(1);
+        sender
+            .try_send(RefreshJob {
+                domain: "already-queued.example.com".to_string(),
+                qtype: 1,
+                qclass: 1,
+            })
+            .unwrap();
+        let resolver = resolver_for_enqueue_tests(metrics.clone()).with_refresh_sender(sender);
+
+        resolver.enqueue_refresh_job(test_refresh_hint("dropped.example.com"));
+
+        assert_eq!(metrics.count(ResolverMetric::RefreshTriggered), 0);
+        assert_eq!(metrics.count(ResolverMetric::RefreshQueueFull), 1);
+        // The channel still only has the pre-filled job -- the dropped one
+        // never made it in, and nothing panicked or blocked.
+        let job = receiver.try_recv().expect("pre-filled job still present");
+        assert_eq!(job.domain, "already-queued.example.com");
+        assert!(receiver.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn enqueue_per_hint_independent() {
+        let metrics = Arc::new(RecordingMetrics::default());
+        // Capacity 1, pre-filled, so exactly one of the two hints below
+        // finds room and the other is dropped -- independently.
+        let (sender, mut receiver) = tokio::sync::mpsc::channel(1);
+        let resolver = resolver_for_enqueue_tests(metrics.clone()).with_refresh_sender(sender);
+
+        resolver.enqueue_refresh_job(test_refresh_hint("first.example.com"));
+        resolver.enqueue_refresh_job(test_refresh_hint("second.example.com"));
+
+        assert_eq!(metrics.count(ResolverMetric::RefreshTriggered), 1);
+        assert_eq!(metrics.count(ResolverMetric::RefreshQueueFull), 1);
+        let job = receiver
+            .try_recv()
+            .expect("first hint should have been enqueued");
+        assert_eq!(job.domain, "first.example.com");
+    }
+
     struct ClientScopedResponsePolicy {
         client_ip: IpAddr,
         domain: DomainSelector,
@@ -10128,6 +10347,7 @@ mod tests {
             _epoch: u64,
             _max_chain_depth: u8,
             _now: SystemTime,
+            _refresh_config: &crate::config::RefreshConfig,
         ) -> ChainLookup {
             self.lookups
                 .lock()
@@ -15907,6 +16127,7 @@ mod tests {
             _epoch: u64,
             _max_chain_depth: u8,
             _now: SystemTime,
+            _refresh_config: &crate::config::RefreshConfig,
         ) -> ChainLookup {
             ChainLookup::Miss
         }
@@ -16881,6 +17102,7 @@ mod tests {
         };
         let resolved = cache::ResolvedAnswer {
             chain: vec![("example.com".to_string(), entry)],
+            refresh_hints: Vec::new(),
         };
         let cache = Arc::new(RecordingCache::with_lookup(ChainLookup::Answered(resolved)));
         let upstream = Arc::new(StaticUpstream::new(Err(UpstreamError::Timeout)));
@@ -16910,6 +17132,133 @@ mod tests {
         assert!(upstream.requests.lock().unwrap().is_empty());
         assert_eq!(metrics.count(ResolverMetric::CacheResponseTruncated), 1);
         assert_eq!(metrics.count(ResolverMetric::CacheHit), 1);
+    }
+
+    /// End-to-end regression test for the seam connecting
+    /// `resolve_from_cache`'s hint production to the actual enqueue: a real
+    /// `.resolve()` call against a cache hit whose `ChainLookup::Answered`
+    /// carries a `refresh_hints` entry must result in a job landing on the
+    /// resolver's `refresh_sender` and a `RefreshTriggered` increment — not
+    /// just `evaluate_cache_lookup`/`enqueue_refresh_job` exercised in
+    /// isolation with hand-built values (code review flagged this seam as
+    /// untested, which is exactly what let a missed call site slip through
+    /// on the coalesced-follower path).
+    #[tokio::test]
+    async fn resolve_cache_hit_with_refresh_hint_enqueues_a_job() {
+        let now = SystemTime::UNIX_EPOCH;
+        let entry = RRsetEntry {
+            records: vec![StoredRecord {
+                rtype: A_RECORD_TYPE,
+                rclass: 1,
+                ttl_at_store: 60,
+                rdata: RecordData::A(std::net::Ipv4Addr::new(192, 0, 2, 1)),
+            }],
+            rrsigs: Vec::new(),
+            response_code: ResponseCode::NoError,
+            minimum_ttl: Duration::from_secs(60),
+            stored_at: now,
+            expires_at: now + Duration::from_secs(60),
+            dnssec_state: Default::default(),
+            cache_epoch: 1,
+            dnssec_complete: true,
+            authoritative: false,
+        };
+        let resolved = cache::ResolvedAnswer {
+            chain: vec![("example.com".to_string(), entry)],
+            refresh_hints: vec![cache::RefreshHint {
+                domain: "example.com".to_string(),
+                qtype: A_RECORD_TYPE,
+                qclass: 1,
+            }],
+        };
+        let cache = Arc::new(RecordingCache::with_lookup(ChainLookup::Answered(resolved)));
+        let upstream = Arc::new(StaticUpstream::new(Err(UpstreamError::Timeout)));
+        let events = Arc::new(RecordingEvents::default());
+        let metrics = Arc::new(RecordingMetrics::default());
+        let (sender, mut receiver) = tokio::sync::mpsc::channel(4);
+        let service = resolve_service_with_cache(upstream, cache, events, metrics.clone(), 1232)
+            .with_refresh_sender(sender);
+
+        let _outcome = service
+            .resolve(ResolveRequest::new(
+                "192.0.2.10".parse().unwrap(),
+                now,
+                a_query(0x4444, "example.com"),
+            ))
+            .await;
+
+        assert_eq!(metrics.count(ResolverMetric::RefreshTriggered), 1);
+        let job = receiver
+            .try_recv()
+            .expect("resolve() should have enqueued the scripted refresh hint");
+        assert_eq!(job.domain, "example.com");
+    }
+
+    /// Regression test for the bug code review found: the single-flight
+    /// *follower* path (`cache_hit_after_coalesced_miss`) must also enqueue
+    /// `refresh_hints`, not just the leader-side `probe_cache` path —
+    /// exactly the hot/concurrent scenario the refresh feature targets.
+    #[tokio::test]
+    async fn cache_hit_after_coalesced_miss_enqueues_refresh_hints() {
+        let now = SystemTime::UNIX_EPOCH;
+        let entry = RRsetEntry {
+            records: vec![StoredRecord {
+                rtype: A_RECORD_TYPE,
+                rclass: 1,
+                ttl_at_store: 60,
+                rdata: RecordData::A(std::net::Ipv4Addr::new(192, 0, 2, 1)),
+            }],
+            rrsigs: Vec::new(),
+            response_code: ResponseCode::NoError,
+            minimum_ttl: Duration::from_secs(60),
+            stored_at: now,
+            expires_at: now + Duration::from_secs(60),
+            dnssec_state: Default::default(),
+            cache_epoch: 1,
+            dnssec_complete: true,
+            authoritative: false,
+        };
+        let resolved = cache::ResolvedAnswer {
+            chain: vec![("example.com".to_string(), entry)],
+            refresh_hints: vec![cache::RefreshHint {
+                domain: "example.com".to_string(),
+                qtype: A_RECORD_TYPE,
+                qclass: 1,
+            }],
+        };
+        let cache = Arc::new(RecordingCache::with_lookup(ChainLookup::Answered(resolved)));
+        let upstream = Arc::new(StaticUpstream::new(Err(UpstreamError::Timeout)));
+        let events = Arc::new(RecordingEvents::default());
+        let metrics = Arc::new(RecordingMetrics::default());
+        let (sender, mut receiver) = tokio::sync::mpsc::channel(4);
+        let service = resolve_service_with_cache(upstream, cache, events, metrics.clone(), 1232)
+            .with_refresh_sender(sender);
+
+        let message = Message::parse_owned(a_query(0x5555, "example.com")).unwrap();
+        let decoded = DecodedQuery::new(message).unwrap();
+        let request = ResolveRequest::new(
+            "192.0.2.10".parse().unwrap(),
+            now,
+            a_query(0x5555, "example.com"),
+        );
+        let backend_snapshot = service.backend.current();
+        let miss_key: MissKey = (
+            "example.com".to_string(),
+            A_RECORD_TYPE,
+            1,
+            backend_snapshot.cache_epoch,
+            false,
+        );
+
+        let _response = service
+            .cache_hit_after_coalesced_miss(&request, &decoded, &backend_snapshot, &miss_key)
+            .await;
+
+        assert_eq!(metrics.count(ResolverMetric::RefreshTriggered), 1);
+        let job = receiver
+            .try_recv()
+            .expect("the coalesced-follower path should also enqueue refresh hints");
+        assert_eq!(job.domain, "example.com");
     }
 
     #[tokio::test]
@@ -19704,6 +20053,7 @@ mod tests {
         let entry = seed_rrset_entry(&record, Duration::from_secs(60), now, 0);
         let resolved = cache::ResolvedAnswer {
             chain: vec![("example.com".to_string(), entry)],
+            refresh_hints: Vec::new(),
         };
         let cache = Arc::new(RecordingCache::with_lookup(ChainLookup::Answered(resolved)));
         let upstream = Arc::new(StaticUpstream::new(Err(UpstreamError::Timeout)));
@@ -19805,6 +20155,7 @@ mod tests {
         let entry = seed_rrset_entry(&record, Duration::from_secs(60), now, 0);
         let resolved = cache::ResolvedAnswer {
             chain: vec![("example.com".to_string(), entry)],
+            refresh_hints: Vec::new(),
         };
         let cache = Arc::new(RecordingCache::with_lookup(ChainLookup::Answered(resolved)));
         let upstream = Arc::new(StaticUpstream::new(Err(UpstreamError::Timeout)));
@@ -19849,6 +20200,7 @@ mod tests {
         let entry = seed_rrset_entry(&record, Duration::from_secs(60), now, 0);
         let resolved = cache::ResolvedAnswer {
             chain: vec![("example.com".to_string(), entry)],
+            refresh_hints: Vec::new(),
         };
         let cache = Arc::new(RecordingCache::with_lookup(ChainLookup::Answered(resolved)));
         let upstream = Arc::new(StaticUpstream::new(Err(UpstreamError::Timeout)));

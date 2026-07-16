@@ -27,11 +27,12 @@ use std::hash::BuildHasher;
 use std::sync::OnceLock;
 use std::time::SystemTime;
 
+use crate::config::RefreshConfig;
 use shard::Shard;
 
 pub use assemble::ChainLookup;
 pub(crate) use assemble::{
-    ResolvedAnswer, ResolvedNegative, assemble_negative_response, assemble_response,
+    RefreshHint, ResolvedAnswer, ResolvedNegative, assemble_negative_response, assemble_response,
 };
 pub use entry::{NegativeEntry, NegativeKey, RRsetEntry, StoredRecord};
 pub(crate) use singleflight::{
@@ -126,6 +127,7 @@ pub trait DomainDnsCache: Send + Sync {
         epoch: u64,
         max_chain_depth: u8,
         now: SystemTime,
+        refresh_config: &RefreshConfig,
     ) -> ChainLookup;
 
     /// Replaces the old flat `store` — called once per backend response,
@@ -158,6 +160,7 @@ impl DomainDnsCache for ShardedDnsCache {
         epoch: u64,
         max_chain_depth: u8,
         now: SystemTime,
+        refresh_config: &RefreshConfig,
     ) -> ChainLookup {
         assemble::resolve_from_cache(
             self,
@@ -168,6 +171,7 @@ impl DomainDnsCache for ShardedDnsCache {
             epoch,
             max_chain_depth,
             now,
+            refresh_config,
         )
     }
 
