@@ -1392,7 +1392,20 @@ pub(crate) fn write_record(
     write_u16(out, 0);
     let rdata_start = out.len();
     write_rdata(out, compressor, rdata);
-    let rdlength = (out.len() - rdata_start) as u16;
+    let rdata_len = out.len() - rdata_start;
+    // RDLENGTH is a 16-bit wire field -- silently truncating a larger
+    // RDATA blob here would both misreport its length and leave the
+    // oversized bytes on the wire past that (wrong) length, corrupting
+    // every record serialized after it. Every `RecordData` variant's own
+    // construction is expected to stay well under this bound (e.g.
+    // `build_opt_record_with_options`'s COOKIE-option caller always builds
+    // a fixed 28-byte options blob), so this is a debug-only invariant
+    // check, not a runtime validation of untrusted input.
+    debug_assert!(
+        rdata_len <= usize::from(u16::MAX),
+        "RDATA is {rdata_len} bytes, exceeding the 16-bit RDLENGTH field -- would silently truncate on the wire"
+    );
+    let rdlength = rdata_len as u16;
     out[rdlength_pos..rdlength_pos + 2].copy_from_slice(&rdlength.to_be_bytes());
 }
 

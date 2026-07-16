@@ -28,7 +28,7 @@ use tokio::sync::mpsc;
 use tokio::task::JoinSet;
 use tokio::time::{self, Instant};
 
-use crate::protocol::edns_cookie::ClientCookie;
+pub use crate::protocol::edns_cookie::ClientCookie;
 use crate::protocol::{
     Message, NameCompressor, QueryDecodeFailure, QueryValidationError, Record, RecordData,
     ResponseCode, build_a_answers_response, build_a_block_response, build_aaaa_answers_response,
