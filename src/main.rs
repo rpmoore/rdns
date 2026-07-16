@@ -1212,6 +1212,7 @@ mod tests {
         assert_eq!(workers.len(), 1);
         for worker in workers {
             worker.abort();
+            let _ = worker.await;
         }
     }
 

@@ -76,6 +76,11 @@ fn seed_entry(now: SystemTime) -> RRsetEntry {
 /// threads repeatedly contend for the same small set of shards rather than
 /// each staying comfortably within its own.
 fn run_workload(cache: &ShardedDnsCache, domains: &[String], operation_count: usize) {
+    // Built once, outside the loop: constructing this fresh on every
+    // lookup_chain call would add avoidable allocation-free-but-nonzero
+    // work to the hot path this benchmark is trying to measure (cache
+    // concurrency/lock contention), skewing throughput numbers.
+    let refresh_config = RefreshConfig::default();
     for i in 0..operation_count {
         let domain = &domains[i % domains.len()];
         // Captured once per iteration and reused below — `SystemTime::now()`
@@ -101,7 +106,7 @@ fn run_workload(cache: &ShardedDnsCache, domains: &[String], operation_count: us
                 CACHE_EPOCH,
                 MAX_CHAIN_DEPTH,
                 now,
-                &RefreshConfig::default(),
+                &refresh_config,
             );
         }
     }
