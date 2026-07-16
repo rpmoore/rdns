@@ -599,6 +599,8 @@ impl Shard {
     /// live in the *authority* section and their TTLs play no part in the
     /// SOA-minimum-derived negative TTL computation, hence this dedicated
     /// read-time check.
+    // lookup_hop threads cache-lookup and refresh-eligibility inputs
+    // through one call; splitting adds indirection without benefit.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn lookup_hop(
         &self,
