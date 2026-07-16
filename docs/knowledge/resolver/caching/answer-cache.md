@@ -220,36 +220,13 @@ Capacity is domain-count-based, configured via `CacheConfig.max_entries`,
 split across shards by `CacheConfig::shard_capacity` (see
 [sharding](sharding.md)).
 
-# Popularity tracking
+# Popularity tracking and auto-refresh
 
-Each domain also has an optional `PopularityBucket` (`src/resolver/cache/shard.rs`)
-— an integer leaky-bucket counter (level + last-drained timestamp),
-drained-then-incremented on every cache hit at the same point `lru.touch`
-already runs. It's cleared alongside the LRU token at the same two removal
-points (`ShardState::evict_domain`, `ShardState::drop_lru_if_domain_now_empty`),
-so a domain's popularity state normally can't outlive its cache data — except
-via `sweep_stale_namespace`, which clears the LRU token directly without going
-through either of those two functions, so a bucket can currently outlive its
-domain's data when cleared by a namespace sweep instead (an accepted gap, not
-yet addressed). This is the foundation for an in-progress auto-refresh feature
-(proactively refetching popular, near-expiry entries); see
-`docs/plans/auto_refresh/` for the full design as later pieces land.
-
-# Refresh worker pool
-
-A fixed pool of `RefreshConfig.worker_count` tasks (`spawn_refresh_worker_pool`,
-`src/resolver/mod.rs`) processes background refresh jobs enqueued from the
-cache-hit path. All workers share one bounded `tokio::sync::mpsc` channel via
-`Arc<tokio::sync::Mutex<Receiver<RefreshJob>>>` — this serializes only the
-dequeue point (one worker parks on `recv()` at a time), not job execution.
-Each dequeued job runs as its own `tokio::spawn`ed task, and the worker
-`.await`s that task's `JoinHandle` before dequeuing the next job: a panic in
-one job fails only its own `JoinHandle` (inspected via `JoinError::is_panic()`
-and logged), never the worker loop itself. Shutdown has no internal signal —
-`main.rs` holds the pool's `JoinHandle`s and `.abort()`s them at teardown,
-mirroring `spawn_sighup_reload_task`'s existing convention exactly. Job
-processing itself (`process_refresh_job`) is a no-op stub until the
-fetch/store logic lands; see `docs/plans/auto_refresh/` for the full design.
+Each domain also has an optional `PopularityBucket` (`ShardState.popularity`,
+`src/resolver/cache/shard.rs:59,168`) feeding a proactive-refresh feature that
+refetches popular, near-expiry entries before a client would ever see the
+miss. Full design, invariants, and file:line references:
+see [auto-refresh](auto-refresh.md).
 
 # See also
 
@@ -257,3 +234,5 @@ fetch/store logic lands; see `docs/plans/auto_refresh/` for the full design.
 - [sharding](sharding.md) — how domains route to shards, and what else shares this routing scheme.
 - [local-dns-entries](local-dns-entries.md) — the separate, non-cached structure for manually-loaded
   answers.
+- [auto-refresh](auto-refresh.md) — proactive cache refresh for popular domains nearing TTL expiry,
+  built on top of this cache's LRU/eviction lifecycle.

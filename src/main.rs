@@ -162,15 +162,13 @@ async fn main() -> io::Result<()> {
     // when enabled, following `spawn_sighup_reload_task`'s own shutdown
     // convention (no internal shutdown signal -- the caller `.abort()`s
     // these at teardown, see `serve_until_shutdown`).
-    let refresh_workers = if config.refresh.enabled {
+    let refresh_workers = spawn_refresh_workers_if_enabled(config.refresh.enabled, || {
         spawn_refresh_worker_pool(
             Arc::clone(&resolver),
             refresh_rx,
             config.refresh.worker_count,
         )
-    } else {
-        Vec::new()
-    };
+    });
 
     let servers =
         UdpDnsServer::bind_configured(&config, Arc::clone(&resolver), Arc::clone(&clock)).await?;
@@ -684,6 +682,18 @@ fn spawn_sighup_reload_task(
     tokio::spawn(async {})
 }
 
+/// Gates auto-refresh worker-pool startup on `enabled`: runs `spawn` (which
+/// does the real `spawn_refresh_worker_pool` call) only when `true`, and
+/// returns an empty `Vec` — zero worker tasks spawned, not idle ones —
+/// without calling `spawn` at all when `false`. Split out from `run` so this
+/// gate is independently testable rather than only verifiable by inspection.
+fn spawn_refresh_workers_if_enabled(
+    enabled: bool,
+    spawn: impl FnOnce() -> Vec<tokio::task::JoinHandle<()>>,
+) -> Vec<tokio::task::JoinHandle<()>> {
+    if enabled { spawn() } else { Vec::new() }
+}
+
 fn build_backend_snapshot(
     config: &RuntimeConfig,
     metrics: Arc<dyn MetricsSink>,
@@ -1181,6 +1191,28 @@ mod tests {
             enabled = true
             public_address_acknowledged = false
         "#
+    }
+
+    #[test]
+    fn refresh_workers_not_spawned_when_disabled() {
+        let workers = spawn_refresh_workers_if_enabled(false, || {
+            panic!("spawn closure must not run when refresh is disabled")
+        });
+        assert!(workers.is_empty());
+    }
+
+    #[tokio::test]
+    async fn refresh_workers_spawned_when_enabled() {
+        let mut spawn_called = false;
+        let workers = spawn_refresh_workers_if_enabled(true, || {
+            spawn_called = true;
+            vec![tokio::spawn(async {})]
+        });
+        assert!(spawn_called);
+        assert_eq!(workers.len(), 1);
+        for worker in workers {
+            worker.abort();
+        }
     }
 
     #[test]

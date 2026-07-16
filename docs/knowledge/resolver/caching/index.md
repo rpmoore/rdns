@@ -8,3 +8,5 @@
   does/doesn't share that sharding scheme.
 * [local-dns-entries](local-dns-entries.md) - Why manually-loaded DNS data is not in this cache at
   all, and what that means for reload invalidation.
+* [auto-refresh](auto-refresh.md) - Proactive cache refresh for popular domains nearing TTL expiry:
+  popularity tracking, the trigger formula, and the background worker pool.

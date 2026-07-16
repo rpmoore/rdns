@@ -17716,6 +17716,237 @@ mod tests {
         );
     }
 
+    // End-to-end verification: section-07-integration. Unlike the isolated
+    // unit/integration tests above, these drive the *real*
+    // `spawn_refresh_worker_pool` wired through a real channel, proving the
+    // whole chain (bucket increment -> trigger -> hint -> enqueue -> worker
+    // -> fetch -> store -> next lookup sees the refreshed entry) actually
+    // cooperates end to end, not just that each piece works in isolation.
+
+    /// Polls (via `yield_now`, never `sleep`) until `upstream` has recorded
+    /// at least `expected` requests, or panics after a generous bound --
+    /// used to deterministically wait for the background worker pool
+    /// (running concurrently in this test's own runtime) to finish
+    /// processing an enqueued job, without any wall-clock sleep.
+    async fn wait_for_upstream_requests(upstream: &StaticUpstream, expected: usize) {
+        for _ in 0..10_000 {
+            if upstream.requests.lock().unwrap().len() >= expected {
+                return;
+            }
+            tokio::task::yield_now().await;
+        }
+        panic!(
+            "timed out waiting for {expected} upstream request(s), saw {}",
+            upstream.requests.lock().unwrap().len()
+        );
+    }
+
+    /// End-to-end: a hot domain's cache entry gets a background refresh
+    /// fetch without ever costing a client a miss. Honesty note: this test
+    /// uses a fixed `now` passed explicitly to every `ResolveRequest` (no
+    /// `Clock` impl that advances), so it cannot and does not verify
+    /// TTL-boundary timing -- "before expiry" in the name refers to the
+    /// production trigger condition (`wants_refresh`'s lead-window gate,
+    /// exercised via `permissive_refresh_config()`), not to this test
+    /// observing time actually elapse toward `expires_at`. What it does
+    /// verify: the full plumbing fires end-to-end (popularity hit -> hint ->
+    /// enqueue -> worker fetch -> store) and the client-visible read path
+    /// never regresses to a miss because of it.
+    #[tokio::test]
+    async fn e2e_hot_domain_refreshed_before_expiry() {
+        let cache = Arc::new(ShardedDnsCache::new(&CacheConfig {
+            max_entries: 16,
+            shard_count: Some(1),
+        }));
+        let domain = "hot.example.com";
+        let upstream = Arc::new(StaticUpstream::new(Ok(upstream_response(
+            a_response_with_answer(0x1234, domain, 60),
+        ))));
+        let metrics = Arc::new(RecordingMetrics::default());
+        let mut service = resolve_service_with_cache(
+            upstream.clone(),
+            Arc::clone(&cache) as Arc<dyn DomainDnsCache>,
+            Arc::new(RecordingEvents::default()),
+            metrics.clone(),
+            1232,
+        );
+        service = service.with_refresh_config(permissive_refresh_config());
+        let (sender, receiver) = mpsc::channel(4);
+        service = service.with_refresh_sender(sender);
+        let service = Arc::new(service);
+        let workers = spawn_refresh_worker_pool(Arc::clone(&service), receiver, 1);
+
+        let now = SystemTime::UNIX_EPOCH;
+        // First call: genuine cache miss, populates the cache. No hint yet
+        // -- there's nothing cached to have a popularity bucket at all.
+        let first = service
+            .resolve(ResolveRequest::new(
+                "192.0.2.10".parse().unwrap(),
+                now,
+                a_query(0x1111, domain),
+            ))
+            .await;
+        assert_eq!(first.decision.kind, ResolveDecisionKind::Allowed);
+        assert_eq!(upstream.requests.lock().unwrap().len(), 1);
+
+        // Second call: now a cache hit. Under the permissive config, this
+        // hit's own popularity increment immediately crosses hot_threshold
+        // (0), and the entry is always "within lead window" -- producing a
+        // refresh hint, which probe_cache enqueues onto the real channel
+        // the real worker pool above is reading from.
+        let second = service
+            .resolve(ResolveRequest::new(
+                "192.0.2.11".parse().unwrap(),
+                now,
+                a_query(0x2222, domain),
+            ))
+            .await;
+        assert_eq!(second.decision.kind, ResolveDecisionKind::CacheHit);
+
+        // The background worker processes the enqueued job concurrently --
+        // wait for its fetch to land, with no client-visible miss at all.
+        wait_for_upstream_requests(&upstream, 2).await;
+        assert_eq!(metrics.count(ResolverMetric::RefreshTriggered), 1);
+
+        // A third call must still be an ordinary cache hit -- the
+        // background refresh happened without ever costing a client a
+        // miss. Note: under the permissive config this third hit also
+        // qualifies and enqueues its own second refresh job; it's
+        // deliberately not awaited here (no assertion depends on it) --
+        // the worker abort below and the test runtime's teardown make
+        // leaving it in flight harmless.
+        let third = service
+            .resolve(ResolveRequest::new(
+                "192.0.2.12".parse().unwrap(),
+                now,
+                a_query(0x3333, domain),
+            ))
+            .await;
+        assert_eq!(third.decision.kind, ResolveDecisionKind::CacheHit);
+
+        for worker in workers {
+            worker.abort();
+            let _ = worker.await;
+        }
+    }
+
+    #[tokio::test]
+    async fn e2e_cooling_domain_stops_being_refreshed() {
+        let cache = Arc::new(ShardedDnsCache::new(&CacheConfig {
+            max_entries: 16,
+            shard_count: Some(1),
+        }));
+        let domain = "cooling.example.com";
+        let upstream = Arc::new(StaticUpstream::new(Ok(upstream_response(
+            a_response_with_answer(0x4321, domain, 60),
+        ))));
+        let metrics = Arc::new(RecordingMetrics::default());
+        let mut service = resolve_service_with_cache(
+            upstream.clone(),
+            Arc::clone(&cache) as Arc<dyn DomainDnsCache>,
+            Arc::new(RecordingEvents::default()),
+            metrics.clone(),
+            1232,
+        );
+        service = service.with_refresh_config(permissive_refresh_config());
+        let (sender, receiver) = mpsc::channel(4);
+        service = service.with_refresh_sender(sender);
+        let service = Arc::new(service);
+        let workers = spawn_refresh_worker_pool(Arc::clone(&service), receiver, 1);
+        let now = SystemTime::UNIX_EPOCH;
+
+        // Warm the domain hot and let one background refresh land, exactly
+        // as in `e2e_hot_domain_refreshed_before_expiry`.
+        let _ = service
+            .resolve(ResolveRequest::new(
+                "192.0.2.10".parse().unwrap(),
+                now,
+                a_query(0x1111, domain),
+            ))
+            .await;
+        let _ = service
+            .resolve(ResolveRequest::new(
+                "192.0.2.11".parse().unwrap(),
+                now,
+                a_query(0x2222, domain),
+            ))
+            .await;
+        wait_for_upstream_requests(&upstream, 2).await;
+        let requests_after_warm_refresh = upstream.requests.lock().unwrap().len();
+
+        // No further queries at all -- there is no periodic background
+        // scan in this design; refresh is purely reactive to real hits.
+        // Give any (incorrect) spontaneous background activity a generous
+        // window to show up.
+        for _ in 0..1000 {
+            tokio::task::yield_now().await;
+        }
+
+        assert_eq!(
+            upstream.requests.lock().unwrap().len(),
+            requests_after_warm_refresh,
+            "with no further real traffic, nothing should trigger another background refresh"
+        );
+
+        for worker in workers {
+            worker.abort();
+            let _ = worker.await;
+        }
+    }
+
+    #[tokio::test]
+    async fn e2e_disabled_feature_is_true_no_op() {
+        let cache = Arc::new(ShardedDnsCache::new(&CacheConfig {
+            max_entries: 16,
+            shard_count: Some(1),
+        }));
+        let domain = "disabled.example.com";
+        let upstream = Arc::new(StaticUpstream::new(Ok(upstream_response(
+            a_response_with_answer(0x5678, domain, 60),
+        ))));
+        let metrics = Arc::new(RecordingMetrics::default());
+        let mut service = resolve_service_with_cache(
+            upstream.clone(),
+            Arc::clone(&cache) as Arc<dyn DomainDnsCache>,
+            Arc::new(RecordingEvents::default()),
+            metrics.clone(),
+            1232,
+        );
+        // Same thresholds that would trigger refresh in the two tests
+        // above, except disabled -- proving `enabled` is the load-bearing
+        // switch, not incidental.
+        service = service.with_refresh_config(RefreshConfig {
+            enabled: false,
+            ..permissive_refresh_config()
+        });
+        let service = Arc::new(service);
+        let now = SystemTime::UNIX_EPOCH;
+
+        for (id, client_ip) in [
+            (0x1111u16, "192.0.2.10"),
+            (0x2222, "192.0.2.11"),
+            (0x3333, "192.0.2.12"),
+        ] {
+            let _ = service
+                .resolve(ResolveRequest::new(
+                    client_ip.parse().unwrap(),
+                    now,
+                    a_query(id, domain),
+                ))
+                .await;
+        }
+
+        assert_eq!(
+            upstream.requests.lock().unwrap().len(),
+            1,
+            "only the first, genuine cache miss should ever reach the backend"
+        );
+        assert_eq!(metrics.count(ResolverMetric::RefreshTriggered), 0);
+        assert_eq!(metrics.count(ResolverMetric::RefreshQueueFull), 0);
+        assert_eq!(metrics.count(ResolverMetric::RefreshSucceeded), 0);
+        assert_eq!(metrics.count(ResolverMetric::RefreshFailed), 0);
+    }
+
     #[tokio::test]
     async fn resolve_blocks_cached_response_with_malicious_cname_target() {
         let cache = Arc::new(ShardedDnsCache::new(&CacheConfig {
