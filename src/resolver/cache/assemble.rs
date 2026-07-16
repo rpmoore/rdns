@@ -48,8 +48,9 @@ use super::shard::HopResult;
 const CNAME_RECORD_TYPE: u16 = 5;
 
 /// One cache hop's signal that it currently qualifies for a background
-/// refresh (all three gates in `docs/plans/auto_refresh/claude-plan.md`
-/// §3.1 hold: eligibility floor, lead window, popularity hot-threshold).
+/// refresh (all three of `wants_refresh`'s gates hold: eligibility floor,
+/// lead window, popularity hot-threshold — see
+/// `docs/knowledge/resolver/caching/auto-refresh.md`).
 /// `qtype`/`qclass` identify the specific record set at `domain` that
 /// should be refetched — for an intermediate CNAME hop this is
 /// `(CNAME_RECORD_TYPE, qclass)`, never the original query's qtype, since

@@ -4047,8 +4047,8 @@ pub struct ResolveQuery {
     // thresholds instead of a hardcoded default. `main.rs` overrides it via
     // `with_refresh_config` once real config is available.
     refresh_config: crate::config::RefreshConfig,
-    // Non-blocking enqueue point for background refresh jobs
-    // (`docs/plans/auto_refresh/claude-plan.md` §4.1). Every constructor
+    // Non-blocking enqueue point for background refresh jobs (see
+    // `docs/knowledge/resolver/caching/auto-refresh.md`). Every constructor
     // defaults this to a sender whose paired receiver has already been
     // dropped, so any enqueue attempt in an existing test (none currently
     // configure a hot popularity bucket) simply counts as a dropped job
@@ -10432,7 +10432,7 @@ mod tests {
         }
     }
 
-    // Job enqueue tests: section-04-chainlookup-plumbing (`claude-plan-tdd.md` §4.1).
+    // Job enqueue tests: section-04-chainlookup-plumbing.
 
     fn resolver_for_enqueue_tests(metrics: Arc<RecordingMetrics>) -> ResolveQuery {
         ResolveQuery::new(

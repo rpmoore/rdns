@@ -413,7 +413,8 @@ impl ShardState {
     }
 }
 
-/// Pure trigger-formula check (`docs/plans/auto_refresh/claude-plan.md` §3.1).
+/// Pure trigger-formula check — see
+/// `docs/knowledge/resolver/caching/auto-refresh.md` for the full formula.
 /// Given a live entry's own TTL data, the domain's current popularity bucket
 /// (if any — a domain that has never been hit, or whose bucket was evicted
 /// alongside its LRU entry, has no bucket and is therefore never hot), and
