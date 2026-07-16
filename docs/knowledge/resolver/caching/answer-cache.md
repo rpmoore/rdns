@@ -24,6 +24,7 @@ ShardState {
     positive: HashMap<domain, DomainRecordSets>,
     negative: HashMap<domain, DomainNegativeEntries>,
     lru: ShardLru,
+    popularity: HashMap<domain, PopularityBucket>,
 }
 ```
 
@@ -218,6 +219,21 @@ negative entries, and LRU token together (`ShardState::evict_domain`).
 Capacity is domain-count-based, configured via `CacheConfig.max_entries`,
 split across shards by `CacheConfig::shard_capacity` (see
 [sharding](sharding.md)).
+
+# Popularity tracking
+
+Each domain also has an optional `PopularityBucket` (`src/resolver/cache/shard.rs`)
+— an integer leaky-bucket counter (level + last-drained timestamp),
+drained-then-incremented on every cache hit at the same point `lru.touch`
+already runs. It's cleared alongside the LRU token at the same two removal
+points (`ShardState::evict_domain`, `ShardState::drop_lru_if_domain_now_empty`),
+so a domain's popularity state normally can't outlive its cache data — except
+via `sweep_stale_namespace`, which clears the LRU token directly without going
+through either of those two functions, so a bucket can currently outlive its
+domain's data when cleared by a namespace sweep instead (an accepted gap, not
+yet addressed). This is the foundation for an in-progress auto-refresh feature
+(proactively refetching popular, near-expiry entries); see
+`docs/plans/auto_refresh/` for the full design as later pieces land.
 
 # See also
 
