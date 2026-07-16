@@ -10573,6 +10573,10 @@ mod tests {
         for handle in handles {
             handle.await.unwrap();
         }
+        // TEST_JOB_HANDLER is thread-local, and the test harness can reuse
+        // this OS thread for a later test -- clear it so this stub doesn't
+        // leak into whatever runs next on this thread.
+        clear_test_job_handler();
     }
 
     #[tokio::test]
@@ -10605,6 +10609,7 @@ mod tests {
         for handle in handles {
             handle.await.unwrap();
         }
+        clear_test_job_handler();
     }
 
     #[tokio::test]
@@ -10646,6 +10651,7 @@ mod tests {
         for handle in handles {
             handle.await.unwrap();
         }
+        clear_test_job_handler();
     }
 
     #[tokio::test]
@@ -10725,6 +10731,7 @@ mod tests {
             "aborting the outer worker loop must also cancel its in-flight inner job task, \
              not leave it detached and running forever",
         );
+        clear_test_job_handler();
     }
 
     struct ClientScopedResponsePolicy {

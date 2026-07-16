@@ -200,7 +200,9 @@ impl RuntimeConfig {
         }
 
         self.cache.validate()?;
-        self.refresh.validate()?;
+        if self.refresh.enabled {
+            self.refresh.validate()?;
+        }
 
         if self.chaos.enabled {
             if self.chaos.version_bind.is_empty() {
@@ -3075,6 +3077,28 @@ a.root-servers.net.      3600000      Aaaa  2001:503:ba3e::2:30
     #[test]
     fn refresh_config_validate_accepts_default() {
         assert_eq!(RefreshConfig::default().validate(), Ok(()));
+    }
+
+    /// Regression test for the bug code review found: `RuntimeConfig::validate()`
+    /// ran `self.refresh.validate()` unconditionally, unlike the
+    /// `if self.metrics.enabled`/`if self.chaos.enabled` pattern used
+    /// elsewhere in this same function -- making it impossible to disable
+    /// auto-refresh while leaving other refresh fields at placeholder/zero
+    /// values. `worker_count = 0` alone would otherwise be rejected even
+    /// though a disabled feature never spawns a worker pool at all.
+    #[test]
+    fn refresh_config_disabled_skips_validation() {
+        let mut toml = valid_toml();
+        toml.push_str(
+            r#"
+            [refresh]
+            enabled = false
+            worker_count = 0
+            channel_capacity = 0
+            "#,
+        );
+
+        assert!(RuntimeConfig::from_toml_str(&toml).is_ok());
     }
 
     #[test]
