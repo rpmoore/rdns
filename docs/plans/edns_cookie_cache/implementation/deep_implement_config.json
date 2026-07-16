@@ -1,0 +1,62 @@
+{
+  "plugin_root": "/home/rpmoore/.claude/plugins/cache/piercelamb-plugins/deep-implement/0.2.1",
+  "sections_dir": "/home/rpmoore/code/rdns/docs/plans/edns_cookie_cache/sections",
+  "target_dir": "/home/rpmoore/code/rdns",
+  "state_dir": "/home/rpmoore/code/rdns/docs/plans/edns_cookie_cache/implementation",
+  "git_root": "/home/rpmoore/code/rdns",
+  "commit_style": "simple",
+  "test_command": "uv run pytest",
+  "sections": [
+    "section-01-cargo-dependencies",
+    "section-02-edns-cookie-module",
+    "section-03-cache-supported-narrowing",
+    "section-04-query-features-opt-threading",
+    "section-05-cache-miss-opt-path",
+    "section-06-opt-record-serialization",
+    "section-07-knowledge-bundle-docs",
+    "section-08-security-review"
+  ],
+  "sections_state": {
+    "section-01-cargo-dependencies": {
+      "status": "complete",
+      "commit_hash": "1cbde7a"
+    },
+    "section-02-edns-cookie-module": {
+      "status": "complete",
+      "commit_hash": "83b8527"
+    },
+    "section-03-cache-supported-narrowing": {
+      "status": "complete",
+      "commit_hash": "cbf8762"
+    },
+    "section-04-query-features-opt-threading": {
+      "status": "complete",
+      "commit_hash": "b7aed3a"
+    },
+    "section-06-opt-record-serialization": {
+      "status": "complete",
+      "commit_hash": "6f372ca"
+    },
+    "section-05-cache-miss-opt-path": {
+      "status": "complete",
+      "commit_hash": "7cea1d2"
+    },
+    "section-07-knowledge-bundle-docs": {
+      "status": "complete",
+      "commit_hash": "b71895b"
+    },
+    "section-08-security-review": {
+      "status": "complete",
+      "commit_hash": "db07c8a"
+    }
+  },
+  "pre_commit": {
+    "present": false,
+    "type": "none",
+    "config_file": null,
+    "native_hook": null,
+    "may_modify_files": false,
+    "detected_formatters": []
+  },
+  "created_at": "2026-07-16T01:11:57.353292+00:00"
+}
