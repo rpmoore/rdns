@@ -28,6 +28,7 @@ use tokio::sync::mpsc;
 use tokio::task::JoinSet;
 use tokio::time::{self, Instant};
 
+use crate::protocol::edns_cookie::ClientCookie;
 use crate::protocol::{
     Message, NameCompressor, QueryDecodeFailure, QueryValidationError, Record, RecordData,
     ResponseCode, build_a_answers_response, build_a_block_response, build_aaaa_answers_response,
@@ -36,6 +37,11 @@ use crate::protocol::{
     build_servfail_response, build_txt_answer_response, message_question_wire, rewrite_response_id,
     rewrite_response_request_fields,
 };
+// Re-exported (not just used privately): `src/main.rs` is a separate
+// binary crate and must construct one via `CookieSecret::generate()` to
+// hand to `ResolveQuery::with_cookie_secret`, mirroring how it constructs
+// `SystemClock` from this same module.
+pub use crate::protocol::edns_cookie::CookieSecret;
 
 mod cache;
 use cache::{
@@ -255,6 +261,13 @@ pub struct QueryFeatures {
     pub checking_disabled: bool,
     pub dnssec_ok: bool,
     pub edns_udp_payload_size: Option<u16>,
+    /// The requester's client cookie, extracted via
+    /// `edns_cookie::parse_cookie_option` (not the stricter
+    /// `is_solely_cookie_option`, which is section-03's cache-admission-only
+    /// concern) -- a query carrying a well-formed Cookie alongside another
+    /// EDNS option still gets its cookie echoed here, even though such a
+    /// query isn't cache-admissible.
+    pub client_cookie: Option<ClientCookie>,
 }
 
 impl QueryFeatures {
@@ -269,6 +282,10 @@ impl QueryFeatures {
                 .map(|edns| edns.dnssec_ok)
                 .unwrap_or(false),
             edns_udp_payload_size: message.edns.as_ref().map(|edns| edns.udp_payload_size),
+            client_cookie: message
+                .edns
+                .as_ref()
+                .and_then(|edns| crate::protocol::edns_cookie::parse_cookie_option(&edns.options)),
         }
     }
 }
@@ -3370,6 +3387,16 @@ pub struct ResolveQuery {
     // threading yet another parameter through every `with_cache*`
     // constructor.
     chaos: crate::config::ChaosConfig,
+    // Not part of any constructor's parameter list by default (defaults to
+    // `Arc::new(CookieSecret::generate())`) -- same reasoning as
+    // `max_chain_depth`/`chaos` above: unlike `clock`, `CookieSecret` isn't
+    // a trait object the vast majority of existing tests need to
+    // substitute (they don't exercise Cookie behavior at all), so a
+    // post-construction setter (`with_cookie_secret`) avoids threading a
+    // new mandatory parameter through every `with_cache*` constructor and
+    // every existing test call site. `main.rs` overrides it with a real,
+    // process-lifetime secret once available.
+    cookie_secret: Arc<CookieSecret>,
 }
 
 impl ResolveQuery {
@@ -3501,6 +3528,7 @@ impl ResolveQuery {
             event_sequence: AtomicU64::new(0),
             metrics,
             chaos: crate::config::ChaosConfig::default(),
+            cookie_secret: Arc::new(CookieSecret::generate()),
         }
     }
 
@@ -3638,6 +3666,16 @@ impl ResolveQuery {
         self
     }
 
+    /// Overrides the default process-lifetime `CookieSecret` set by every
+    /// constructor. `main.rs` calls this with the one real secret generated
+    /// alongside `SystemClock` -- see `ResolveQuery.cookie_secret`'s doc
+    /// comment for why this is a post-construction override rather than a
+    /// parameter threaded through every `with_cache*` constructor.
+    pub fn with_cookie_secret(mut self, cookie_secret: Arc<CookieSecret>) -> Self {
+        self.cookie_secret = cookie_secret;
+        self
+    }
+
     /// Overrides the default `ShardedSingleFlight` shard count set by
     /// every constructor. `main.rs` calls this with the real
     /// `ShardedDnsCache`'s own `shard_count()` once both are constructed,
@@ -3704,6 +3742,7 @@ impl ResolveQuery {
             event_sequence: AtomicU64::new(0),
             metrics,
             chaos: crate::config::ChaosConfig::default(),
+            cookie_secret: Arc::new(CookieSecret::generate()),
         }
     }
 
@@ -4555,6 +4594,8 @@ impl ResolveQuery {
             request.received_at.0,
             !request.observed_source.is_tcp(),
             self.protocol.configured_max_udp_payload_size(),
+            &self.cookie_secret,
+            request.client_ip,
         )
     }
 
@@ -4574,6 +4615,8 @@ impl ResolveQuery {
             request.received_at.0,
             !request.observed_source.is_tcp(),
             self.protocol.configured_max_udp_payload_size(),
+            &self.cookie_secret,
+            request.client_ip,
         )
     }
 
@@ -7952,6 +7995,42 @@ mod tests {
 
     fn a_query_with_edns(id: u16, name: &str, udp_payload_size: u16, dnssec_ok: bool) -> Vec<u8> {
         a_query_with_edns_options(id, name, udp_payload_size, dnssec_ok, &[])
+    }
+
+    #[test]
+    fn query_features_from_message_extracts_client_cookie() {
+        let cookie_option = [
+            0u8, 10, 0, 8, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88,
+        ];
+        let bytes = a_query_with_edns_options(0x7777, "example.com", 1232, false, &cookie_option);
+        let message = Message::parse(&bytes).unwrap();
+
+        let features = QueryFeatures::from_message(&message);
+
+        assert_eq!(
+            features.client_cookie,
+            Some([0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88])
+        );
+    }
+
+    #[test]
+    fn query_features_from_message_has_no_client_cookie_without_edns() {
+        let bytes = a_query(0x7777, "example.com");
+        let message = Message::parse(&bytes).unwrap();
+
+        let features = QueryFeatures::from_message(&message);
+
+        assert_eq!(features.client_cookie, None);
+    }
+
+    #[test]
+    fn query_features_from_message_has_no_client_cookie_when_edns_options_empty() {
+        let bytes = a_query_with_edns(0x7777, "example.com", 1232, false);
+        let message = Message::parse(&bytes).unwrap();
+
+        let features = QueryFeatures::from_message(&message);
+
+        assert_eq!(features.client_cookie, None);
     }
 
     fn a_query_with_edns_options(

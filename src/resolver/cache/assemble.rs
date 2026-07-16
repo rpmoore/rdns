@@ -30,11 +30,13 @@
 #![allow(dead_code)]
 
 use std::collections::HashSet;
+use std::net::IpAddr;
 use std::time::{Duration, SystemTime};
 
+use crate::protocol::edns_cookie::{CookieSecret, build_cookie_option, build_server_cookie};
 use crate::protocol::{
-    NameCompressor, Record, ResponseCode, build_truncated_wire_response, write_message_header,
-    write_opt_record, write_record,
+    NameCompressor, Record, RecordData, ResponseCode, build_truncated_wire_response,
+    write_message_header, write_opt_record, write_record,
 };
 use crate::resolver::QueryFeatures;
 
@@ -437,22 +439,39 @@ fn negative_dnssec_ad_bit(
 fn requester_opt_record(
     requester_features: &QueryFeatures,
     configured_max_udp_payload_size: usize,
+    cookie_secret: &CookieSecret,
+    client_ip: IpAddr,
+    now: SystemTime,
 ) -> Option<Record> {
     requester_features.edns_udp_payload_size?;
     let udp_payload_size = configured_max_udp_payload_size.min(u16::MAX as usize) as u16;
-    Some(crate::protocol::build_opt_record(
-        udp_payload_size,
-        requester_features.dnssec_ok,
-    ))
+    let mut opt = crate::protocol::build_opt_record(udp_payload_size, requester_features.dnssec_ok);
+    if let Some(client_cookie) = requester_features.client_cookie {
+        let server_cookie = build_server_cookie(cookie_secret, client_cookie, client_ip, now);
+        if let RecordData::OPT(ref mut edns) = opt.record {
+            edns.options = build_cookie_option(client_cookie, server_cookie);
+        }
+    }
+    Some(opt)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn build_servfail(
     request_id: u16,
     requester_question_wire: &[u8],
     requester_features: &QueryFeatures,
     configured_max_udp_payload_size: usize,
+    cookie_secret: &CookieSecret,
+    client_ip: IpAddr,
+    now: SystemTime,
 ) -> Vec<u8> {
-    let opt = requester_opt_record(requester_features, configured_max_udp_payload_size);
+    let opt = requester_opt_record(
+        requester_features,
+        configured_max_udp_payload_size,
+        cookie_secret,
+        client_ip,
+        now,
+    );
     let mut response = Vec::new();
     write_message_header(
         &mut response,
@@ -510,6 +529,9 @@ fn finish_with_truncation_check(
     authoritative: bool,
     allow_udp_truncation: bool,
     configured_max_udp_payload_size: usize,
+    cookie_secret: &CookieSecret,
+    client_ip: IpAddr,
+    now: SystemTime,
 ) -> Vec<u8> {
     if !allow_udp_truncation {
         return response;
@@ -524,7 +546,13 @@ fn finish_with_truncation_check(
     if response.len() <= effective {
         return response;
     }
-    let opt = requester_opt_record(requester_features, configured_max_udp_payload_size);
+    let opt = requester_opt_record(
+        requester_features,
+        configured_max_udp_payload_size,
+        cookie_secret,
+        client_ip,
+        now,
+    );
     build_truncated_wire_response(
         request_id,
         requester_features.recursion_desired,
@@ -543,6 +571,7 @@ fn finish_with_truncation_check(
 /// plan's literal signature — `QueryFeatures` carries no transaction ID,
 /// so it must be threaded through explicitly (mirrors the
 /// `configured_max_udp_payload_size` deviation above).
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn assemble_response(
     request_id: u16,
     requester_question_wire: &[u8],
@@ -551,6 +580,8 @@ pub(crate) fn assemble_response(
     now: SystemTime,
     allow_udp_truncation: bool,
     configured_max_udp_payload_size: usize,
+    cookie_secret: &CookieSecret,
+    client_ip: IpAddr,
 ) -> Vec<u8> {
     if dnssec_servfail_check(&resolved.chain, requester_features) {
         return build_servfail(
@@ -558,6 +589,9 @@ pub(crate) fn assemble_response(
             requester_question_wire,
             requester_features,
             configured_max_udp_payload_size,
+            cookie_secret,
+            client_ip,
+            now,
         );
     }
 
@@ -565,7 +599,13 @@ pub(crate) fn assemble_response(
     let ad = dnssec_ad_bit(&resolved.chain, requester_features);
     let authoritative = chain_authoritative(&resolved.chain);
     let an_count = chain_answer_count(&resolved.chain, dnssec_ok);
-    let opt = requester_opt_record(requester_features, configured_max_udp_payload_size);
+    let opt = requester_opt_record(
+        requester_features,
+        configured_max_udp_payload_size,
+        cookie_secret,
+        client_ip,
+        now,
+    );
 
     let mut response = Vec::new();
     write_message_header(
@@ -601,6 +641,9 @@ pub(crate) fn assemble_response(
         authoritative,
         allow_udp_truncation,
         configured_max_udp_payload_size,
+        cookie_secret,
+        client_ip,
+        now,
     )
 }
 
@@ -621,6 +664,8 @@ pub(crate) fn assemble_negative_response(
     now: SystemTime,
     allow_udp_truncation: bool,
     configured_max_udp_payload_size: usize,
+    cookie_secret: &CookieSecret,
+    client_ip: IpAddr,
 ) -> Vec<u8> {
     if negative_dnssec_servfail_check(&resolved.chain, &resolved.negative, requester_features) {
         return build_servfail(
@@ -628,6 +673,9 @@ pub(crate) fn assemble_negative_response(
             requester_question_wire,
             requester_features,
             configured_max_udp_payload_size,
+            cookie_secret,
+            client_ip,
+            now,
         );
     }
 
@@ -636,7 +684,13 @@ pub(crate) fn assemble_negative_response(
     let authoritative = chain_authoritative(&resolved.chain) && resolved.negative.authoritative;
     let an_count = chain_answer_count(&resolved.chain, dnssec_ok);
     let ns_count = negative_authority_count(&resolved.negative, dnssec_ok);
-    let opt = requester_opt_record(requester_features, configured_max_udp_payload_size);
+    let opt = requester_opt_record(
+        requester_features,
+        configured_max_udp_payload_size,
+        cookie_secret,
+        client_ip,
+        now,
+    );
 
     let mut response = Vec::new();
     write_message_header(
@@ -680,6 +734,9 @@ pub(crate) fn assemble_negative_response(
         authoritative,
         allow_udp_truncation,
         configured_max_udp_payload_size,
+        cookie_secret,
+        client_ip,
+        now,
     )
 }
 
@@ -687,14 +744,23 @@ pub(crate) fn assemble_negative_response(
 mod tests {
     use super::*;
     use crate::config::CacheConfig;
+    use crate::protocol::edns_cookie::ClientCookie;
     use crate::protocol::{Message, RecordData, write_u16};
     use crate::resolver::NegativeCacheKind;
     use crate::resolver::cache::entry::{NegativeKey, StoredRecord};
-    use std::net::Ipv4Addr;
+    use std::net::{IpAddr, Ipv4Addr};
     use std::time::Duration;
 
     const IN_QCLASS: u16 = 1;
     const A_QTYPE: u16 = 1;
+
+    fn test_cookie_secret() -> CookieSecret {
+        CookieSecret::generate()
+    }
+
+    fn test_client_ip() -> IpAddr {
+        IpAddr::V4(Ipv4Addr::new(192, 0, 2, 10))
+    }
 
     fn question_wire(qname: &str, qtype: u16, qclass: u16) -> Vec<u8> {
         let mut compressor = NameCompressor::new();
@@ -712,6 +778,29 @@ mod tests {
             checking_disabled: false,
             dnssec_ok,
             edns_udp_payload_size: None,
+            client_cookie: None,
+        }
+    }
+
+    fn features_with_cookie(client_cookie: ClientCookie) -> QueryFeatures {
+        QueryFeatures {
+            recursion_desired: true,
+            authenticated_data: false,
+            checking_disabled: false,
+            dnssec_ok: false,
+            edns_udp_payload_size: Some(1232),
+            client_cookie: Some(client_cookie),
+        }
+    }
+
+    fn features_with_edns_no_cookie() -> QueryFeatures {
+        QueryFeatures {
+            recursion_desired: true,
+            authenticated_data: false,
+            checking_disabled: false,
+            dnssec_ok: false,
+            edns_udp_payload_size: Some(1232),
+            client_cookie: None,
         }
     }
 
@@ -751,6 +840,51 @@ mod tests {
     }
 
     #[test]
+    fn requester_opt_record_attaches_server_cookie_when_client_cookie_present() {
+        let client_cookie: ClientCookie = [0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88];
+        let features = features_with_cookie(client_cookie);
+        let secret = test_cookie_secret();
+        let client_ip = test_client_ip();
+        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+
+        let record = requester_opt_record(&features, 4096, &secret, client_ip, now)
+            .expect("edns_udp_payload_size is set, so a record must be returned");
+
+        let RecordData::OPT(edns) = &record.record else {
+            panic!("expected an OPT record");
+        };
+        assert_eq!(
+            &edns.options[0..2],
+            &10u16.to_be_bytes(),
+            "COOKIE option code"
+        );
+        assert_eq!(&edns.options[2..4], &24u16.to_be_bytes(), "length: 8 + 16");
+        assert_eq!(&edns.options[4..12], &client_cookie);
+        let expected_server_cookie = build_server_cookie(&secret, client_cookie, client_ip, now);
+        assert_eq!(&edns.options[12..28], &expected_server_cookie);
+    }
+
+    /// Regression test: a non-Cookie request's OPT record must stay
+    /// byte-for-byte identical to pre-cookie-support behavior (empty
+    /// options), same as `assemble_response_includes_opt_record_when_requester_used_edns`
+    /// pins at a higher level.
+    #[test]
+    fn requester_opt_record_omits_options_when_no_client_cookie() {
+        let features = features_with_edns_no_cookie();
+        let secret = test_cookie_secret();
+        let client_ip = test_client_ip();
+        let now = SystemTime::UNIX_EPOCH;
+
+        let record = requester_opt_record(&features, 4096, &secret, client_ip, now)
+            .expect("edns_udp_payload_size is set, so a record must be returned");
+
+        let RecordData::OPT(edns) = &record.record else {
+            panic!("expected an OPT record");
+        };
+        assert!(edns.options.is_empty());
+    }
+
+    #[test]
     fn assemble_response_ages_each_record_ttl_independently() {
         let now = SystemTime::now();
         let stored_at = now - Duration::from_secs(100);
@@ -765,7 +899,17 @@ mod tests {
         };
         let wire = question_wire("example.com", A_QTYPE, IN_QCLASS);
 
-        let response = assemble_response(1, &wire, &features(false), &resolved, now, false, 4096);
+        let response = assemble_response(
+            1,
+            &wire,
+            &features(false),
+            &resolved,
+            now,
+            false,
+            4096,
+            &test_cookie_secret(),
+            test_client_ip(),
+        );
         let parsed = Message::parse(&response).unwrap();
 
         assert_eq!(parsed.answers.len(), 2);
@@ -784,7 +928,17 @@ mod tests {
         };
         let wire = question_wire("example.com", A_QTYPE, IN_QCLASS);
 
-        let response = assemble_response(1, &wire, &features(false), &resolved, now, false, 4096);
+        let response = assemble_response(
+            1,
+            &wire,
+            &features(false),
+            &resolved,
+            now,
+            false,
+            4096,
+            &test_cookie_secret(),
+            test_client_ip(),
+        );
         let parsed = Message::parse(&response).unwrap();
 
         // Aged TTL would be 10s, remaining lifetime is also 10s: capped, not
@@ -811,7 +965,17 @@ mod tests {
         };
         let wire = question_wire("example.com", A_QTYPE, IN_QCLASS);
 
-        let response = assemble_response(1, &wire, &features(false), &resolved, now, false, 4096);
+        let response = assemble_response(
+            1,
+            &wire,
+            &features(false),
+            &resolved,
+            now,
+            false,
+            4096,
+            &test_cookie_secret(),
+            test_client_ip(),
+        );
         let parsed = Message::parse(&response).unwrap();
 
         // Even though the entry is still servable for ~25 more seconds
@@ -840,6 +1004,8 @@ mod tests {
             now,
             false,
             4096,
+            &test_cookie_secret(),
+            test_client_ip(),
         );
         let mixed_response = assemble_response(
             1,
@@ -849,6 +1015,8 @@ mod tests {
             now,
             false,
             4096,
+            &test_cookie_secret(),
+            test_client_ip(),
         );
 
         let lower_parsed = Message::parse(&lower_response).unwrap();
@@ -870,7 +1038,17 @@ mod tests {
 
         let mut udp_features = features(false);
         udp_features.edns_udp_payload_size = Some(512);
-        let udp_response = assemble_response(1, &wire, &udp_features, &resolved, now, true, 4096);
+        let udp_response = assemble_response(
+            1,
+            &wire,
+            &udp_features,
+            &resolved,
+            now,
+            true,
+            4096,
+            &test_cookie_secret(),
+            test_client_ip(),
+        );
         let udp_parsed = Message::parse(&udp_response).unwrap();
         assert!(udp_parsed.header.tc());
         assert_eq!(udp_parsed.answers.len(), 0);
@@ -883,7 +1061,17 @@ mod tests {
 
         // TCP-sourced queries pass allow_udp_truncation = false: full
         // response regardless of size.
-        let tcp_response = assemble_response(1, &wire, &udp_features, &resolved, now, false, 4096);
+        let tcp_response = assemble_response(
+            1,
+            &wire,
+            &udp_features,
+            &resolved,
+            now,
+            false,
+            4096,
+            &test_cookie_secret(),
+            test_client_ip(),
+        );
         let tcp_parsed = Message::parse(&tcp_response).unwrap();
         assert!(!tcp_parsed.header.tc());
         assert_eq!(tcp_parsed.answers.len(), 40);
@@ -912,7 +1100,17 @@ mod tests {
         let mut edns_features = features(false);
         edns_features.edns_udp_payload_size = Some(4096);
 
-        let response = assemble_response(1, &wire, &edns_features, &resolved, now, false, 700);
+        let response = assemble_response(
+            1,
+            &wire,
+            &edns_features,
+            &resolved,
+            now,
+            false,
+            700,
+            &test_cookie_secret(),
+            test_client_ip(),
+        );
         let parsed = Message::parse(&response).unwrap();
 
         assert_eq!(
@@ -930,11 +1128,69 @@ mod tests {
         assert!(!edns.dnssec_ok);
 
         // A requester with no EDNS at all must not get an OPT record back.
-        let no_edns_response =
-            assemble_response(1, &wire, &features(false), &resolved, now, false, 700);
+        let no_edns_response = assemble_response(
+            1,
+            &wire,
+            &features(false),
+            &resolved,
+            now,
+            false,
+            700,
+            &test_cookie_secret(),
+            test_client_ip(),
+        );
         let no_edns_parsed = Message::parse(&no_edns_response).unwrap();
         assert_eq!(no_edns_parsed.header.ar_count, 0);
         assert!(no_edns_parsed.edns.is_none());
+    }
+
+    /// `write_opt_record`/`write_rdata` (`src/protocol/mod.rs`) already
+    /// serialize whatever bytes sit in `EdnsInfo.options` onto the wire
+    /// unconditionally -- there's no separate "wire encoder" gate to wait
+    /// on. That means `requester_opt_record` attaching a COOKIE option is
+    /// already live, externally observable wire behavior as of this
+    /// section, not inert in-memory plumbing deferred to a later section.
+    /// This test proves the option actually round-trips through
+    /// `write_opt_record` -> `Message::parse` intact, not just that the
+    /// in-memory `Record` looks right (`requester_opt_record_attaches_server_cookie_when_client_cookie_present`
+    /// above only checks the latter).
+    #[test]
+    fn assemble_response_serializes_server_cookie_option_on_wire_for_cookie_bearing_query() {
+        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+        let entry = rrset_entry(vec![a_record(300, 1)], Duration::from_secs(300), now);
+        let resolved = ResolvedAnswer {
+            chain: vec![("example.com".to_string(), entry)],
+        };
+        let wire = question_wire("example.com", A_QTYPE, IN_QCLASS);
+        let client_cookie: ClientCookie = [0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88];
+        let secret = test_cookie_secret();
+        let client_ip = test_client_ip();
+
+        let response = assemble_response(
+            1,
+            &wire,
+            &features_with_cookie(client_cookie),
+            &resolved,
+            now,
+            false,
+            4096,
+            &secret,
+            client_ip,
+        );
+        let parsed = Message::parse(&response).unwrap();
+
+        let edns = parsed
+            .edns
+            .expect("response must carry an OPT record for a cookie-bearing requester");
+        assert_eq!(
+            &edns.options[0..2],
+            &10u16.to_be_bytes(),
+            "COOKIE option code"
+        );
+        assert_eq!(&edns.options[2..4], &24u16.to_be_bytes(), "length: 8 + 16");
+        assert_eq!(&edns.options[4..12], &client_cookie);
+        let expected_server_cookie = build_server_cookie(&secret, client_cookie, client_ip, now);
+        assert_eq!(&edns.options[12..28], &expected_server_cookie);
     }
 
     // Regression test: a cache-hit response must preserve the *original
@@ -961,6 +1217,8 @@ mod tests {
             now,
             false,
             4096,
+            &test_cookie_secret(),
+            test_client_ip(),
         );
         assert!(
             Message::parse(&aa_response).unwrap().header.aa(),
@@ -981,6 +1239,8 @@ mod tests {
             now,
             false,
             4096,
+            &test_cookie_secret(),
+            test_client_ip(),
         );
         assert!(
             !Message::parse(&no_aa_response).unwrap().header.aa(),
@@ -1018,6 +1278,8 @@ mod tests {
             now,
             false,
             4096,
+            &test_cookie_secret(),
+            test_client_ip(),
         );
         assert!(
             !Message::parse(&mixed_response).unwrap().header.aa(),
@@ -1040,14 +1302,33 @@ mod tests {
 
         let mut cd_features = features(false);
         cd_features.checking_disabled = true;
-        let cd_response = assemble_response(1, &wire, &cd_features, &resolved, now, false, 4096);
+        let cd_response = assemble_response(
+            1,
+            &wire,
+            &cd_features,
+            &resolved,
+            now,
+            false,
+            4096,
+            &test_cookie_secret(),
+            test_client_ip(),
+        );
         assert!(
             Message::parse(&cd_response).unwrap().header.cd(),
             "CD=1 on the query must produce CD=1 on the response"
         );
 
-        let no_cd_response =
-            assemble_response(1, &wire, &features(false), &resolved, now, false, 4096);
+        let no_cd_response = assemble_response(
+            1,
+            &wire,
+            &features(false),
+            &resolved,
+            now,
+            false,
+            4096,
+            &test_cookie_secret(),
+            test_client_ip(),
+        );
         assert!(
             !Message::parse(&no_cd_response).unwrap().header.cd(),
             "CD=0 on the query must produce CD=0 on the response"
@@ -1079,8 +1360,28 @@ mod tests {
         };
         let wire = question_wire("example.com", A_QTYPE, IN_QCLASS);
 
-        let without_do = assemble_response(1, &wire, &features(false), &resolved, now, false, 4096);
-        let with_do = assemble_response(1, &wire, &features(true), &resolved, now, false, 4096);
+        let without_do = assemble_response(
+            1,
+            &wire,
+            &features(false),
+            &resolved,
+            now,
+            false,
+            4096,
+            &test_cookie_secret(),
+            test_client_ip(),
+        );
+        let with_do = assemble_response(
+            1,
+            &wire,
+            &features(true),
+            &resolved,
+            now,
+            false,
+            4096,
+            &test_cookie_secret(),
+            test_client_ip(),
+        );
 
         assert_eq!(Message::parse(&without_do).unwrap().answers.len(), 1);
         assert_eq!(Message::parse(&with_do).unwrap().answers.len(), 2);
@@ -1097,12 +1398,31 @@ mod tests {
         let wire = question_wire("example.com", A_QTYPE, IN_QCLASS);
 
         let mut do_features = features(true);
-        let with_do = assemble_response(1, &wire, &do_features, &resolved, now, false, 4096);
+        let with_do = assemble_response(
+            1,
+            &wire,
+            &do_features,
+            &resolved,
+            now,
+            false,
+            4096,
+            &test_cookie_secret(),
+            test_client_ip(),
+        );
         assert!(Message::parse(&with_do).unwrap().header.ad());
 
         do_features.dnssec_ok = false;
-        let without_do_or_ad =
-            assemble_response(1, &wire, &do_features, &resolved, now, false, 4096);
+        let without_do_or_ad = assemble_response(
+            1,
+            &wire,
+            &do_features,
+            &resolved,
+            now,
+            false,
+            4096,
+            &test_cookie_secret(),
+            test_client_ip(),
+        );
         assert!(!Message::parse(&without_do_or_ad).unwrap().header.ad());
 
         // Unvalidated never produces AD=1 regardless of requester flags.
@@ -1120,6 +1440,8 @@ mod tests {
             now,
             false,
             4096,
+            &test_cookie_secret(),
+            test_client_ip(),
         );
         assert!(!Message::parse(&unvalidated_response).unwrap().header.ad());
     }
@@ -1135,8 +1457,17 @@ mod tests {
         let wire = question_wire("example.com", A_QTYPE, IN_QCLASS);
 
         let checking_enabled = features(false);
-        let servfail_response =
-            assemble_response(1, &wire, &checking_enabled, &resolved, now, false, 4096);
+        let servfail_response = assemble_response(
+            1,
+            &wire,
+            &checking_enabled,
+            &resolved,
+            now,
+            false,
+            4096,
+            &test_cookie_secret(),
+            test_client_ip(),
+        );
         let servfail_parsed = Message::parse(&servfail_response).unwrap();
         assert_eq!(
             servfail_parsed.header.r_code(),
@@ -1146,8 +1477,17 @@ mod tests {
 
         let mut checking_disabled = features(false);
         checking_disabled.checking_disabled = true;
-        let served_response =
-            assemble_response(1, &wire, &checking_disabled, &resolved, now, false, 4096);
+        let served_response = assemble_response(
+            1,
+            &wire,
+            &checking_disabled,
+            &resolved,
+            now,
+            false,
+            4096,
+            &test_cookie_secret(),
+            test_client_ip(),
+        );
         let served_parsed = Message::parse(&served_response).unwrap();
         assert_eq!(served_parsed.header.r_code(), ResponseCode::NoError as u8);
         assert_eq!(served_parsed.answers.len(), 1);
@@ -1222,6 +1562,8 @@ mod tests {
             now,
             false,
             4096,
+            &test_cookie_secret(),
+            test_client_ip(),
         );
         let parsed = Message::parse(&nxdomain_response).unwrap();
         assert_eq!(parsed.header.r_code(), ResponseCode::NxDomain as u8);
@@ -1238,6 +1580,8 @@ mod tests {
             now,
             false,
             4096,
+            &test_cookie_secret(),
+            test_client_ip(),
         );
         assert_eq!(
             Message::parse(&nodata_response).unwrap().header.r_code(),
@@ -1276,6 +1620,8 @@ mod tests {
             now,
             false,
             4096,
+            &test_cookie_secret(),
+            test_client_ip(),
         );
         let servfail_parsed = Message::parse(&servfail_response).unwrap();
         assert_eq!(
@@ -1296,6 +1642,8 @@ mod tests {
             now,
             false,
             4096,
+            &test_cookie_secret(),
+            test_client_ip(),
         );
         let served_parsed = Message::parse(&served_response).unwrap();
         assert_eq!(
@@ -1330,6 +1678,8 @@ mod tests {
             now,
             false,
             4096,
+            &test_cookie_secret(),
+            test_client_ip(),
         );
         let servfail_parsed = Message::parse(&servfail_response).unwrap();
         assert_eq!(
@@ -1350,6 +1700,8 @@ mod tests {
             now,
             false,
             4096,
+            &test_cookie_secret(),
+            test_client_ip(),
         );
         let served_parsed = Message::parse(&served_response).unwrap();
         assert_eq!(
@@ -1388,6 +1740,8 @@ mod tests {
             now,
             false,
             4096,
+            &test_cookie_secret(),
+            test_client_ip(),
         );
         let parsed = Message::parse(&response).unwrap();
 
@@ -1479,6 +1833,8 @@ mod tests {
             now,
             false,
             4096,
+            &test_cookie_secret(),
+            test_client_ip(),
         );
         let parsed = Message::parse(&response).unwrap();
 
@@ -1588,6 +1944,8 @@ mod tests {
             now,
             false,
             4096,
+            &test_cookie_secret(),
+            test_client_ip(),
         );
         let without_do_parsed = Message::parse(&without_do).unwrap();
         assert_eq!(
@@ -1610,6 +1968,8 @@ mod tests {
             now,
             false,
             4096,
+            &test_cookie_secret(),
+            test_client_ip(),
         );
         let with_do_parsed = Message::parse(&with_do).unwrap();
         assert_eq!(with_do_parsed.answers.len(), 1);
@@ -1658,6 +2018,8 @@ mod tests {
             now,
             true,
             4096,
+            &test_cookie_secret(),
+            test_client_ip(),
         );
         let parsed = Message::parse(&response).unwrap();
 
@@ -1708,6 +2070,8 @@ mod tests {
             now,
             false,
             700,
+            &test_cookie_secret(),
+            test_client_ip(),
         );
         let parsed = Message::parse(&response).unwrap();
 
@@ -1734,6 +2098,8 @@ mod tests {
             now,
             false,
             4096,
+            &test_cookie_secret(),
+            test_client_ip(),
         );
         let no_edns_parsed = Message::parse(&no_edns_response).unwrap();
         assert_eq!(no_edns_parsed.header.ar_count, 0);
@@ -1763,6 +2129,8 @@ mod tests {
             now,
             false,
             4096,
+            &test_cookie_secret(),
+            test_client_ip(),
         );
         assert!(
             Message::parse(&cd_response).unwrap().header.cd(),
@@ -1778,6 +2146,8 @@ mod tests {
             now,
             false,
             4096,
+            &test_cookie_secret(),
+            test_client_ip(),
         );
         assert!(
             !Message::parse(&no_cd_response).unwrap().header.cd(),
@@ -1811,6 +2181,8 @@ mod tests {
             now,
             false,
             4096,
+            &test_cookie_secret(),
+            test_client_ip(),
         );
         assert!(
             Message::parse(&with_do).unwrap().header.ad(),
@@ -1827,6 +2199,8 @@ mod tests {
             now,
             false,
             4096,
+            &test_cookie_secret(),
+            test_client_ip(),
         );
         assert!(
             !Message::parse(&without_do_or_ad).unwrap().header.ad(),
@@ -1849,6 +2223,8 @@ mod tests {
             now,
             false,
             4096,
+            &test_cookie_secret(),
+            test_client_ip(),
         );
         assert!(
             !Message::parse(&unvalidated_response).unwrap().header.ad(),
@@ -1886,6 +2262,8 @@ mod tests {
             now,
             false,
             4096,
+            &test_cookie_secret(),
+            test_client_ip(),
         );
         assert!(
             Message::parse(&secure_chain_response).unwrap().header.ad(),
@@ -1919,6 +2297,8 @@ mod tests {
             now,
             false,
             4096,
+            &test_cookie_secret(),
+            test_client_ip(),
         );
         assert!(
             !Message::parse(&mixed_response).unwrap().header.ad(),

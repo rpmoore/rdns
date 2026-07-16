@@ -20,11 +20,6 @@
 //! plan's non-goals. It only extracts the client cookie from a query and
 //! computes a fresh server cookie to attach to every response.
 
-// This module is intentionally unwired until later plan sections
-// (cache-admission narrowing, QueryFeatures threading, OPT-record
-// serialization) consume its public items -- allow dead_code until then.
-#![allow(dead_code)]
-
 use std::net::IpAddr;
 use std::time::SystemTime;
 
@@ -36,7 +31,11 @@ const COOKIE_OPTION_CODE: u16 = 10;
 
 /// The 8-byte client cookie extracted from an incoming query's COOKIE
 /// option.
-pub(crate) type ClientCookie = [u8; 8];
+///
+/// `pub`, not `pub(crate)`: it appears in `QueryFeatures.client_cookie`, a
+/// public field on a public struct, so it must be nameable from outside
+/// this crate too.
+pub type ClientCookie = [u8; 8];
 
 /// The resolver's one random, process-lifetime server-cookie secret
 /// (RFC 9018 §4.2: SHOULD be >= 128 bits). Constructed once at process
@@ -44,17 +43,24 @@ pub(crate) type ClientCookie = [u8; 8];
 /// side-effect-holding value. Held behind an `Arc<CookieSecret>` at call
 /// sites that need it, exactly like `Arc<dyn Clock>`.
 ///
+/// `pub`, not `pub(crate)`: `src/main.rs` (a separate binary crate) must
+/// construct one via `generate()` and hand it to
+/// `ResolveQuery::with_cookie_secret`, mirroring how it constructs
+/// `SystemClock` -- re-exported at `crate::resolver::CookieSecret` for that
+/// call site. Every other item in this module stays `pub(crate)`: nothing
+/// else needs to cross the crate boundary.
+///
 /// Deliberately does not derive/implement `Debug`, `Display`, or
 /// `Serialize` -- doing so would risk printing or serializing the raw
 /// secret bytes.
-pub(crate) struct CookieSecret {
+pub struct CookieSecret {
     bytes: [u8; 16],
 }
 
 impl CookieSecret {
     /// Generates a fresh, CSPRNG-backed secret. Called exactly once, in
     /// `src/main.rs`, alongside where `SystemClock` is constructed.
-    pub(crate) fn generate() -> Self {
+    pub fn generate() -> Self {
         let mut bytes = [0u8; 16];
         rand::rng().fill_bytes(&mut bytes);
         CookieSecret { bytes }
