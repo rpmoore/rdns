@@ -455,6 +455,22 @@ no other files touched for the code itself.
   the new field per `AGENTS.md`'s Knowledge Bundle requirement. Kept brief —
   the full auto-refresh design doc lands in section-07.
 
+**Follow-up deviation (from section-02's implementation):** `LeakRate` was
+originally defined here as `pub(crate) struct LeakRate` in `shard.rs`, as
+planned. When section-02 implemented `RefreshConfig`, it discovered its own
+plan text independently specified a second, conflicting `pub struct
+LeakRate` in `config::mod` — the two section plans, written by
+non-communicating parallel subagents, each assumed the other side would
+reference their definition. Resolved in section-02's diff: `LeakRate` now
+lives once, as `pub struct LeakRate` in `config::mod` (required since it
+must be `pub` to appear on `RefreshConfig`'s public field), and this file
+imports it via `use crate::config::LeakRate;` instead of defining its own
+copy. See `section-02-refresh-config.md`'s Implementation Notes for the full
+rationale. Everything else in this section (`PopularityBucket`, the
+`ShardState.popularity` field, removal wiring, `record_popularity_hit`,
+the 4 `lookup_hop` call sites) is unaffected — only `LeakRate`'s definition
+site moved.
+
 **Test coverage: 32 tests in `shard.rs`'s test module** (up from the plan's
 minimum ask of one end-to-end wiring test). Beyond the 9 listed in the original
 plan, code review prompted 4 more: `lookup_hop_cname_hop_hit_increments_popularity_level`,

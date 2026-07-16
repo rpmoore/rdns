@@ -34,6 +34,7 @@ use super::entry::{
     DomainNegativeEntries, DomainRecordSets, NegativeEntry, NegativeKey, RRsetEntry,
 };
 use super::lru::ShardLru;
+use crate::config::LeakRate;
 use crate::protocol::RecordData;
 
 const CNAME_RECORD_TYPE: u16 = 5;
@@ -44,17 +45,6 @@ const DEFAULT_POPULARITY_LEAK_RATE: LeakRate = LeakRate {
 };
 const DEFAULT_POPULARITY_HIT_INCREMENT: u32 = 1;
 const DEFAULT_POPULARITY_BUCKET_CAPACITY: u32 = 10;
-
-/// Leak rate for a `PopularityBucket`: drains `units` worth of level per
-/// `per` elapsed real time. Defined here (cache layer), not in `config`,
-/// because the leaky-bucket concept itself belongs to the cache; a later
-/// section's `RefreshConfig` (`src/config/mod.rs`) references this same
-/// type by name for its `leak_rate` field.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct LeakRate {
-    pub(crate) units: u32,
-    pub(crate) per: Duration,
-}
 
 /// Per-domain leaky-bucket popularity tracker. Created the first time a
 /// domain is stored (mirroring `ShardLru`'s own on-first-store creation),
