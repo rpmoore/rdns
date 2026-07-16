@@ -31,13 +31,13 @@ use rdns::delivery::metrics_http::MetricsServer;
 use rdns::delivery::upstream::{ForwardingResolutionBackend, RecursiveAuthorityTransportClient};
 use rdns::resolver::{
     BackendHealth, BackendRootHintsStatus, BackendSnapshot, BackendStatus, BasicResponseFactory,
-    CacheTtlPolicy, ChannelQueryEventSink, Clock, DnssecValidationStatus, DomainDnsCache,
-    DomainName, InMemoryLocalDnsEntries, InMemoryQueryEventStore, InMemoryQueryEventStoreConfig,
-    InMemorySuspiciousLookupClassifier, InMemorySuspiciousLookupClassifierConfig, LocalDnsEntry,
-    MetricsSink, NoopPolicyEvaluator, QueryEventRecordResult, QueryEventSink, QueryEventV1,
-    RecursiveResolutionBackend, RecursiveResolverConfig, RecursiveRootHint,
-    ResolutionMode as ResolverResolutionMode, ResolveQuery, ResolverMetric, ShardedDnsCache,
-    StandardProtocolCodec, SystemClock,
+    CacheTtlPolicy, ChannelQueryEventSink, Clock, CookieSecret, DnssecValidationStatus,
+    DomainDnsCache, DomainName, InMemoryLocalDnsEntries, InMemoryQueryEventStore,
+    InMemoryQueryEventStoreConfig, InMemorySuspiciousLookupClassifier,
+    InMemorySuspiciousLookupClassifierConfig, LocalDnsEntry, MetricsSink, NoopPolicyEvaluator,
+    QueryEventRecordResult, QueryEventSink, QueryEventV1, RecursiveResolutionBackend,
+    RecursiveResolverConfig, RecursiveRootHint, ResolutionMode as ResolverResolutionMode,
+    ResolveQuery, ResolverMetric, ShardedDnsCache, StandardProtocolCodec, SystemClock,
 };
 use tokio::task::{JoinError, JoinSet};
 use tracing::{error, info, warn};
@@ -127,6 +127,7 @@ async fn main() -> io::Result<()> {
         .map(|recursive| recursive.max_cname_restarts)
         .unwrap_or(8);
     let clock: Arc<dyn Clock> = Arc::new(SystemClock);
+    let cookie_secret = Arc::new(CookieSecret::generate());
     let resolver = Arc::new(
         ResolveQuery::with_cache_policy_and_backend_snapshot(
             Arc::new(StandardProtocolCodec::new(config.max_udp_payload_size)),
@@ -145,7 +146,8 @@ async fn main() -> io::Result<()> {
         )
         .with_max_chain_depth(max_chain_depth)
         .with_single_flight_shard_count(cache.shard_count())
-        .with_chaos_config(config.chaos.clone()),
+        .with_chaos_config(config.chaos.clone())
+        .with_cookie_secret(cookie_secret),
     );
 
     let sighup_task =

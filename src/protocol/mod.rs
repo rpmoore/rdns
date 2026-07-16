@@ -21,6 +21,8 @@ use std::time::Duration;
 use bytes::Bytes;
 use serde::Serialize;
 
+pub(crate) mod edns_cookie;
+
 pub(crate) const DNS_HEADER_LEN: usize = 12;
 pub const DNS_DEFAULT_UDP_PAYLOAD_SIZE: usize = 512;
 const MAX_LABEL_LEN: usize = 63;
@@ -625,7 +627,7 @@ pub fn build_badvers_response(
     let question_count = u16::from(!request.questions.is_empty());
     let dnssec_ok = request.edns.as_ref().is_some_and(|edns| edns.dnssec_ok);
     let udp_payload_size = configured_max_udp_payload_size.min(u16::MAX as usize) as u16;
-    let opt = build_opt_record_with_extended_rcode(udp_payload_size, dnssec_ok, 1);
+    let opt = build_opt_record_with_extended_rcode(udp_payload_size, dnssec_ok, 1, Vec::new());
 
     write_message_header(
         &mut response,
@@ -1244,7 +1246,24 @@ fn from_hex(hex: &str) -> Vec<u8> {
 /// `Message` to read from at cache-hit serve time) so both build the exact
 /// same OPT shape rather than duplicating this construction.
 pub(crate) fn build_opt_record(udp_payload_size: u16, dnssec_ok: bool) -> Record {
-    build_opt_record_with_extended_rcode(udp_payload_size, dnssec_ok, 0)
+    build_opt_record_with_extended_rcode(udp_payload_size, dnssec_ok, 0, Vec::new())
+}
+
+/// `build_opt_record`, with a pre-built `options` TLV byte vector (e.g. a
+/// COOKIE option from `crate::protocol::edns_cookie::build_cookie_option`)
+/// attached to the OPT record's RDATA instead of always building an
+/// options-less OPT. Used by `message_edns_opt_record_with_cookie` (backing
+/// `resolver::mirrored_client_opt_record_with_cookie`, the cache-miss/
+/// recursive path) once a client cookie needs echoing back to the
+/// requester there -- `resolver::cache::assemble::requester_opt_record`
+/// (cache-hit path) attaches a cookie by building via `build_opt_record`
+/// and mutating the resulting `EdnsInfo.options` field in place instead.
+pub(crate) fn build_opt_record_with_options(
+    udp_payload_size: u16,
+    dnssec_ok: bool,
+    options: Vec<u8>,
+) -> Record {
+    build_opt_record_with_extended_rcode(udp_payload_size, dnssec_ok, 0, options)
 }
 
 /// `build_opt_record`, with an explicit extended-RCODE byte (the upper 8
@@ -1258,6 +1277,7 @@ fn build_opt_record_with_extended_rcode(
     udp_payload_size: u16,
     dnssec_ok: bool,
     extended_rcode: u8,
+    options: Vec<u8>,
 ) -> Record {
     let flags = if dnssec_ok { EDNS_DO_FLAG } else { 0 };
     let ttl = (u32::from(extended_rcode) << 24) | u32::from(flags);
@@ -1272,7 +1292,7 @@ fn build_opt_record_with_extended_rcode(
             version: 0,
             flags,
             dnssec_ok,
-            options: Vec::new(),
+            options,
         }),
     }
 }
@@ -1300,6 +1320,45 @@ pub(crate) fn message_edns_opt_record(
     let edns = message.edns.as_ref()?;
     let udp_payload_size = responder_udp_payload_size.min(u16::MAX as usize) as u16;
     Some(build_opt_record(udp_payload_size, edns.dnssec_ok))
+}
+
+/// `message_edns_opt_record`, plus RFC 9018 server-cookie construction: if
+/// `message`'s EDNS options carry a well-formed RFC 7873 client cookie
+/// (`edns_cookie::parse_cookie_option`), the returned OPT record's options
+/// carry a freshly-built COOKIE option (`edns_cookie::build_server_cookie` +
+/// `build_cookie_option`) echoing that client cookie back with a fresh
+/// server cookie, instead of the options-less OPT `message_edns_opt_record`
+/// always builds.
+///
+/// A separate function rather than widening `message_edns_opt_record`
+/// in place: that function also backs `build_question_response` and
+/// `build_txt_answer_response` (the statically-configured local-entry
+/// response path), which section 05 of the EDNS-cookie plan explicitly
+/// leaves untouched. Used by `resolver::mirrored_client_opt_record_with_cookie`
+/// on the cache-miss/recursive path, mirroring
+/// `resolver::cache::assemble::requester_opt_record` on the cache-hit path.
+pub(crate) fn message_edns_opt_record_with_cookie(
+    message: &Message,
+    responder_udp_payload_size: usize,
+    cookie_secret: &edns_cookie::CookieSecret,
+    client_ip: std::net::IpAddr,
+    now: std::time::SystemTime,
+) -> Option<Record> {
+    let edns = message.edns.as_ref()?;
+    let udp_payload_size = responder_udp_payload_size.min(u16::MAX as usize) as u16;
+    match edns_cookie::parse_cookie_option(&edns.options) {
+        Some(client_cookie) => {
+            let server_cookie =
+                edns_cookie::build_server_cookie(cookie_secret, client_cookie, client_ip, now);
+            let options = edns_cookie::build_cookie_option(client_cookie, server_cookie);
+            Some(build_opt_record_with_options(
+                udp_payload_size,
+                edns.dnssec_ok,
+                options,
+            ))
+        }
+        None => Some(build_opt_record(udp_payload_size, edns.dnssec_ok)),
+    }
 }
 
 /// Encodes one arbitrary resource record to wire bytes: owner name, type,
@@ -1333,7 +1392,20 @@ pub(crate) fn write_record(
     write_u16(out, 0);
     let rdata_start = out.len();
     write_rdata(out, compressor, rdata);
-    let rdlength = (out.len() - rdata_start) as u16;
+    let rdata_len = out.len() - rdata_start;
+    // RDLENGTH is a 16-bit wire field -- silently truncating a larger
+    // RDATA blob here would both misreport its length and leave the
+    // oversized bytes on the wire past that (wrong) length, corrupting
+    // every record serialized after it. Every `RecordData` variant's own
+    // construction is expected to stay well under this bound (e.g.
+    // `build_opt_record_with_options`'s COOKIE-option caller always builds
+    // a fixed 28-byte options blob), so this is a debug-only invariant
+    // check, not a runtime validation of untrusted input.
+    debug_assert!(
+        rdata_len <= usize::from(u16::MAX),
+        "RDATA is {rdata_len} bytes, exceeding the 16-bit RDLENGTH field -- would silently truncate on the wire"
+    );
+    let rdlength = rdata_len as u16;
     out[rdlength_pos..rdlength_pos + 2].copy_from_slice(&rdlength.to_be_bytes());
 }
 
@@ -4900,6 +4972,34 @@ mod tests {
         match parse_test_record(&bytes).record {
             RecordData::TXT(parsed) => assert_eq!(parsed, text),
             other => panic!("expected TXT, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn build_opt_record_with_options_round_trips_cookie_option_bytes() {
+        let secret = edns_cookie::CookieSecret::generate();
+        let client_cookie: edns_cookie::ClientCookie = [1, 2, 3, 4, 5, 6, 7, 8];
+        let client_ip = std::net::IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1));
+        let now = std::time::SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+        let server_cookie =
+            edns_cookie::build_server_cookie(&secret, client_cookie, client_ip, now);
+        let options = edns_cookie::build_cookie_option(client_cookie, server_cookie);
+
+        let opt = build_opt_record_with_options(1232, true, options.clone());
+        let mut bytes = Vec::new();
+        write_opt_record(&mut bytes, &opt);
+
+        let parsed = parse_test_record(&bytes);
+        assert_eq!(parsed.rtype, OPT_RECORD_TYPE);
+        match parsed.record {
+            RecordData::OPT(info) => {
+                assert_eq!(info.options, options);
+                assert_eq!(info.udp_payload_size, 1232);
+                assert!(info.dnssec_ok);
+                assert_eq!(info.extended_rcode, 0);
+                assert_eq!(info.version, 0);
+            }
+            other => panic!("expected OPT, got {other:?}"),
         }
     }
 
