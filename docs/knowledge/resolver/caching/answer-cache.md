@@ -190,10 +190,15 @@ unconditionally. This is one of RFC 7873's own compliant behaviors (§5.2.3/
 corner cut — but it means this implementation gains **no**
 anti-off-path-spoofing value from DNS Cookies. That protection comes from
 the incoming-cookie validation/rejection path this implementation
-deliberately does not build (no BADCOOKIE, no server-cookie verification, no
-secret rotation — see `docs/plans/edns_cookie_cache/claude-plan.md`'s
-Non-goals). If you're checking whether rdns has DNS Cookie *protection*: no
-— it has Cookie *echo/interop* only.
+deliberately does not build — see the module doc comment at
+`src/protocol/edns_cookie.rs:15-21` ("never validates an incoming server
+cookie's hash or timestamp") and `parse_cookie_option`
+(`src/protocol/edns_cookie.rs:113-131`, whose own doc comment repeats the
+same non-goal at the one function that actually reads an incoming cookie);
+the full non-goals list (no BADCOOKIE, no server-cookie verification, no
+secret rotation) is in
+`docs/plans/edns_cookie_cache/claude-plan.md`. If you're checking whether
+rdns has DNS Cookie *protection*: no — it has Cookie *echo/interop* only.
 
 # Concurrency model, in one sentence
 
