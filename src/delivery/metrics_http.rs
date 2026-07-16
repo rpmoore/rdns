@@ -166,7 +166,10 @@ async fn handle_request(
     if req.method() != Method::GET || req.uri().path() != "/metrics" {
         return Ok(Response::builder()
             .status(StatusCode::NOT_FOUND)
-            .body(Full::new(Bytes::new()))
+            .header("Content-Type", "text/plain; charset=utf-8")
+            .body(Full::new(Bytes::from_static(
+                b"404 Not Found: metrics are served at GET /metrics\n",
+            )))
             .expect("static response is well-formed"));
     }
 
@@ -253,6 +256,7 @@ mod tests {
 
         let response = http_get(addr, "/nope").await;
         assert!(response.starts_with("HTTP/1.1 404"));
+        assert!(response.contains("404 Not Found: metrics are served at GET /metrics"));
 
         shutdown_tx.send(()).unwrap();
         task.await.unwrap().unwrap();
