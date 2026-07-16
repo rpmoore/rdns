@@ -3578,6 +3578,127 @@ pub struct RefreshJob {
     qclass: u16,
 }
 
+/// Spawns a fixed pool of `worker_count` tasks that share one bounded
+/// `receiver`, each dequeuing and processing `RefreshJob`s. Mirrors
+/// `spawn_sighup_reload_task`'s (`main.rs:579`) shutdown convention exactly:
+/// no internal shutdown signal, no `select!` -- the caller holds the
+/// returned `JoinHandle`s and `.abort()`s them at teardown.
+///
+/// `Receiver` is single-consumer, so it's wrapped in
+/// `Arc<tokio::sync::Mutex<_>>` and shared across the pool. This serializes
+/// only the dequeue point (one worker parks on `recv()` at a time), not job
+/// *execution* -- each dequeued job is spawned as its own task (see below),
+/// so total concurrency stays bounded at `worker_count` without a true MPMC
+/// channel and its accompanying new dependency.
+pub fn spawn_refresh_worker_pool(
+    resolver: Arc<ResolveQuery>,
+    receiver: tokio::sync::mpsc::Receiver<RefreshJob>,
+    worker_count: usize,
+) -> Vec<tokio::task::JoinHandle<()>> {
+    let receiver = Arc::new(tokio::sync::Mutex::new(receiver));
+    (0..worker_count)
+        .map(|_| {
+            tokio::spawn(refresh_worker_loop(
+                Arc::clone(&resolver),
+                Arc::clone(&receiver),
+            ))
+        })
+        .collect()
+}
+
+/// One worker's dequeue-process-repeat loop. A panic inside a given job's
+/// processing (`process_refresh_job`) is isolated by spawning that job as
+/// its own task and awaiting its `JoinHandle` before dequeuing the next job
+/// -- deliberately not `futures::FutureExt::catch_unwind` (this repo has no
+/// `futures` dependency; adding one solely for this would contradict the
+/// same "add dependencies conservatively" reasoning already used to reject
+/// a true MPMC channel above). A panicked job fails only its own
+/// `JoinHandle` (`JoinError::is_panic()`); this loop, and thus this worker,
+/// keeps running.
+///
+/// Known gap, harmless today: `.abort()`ing this outer loop task (at
+/// shutdown, see `main.rs`) while it's parked in `handle.await` only
+/// cancels the loop task itself -- it does not abort the inner spawned job
+/// task, which is left detached and keeps running unsupervised. This is a
+/// no-op concern while `process_refresh_job` is a no-op stub, but section-06
+/// (real fetch/store I/O per job) should revisit whether an in-flight job
+/// needs to be cancelled too, or whether letting it finish in the
+/// background during shutdown is acceptable.
+async fn refresh_worker_loop(
+    resolver: Arc<ResolveQuery>,
+    receiver: Arc<tokio::sync::Mutex<tokio::sync::mpsc::Receiver<RefreshJob>>>,
+) {
+    loop {
+        let job = {
+            let mut receiver = receiver.lock().await;
+            receiver.recv().await
+        };
+        let Some(job) = job else {
+            break; // channel closed (all senders dropped) -- exit cleanly.
+        };
+        let task_resolver = Arc::clone(&resolver);
+        let handle = tokio::spawn(async move { process_refresh_job(task_resolver, job).await });
+        if let Err(join_error) = handle.await
+            && join_error.is_panic()
+        {
+            tracing::error!(?join_error, "refresh job panicked");
+        }
+    }
+}
+
+/// Test-only injectable job handler, so worker-pool tests can exercise the
+/// *real* `spawn_refresh_worker_pool`/`refresh_worker_loop` (dequeue, spawn,
+/// await, panic isolation) instead of a hand-rolled lookalike, without
+/// section-06's real fetch/store logic existing yet. `thread_local` is safe
+/// here specifically because these tests use the default `#[tokio::test]`
+/// current-thread runtime flavor (never `flavor = "multi_thread"`): the
+/// whole runtime, including every spawned task, runs on the one OS thread
+/// that called `block_on`, so a handler set before spawning is visible to
+/// every task the pool spawns on that same thread. Each worker-pool test
+/// explicitly sets (or clears) this at its own start, since the test
+/// harness's thread pool can reuse an OS thread across different test
+/// functions.
+#[cfg(test)]
+type TestJobHandler = std::sync::Arc<
+    dyn Fn(RefreshJob) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>
+        + Send
+        + Sync,
+>;
+
+#[cfg(test)]
+thread_local! {
+    static TEST_JOB_HANDLER: std::cell::RefCell<Option<TestJobHandler>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+fn set_test_job_handler(handler: TestJobHandler) {
+    TEST_JOB_HANDLER.with(|cell| *cell.borrow_mut() = Some(handler));
+}
+
+#[cfg(test)]
+fn clear_test_job_handler() {
+    TEST_JOB_HANDLER.with(|cell| *cell.borrow_mut() = None);
+}
+
+/// Processes one dequeued job. **This section's implementation is a no-op
+/// stub in production** -- real epoch-capture, eligibility recheck,
+/// singleflight-based fetch, and cache-store logic is added in section-06.
+/// Keeping this as an explicit stub (rather than deferring the whole
+/// function's existence to section-06) is what lets this section's
+/// worker-pool tests (panic isolation, concurrency bound, sequential-per-
+/// worker dequeue, abort shutdown) run against the real pool mechanics
+/// without section-06's fetch logic existing yet, via `TEST_JOB_HANDLER`.
+async fn process_refresh_job(_resolver: Arc<ResolveQuery>, _job: RefreshJob) {
+    #[cfg(test)]
+    {
+        let handler = TEST_JOB_HANDLER.with(|cell| cell.borrow().clone());
+        if let Some(handler) = handler {
+            handler(_job).await;
+        }
+    }
+}
+
 pub struct ResolveQuery {
     protocol: Arc<dyn ProtocolCodec>,
     policy: Arc<dyn PolicyEvaluator>,
@@ -8287,6 +8408,11 @@ pub enum ResolverMetric {
     /// no live receiver until `main.rs` wires one up), so the job was
     /// dropped. Best-effort by design; no correctness impact.
     RefreshQueueFull,
+    /// A worker's refetch completed and the entry was re-stored
+    /// (section-06).
+    RefreshSucceeded,
+    /// A worker's refetch failed for any reason (section-06); no retry.
+    RefreshFailed,
 }
 
 #[cfg(test)]
@@ -8295,7 +8421,7 @@ mod tests {
     use std::sync::Mutex;
     use std::sync::mpsc as std_mpsc;
     use std::thread;
-    use tokio::sync::Notify;
+    use tokio::sync::{Barrier, Notify};
 
     use crate::config::CacheConfig;
     use crate::protocol::{EdnsInfo, Header, Question, Record, build_a_block_response};
@@ -10041,6 +10167,166 @@ mod tests {
             .try_recv()
             .expect("first hint should have been enqueued");
         assert_eq!(job.domain, "first.example.com");
+    }
+
+    // Worker pool tests: section-05-worker-pool-metrics.
+    //
+    // `process_refresh_job` is a fixed no-op stub in this section (real
+    // behavior lands in section-06). Rather than a hand-rolled lookalike of
+    // `refresh_worker_loop`, these tests drive the *real*
+    // `spawn_refresh_worker_pool`/`refresh_worker_loop`/`process_refresh_job`
+    // via the `TEST_JOB_HANDLER` thread-local seam, so a real bug in the
+    // production dequeue/spawn/await/panic-isolation path would actually be
+    // caught here.
+
+    fn test_job(domain: &str) -> RefreshJob {
+        RefreshJob {
+            domain: domain.to_string(),
+            qtype: 1,
+            qclass: 1,
+        }
+    }
+
+    fn resolver_for_worker_pool_tests() -> Arc<ResolveQuery> {
+        Arc::new(resolver_for_enqueue_tests(Arc::new(
+            RecordingMetrics::default(),
+        )))
+    }
+
+    #[tokio::test]
+    async fn worker_processes_jobs_sequentially_per_worker() {
+        let (events_tx, mut events_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+        let gate = Arc::new(Notify::new());
+        let gate_for_handler = Arc::clone(&gate);
+        set_test_job_handler(std::sync::Arc::new(move |job: RefreshJob| {
+            let events_tx = events_tx.clone();
+            let gate = Arc::clone(&gate_for_handler);
+            Box::pin(async move {
+                events_tx.send(format!("start:{}", job.domain)).unwrap();
+                if job.domain == "first" {
+                    gate.notified().await;
+                }
+                events_tx.send(format!("done:{}", job.domain)).unwrap();
+            })
+        }));
+
+        let (sender, receiver) = mpsc::channel(4);
+        sender.try_send(test_job("first")).unwrap();
+        sender.try_send(test_job("second")).unwrap();
+        drop(sender); // lets the loop exit once both jobs are drained
+
+        let handles = spawn_refresh_worker_pool(resolver_for_worker_pool_tests(), receiver, 1);
+
+        assert_eq!(events_rx.recv().await.unwrap(), "start:first");
+        // "second" must not start until "first"'s spawned task has been
+        // awaited to completion -- a single worker dequeues sequentially.
+        assert!(events_rx.try_recv().is_err());
+
+        gate.notify_one();
+        assert_eq!(events_rx.recv().await.unwrap(), "done:first");
+        assert_eq!(events_rx.recv().await.unwrap(), "start:second");
+        assert_eq!(events_rx.recv().await.unwrap(), "done:second");
+
+        for handle in handles {
+            handle.await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn worker_panic_isolated_via_joinhandle() {
+        let (events_tx, mut events_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+        set_test_job_handler(std::sync::Arc::new(move |job: RefreshJob| {
+            let events_tx = events_tx.clone();
+            Box::pin(async move {
+                events_tx.send(format!("start:{}", job.domain)).unwrap();
+                if job.domain == "boom" {
+                    panic!("simulated job panic");
+                }
+                events_tx.send(format!("done:{}", job.domain)).unwrap();
+            })
+        }));
+
+        let (sender, receiver) = mpsc::channel(4);
+        sender.try_send(test_job("boom")).unwrap();
+        sender.try_send(test_job("safe")).unwrap();
+        drop(sender);
+
+        let handles = spawn_refresh_worker_pool(resolver_for_worker_pool_tests(), receiver, 1);
+
+        assert_eq!(events_rx.recv().await.unwrap(), "start:boom");
+        // The real worker loop must survive "boom"'s panic (isolated to its
+        // own spawned task/JoinHandle) and go on to dequeue "safe".
+        assert_eq!(events_rx.recv().await.unwrap(), "start:safe");
+        assert_eq!(events_rx.recv().await.unwrap(), "done:safe");
+
+        for handle in handles {
+            handle.await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn worker_pool_bounds_total_concurrency_to_worker_count() {
+        const WORKER_COUNT: usize = 3;
+        let (events_tx, mut events_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+        // A barrier sized to exactly `WORKER_COUNT` only ever completes if
+        // all `WORKER_COUNT` jobs are genuinely running concurrently --
+        // proving the pool both reaches and never exceeds this bound (if
+        // fewer ran concurrently, the barrier wait would hang, which the
+        // timeout below turns into a clear test failure instead).
+        let barrier = Arc::new(Barrier::new(WORKER_COUNT));
+        set_test_job_handler(std::sync::Arc::new(move |job: RefreshJob| {
+            let events_tx = events_tx.clone();
+            let barrier = Arc::clone(&barrier);
+            Box::pin(async move {
+                barrier.wait().await;
+                events_tx.send(format!("done:{}", job.domain)).unwrap();
+            })
+        }));
+
+        let (sender, receiver) = mpsc::channel(WORKER_COUNT);
+        for i in 0..WORKER_COUNT {
+            sender.try_send(test_job(&format!("job-{i}"))).unwrap();
+        }
+        drop(sender);
+
+        let handles =
+            spawn_refresh_worker_pool(resolver_for_worker_pool_tests(), receiver, WORKER_COUNT);
+
+        tokio::time::timeout(Duration::from_secs(2), async {
+            for _ in 0..WORKER_COUNT {
+                events_rx.recv().await.unwrap();
+            }
+        })
+        .await
+        .expect("all jobs should complete concurrently well within the timeout");
+
+        for handle in handles {
+            handle.await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn worker_pool_shutdown_via_abort() {
+        // Explicitly clears the test hook (rather than relying on it never
+        // having been set) since the test harness's thread pool can reuse
+        // an OS thread across different test functions, and this test
+        // relies on the true production no-op `process_refresh_job` -- not
+        // whatever handler a previous test on this same thread happened to
+        // leave behind.
+        clear_test_job_handler();
+
+        let (_sender, receiver) = mpsc::channel::<RefreshJob>(4);
+        let handles = spawn_refresh_worker_pool(resolver_for_worker_pool_tests(), receiver, 2);
+        for handle in &handles {
+            handle.abort();
+        }
+        for handle in handles {
+            let result = handle.await;
+            assert!(
+                result.is_ok() || result.unwrap_err().is_cancelled(),
+                "aborted worker task should join cleanly (Ok or a cancelled JoinError)"
+            );
+        }
     }
 
     struct ClientScopedResponsePolicy {

@@ -235,6 +235,22 @@ yet addressed). This is the foundation for an in-progress auto-refresh feature
 (proactively refetching popular, near-expiry entries); see
 `docs/plans/auto_refresh/` for the full design as later pieces land.
 
+# Refresh worker pool
+
+A fixed pool of `RefreshConfig.worker_count` tasks (`spawn_refresh_worker_pool`,
+`src/resolver/mod.rs`) processes background refresh jobs enqueued from the
+cache-hit path. All workers share one bounded `tokio::sync::mpsc` channel via
+`Arc<tokio::sync::Mutex<Receiver<RefreshJob>>>` — this serializes only the
+dequeue point (one worker parks on `recv()` at a time), not job execution.
+Each dequeued job runs as its own `tokio::spawn`ed task, and the worker
+`.await`s that task's `JoinHandle` before dequeuing the next job: a panic in
+one job fails only its own `JoinHandle` (inspected via `JoinError::is_panic()`
+and logged), never the worker loop itself. Shutdown has no internal signal —
+`main.rs` holds the pool's `JoinHandle`s and `.abort()`s them at teardown,
+mirroring `spawn_sighup_reload_task`'s existing convention exactly. Job
+processing itself (`process_refresh_job`) is a no-op stub until the
+fetch/store logic lands; see `docs/plans/auto_refresh/` for the full design.
+
 # See also
 
 - [cache-epoch](cache-epoch.md) — how a SIGHUP reload invalidates entries here.
