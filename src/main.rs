@@ -23,8 +23,9 @@ use opentelemetry::metrics::{Counter, Gauge, Histogram, MeterProvider, Observabl
 use opentelemetry_sdk::metrics::SdkMeterProvider;
 use prometheus::Registry;
 use rdns::config::{
-    LocalZoneConfig, MAX_LOCAL_ZONE_FILE_BYTES, ResolutionMode as ConfigResolutionMode,
-    RootHintsSource as ConfigRootHintsSource, RuntimeConfig, parse_local_zone_file,
+    LocalZoneConfig, MAX_LOCAL_ZONE_FILE_BYTES, RefreshConfig,
+    ResolutionMode as ConfigResolutionMode, RootHintsSource as ConfigRootHintsSource,
+    RuntimeConfig, parse_local_zone_file,
 };
 use rdns::delivery::dns::{TcpDnsServer, UdpDnsServer};
 use rdns::delivery::metrics_http::MetricsServer;
@@ -129,7 +130,8 @@ async fn main() -> io::Result<()> {
         .unwrap_or(8);
     let clock: Arc<dyn Clock> = Arc::new(SystemClock);
     let cookie_secret = Arc::new(CookieSecret::generate());
-    let (refresh_tx, refresh_rx) = tokio::sync::mpsc::channel(config.refresh.channel_capacity);
+    let (refresh_tx, refresh_rx) =
+        tokio::sync::mpsc::channel(refresh_channel_capacity(&config.refresh));
     let mut resolver_builder = ResolveQuery::with_cache_policy_and_backend_snapshot(
         Arc::new(StandardProtocolCodec::new(config.max_udp_payload_size)),
         Arc::clone(&cache) as Arc<dyn DomainDnsCache>,
@@ -694,6 +696,22 @@ fn spawn_refresh_workers_if_enabled(
     if enabled { spawn() } else { Vec::new() }
 }
 
+/// The capacity to construct the refresh-job `mpsc` channel with.
+/// `RuntimeConfig::validate()` only requires `channel_capacity != 0` when
+/// `refresh.enabled` (review found this loosening otherwise allows a
+/// disabled config to carry a placeholder `channel_capacity = 0`, which
+/// `tokio::sync::mpsc::channel` panics on) -- when disabled, this returns a
+/// harmless `1` instead, since the channel and its receiver are never
+/// actually wired up (`with_refresh_sender`, `spawn_refresh_workers_if_enabled`)
+/// in that case anyway.
+fn refresh_channel_capacity(refresh: &RefreshConfig) -> usize {
+    if refresh.enabled {
+        refresh.channel_capacity
+    } else {
+        1
+    }
+}
+
 fn build_backend_snapshot(
     config: &RuntimeConfig,
     metrics: Arc<dyn MetricsSink>,
@@ -1214,6 +1232,32 @@ mod tests {
             worker.abort();
             let _ = worker.await;
         }
+    }
+
+    /// Regression test for the bug code review found: `RuntimeConfig::validate()`
+    /// only requires `channel_capacity != 0` when `refresh.enabled` (a
+    /// disabled config may legitimately carry a placeholder
+    /// `channel_capacity = 0`), but `tokio::sync::mpsc::channel(0)` panics.
+    /// `refresh_channel_capacity` must substitute a harmless nonzero value
+    /// in that case rather than passing the placeholder straight through.
+    #[test]
+    fn refresh_channel_capacity_substitutes_when_disabled_with_zero_capacity() {
+        let refresh = RefreshConfig {
+            enabled: false,
+            channel_capacity: 0,
+            ..RefreshConfig::default()
+        };
+        assert_eq!(refresh_channel_capacity(&refresh), 1);
+    }
+
+    #[test]
+    fn refresh_channel_capacity_uses_configured_value_when_enabled() {
+        let refresh = RefreshConfig {
+            enabled: true,
+            channel_capacity: 256,
+            ..RefreshConfig::default()
+        };
+        assert_eq!(refresh_channel_capacity(&refresh), 256);
     }
 
     #[test]
