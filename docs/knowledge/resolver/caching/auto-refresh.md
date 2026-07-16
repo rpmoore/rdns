@@ -123,22 +123,33 @@ and never trigger refresh.
 
 `ResolveQuery::probe_cache` and the singleflight-follower path
 `cache_hit_after_coalesced_miss` (`src/resolver/mod.rs`) both read
-`refresh_hints` off the `ChainLookup` result and call
-`enqueue_refresh_job` (`resolver/mod.rs:5232-...`) once per hint — a
-non-blocking `try_send` onto the worker pool's channel. `RefreshTriggered`/
-`RefreshQueueFull` metrics (`resolver/mod.rs:8629,8634`) record success/drop;
-a dropped trigger has no correctness impact, the entry just expires
-normally.
+`refresh_hints` off the `ChainLookup` result, but deliberately don't enqueue
+them directly — they carry the hints forward instead (`CacheProbe.refresh_hints`,
+`CoalescedFollowerHit.refresh_hints`) so the caller enqueues only once the hit
+is genuinely admitted. `finish_cache_hit` enqueues (via `enqueue_refresh_job`,
+`resolver/mod.rs:5339-...`) only if the response-block policy doesn't block
+the hit *and* the query's `recursion_desired` flag is set; `resolve_coalesced_follower`
+enqueues only if the block-policy check passes (its `recursion_desired` is
+already guaranteed `true` by control flow — a real miss coalescing only
+happens past the RD=0 refusal check). Review found the original, simpler
+design (enqueue directly inside `probe_cache`/`cache_hit_after_coalesced_miss`)
+could trigger a real background backend fetch for a query the rest of the
+pipeline hadn't admitted yet: an RD=0 cache-only query, or a hit about to be
+rejected by response policy. `enqueue_refresh_job` itself
+(`resolver/mod.rs:5339-...`) is unchanged — a non-blocking `try_send` onto the
+worker pool's channel. `RefreshTriggered`/`RefreshQueueFull` metrics
+(`resolver/mod.rs:8748,8753`) record success/drop; a dropped trigger has no
+correctness impact, the entry just expires normally.
 
 # Worker pool: bounded channel, per-job panic isolation
 
-`spawn_refresh_worker_pool` (`src/resolver/mod.rs:3593-3625`) spawns a fixed
+`spawn_refresh_worker_pool` (`src/resolver/mod.rs:3606-3620`) spawns a fixed
 pool of `RefreshConfig.worker_count` tasks sharing one bounded
 `tokio::sync::mpsc::Receiver<RefreshJob>`, wrapped in
 `Arc<tokio::sync::Mutex<_>>` since `Receiver` is single-consumer — this
 serializes only the dequeue point (one worker parks on `recv()` at a time),
 not job *execution*. Each dequeued job (`refresh_worker_loop`,
-`resolver/mod.rs:3627-3653`) is spawned as its own `tokio::spawn`ed task,
+`resolver/mod.rs:3646-3672`) is spawned as its own `tokio::spawn`ed task,
 and the worker `.await`s that task's `JoinHandle` before dequeuing the
 next job: a panic in one job fails only its own `JoinHandle` (inspected via
 `JoinError::is_panic()` and logged via `tracing::error!`), never the worker
@@ -147,13 +158,19 @@ this codebase adds dependencies conservatively and already has no
 `futures` crate dependency.
 
 **Shutdown has no internal signal** — `main.rs` holds the pool's
-`JoinHandle`s and `.abort()`s them at teardown (`main.rs:326-329`),
-mirroring `spawn_sighup_reload_task`'s (`main.rs:605`) existing convention
-exactly: no `select!`, no shutdown channel, the loops just run until
-aborted from outside. Known gap: aborting the outer loop task while a job's
-inner spawned task is in flight only cancels the loop, not the inner
-task — left detached, harmless while job processing has no real I/O
-side effects beyond the cache store itself.
+`JoinHandle`s and `.abort()`s them at teardown (`main.rs:324-327`),
+mirroring `spawn_sighup_reload_task`'s existing convention exactly: no
+`select!`, no shutdown channel, the loops just run until aborted from
+outside. Aborting the outer loop task while a job's inner spawned task is
+in flight only cancels the *outer* future by itself — review found this
+could leave the inner job task detached, still holding its own
+`Arc<ResolveQuery>` clone, which could prevent `drop(resolver)` from
+happening and hang shutdown's `event_drain.await`. Fixed via `AbortOnDrop`
+(`resolver/mod.rs:3676-3682`): `refresh_worker_loop` holds an `AbortHandle`
+for the just-spawned inner job task in a guard tied to its own stack frame,
+so aborting the outer task drops that guard too — wherever the outer
+future happened to be parked, including mid-`handle.await` — which reliably
+requests cancellation of the inner job task as well.
 
 `main.rs` creates the channel *before* building the resolver
 (`main.rs:132`), threads the sender in via `.with_refresh_config(...)` /
@@ -162,9 +179,9 @@ both the sender wiring and the pool spawn on `config.refresh.enabled`
 (`main.rs:152-173`): when disabled, no worker tasks are spawned at all —
 not merely idle ones.
 
-# Job processing: epoch-first recheck, DO=true fetch, direct store
+# Job processing: epoch-first recheck, DO=true fetch, store-before-complete
 
-`process_refresh_job` (`resolver/mod.rs:3765-...`) does, per dequeued job:
+`process_refresh_job` (`resolver/mod.rs:3807-...`) does, per dequeued job:
 
 1. **Capture epoch once**: `BackendHandle::current()` is read exactly once
    at the top and reused for every subsequent step — never re-read
@@ -178,22 +195,40 @@ not merely idle ones.
    miss, since `lookup_hop` already treats an epoch mismatch as invisible —
    no separate epoch check is needed.
 3. **Fetch via `ShardedSingleFlight`** (`MissKey = (domain, qtype, qclass,
-   epoch, dnssec_ok=true)`) using a new `build_refresh_query` production
-   helper (`resolver/mod.rs:3710-...`) to build a synthetic outbound query.
-   Fetches always use `dnssec_ok = true` — a refresh always upgrades to a
+   epoch, dnssec_ok=true)`) using a `build_refresh_query` production helper
+   (`resolver/mod.rs:3752-...`) to build a synthetic outbound query. Fetches
+   always use `dnssec_ok = true` — a refresh always upgrades to a
    DNSSEC-complete fetch, regardless of the original entry's own DNSSEC
-   state. **Coalescing caveat**: because `MissKey` includes `dnssec_ok`,
-   this only coalesces with a concurrent client request that itself has
-   `dnssec_ok = true` — a DO=false client miss for the same key becomes its
-   own independent singleflight `Leader`, paying its own round trip. No
-   correctness impact, just narrower coalescing than "any concurrent miss."
-4. **Store directly** via `cache_store_for_response`/`store_cache_response`,
-   deliberately bypassing `prepare_backend_result`'s policy-block,
-   response-rewrite, and chaos-injection layers (none apply to a
-   server-internal refresh) — but *does* check
+   state. The query's EDNS UDP payload size is the operator's own
+   `configured_max_udp_payload_size()` (not a fixed constant — review found
+   a hard-coded 1232 bytes could truncate/fail a large DNSSEC refresh
+   response for an operator who configured a bigger buffer, since only
+   `ResolutionMode::Recursive` backend calls get their EDNS size rewritten
+   downstream by `resolve_backend`; `ResolutionMode::Forward` sends whatever
+   `build_refresh_query` encoded, verbatim). **Coalescing caveat**: because
+   `MissKey` includes `dnssec_ok`, this only coalesces with a concurrent
+   client request that itself has `dnssec_ok = true` — a DO=false client
+   miss for the same key becomes its own independent singleflight `Leader`,
+   paying its own round trip. No correctness impact, just narrower
+   coalescing than "any concurrent miss."
+4. **Store before completing the singleflight flight** via
+   `store_cache_response`, deliberately bypassing `prepare_backend_result`'s
+   policy-block, response-rewrite, and chaos-injection layers (none apply to
+   a server-internal refresh) — but *does* check
    `ResolutionCacheDirective::is_cacheable()` first, same as
    `prepare_backend_result` does, so a backend-declared "do not cache this"
-   signal is still honored.
+   signal is still honored. If this job is the singleflight `Leader`,
+   `SingleFlightLeader::complete` — which wakes any waiting follower — is
+   called *after* the store, not before, on every exit path (cacheable
+   success, `DoNotCache`, invalid response, or fetch error). Review found
+   the original leader-completes-then-stores ordering (matching the naive
+   reading of `resolve_backend`'s result) could wake a follower before this
+   job's own store landed; the follower re-probes the cache immediately on
+   waking (`cache_hit_after_coalesced_miss`), and could still see the stale
+   entry, miss, and fall back to this job's raw synthetic backend result —
+   which in forward mode only has its ID/RD/CD rewritten for the real
+   client, not reframed with that client's own question/OPT. Storing first
+   mirrors `resolve_coalesced_leader`'s own store-then-complete ordering.
 5. **No retry on any failure** (timeout, backend error, an uncacheable or
    unparseable response) — the stale entry is simply left untouched and
    falls back to ordinary reactive-miss behavior at its real expiry.
@@ -211,7 +246,7 @@ silently defeating refresh for that entire class of domain forever.
 # Metrics
 
 `ResolverMetric::RefreshTriggered`/`RefreshQueueFull`/`RefreshSucceeded`/
-`RefreshFailed` (`resolver/mod.rs:8629-8639`), following existing
+`RefreshFailed` (`resolver/mod.rs:8748-8758`), following existing
 `CacheHit`/`CacheMiss`-style naming. `OpenTelemetryMetrics` in `main.rs`
 exposes each as its own Prometheus counter (`refresh_triggered_total`,
 etc.) — `ResolverMetric` and `OpenTelemetryMetrics::increment` are both
