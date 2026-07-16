@@ -1756,6 +1756,120 @@ fn rebuild_recursive_response_with_own_framing(
     )
 }
 
+/// Rebuilds a forward-mode (`ResolutionMode::Forward`) response's OPT
+/// record so it carries a fresh, rdns-owned RFC 9018 server cookie tied to
+/// *this specific requester's* own client cookie and client IP, instead of
+/// trusting whatever cookie (if any) the upstream forwarder's raw response
+/// already carries.
+///
+/// Two things can otherwise go wrong once a Cookie-only query became
+/// cache-admissible for the forward backend too (this covers both, per the
+/// PR review that caught this gap):
+///
+/// 1. **Coalesced-follower fallback.** `MissKey` coalesces on
+///    name/type/class/namespace/DO only, never on cookie bytes or client
+///    IP -- so a follower can share the *leader's* raw forwarded bytes
+///    verbatim (`prepare_backend_result`'s callers reuse `response.bytes`
+///    for every coalesced requester whose fetch wasn't independently
+///    re-run). Without this rebuild, a follower presenting its own client
+///    cookie could receive the *leader's* echoed client-cookie bytes back
+///    -- a genuine RFC 7873 §5.2 violation (the server must echo the
+///    requester's own cookie), not just an imprecise one.
+/// 2. **Upstream-computed server cookie.** The forwarding backend relays
+///    the client's original query bytes verbatim
+///    (`ForwardingResolutionBackend::resolve_once`), so any server cookie
+///    the upstream computed is bound to *rdns's own* outbound IP (per RFC
+///    9018 §4.4's `Client-IP` input), not this downstream client's --
+///    relaying it verbatim would be a foreign resolver's cookie wearing
+///    rdns's `CookieSecret`-less clothing.
+///
+/// Every other byte of the upstream's real response is preserved
+/// verbatim -- AA/RA/AD/TC flags, rcode, and all answer/authority/other
+/// -additional content -- consistent with forward mode's transparent-proxy
+/// contract elsewhere in this file (e.g. `store_authoritative` preserving
+/// the forwarder's real AA bit in `prepare_backend_result`). ID/RD/CD are
+/// rewritten from `decoded.message`, reproducing what
+/// `crate::protocol::rewrite_response_request_fields` already did to
+/// `response_bytes` earlier in `prepare_backend_result` -- this function
+/// must redo that rewrite itself since it reserializes from
+/// `response_message` (parsed from the original bytes, before that
+/// byte-level rewrite ran), not from the already-rewritten
+/// `response_bytes`.
+fn rebuild_forward_response_with_own_cookie(
+    decoded: &DecodedQuery,
+    response_message: &Message,
+    configured_max_udp_payload_size: usize,
+    cookie_secret: &CookieSecret,
+    client_ip: IpAddr,
+    now: SystemTime,
+) -> Result<Vec<u8>, ResolutionBackendError> {
+    let Some(question) = response_message.questions.first() else {
+        return Err(ResolutionBackendError::MalformedResponse);
+    };
+
+    let mut additionals: Vec<Record> = response_message
+        .additionals
+        .iter()
+        .filter(|record| !matches!(record.record, RecordData::OPT(_)))
+        .cloned()
+        .collect();
+    if let Some(opt) = mirrored_client_opt_record_with_cookie(
+        &decoded.message,
+        configured_max_udp_payload_size,
+        cookie_secret,
+        client_ip,
+        now,
+    ) {
+        additionals.push(opt);
+    }
+
+    let mut bytes = Vec::new();
+    write_dns_u16(&mut bytes, decoded.message.header.id);
+    let mut flags = 0x8000u16; // QR = 1 (response)
+    if response_message.header.aa() {
+        flags |= 0x0400;
+    }
+    if response_message.header.tc() {
+        flags |= 0x0200;
+    }
+    if decoded.message.header.rd() {
+        flags |= 0x0100;
+    }
+    if response_message.header.ra() {
+        flags |= 0x0080;
+    }
+    if response_message.header.ad() {
+        flags |= 0x0020;
+    }
+    if decoded.message.header.cd() {
+        flags |= 0x0010;
+    }
+    flags |= u16::from(response_message.header.r_code() & 0x0f);
+    write_dns_u16(&mut bytes, flags);
+    write_dns_u16(&mut bytes, 1);
+    write_dns_u16(&mut bytes, response_message.answers.len() as u16);
+    write_dns_u16(&mut bytes, response_message.authorities.len() as u16);
+    write_dns_u16(&mut bytes, additionals.len() as u16);
+    let mut compressor = NameCompressor::new();
+    write_dns_question(
+        &mut bytes,
+        &mut compressor,
+        &question.qname,
+        question.qtype,
+        question.qclass,
+    );
+    for record in &response_message.answers {
+        write_dns_record(&mut bytes, &mut compressor, record)?;
+    }
+    for record in &response_message.authorities {
+        write_dns_record(&mut bytes, &mut compressor, record)?;
+    }
+    for record in &additionals {
+        write_dns_record(&mut bytes, &mut compressor, record)?;
+    }
+    Ok(bytes)
+}
+
 /// Builds a truncated (TC=1) response for `decoded`'s original query:
 /// header + question + a mirrored OPT record (RFC 6891 §7) if the query
 /// carried EDNS, no answer/authority/other additional records, and CD
@@ -5203,6 +5317,35 @@ impl ResolveQuery {
                     request.client_ip,
                     self.clock.now(),
                 );
+            }
+        } else if backend_mode == ResolutionMode::Forward
+            && decoded.features.client_cookie.is_some()
+        {
+            // Cookie-only queries are cache-admissible regardless of
+            // backend mode (`cache_supported()` doesn't distinguish), so a
+            // forward-mode miss can reach here with a Cookie-bearing
+            // `decoded` query too -- every branch above is gated on
+            // `backend_mode == Recursive` and does nothing for forward
+            // mode, so without this branch `response_bytes` would stay
+            // whatever `response.bytes` already was: the upstream
+            // forwarder's raw relayed bytes, which may echo a different
+            // requester's client cookie (coalesced-follower fallback) or a
+            // server cookie computed against rdns's own outbound IP rather
+            // than this client's. See
+            // `rebuild_forward_response_with_own_cookie`'s doc comment for
+            // the full reasoning (this gap was caught by PR review, not
+            // originally scoped into section-05 of the EDNS-cookie plan,
+            // which only enumerated `mirrored_client_opt_record` call sites
+            // reachable from recursive-synthesis responses).
+            if let Ok(bytes) = rebuild_forward_response_with_own_cookie(
+                decoded,
+                &response_message,
+                configured_max_udp_payload_size,
+                &self.cookie_secret,
+                request.client_ip,
+                self.clock.now(),
+            ) {
+                response_bytes = bytes;
             }
         }
 
@@ -19769,6 +19912,173 @@ mod tests {
         assert_ne!(
             &options_a[12..28],
             &options_b[12..28],
+            "each requester must get its own freshly-computed server cookie, \
+             never a shared/replayed one"
+        );
+    }
+
+    /// PR review finding: `cache_supported()` admits Cookie-only queries
+    /// regardless of backend mode, but section-05's cookie-aware OPT
+    /// rebuild only ever ran for `ResolutionMode::Recursive` responses.
+    /// This is the forward-mode counterpart of
+    /// `resolve_recursive_miss_response_carries_cookie_option_for_cookie_bearing_query`:
+    /// a single, non-coalesced forward-mode miss for a Cookie-bearing query
+    /// must get its own rdns-computed server cookie, not silently pass the
+    /// upstream forwarder's raw (cookie-less, in this fixture) response
+    /// straight through.
+    #[tokio::test]
+    async fn resolve_forward_miss_response_carries_own_cookie_option_for_cookie_bearing_query() {
+        let cache = Arc::new(RecordingCache::with_lookup(ChainLookup::Miss));
+        let upstream = Arc::new(StaticUpstream::new(Ok(upstream_response(
+            a_response_with_answer(0x7777, "example.com", 60),
+        ))));
+        let events = Arc::new(RecordingEvents::default());
+        let metrics = Arc::new(RecordingMetrics::default());
+        let cookie_secret = Arc::new(CookieSecret::generate());
+        let service = resolve_service_with_cache(upstream, cache, events, metrics, 1232)
+            .with_cookie_secret(cookie_secret);
+
+        let client_cookie = [0x11u8, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88];
+        let mut cookie_option = vec![0u8, 10, 0, 8];
+        cookie_option.extend_from_slice(&client_cookie);
+        let query = a_query_with_edns_options(0x7777, "example.com", 1232, false, &cookie_option);
+
+        let outcome = service
+            .resolve(ResolveRequest::new(
+                "192.0.2.10".parse().unwrap(),
+                SystemTime::UNIX_EPOCH,
+                query,
+            ))
+            .await;
+
+        let response = Message::parse(&outcome.response_bytes).unwrap();
+        assert_eq!(
+            response.answers.len(),
+            1,
+            "the upstream's real answer content must be preserved verbatim"
+        );
+        let opt = response
+            .additionals
+            .iter()
+            .find(|record| matches!(record.record, RecordData::OPT(_)))
+            .expect(
+                "forward-mode miss response to a Cookie-bearing query must carry an OPT record",
+            );
+        let RecordData::OPT(edns) = &opt.record else {
+            unreachable!();
+        };
+        let echoed_client_cookie = crate::protocol::edns_cookie::parse_cookie_option(&edns.options)
+            .expect("OPT options must decode to a well-formed COOKIE option");
+        assert_eq!(echoed_client_cookie, client_cookie);
+        assert_eq!(
+            edns.options.len(),
+            4 + 8 + 16,
+            "COOKIE option TLV must carry the 8-byte client cookie plus a 16-byte server cookie"
+        );
+    }
+
+    /// PR review finding, coalesced case: `MissKey` coalesces on
+    /// name/type/class/namespace/DO only, never on cookie bytes or client
+    /// IP -- so when the leader's forwarded response doesn't end up stored
+    /// (forcing every `RecordingCache` lookup to `Miss` here, including the
+    /// follower's post-coalesce re-probe), `resolve_coalesced_follower`
+    /// falls back to reusing the leader's raw backend result. Before the
+    /// fix, the follower would have received the *leader's* echoed client
+    /// cookie back -- an RFC 7873 §5.2 violation. Two coalesced requesters
+    /// with distinct client cookies must each get their own correctly
+    /// -echoed cookie.
+    #[tokio::test]
+    async fn resolve_coalesced_forward_miss_gives_each_requester_a_distinct_cookie() {
+        let cache = Arc::new(RecordingCache::with_lookup(ChainLookup::Miss));
+        let upstream = Arc::new(BlockingUpstream::new(Ok(upstream_response(
+            a_response_with_answer(0xaaaa, "example.com", 60),
+        ))));
+        let events = Arc::new(RecordingEvents::default());
+        let metrics = Arc::new(RecordingMetrics::default());
+        let cookie_secret = Arc::new(CookieSecret::generate());
+        let service = Arc::new(
+            resolve_service_with_cache(upstream.clone(), cache, events, metrics.clone(), 1232)
+                .with_cookie_secret(cookie_secret),
+        );
+
+        let cookie_a = [0x11u8; 8];
+        let cookie_b = [0x22u8; 8];
+        let mut option_a = vec![0u8, 10, 0, 8];
+        option_a.extend_from_slice(&cookie_a);
+        let mut option_b = vec![0u8, 10, 0, 8];
+        option_b.extend_from_slice(&cookie_b);
+        let leader_query = a_query_with_edns_options(0x1111, "example.com", 1232, false, &option_a);
+        let follower_query =
+            a_query_with_edns_options(0x2222, "example.com", 1232, false, &option_b);
+
+        let leader = {
+            let service = Arc::clone(&service);
+            tokio::spawn(async move {
+                service
+                    .resolve(ResolveRequest::new(
+                        "192.0.2.10".parse().unwrap(),
+                        SystemTime::UNIX_EPOCH,
+                        leader_query,
+                    ))
+                    .await
+            })
+        };
+        upstream.wait_for_requests(1).await;
+
+        let follower = {
+            let service = Arc::clone(&service);
+            tokio::spawn(async move {
+                service
+                    .resolve(ResolveRequest::new(
+                        "192.0.2.11".parse().unwrap(),
+                        SystemTime::UNIX_EPOCH,
+                        follower_query,
+                    ))
+                    .await
+            })
+        };
+        tokio::task::yield_now().await;
+        assert_eq!(
+            upstream.requests.lock().unwrap().len(),
+            1,
+            "the follower must coalesce onto the leader's single in-flight fetch"
+        );
+
+        upstream.release.notify_waiters();
+        let leader = leader.await.unwrap();
+        let follower = follower.await.unwrap();
+
+        assert_eq!(metrics.count(ResolverMetric::CacheCoalescedMiss), 1);
+
+        let opt_options = |bytes: &[u8]| -> Vec<u8> {
+            let message = Message::parse(bytes).unwrap();
+            let opt = message
+                .additionals
+                .iter()
+                .find(|record| matches!(record.record, RecordData::OPT(_)))
+                .expect("Cookie-bearing requester must get an OPT record back")
+                .clone();
+            let RecordData::OPT(edns) = opt.record else {
+                unreachable!();
+            };
+            edns.options
+        };
+        let options_leader = opt_options(&leader.response_bytes);
+        let options_follower = opt_options(&follower.response_bytes);
+
+        assert_eq!(
+            &options_leader[4..12],
+            &cookie_a,
+            "leader's response must echo its own client cookie, not the follower's"
+        );
+        assert_eq!(
+            &options_follower[4..12],
+            &cookie_b,
+            "follower's response must echo its own client cookie, not the leader's"
+        );
+        assert_ne!(
+            &options_leader[12..28],
+            &options_follower[12..28],
             "each requester must get its own freshly-computed server cookie, \
              never a shared/replayed one"
         );
