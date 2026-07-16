@@ -93,12 +93,12 @@ fn upstream_config(name: &str, endpoint: SocketAddr, priority: u16) -> UpstreamC
     }
 }
 
-fn resolver_from_config(config: &RuntimeConfig) -> Arc<ResolveQuery> {
+fn resolver_from_config(config: &RuntimeConfig, clock: Arc<dyn Clock>) -> Arc<ResolveQuery> {
     Arc::new(ResolveQuery::new(
         Arc::new(StandardProtocolCodec::new(config.max_udp_payload_size)),
         Arc::new(ForwardingResolutionBackend::from_runtime_config(config).unwrap()),
         Arc::new(BasicResponseFactory),
-        Arc::new(FixedClock),
+        clock,
         Arc::new(NoopEvents),
         Arc::new(NoopMetrics),
     ))
@@ -111,9 +111,10 @@ async fn run_server(
     tokio::sync::oneshot::Sender<()>,
     tokio::task::JoinHandle<std::io::Result<()>>,
 ) {
-    let resolver = resolver_from_config(config);
+    let clock: Arc<dyn Clock> = Arc::new(FixedClock);
+    let resolver = resolver_from_config(config, Arc::clone(&clock));
     let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
-    let server = UdpDnsServer::new(socket, resolver, config.max_udp_payload_size);
+    let server = UdpDnsServer::new(socket, resolver, clock, config.max_udp_payload_size);
     let server_addr = server.local_addr().unwrap();
     let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
     let server_task = tokio::spawn(async move {

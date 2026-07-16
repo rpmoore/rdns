@@ -17,7 +17,7 @@ use std::future::Future;
 use std::io;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, SystemTime};
+use std::time::Duration;
 
 use bytes::Bytes;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -28,7 +28,7 @@ use tokio::time;
 
 use crate::config::{DEFAULT_MAX_TCP_CONNECTIONS, RuntimeConfig};
 use crate::protocol::{DNS_HEADER_LEN, Message, build_servfail_response};
-use crate::resolver::{ObservedSourceEndpoint, ResolveQuery, ResolveRequest};
+use crate::resolver::{Clock, ObservedSourceEndpoint, ResolveQuery, ResolveRequest};
 
 const DEFAULT_MAX_IN_FLIGHT_REQUESTS: usize = 1024;
 /// Caps how many concurrent connections a single source IP may hold against
@@ -117,16 +117,23 @@ async fn bind_tcp_listener_socket(address: SocketAddr) -> io::Result<TcpListener
 pub struct UdpDnsServer {
     socket: Arc<UdpSocket>,
     resolver: Arc<ResolveQuery>,
+    clock: Arc<dyn Clock>,
     listener: Option<SocketAddr>,
     max_request_size: usize,
     max_in_flight_requests: usize,
 }
 
 impl UdpDnsServer {
-    pub fn new(socket: UdpSocket, resolver: Arc<ResolveQuery>, max_request_size: usize) -> Self {
+    pub fn new(
+        socket: UdpSocket,
+        resolver: Arc<ResolveQuery>,
+        clock: Arc<dyn Clock>,
+        max_request_size: usize,
+    ) -> Self {
         Self::with_max_in_flight_requests(
             socket,
             resolver,
+            clock,
             max_request_size,
             DEFAULT_MAX_IN_FLIGHT_REQUESTS,
         )
@@ -135,6 +142,7 @@ impl UdpDnsServer {
     pub fn with_max_in_flight_requests(
         socket: UdpSocket,
         resolver: Arc<ResolveQuery>,
+        clock: Arc<dyn Clock>,
         max_request_size: usize,
         max_in_flight_requests: usize,
     ) -> Self {
@@ -142,6 +150,7 @@ impl UdpDnsServer {
         Self {
             socket: Arc::new(socket),
             resolver,
+            clock,
             listener,
             max_request_size,
             max_in_flight_requests,
@@ -151,20 +160,29 @@ impl UdpDnsServer {
     pub async fn bind(
         address: SocketAddr,
         resolver: Arc<ResolveQuery>,
+        clock: Arc<dyn Clock>,
         max_request_size: usize,
     ) -> io::Result<Self> {
         let socket = bind_listener_socket(address).await?;
-        Ok(Self::new(socket, resolver, max_request_size))
+        Ok(Self::new(socket, resolver, clock, max_request_size))
     }
 
     pub async fn bind_configured(
         config: &RuntimeConfig,
         resolver: Arc<ResolveQuery>,
+        clock: Arc<dyn Clock>,
     ) -> io::Result<Vec<Self>> {
         let mut servers = Vec::with_capacity(config.dns_listen.len());
         for address in &config.dns_listen {
-            servers
-                .push(Self::bind(*address, resolver.clone(), config.max_udp_payload_size).await?);
+            servers.push(
+                Self::bind(
+                    *address,
+                    resolver.clone(),
+                    clock.clone(),
+                    config.max_udp_payload_size,
+                )
+                .await?,
+            );
         }
         Ok(servers)
     }
@@ -238,8 +256,11 @@ impl UdpDnsServer {
     fn spawn_datagram_task(&self, datagram: ReceivedDatagram, tasks: &mut JoinSet<io::Result<()>>) {
         let socket = Arc::clone(&self.socket);
         let resolver = Arc::clone(&self.resolver);
+        let clock = Arc::clone(&self.clock);
         let listener = self.listener;
-        tasks.spawn(async move { handle_datagram(socket, resolver, listener, datagram).await });
+        tasks.spawn(
+            async move { handle_datagram(socket, resolver, clock, listener, datagram).await },
+        );
     }
 }
 
@@ -252,6 +273,7 @@ struct ReceivedDatagram {
 async fn handle_datagram(
     socket: Arc<UdpSocket>,
     resolver: Arc<ResolveQuery>,
+    clock: Arc<dyn Clock>,
     listener: Option<SocketAddr>,
     datagram: ReceivedDatagram,
 ) -> io::Result<()> {
@@ -259,7 +281,7 @@ async fn handle_datagram(
     let outcome = resolver
         .resolve(ResolveRequest::new_with_observed_source(
             ObservedSourceEndpoint::udp(datagram.source, listener),
-            SystemTime::now(),
+            clock.now(),
             datagram.request_bytes,
         ))
         .await;
@@ -285,6 +307,7 @@ fn task_result_to_io(
 pub struct TcpDnsServer {
     listener: TcpListener,
     resolver: Arc<ResolveQuery>,
+    clock: Arc<dyn Clock>,
     local_addr: SocketAddr,
     max_connections: usize,
     max_connections_per_ip: usize,
@@ -292,18 +315,24 @@ pub struct TcpDnsServer {
 }
 
 impl TcpDnsServer {
-    pub async fn bind(address: SocketAddr, resolver: Arc<ResolveQuery>) -> io::Result<Self> {
-        Self::bind_with_max_connections(address, resolver, DEFAULT_MAX_TCP_CONNECTIONS).await
+    pub async fn bind(
+        address: SocketAddr,
+        resolver: Arc<ResolveQuery>,
+        clock: Arc<dyn Clock>,
+    ) -> io::Result<Self> {
+        Self::bind_with_max_connections(address, resolver, clock, DEFAULT_MAX_TCP_CONNECTIONS).await
     }
 
     pub async fn bind_with_max_connections(
         address: SocketAddr,
         resolver: Arc<ResolveQuery>,
+        clock: Arc<dyn Clock>,
         max_connections: usize,
     ) -> io::Result<Self> {
         Self::bind_with_options(
             address,
             resolver,
+            clock,
             max_connections,
             DEFAULT_MAX_TCP_CONNECTIONS_PER_IP,
             TCP_SHUTDOWN_GRACE_PERIOD,
@@ -314,6 +343,7 @@ impl TcpDnsServer {
     async fn bind_with_options(
         address: SocketAddr,
         resolver: Arc<ResolveQuery>,
+        clock: Arc<dyn Clock>,
         max_connections: usize,
         max_connections_per_ip: usize,
         shutdown_grace_period: Duration,
@@ -347,6 +377,7 @@ impl TcpDnsServer {
         Ok(Self {
             listener,
             resolver,
+            clock,
             local_addr,
             max_connections,
             max_connections_per_ip,
@@ -357,6 +388,7 @@ impl TcpDnsServer {
     pub async fn bind_configured(
         config: &RuntimeConfig,
         resolver: Arc<ResolveQuery>,
+        clock: Arc<dyn Clock>,
     ) -> io::Result<Vec<Self>> {
         let mut servers = Vec::with_capacity(config.dns_listen.len());
         let shutdown_grace_period = config.per_query_deadline + TCP_SHUTDOWN_GRACE_BUFFER;
@@ -365,6 +397,7 @@ impl TcpDnsServer {
                 Self::bind_with_options(
                     *address,
                     resolver.clone(),
+                    clock.clone(),
                     config.max_tcp_connections,
                     DEFAULT_MAX_TCP_CONNECTIONS_PER_IP,
                     shutdown_grace_period,
@@ -462,11 +495,14 @@ impl TcpDnsServer {
         tasks: &mut JoinSet<()>,
     ) {
         let resolver = Arc::clone(&self.resolver);
+        let clock = Arc::clone(&self.clock);
         let listener = self.local_addr;
         tasks.spawn(async move {
             let _permit = permit;
             let _per_ip_guard = per_ip_guard;
-            if let Err(error) = serve_tcp_connection(stream, peer_addr, listener, resolver).await {
+            if let Err(error) =
+                serve_tcp_connection(stream, peer_addr, listener, resolver, clock).await
+            {
                 tracing::debug!(%error, %peer_addr, "tcp dns connection closed with error");
             }
         });
@@ -555,6 +591,7 @@ async fn serve_tcp_connection(
     peer_addr: SocketAddr,
     listener: SocketAddr,
     resolver: Arc<ResolveQuery>,
+    clock: Arc<dyn Clock>,
 ) -> io::Result<()> {
     loop {
         let mut length_prefix = [0u8; 2];
@@ -617,7 +654,7 @@ async fn serve_tcp_connection(
         let outcome = resolver
             .resolve(ResolveRequest::new_with_observed_source(
                 ObservedSourceEndpoint::tcp(peer_addr, Some(listener)),
-                SystemTime::now(),
+                clock.now(),
                 message,
             ))
             .await;
@@ -668,16 +705,19 @@ async fn serve_tcp_connection(
 mod tests {
     use super::*;
     use std::pin::Pin;
-    use std::time::Duration;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::time::{Duration, SystemTime};
 
     use tokio::sync::Notify;
     use tokio::time;
 
+    use crate::config::CacheConfig;
     use crate::protocol::{Message, ResponseCode};
     use crate::resolver::{
-        BasicResponseFactory, Clock, MetricsSink, QueryEventRecordResult, QueryEventSink,
-        QueryEventV1, QueryTransport, ResolutionBackend, ResolverMetric, StandardProtocolCodec,
-        UpstreamError, UpstreamRequest, UpstreamResponse,
+        BasicResponseFactory, CacheTtlPolicy, Clock, DomainDnsCache, MetricsSink,
+        QueryEventRecordResult, QueryEventSink, QueryEventV1, QueryTransport, ResolutionBackend,
+        ResolverMetric, ShardedDnsCache, StandardProtocolCodec, UpstreamError, UpstreamRequest,
+        UpstreamResponse,
     };
 
     fn a_query(id: u16, name: &str) -> Vec<u8> {
@@ -758,6 +798,10 @@ mod tests {
         fn now(&self) -> SystemTime {
             self.0
         }
+    }
+
+    fn test_clock() -> Arc<dyn Clock> {
+        Arc::new(FixedClock(SystemTime::UNIX_EPOCH))
     }
 
     #[derive(Default)]
@@ -864,6 +908,78 @@ mod tests {
         ))
     }
 
+    /// Like `resolve_service`, but backed by a real `ShardedDnsCache` (not
+    /// `NoopDnsCache`) and sharing `clock` with the caller's transport, so a
+    /// cache-hit's served TTL reflects the same clock used to seed
+    /// `ReceivedAt` at the transport layer.
+    fn resolve_service_with_cache_and_clock(
+        upstream: Arc<StaticUpstream>,
+        events: Arc<RecordingEvents>,
+        clock: Arc<dyn Clock>,
+    ) -> Arc<ResolveQuery> {
+        let cache = Arc::new(ShardedDnsCache::new(&CacheConfig::default()));
+        Arc::new(ResolveQuery::with_cache(
+            Arc::new(StandardProtocolCodec::new(1232)),
+            cache as Arc<dyn DomainDnsCache>,
+            CacheTtlPolicy::default(),
+            upstream,
+            Arc::new(BasicResponseFactory),
+            clock,
+            events,
+            Arc::new(NoopMetrics),
+        ))
+    }
+
+    /// A minimal, fully-parseable A response with one answer record
+    /// carrying `ttl`, matching `oversized_a_response`'s per-record shape
+    /// (name pointer to the question, TYPE=A, CLASS=IN, 4-byte RDATA).
+    fn a_response_with_ttl(id: u16, name: &str, ttl: u32) -> Vec<u8> {
+        let mut bytes = a_response(id, name);
+        bytes[6..8].copy_from_slice(&1u16.to_be_bytes()); // ANCOUNT = 1
+        bytes.extend_from_slice(&0xc00cu16.to_be_bytes()); // name: pointer to question at offset 12
+        bytes.extend_from_slice(&1u16.to_be_bytes()); // TYPE = A
+        bytes.extend_from_slice(&1u16.to_be_bytes()); // CLASS = IN
+        bytes.extend_from_slice(&ttl.to_be_bytes());
+        bytes.extend_from_slice(&4u16.to_be_bytes()); // RDLENGTH
+        bytes.extend_from_slice(&[192, 0, 2, 1]);
+        bytes
+    }
+
+    fn answer_ttl(response_bytes: &[u8]) -> u32 {
+        Message::parse(response_bytes)
+            .expect("valid dns response")
+            .answers[0]
+            .ttl
+    }
+
+    /// A `Clock` whose value can be advanced in place between two requests
+    /// in the same test, unlike `FixedClock` (single-valued, immutable) --
+    /// needed to prove `handle_datagram`/`serve_tcp_connection` read from
+    /// the injected clock, not a fresh `SystemTime::now()`, by aging a
+    /// cache-hit's TTL by an amount real wall-clock elapsed time (a few
+    /// microseconds within one test) could never explain.
+    struct AdvanceableClock {
+        offset_secs: AtomicU64,
+    }
+
+    impl AdvanceableClock {
+        fn new() -> Self {
+            Self {
+                offset_secs: AtomicU64::new(0),
+            }
+        }
+
+        fn advance(&self, secs: u64) {
+            self.offset_secs.fetch_add(secs, Ordering::SeqCst);
+        }
+    }
+
+    impl Clock for AdvanceableClock {
+        fn now(&self) -> SystemTime {
+            SystemTime::UNIX_EPOCH + Duration::from_secs(self.offset_secs.load(Ordering::SeqCst))
+        }
+    }
+
     async fn unused_high_local_address() -> SocketAddr {
         let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let address = socket.local_addr().unwrap();
@@ -883,9 +999,10 @@ mod tests {
         let upstream = Arc::new(StaticUpstream::new(Ok(upstream_response(backend_bytes))));
         let events = Arc::new(RecordingEvents::default());
         let resolver = resolve_service(upstream.clone(), events.clone());
-        let server = UdpDnsServer::bind("127.0.0.1:0".parse().unwrap(), resolver, 1232)
-            .await
-            .unwrap();
+        let server =
+            UdpDnsServer::bind("127.0.0.1:0".parse().unwrap(), resolver, test_clock(), 1232)
+                .await
+                .unwrap();
         let server_addr = server.local_addr().unwrap();
         let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
         let server_task = tokio::spawn(async move {
@@ -937,6 +1054,65 @@ mod tests {
         server_task.await.unwrap().unwrap();
     }
 
+    /// Regression test for section-02 (Clock DI, `docs/plans/ttl_remaining/`):
+    /// before that section's wiring, `handle_datagram` called raw
+    /// `SystemTime::now()` with no way to inject a controllable value, so
+    /// this test could not have been written. Two live queries share one
+    /// `AdvanceableClock` across both the transport and the resolver/cache;
+    /// the served TTL ages by exactly the clock's advance (not by the near-
+    /// zero real wall-clock time the two queries actually take), proving
+    /// `handle_datagram` reads `ReceivedAt` from the injected clock. The
+    /// fake upstream only ever answers once, so a passing test also proves
+    /// the second query was a cache hit, not a re-resolve.
+    #[tokio::test]
+    async fn handle_datagram_uses_injected_clock_for_cache_ttl_aging() {
+        let origin_ttl = 100u32;
+        let upstream = Arc::new(StaticUpstream::new(Ok(upstream_response(
+            a_response_with_ttl(0xabcd, "example.com", origin_ttl),
+        ))));
+        let events = Arc::new(RecordingEvents::default());
+        let clock: Arc<AdvanceableClock> = Arc::new(AdvanceableClock::new());
+        let clock_dyn: Arc<dyn Clock> = clock.clone();
+        let resolver = resolve_service_with_cache_and_clock(upstream, events, clock_dyn.clone());
+        let server = UdpDnsServer::bind("127.0.0.1:0".parse().unwrap(), resolver, clock_dyn, 1232)
+            .await
+            .unwrap();
+        let server_addr = server.local_addr().unwrap();
+        let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
+        let server_task = tokio::spawn(async move {
+            server
+                .serve_until(async {
+                    let _ = shutdown_rx.await;
+                })
+                .await
+        });
+
+        let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        client
+            .send_to(&a_query(0x1111, "example.com"), server_addr)
+            .await
+            .unwrap();
+        let mut response = [0u8; 64];
+        let (response_len, _) = client.recv_from(&mut response).await.unwrap();
+        assert_eq!(answer_ttl(&response[..response_len]), origin_ttl);
+
+        clock.advance(40);
+
+        client
+            .send_to(&a_query(0x2222, "example.com"), server_addr)
+            .await
+            .unwrap();
+        let (response_len, _) = client.recv_from(&mut response).await.unwrap();
+        assert_eq!(
+            answer_ttl(&response[..response_len]),
+            origin_ttl - 40,
+            "handle_datagram should read the injected clock, not SystemTime::now()"
+        );
+
+        shutdown_tx.send(()).unwrap();
+        server_task.await.unwrap().unwrap();
+    }
+
     #[tokio::test]
     async fn bind_configured_creates_one_server_per_dns_listener() {
         let first_address = unused_high_local_address().await;
@@ -958,7 +1134,7 @@ mod tests {
         let upstream = Arc::new(StaticUpstream::new(Err(UpstreamError::Timeout)));
         let resolver = resolve_service(upstream, Arc::new(RecordingEvents::default()));
 
-        let servers = UdpDnsServer::bind_configured(&config, resolver)
+        let servers = UdpDnsServer::bind_configured(&config, resolver, test_clock())
             .await
             .unwrap();
 
@@ -992,7 +1168,7 @@ mod tests {
         let upstream = Arc::new(StaticUpstream::new(Ok(upstream_response(backend_bytes))));
         let events = Arc::new(RecordingEvents::default());
         let resolver = resolve_service(upstream.clone(), events.clone());
-        let server = TcpDnsServer::bind("127.0.0.1:0".parse().unwrap(), resolver)
+        let server = TcpDnsServer::bind("127.0.0.1:0".parse().unwrap(), resolver, test_clock())
             .await
             .unwrap();
         let server_addr = server.local_addr().unwrap();
@@ -1034,6 +1210,51 @@ mod tests {
         server_task.await.unwrap().unwrap();
     }
 
+    /// TCP counterpart to `handle_datagram_uses_injected_clock_for_cache_ttl_aging`
+    /// -- same regression, `serve_tcp_connection` path.
+    #[tokio::test]
+    async fn serve_tcp_connection_uses_injected_clock_for_cache_ttl_aging() {
+        let origin_ttl = 100u32;
+        let upstream = Arc::new(StaticUpstream::new(Ok(upstream_response(
+            a_response_with_ttl(0xabcd, "example.com", origin_ttl),
+        ))));
+        let events = Arc::new(RecordingEvents::default());
+        let clock: Arc<AdvanceableClock> = Arc::new(AdvanceableClock::new());
+        let clock_dyn: Arc<dyn Clock> = clock.clone();
+        let resolver = resolve_service_with_cache_and_clock(upstream, events, clock_dyn.clone());
+        let server = TcpDnsServer::bind("127.0.0.1:0".parse().unwrap(), resolver, clock_dyn)
+            .await
+            .unwrap();
+        let server_addr = server.local_addr().unwrap();
+        let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
+        let server_task = tokio::spawn(async move {
+            server
+                .serve_until(async {
+                    let _ = shutdown_rx.await;
+                })
+                .await
+        });
+
+        let mut client = TcpStream::connect(server_addr).await.unwrap();
+        tcp_send_query(&mut client, &a_query(0x1111, "example.com")).await;
+        let response = tcp_recv_response(&mut client).await;
+        assert_eq!(answer_ttl(&response), origin_ttl);
+
+        clock.advance(40);
+
+        tcp_send_query(&mut client, &a_query(0x2222, "example.com")).await;
+        let response = tcp_recv_response(&mut client).await;
+        assert_eq!(
+            answer_ttl(&response),
+            origin_ttl - 40,
+            "serve_tcp_connection should read the injected clock, not SystemTime::now()"
+        );
+
+        drop(client);
+        shutdown_tx.send(()).unwrap();
+        server_task.await.unwrap().unwrap();
+    }
+
     /// RFC 7766 §6.2.1: a server should support multiple outstanding queries
     /// pipelined on a single TCP connection, not require one-query-per-connection.
     #[tokio::test]
@@ -1043,7 +1264,7 @@ mod tests {
             "example.com",
         )))));
         let resolver = resolve_service(upstream, Arc::new(RecordingEvents::default()));
-        let server = TcpDnsServer::bind("127.0.0.1:0".parse().unwrap(), resolver)
+        let server = TcpDnsServer::bind("127.0.0.1:0".parse().unwrap(), resolver, test_clock())
             .await
             .unwrap();
         let server_addr = server.local_addr().unwrap();
@@ -1095,7 +1316,7 @@ mod tests {
         let upstream = Arc::new(StaticUpstream::new(Err(UpstreamError::Timeout)));
         let resolver = resolve_service(upstream, Arc::new(RecordingEvents::default()));
 
-        let servers = TcpDnsServer::bind_configured(&config, resolver)
+        let servers = TcpDnsServer::bind_configured(&config, resolver, test_clock())
             .await
             .unwrap();
 
@@ -1142,6 +1363,7 @@ mod tests {
         let server = TcpDnsServer::bind_with_options(
             "127.0.0.1:0".parse().unwrap(),
             resolver,
+            test_clock(),
             10,
             2,
             Duration::from_secs(1),
@@ -1205,7 +1427,7 @@ mod tests {
         )))));
         let resolver = resolve_service(upstream, Arc::new(RecordingEvents::default()));
 
-        let server = TcpDnsServer::bind_configured(&config, resolver)
+        let server = TcpDnsServer::bind_configured(&config, resolver, test_clock())
             .await
             .unwrap()
             .into_iter()
@@ -1261,7 +1483,7 @@ mod tests {
             oversized_backend_response,
         ))));
         let resolver = resolve_service(upstream, Arc::new(RecordingEvents::default()));
-        let server = TcpDnsServer::bind("127.0.0.1:0".parse().unwrap(), resolver)
+        let server = TcpDnsServer::bind("127.0.0.1:0".parse().unwrap(), resolver, test_clock())
             .await
             .unwrap();
         let server_addr = server.local_addr().unwrap();
@@ -1317,7 +1539,7 @@ mod tests {
         // the fallback response reflects the resolver's size, not a mirror
         // of the requester's.
         let resolver = resolve_service(upstream, Arc::new(RecordingEvents::default()));
-        let server = TcpDnsServer::bind("127.0.0.1:0".parse().unwrap(), resolver)
+        let server = TcpDnsServer::bind("127.0.0.1:0".parse().unwrap(), resolver, test_clock())
             .await
             .unwrap();
         let server_addr = server.local_addr().unwrap();
@@ -1416,7 +1638,7 @@ mod tests {
             "example.com",
         )))));
         let resolver = resolve_service(upstream, Arc::new(RecordingEvents::default()));
-        let server = TcpDnsServer::bind("127.0.0.1:0".parse().unwrap(), resolver)
+        let server = TcpDnsServer::bind("127.0.0.1:0".parse().unwrap(), resolver, test_clock())
             .await
             .unwrap();
         let server_addr = server.local_addr().unwrap();
@@ -1464,7 +1686,7 @@ mod tests {
             oversized_a_response(0xaaaa, "example.com"),
         ))));
         let resolver = resolve_service(upstream, Arc::new(RecordingEvents::default()));
-        let server = TcpDnsServer::bind("127.0.0.1:0".parse().unwrap(), resolver)
+        let server = TcpDnsServer::bind("127.0.0.1:0".parse().unwrap(), resolver, test_clock())
             .await
             .unwrap();
         let server_addr = server.local_addr().unwrap();
@@ -1509,9 +1731,13 @@ mod tests {
             "example.com",
         )))));
         let resolver = resolve_service(upstream, Arc::new(RecordingEvents::default()));
-        let result =
-            TcpDnsServer::bind_with_max_connections("127.0.0.1:0".parse().unwrap(), resolver, 0)
-                .await;
+        let result = TcpDnsServer::bind_with_max_connections(
+            "127.0.0.1:0".parse().unwrap(),
+            resolver,
+            test_clock(),
+            0,
+        )
+        .await;
         match result {
             Ok(_) => panic!("expected max_connections = 0 to be rejected"),
             Err(error) => assert_eq!(error.kind(), io::ErrorKind::InvalidInput),
@@ -1533,6 +1759,7 @@ mod tests {
         let result = TcpDnsServer::bind_with_options(
             "127.0.0.1:0".parse().unwrap(),
             resolver,
+            test_clock(),
             10,
             0,
             Duration::from_secs(1),
@@ -1555,7 +1782,7 @@ mod tests {
             "example.com",
         )))));
         let resolver = resolve_service(upstream, Arc::new(RecordingEvents::default()));
-        let server = TcpDnsServer::bind("127.0.0.1:0".parse().unwrap(), resolver)
+        let server = TcpDnsServer::bind("127.0.0.1:0".parse().unwrap(), resolver, test_clock())
             .await
             .unwrap();
         let server_addr = server.local_addr().unwrap();
@@ -1605,7 +1832,8 @@ mod tests {
             Arc::new(NoopMetrics),
         ));
         let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
-        let server = UdpDnsServer::with_max_in_flight_requests(socket, resolver, 1232, 2);
+        let server =
+            UdpDnsServer::with_max_in_flight_requests(socket, resolver, test_clock(), 1232, 2);
         let server_addr = server.local_addr().unwrap();
         let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
         let server_task = tokio::spawn(async move {
@@ -1653,7 +1881,8 @@ mod tests {
             Arc::new(NoopMetrics),
         ));
         let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
-        let server = UdpDnsServer::with_max_in_flight_requests(socket, resolver, 1232, 2);
+        let server =
+            UdpDnsServer::with_max_in_flight_requests(socket, resolver, test_clock(), 1232, 2);
         let server_addr = server.local_addr().unwrap();
         let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
         let mut server_task = tokio::spawn(async move {

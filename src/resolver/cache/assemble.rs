@@ -793,6 +793,35 @@ mod tests {
     }
 
     #[test]
+    fn compute_wire_ttl_never_exceeds_origin_ttl_even_when_floor_extends_entry_lifetime() {
+        // Origin TTL is 0 - a record that "should" expire almost
+        // immediately by its own TTL.
+        let now = SystemTime::now();
+        let stored_at = now - Duration::from_secs(5);
+        // The 30s `minimum_ttl` here simulates a min_positive_ttl floor
+        // extending this entry's actual cache lifetime (`expires_at`) far
+        // past what the origin TTL of 0 implies.
+        let entry = rrset_entry(
+            vec![a_record(0, 1)], // ttl_at_store = 0
+            Duration::from_secs(30),
+            stored_at,
+        );
+        let resolved = ResolvedAnswer {
+            chain: vec![("example.com".to_string(), entry)],
+        };
+        let wire = question_wire("example.com", A_QTYPE, IN_QCLASS);
+
+        let response = assemble_response(1, &wire, &features(false), &resolved, now, false, 4096);
+        let parsed = Message::parse(&response).unwrap();
+
+        // Even though the entry is still servable for ~25 more seconds
+        // (floored expires_at), the wire TTL must reflect the record's own
+        // origin TTL of 0, aged - never the entry's floor-extended remaining
+        // lifetime.
+        assert_eq!(parsed.answers[0].ttl, 0);
+    }
+
+    #[test]
     fn assemble_response_echoes_requesters_own_casing() {
         let now = SystemTime::now();
         let entry = rrset_entry(vec![a_record(300, 1)], Duration::from_secs(300), now);
