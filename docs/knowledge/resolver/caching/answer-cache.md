@@ -24,6 +24,7 @@ ShardState {
     positive: HashMap<domain, DomainRecordSets>,
     negative: HashMap<domain, DomainNegativeEntries>,
     lru: ShardLru,
+    popularity: HashMap<domain, PopularityBucket>,
 }
 ```
 
@@ -219,9 +220,19 @@ Capacity is domain-count-based, configured via `CacheConfig.max_entries`,
 split across shards by `CacheConfig::shard_capacity` (see
 [sharding](sharding.md)).
 
+# Popularity tracking and auto-refresh
+
+Each domain also has an optional `PopularityBucket` (`ShardState.popularity`,
+`src/resolver/cache/shard.rs:59,168`) feeding a proactive-refresh feature that
+refetches popular, near-expiry entries before a client would ever see the
+miss. Full design, invariants, and file:line references:
+see [auto-refresh](auto-refresh.md).
+
 # See also
 
 - [cache-epoch](cache-epoch.md) — how a SIGHUP reload invalidates entries here.
 - [sharding](sharding.md) — how domains route to shards, and what else shares this routing scheme.
 - [local-dns-entries](local-dns-entries.md) — the separate, non-cached structure for manually-loaded
   answers.
+- [auto-refresh](auto-refresh.md) — proactive cache refresh for popular domains nearing TTL expiry,
+  built on top of this cache's LRU/eviction lifecycle.

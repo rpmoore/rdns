@@ -3547,6 +3547,454 @@ struct CacheProbe {
     hit: Option<Vec<u8>>,
     store_allowed: bool,
     event_cache_result: Option<QueryEventCacheResult>,
+    /// Deliberately *not* enqueued here -- see `probe_cache`'s doc comment.
+    /// Carried forward so the caller can enqueue only once a hit is fully
+    /// admitted (passes the `recursion_desired` check and response policy).
+    refresh_hints: Vec<cache::RefreshHint>,
+}
+
+/// Named return shape for `evaluate_cache_lookup`, matching this file's
+/// existing `CacheProbe` convention -- avoids a positional 4-tuple at the
+/// call site, where an accidental field reorder would compile but silently
+/// swap meanings.
+struct CacheLookupEvaluation {
+    store_allowed: bool,
+    hit: Option<Vec<u8>>,
+    event_cache_result: QueryEventCacheResult,
+    refresh_hints: Vec<cache::RefreshHint>,
+}
+
+/// Return shape for `cache_hit_after_coalesced_miss` -- carries
+/// `refresh_hints` alongside the serialized hit response rather than
+/// enqueueing them inline, so the caller (`resolve_coalesced_follower`) can
+/// enqueue only once this hit passes the response-block policy check.
+struct CoalescedFollowerHit {
+    response_bytes: Vec<u8>,
+    refresh_hints: Vec<cache::RefreshHint>,
+}
+
+/// One background refresh attempt: a domain/qtype/qclass to refetch and
+/// re-store before its cached entry actually expires. Built from a
+/// `RefreshHint` at enqueue time (`ResolveQuery::probe_cache`); consumed by
+/// the worker pool (section-05) and processed by job-processing logic
+/// (section-06). `pub`, not `pub(crate)`: `main.rs` is a separate binary
+/// crate and needs to name this type to construct the channel
+/// (`with_refresh_sender`) once the worker pool exists.
+///
+/// Fields are inert (never read) until section-06's job-processing logic
+/// consumes them — `#[allow(dead_code)]` until then.
+#[allow(dead_code)]
+#[derive(Debug, Clone)]
+pub struct RefreshJob {
+    domain: String,
+    qtype: u16,
+    qclass: u16,
+}
+
+/// Spawns a fixed pool of `worker_count` tasks that share one bounded
+/// `receiver`, each dequeuing and processing `RefreshJob`s. Mirrors
+/// `spawn_sighup_reload_task`'s (`main.rs:579`) shutdown convention exactly:
+/// no internal shutdown signal, no `select!` -- the caller holds the
+/// returned `JoinHandle`s and `.abort()`s them at teardown.
+///
+/// `Receiver` is single-consumer, so it's wrapped in
+/// `Arc<tokio::sync::Mutex<_>>` and shared across the pool. This serializes
+/// only the dequeue point (one worker parks on `recv()` at a time), not job
+/// *execution* -- each dequeued job is spawned as its own task (see below),
+/// so total concurrency stays bounded at `worker_count` without a true MPMC
+/// channel and its accompanying new dependency.
+pub fn spawn_refresh_worker_pool(
+    resolver: Arc<ResolveQuery>,
+    receiver: tokio::sync::mpsc::Receiver<RefreshJob>,
+    worker_count: usize,
+) -> Vec<tokio::task::JoinHandle<()>> {
+    let receiver = Arc::new(tokio::sync::Mutex::new(receiver));
+    (0..worker_count)
+        .map(|_| {
+            tokio::spawn(refresh_worker_loop(
+                Arc::clone(&resolver),
+                Arc::clone(&receiver),
+            ))
+        })
+        .collect()
+}
+
+/// One worker's dequeue-process-repeat loop. A panic inside a given job's
+/// processing (`process_refresh_job`) is isolated by spawning that job as
+/// its own task and awaiting its `JoinHandle` before dequeuing the next job
+/// -- deliberately not `futures::FutureExt::catch_unwind` (this repo has no
+/// `futures` dependency; adding one solely for this would contradict the
+/// same "add dependencies conservatively" reasoning already used to reject
+/// a true MPMC channel above). A panicked job fails only its own
+/// `JoinHandle` (`JoinError::is_panic()`); this loop, and thus this worker,
+/// keeps running.
+///
+/// Shutdown correctness: `.abort()`ing this outer loop task (at shutdown,
+/// see `main.rs`) while it's parked in `handle.await` only cancels the loop
+/// task's own future -- it does not, by itself, abort the inner spawned job
+/// task. Left alone, that inner task would keep running detached, still
+/// holding its own `Arc<ResolveQuery>` clone (`task_resolver`), which can
+/// prevent `drop(resolver)` from ever happening and hang shutdown's
+/// `event_drain.await` (found by review: `docs/plans/auto_refresh/`).
+/// `_abort_inner_job_on_drop` closes this gap: it holds an `AbortHandle` for
+/// the just-spawned inner task, tied to this stack frame's lifetime via
+/// `AbortOnDrop`'s `Drop` impl. Aborting *this* outer task drops its future
+/// (and everything on its stack, including this guard) at whatever point it
+/// was parked -- including mid-`handle.await` -- so the inner job task is
+/// reliably requested to cancel too, releasing its `Arc<ResolveQuery>` clone
+/// promptly instead of only whenever that job's own I/O happens to finish.
+async fn refresh_worker_loop(
+    resolver: Arc<ResolveQuery>,
+    receiver: Arc<tokio::sync::Mutex<tokio::sync::mpsc::Receiver<RefreshJob>>>,
+) {
+    loop {
+        let job = {
+            let mut receiver = receiver.lock().await;
+            receiver.recv().await
+        };
+        let Some(job) = job else {
+            break; // channel closed (all senders dropped) -- exit cleanly.
+        };
+        let task_resolver = Arc::clone(&resolver);
+        let handle = tokio::spawn(async move { process_refresh_job(task_resolver, job).await });
+        let _abort_inner_job_on_drop = AbortOnDrop(handle.abort_handle());
+        if let Err(join_error) = handle.await
+            && join_error.is_panic()
+        {
+            tracing::error!(?join_error, "refresh job panicked");
+        }
+    }
+}
+
+/// Aborts the wrapped task on drop -- used to tie an inner spawned job
+/// task's lifetime to its outer worker loop's stack frame, so cancelling
+/// the outer task (via `JoinHandle::abort`) reliably cancels the inner one
+/// too, even if the outer future is dropped mid-`.await` on the inner
+/// task's own `JoinHandle`. Aborting an already-finished task is a
+/// documented no-op, so this is safe to run unconditionally on every drop,
+/// not just the cancelled-outer-task case.
+struct AbortOnDrop(tokio::task::AbortHandle);
+
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
+/// Test-only injectable job handler, so worker-pool tests can exercise the
+/// *real* `spawn_refresh_worker_pool`/`refresh_worker_loop` (dequeue, spawn,
+/// await, panic isolation) instead of a hand-rolled lookalike, without
+/// section-06's real fetch/store logic existing yet. `thread_local` is safe
+/// here specifically because these tests use the default `#[tokio::test]`
+/// current-thread runtime flavor (never `flavor = "multi_thread"`): the
+/// whole runtime, including every spawned task, runs on the one OS thread
+/// that called `block_on`, so a handler set before spawning is visible to
+/// every task the pool spawns on that same thread. Each worker-pool test
+/// explicitly sets (or clears) this at its own start, since the test
+/// harness's thread pool can reuse an OS thread across different test
+/// functions.
+#[cfg(test)]
+type TestJobHandler = std::sync::Arc<
+    dyn Fn(RefreshJob) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>
+        + Send
+        + Sync,
+>;
+
+#[cfg(test)]
+thread_local! {
+    static TEST_JOB_HANDLER: std::cell::RefCell<Option<TestJobHandler>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+fn set_test_job_handler(handler: TestJobHandler) {
+    TEST_JOB_HANDLER.with(|cell| *cell.borrow_mut() = Some(handler));
+}
+
+#[cfg(test)]
+fn clear_test_job_handler() {
+    TEST_JOB_HANDLER.with(|cell| *cell.borrow_mut() = None);
+}
+
+/// Builds a minimal outbound `DecodedQuery` for a synthetic, server-internal
+/// refresh fetch -- not a client-originated query. Follows the exact same
+/// standard-query wire shape the test-only `query`/`query_with_edns` helpers
+/// build (`src/resolver/mod.rs` test module), just as production code
+/// instead of a test fixture: a single question for `(qname, qtype,
+/// qclass)`, RD set, and one EDNS OPT additional record with the DO flag
+/// set according to `dnssec_ok`. `dnssec_ok` is kept as an explicit
+/// parameter rather than hardcoded so this builder stays a pure,
+/// independently testable function -- it's the caller (`process_refresh_job`)
+/// that always passes `true` for refresh jobs, a policy decision that
+/// doesn't belong baked into the builder itself. `udp_payload_size` is the
+/// operator's own `configured_max_udp_payload_size()` (not a fixed
+/// constant): review found the previous hard-coded 1232 bytes could
+/// truncate/fail a large DNSSEC refresh response for an operator who
+/// configured a bigger buffer, since only `ResolutionMode::Recursive`
+/// backend calls get their EDNS size rewritten downstream
+/// (`resolve_backend` -> `backend_query_with_configured_udp_limit`) --
+/// `ResolutionMode::Forward` sends whatever this builder encoded, verbatim.
+///
+/// The bytes built here are always well-formed by construction, so the
+/// `expect`s below reflect a bug in this function, not a runtime condition
+/// to recover from.
+/// Returns `None` (never panics) if `qname` can't be encoded as a valid DNS
+/// name -- in practice `qname` always originates from an already-cached,
+/// already-validated name (every name that ever reaches the cache passed
+/// through this same label-length limit at original decode time), so this
+/// is a defense-in-depth guard against a pathological input, not an
+/// expected path. `job.domain` splitting on `.` (matching the test-only
+/// `query`/`query_with_edns` helpers this mirrors) does not attempt to
+/// un-escape a label containing a literal embedded dot -- not reachable
+/// from any name this codebase itself decodes and re-serializes today, but
+/// worth a future reader's awareness if `job.domain` ever gained a
+/// different source.
+fn build_refresh_query(
+    qname: &str,
+    qtype: u16,
+    qclass: u16,
+    dnssec_ok: bool,
+    udp_payload_size: u16,
+) -> Option<DecodedQuery> {
+    const REFRESH_QUERY_ID: u16 = 0;
+    const MAX_LABEL_LEN: usize = 63;
+
+    let mut bytes = Vec::new();
+    bytes.extend_from_slice(&REFRESH_QUERY_ID.to_be_bytes());
+    bytes.extend_from_slice(&0x0100u16.to_be_bytes()); // flags: RD=1, standard query
+    bytes.extend_from_slice(&1u16.to_be_bytes()); // qdcount
+    bytes.extend_from_slice(&0u16.to_be_bytes()); // ancount
+    bytes.extend_from_slice(&0u16.to_be_bytes()); // nscount
+    bytes.extend_from_slice(&1u16.to_be_bytes()); // arcount (EDNS OPT)
+    for label in qname.split('.') {
+        if label.is_empty() {
+            continue; // root ("") or an already-trailing-dot-stripped name
+        }
+        if label.len() > MAX_LABEL_LEN {
+            return None;
+        }
+        bytes.push(label.len() as u8);
+        bytes.extend_from_slice(label.as_bytes());
+    }
+    bytes.push(0);
+    bytes.extend_from_slice(&qtype.to_be_bytes());
+    bytes.extend_from_slice(&qclass.to_be_bytes());
+    // EDNS OPT additional record: root owner name, TYPE=41, CLASS carries
+    // the UDP payload size, extended-rcode/version, DO flag, rdlen=0.
+    bytes.push(0);
+    bytes.extend_from_slice(&41u16.to_be_bytes());
+    bytes.extend_from_slice(&udp_payload_size.to_be_bytes());
+    bytes.push(0);
+    bytes.push(0);
+    let flags = if dnssec_ok { EDNS_DO_FLAG } else { 0 };
+    bytes.extend_from_slice(&flags.to_be_bytes());
+    bytes.extend_from_slice(&0u16.to_be_bytes());
+
+    let message = Message::parse_standard_query_owned(bytes).ok()?;
+    DecodedQuery::new(message)
+}
+
+/// Processes one dequeued job: epoch-first eligibility recheck,
+/// singleflight-based fetch (always `dnssec_ok = true`), and direct cache
+/// store bypassing `prepare_backend_result`'s policy/rewrite/chaos layers
+/// (none of which apply to a server-internal refresh). No retry on any
+/// failure -- the stale entry is simply left to expire normally.
+///
+/// In test builds, `TEST_JOB_HANDLER` (if set) takes over entirely instead
+/// -- see its own doc comment for why (exercising the real worker-pool
+/// mechanics in section-05's tests without this section's fetch logic
+/// existing yet).
+async fn process_refresh_job(resolver: Arc<ResolveQuery>, job: RefreshJob) {
+    #[cfg(test)]
+    {
+        let handler = TEST_JOB_HANDLER.with(|cell| cell.borrow().clone());
+        if let Some(handler) = handler {
+            handler(job).await;
+            return;
+        }
+    }
+
+    // 1. Capture epoch first -- reused for every subsequent step in this
+    //    job, never re-read mid-job (same discipline every other store path
+    //    in this file already follows; see `cache-epoch.md`).
+    let backend_snapshot = resolver.backend.current();
+    let epoch = backend_snapshot.cache_epoch;
+    let now = resolver.clock.now();
+
+    // 2. Re-check eligibility against that captured epoch by re-probing the
+    //    cache through the same lookup_chain path a real query uses. An
+    //    epoch mismatch (a reload happened while this job sat in the
+    //    channel) surfaces here as an ordinary miss -- `lookup_hop` already
+    //    treats a stale-epoch entry as invisible, so there's no separate
+    //    epoch check needed. A hint no longer present in the re-probed
+    //    result means the entry moved out of the lead window (or cooled)
+    //    since the job was enqueued.
+    //
+    //    Deliberately `dnssec_ok = false` here, not `true`: this recheck's
+    //    only job is "is this still a live, in-window, hot answer,"
+    //    independent of the entry's own DNSSEC completeness -- unlike the
+    //    actual fetch below (step 3), which always uses `true` per the
+    //    confirmed refresh-always-upgrades-to-DNSSEC-complete decision.
+    //    Rechecking with `true` here would incorrectly treat any entry
+    //    whose `dnssec_complete` is `false` as invisible (the same
+    //    DO=true-vs-dnssec_complete=false filter `take_live_positive`
+    //    applies to a real DO=true reader), permanently defeating refresh
+    //    for every domain whose cached answer happened to originate from a
+    //    DO=false query -- caught by `job_fetch_uses_dnssec_ok_true_always`.
+    //
+    //    Known feedback-loop caveat (flagged during review, not fixed here):
+    //    this recheck reuses the exact same `lookup_hop` code path a real
+    //    query uses, which unconditionally records a popularity hit and
+    //    touches the domain's LRU position on every live match -- including
+    //    this recheck itself. A successful refresh cycle alone (independent
+    //    of any real client traffic) therefore contributes its own hit
+    //    toward keeping the domain "hot," which for a domain whose lead
+    //    window recurs faster than the popularity bucket's leak rate could
+    //    theoretically sustain refreshing indefinitely even after real
+    //    demand stops. Deliberately not fixed here -- the alternative is a
+    //    second, side-effect-free recheck path, contradicting this design's
+    //    explicit choice to reuse `lookup_chain` rather than hand-roll a
+    //    parallel one. Section-07's end-to-end verification ("a domain that
+    //    stops being queried stops getting refreshed") should specifically
+    //    probe a short-TTL/fast-refresh-cycle domain to confirm whether
+    //    this is a practical problem with the shipped defaults, not just a
+    //    long-TTL domain where natural leak easily outpaces one hit/cycle.
+    let recheck = resolver.cache.lookup_chain(
+        &job.domain,
+        job.qtype,
+        job.qclass,
+        false,
+        epoch,
+        resolver.max_chain_depth,
+        now,
+        &resolver.refresh_config,
+    );
+    let still_eligible = matches!(
+        &recheck,
+        ChainLookup::Answered(resolved) if resolved.refresh_hints.iter().any(|hint| {
+            hint.domain == job.domain && hint.qtype == job.qtype && hint.qclass == job.qclass
+        })
+    );
+    if !still_eligible {
+        return;
+    }
+
+    // 3. Fetch via singleflight -- dnssec_ok always true for refresh jobs
+    //    (a refresh always upgrades to a DNSSEC-complete fetch). This only
+    //    coalesces with a concurrent client miss that itself has
+    //    dnssec_ok = true, since MissKey includes this flag; a DO=false
+    //    client miss for the same key becomes its own independent Leader.
+    //    `udp_payload_size` uses the operator's own configured limit (review
+    //    found the previous hard-coded 1232 bytes could truncate/fail a
+    //    large DNSSEC refresh response when a larger limit was configured --
+    //    see `build_refresh_query`'s doc comment).
+    let miss_key: MissKey = (job.domain.clone(), job.qtype, job.qclass, epoch, true);
+    let udp_payload_size = resolver
+        .configured_max_udp_payload_size()
+        .min(u16::MAX as usize) as u16;
+    let Some(synthetic_query) =
+        build_refresh_query(&job.domain, job.qtype, job.qclass, true, udp_payload_size)
+    else {
+        resolver.metrics.increment(ResolverMetric::RefreshFailed);
+        return;
+    };
+    let (leader, fetch_result) = match resolver.miss_coalescer.begin(miss_key) {
+        SingleFlightTicket::Leader { key, flight } => {
+            let leader = SingleFlightLeader::new(Arc::clone(&resolver.miss_coalescer), key, flight);
+            let result = resolver
+                .resolve_backend(&backend_snapshot, &synthetic_query)
+                .await;
+            (Some(leader), result)
+        }
+        SingleFlightTicket::Follower { flight } => (None, flight.wait().await),
+    };
+
+    // 4. Store on success (*before* notifying any singleflight followers via
+    //    `leader.complete` below), no retry on any failure.
+    //
+    //    Ordering matters (found by review): completing the leader's flight
+    //    wakes any waiting follower immediately, and a follower re-probes
+    //    the cache right after waking (`cache_hit_after_coalesced_miss`). If
+    //    that happened *before* this job's own store landed, the follower
+    //    could still see the stale (or by-then-expired) entry, miss, and
+    //    fall back to this job's raw synthetic backend result -- which in
+    //    forward mode only has its ID/RD/CD rewritten for the real client,
+    //    not reframed with that client's own question/OPT. Storing first
+    //    (mirroring `resolve_coalesced_leader`'s own store-then-complete
+    //    ordering) means a follower's cache re-probe always sees the fresh
+    //    entry.
+    //
+    //    Note: this runs identically whether this job ended up as the
+    //    singleflight Leader or a Follower -- if some other party (a real
+    //    client miss, or another refresh job racing the same key) was
+    //    already the Leader, this job still independently calls
+    //    store_cache_response on the shared result once it wakes from
+    //    `flight.wait()`. That's a deliberate, harmless redundancy (last
+    //    store wins with materially the same data, since both sides are
+    //    storing the identical backend response) rather than a bug worth
+    //    special-casing away -- the alternative (skip storing when a
+    //    Follower) would depend on the other party's own store path having
+    //    already run by the time this one observes the result, which isn't
+    //    guaranteed.
+    match fetch_result {
+        Ok(mut response) => {
+            if !response.cache_directive.is_cacheable() {
+                // The backend itself declared this specific response
+                // not cacheable (e.g. DNSSEC validation was incomplete,
+                // or a backend policy said so) -- `prepare_backend_result`
+                // honors this same directive before its own store call
+                // (see its `cache_directive.is_cacheable()` check), and a
+                // refresh must not force-cache something the backend
+                // explicitly said not to.
+                resolver.metrics.increment(ResolverMetric::RefreshFailed);
+                if let Some(leader) = leader {
+                    leader.complete(Ok(response));
+                }
+                return;
+            }
+            let Some(response_message) = validate_backend_response(&mut response, &synthetic_query)
+            else {
+                resolver.metrics.increment(ResolverMetric::RefreshFailed);
+                if let Some(leader) = leader {
+                    leader.complete(Ok(response));
+                }
+                return;
+            };
+            // Same store_dnssec_ok/store_authoritative computation
+            // `prepare_backend_result` uses, so a refresh-stored entry is
+            // structurally indistinguishable from what the normal
+            // client-miss path would have stored for the same response.
+            // store_dnssec_ok collapses to `true` in both arms here
+            // (unlike prepare_backend_result's general case) since the
+            // synthetic query itself always sets dnssec_ok = true.
+            let store_authoritative = match backend_snapshot.mode {
+                ResolutionMode::Recursive => false,
+                ResolutionMode::Forward => response_message.header.aa(),
+            };
+            let synthetic_request =
+                ResolveRequest::new(Ipv4Addr::UNSPECIFIED.into(), now, Vec::new());
+            resolver
+                .store_cache_response(
+                    epoch,
+                    &response_message,
+                    &synthetic_query.question,
+                    &synthetic_request,
+                    true,
+                    store_authoritative,
+                )
+                .await;
+            resolver.metrics.increment(ResolverMetric::RefreshSucceeded);
+            if let Some(leader) = leader {
+                leader.complete(Ok(response));
+            }
+        }
+        Err(error) => {
+            resolver.metrics.increment(ResolverMetric::RefreshFailed);
+            if let Some(leader) = leader {
+                leader.complete(Err(error));
+            }
+        }
+    }
 }
 
 pub struct ResolveQuery {
@@ -3591,6 +4039,23 @@ pub struct ResolveQuery {
     // every existing test call site. `main.rs` overrides it with a real,
     // process-lifetime secret once available.
     cookie_secret: Arc<CookieSecret>,
+    // Not part of any constructor's parameter list by default (defaults to
+    // `RefreshConfig::default()`) -- same reasoning as `max_chain_depth`/
+    // `chaos`/`cookie_secret` above. Threaded into every `self.cache.lookup_chain(...)`
+    // call so `Shard::lookup_hop` (via `resolve_from_cache`) can compute the
+    // auto-refresh trigger formula (`docs/plans/auto_refresh/`) with real
+    // thresholds instead of a hardcoded default. `main.rs` overrides it via
+    // `with_refresh_config` once real config is available.
+    refresh_config: crate::config::RefreshConfig,
+    // Non-blocking enqueue point for background refresh jobs (see
+    // `docs/knowledge/resolver/caching/auto-refresh.md`). Every constructor
+    // defaults this to a sender whose paired receiver has already been
+    // dropped, so any enqueue attempt in an existing test (none currently
+    // configure a hot popularity bucket) simply counts as a dropped job
+    // (`ResolverMetric::RefreshQueueFull`) rather than panicking or
+    // blocking. `main.rs` overrides this via `with_refresh_sender` once the
+    // real worker pool's channel exists (section-05).
+    refresh_sender: tokio::sync::mpsc::Sender<RefreshJob>,
 }
 
 impl ResolveQuery {
@@ -3706,6 +4171,7 @@ impl ResolveQuery {
         metrics: Arc<dyn MetricsSink>,
     ) -> Self {
         metrics.record_backend_status(&backend_snapshot.status());
+        let (refresh_sender, _dropped_refresh_receiver) = tokio::sync::mpsc::channel(1);
         Self {
             protocol,
             policy,
@@ -3723,6 +4189,8 @@ impl ResolveQuery {
             metrics,
             chaos: crate::config::ChaosConfig::default(),
             cookie_secret: Arc::new(CookieSecret::generate()),
+            refresh_config: crate::config::RefreshConfig::default(),
+            refresh_sender,
         }
     }
 
@@ -3870,6 +4338,26 @@ impl ResolveQuery {
         self
     }
 
+    /// Overrides the default `RefreshConfig` set by every constructor.
+    /// `main.rs` calls this with the real `[refresh]` config once available
+    /// -- see `ResolveQuery.refresh_config`'s doc comment for why this is a
+    /// post-construction override rather than a parameter threaded through
+    /// every `with_cache*` constructor.
+    pub fn with_refresh_config(mut self, refresh_config: crate::config::RefreshConfig) -> Self {
+        self.refresh_config = refresh_config;
+        self
+    }
+
+    /// Wires the auto-refresh job sender into this resolver. Left at its
+    /// default (a sender whose receiver has already been dropped) when
+    /// `RefreshConfig::enabled` is `false`, or before the worker pool
+    /// (section-05) exists -- see `ResolveQuery.refresh_sender`'s doc
+    /// comment.
+    pub fn with_refresh_sender(mut self, sender: tokio::sync::mpsc::Sender<RefreshJob>) -> Self {
+        self.refresh_sender = sender;
+        self
+    }
+
     /// Overrides the default `ShardedSingleFlight` shard count set by
     /// every constructor. `main.rs` calls this with the real
     /// `ShardedDnsCache`'s own `shard_count()` once both are constructed,
@@ -3920,6 +4408,7 @@ impl ResolveQuery {
         metrics: Arc<dyn MetricsSink>,
     ) -> Self {
         metrics.record_backend_status(&backend_handle.status());
+        let (refresh_sender, _dropped_refresh_receiver) = tokio::sync::mpsc::channel(1);
         Self {
             protocol,
             policy,
@@ -3937,6 +4426,8 @@ impl ResolveQuery {
             metrics,
             chaos: crate::config::ChaosConfig::default(),
             cookie_secret: Arc::new(CookieSecret::generate()),
+            refresh_config: crate::config::RefreshConfig::default(),
+            refresh_sender,
         }
     }
 
@@ -4036,6 +4527,7 @@ impl ResolveQuery {
                     response_bytes,
                     cache_probe.event_cache_result,
                     &backend_snapshot,
+                    cache_probe.refresh_hints,
                 )
                 .await;
         }
@@ -4320,6 +4812,14 @@ impl ResolveQuery {
 
     /// Finishes a cache-probe hit: applies the response-bytes block policy,
     /// then serves the blocked response or the cached one.
+    ///
+    /// `refresh_hints` are enqueued here, not in `probe_cache` where they
+    /// were originally produced -- review found the original call site
+    /// enqueued unconditionally, which could trigger a background refresh
+    /// (a real backend fetch) for a hit that turns out to be response-policy
+    /// blocked just below, or for an RD=0 cache-only query that shouldn't
+    /// cause any fresh upstream work at all. Only enqueue once the hit is
+    /// fully admitted: not blocked, and `recursion_desired`.
     #[allow(clippy::too_many_arguments)]
     async fn finish_cache_hit(
         &self,
@@ -4330,6 +4830,7 @@ impl ResolveQuery {
         response_bytes: Vec<u8>,
         event_cache_result: Option<QueryEventCacheResult>,
         backend_snapshot: &BackendSnapshot,
+        refresh_hints: Vec<cache::RefreshHint>,
     ) -> ResolveOutcome {
         if let Some(block) = self.response_bytes_policy_block(request.client_ip, &response_bytes) {
             self.metrics.increment(ResolverMetric::QueryBlocked);
@@ -4354,6 +4855,11 @@ impl ResolveQuery {
                     Some(QueryEventBackend::from_snapshot(backend_snapshot)),
                 )
                 .await;
+        }
+        if decoded.features.recursion_desired {
+            for hint in refresh_hints {
+                self.enqueue_refresh_job(hint);
+            }
         }
         let decision = ResolveDecision {
             client_ip: request.client_ip,
@@ -4475,7 +4981,10 @@ impl ResolveQuery {
     ) -> ResolveOutcome {
         self.metrics.increment(ResolverMetric::CacheCoalescedMiss);
         let backend_result = flight.wait().await;
-        let Some(response_bytes) = self
+        let Some(CoalescedFollowerHit {
+            response_bytes,
+            refresh_hints,
+        }) = self
             .cache_hit_after_coalesced_miss(request, decoded, backend_snapshot, &miss_key)
             .await
         else {
@@ -4522,6 +5031,14 @@ impl ResolveQuery {
                     Some(QueryEventBackend::from_snapshot(backend_snapshot)),
                 )
                 .await;
+        }
+
+        // Admitted: not policy-blocked. `resolve_coalesced_follower` is only
+        // ever reached with `recursion_desired = true` (an RD=0 query never
+        // gets past `refuse_recursion` on a genuine miss), so unlike
+        // `finish_cache_hit`'s hit path, no separate RD check is needed here.
+        for hint in refresh_hints {
+            self.enqueue_refresh_job(hint);
         }
 
         let decision = ResolveDecision {
@@ -4653,6 +5170,14 @@ impl ResolveQuery {
         LocalAnswerMetadata::from_entry(entry, local_answer_family(decoded.question.qtype))
     }
 
+    /// Note: `refresh_hints` are deliberately *not* enqueued here, even
+    /// though this is where `ChainLookup::Answered` first produces them.
+    /// Review found that enqueueing this early could trigger a background
+    /// refresh (a real, if server-internal, backend fetch) for a query that
+    /// the rest of the pipeline hasn't yet admitted -- an RD=0 cache-only
+    /// query, or a hit the response-block policy is about to reject in
+    /// `finish_cache_hit`. `CacheProbe::refresh_hints` carries them forward
+    /// so the caller enqueues only once a hit is fully admitted.
     async fn probe_cache(
         &self,
         backend_snapshot: &BackendSnapshot,
@@ -4667,6 +5192,7 @@ impl ResolveQuery {
                 hit: None,
                 store_allowed: false,
                 event_cache_result: Some(QueryEventCacheResult::Bypass),
+                refresh_hints: Vec::new(),
             };
         }
 
@@ -4685,9 +5211,14 @@ impl ResolveQuery {
             epoch,
             self.max_chain_depth,
             request.received_at.0,
+            &self.refresh_config,
         );
-        let (store_allowed, hit, event_cache_result) =
-            self.evaluate_cache_lookup(lookup, decoded, request);
+        let CacheLookupEvaluation {
+            store_allowed,
+            hit,
+            event_cache_result,
+            refresh_hints,
+        } = self.evaluate_cache_lookup(lookup, decoded, request);
 
         // The DO dimension of `MissKey` only needs to distinguish backend
         // fetches that can genuinely differ. The forwarding backend still
@@ -4722,6 +5253,7 @@ impl ResolveQuery {
             hit,
             store_allowed,
             event_cache_result: Some(event_cache_result),
+            refresh_hints,
         }
     }
 
@@ -4743,12 +5275,18 @@ impl ResolveQuery {
         lookup: ChainLookup,
         decoded: &DecodedQuery,
         request: &ResolveRequest,
-    ) -> (bool, Option<Vec<u8>>, QueryEventCacheResult) {
+    ) -> CacheLookupEvaluation {
         match lookup {
             ChainLookup::Answered(resolved) => {
+                let refresh_hints = resolved.refresh_hints.clone();
                 let response_bytes = self.serialize_cache_hit_answer(decoded, &resolved, request);
                 self.record_cache_hit_metrics(&response_bytes, false);
-                (false, Some(response_bytes), QueryEventCacheResult::Hit)
+                CacheLookupEvaluation {
+                    store_allowed: false,
+                    hit: Some(response_bytes),
+                    event_cache_result: QueryEventCacheResult::Hit,
+                    refresh_hints,
+                }
             }
             ChainLookup::NxDomain(resolved) => {
                 let response_bytes = self.serialize_cache_hit_negative(
@@ -4758,7 +5296,12 @@ impl ResolveQuery {
                     request,
                 );
                 self.record_cache_hit_metrics(&response_bytes, true);
-                (false, Some(response_bytes), QueryEventCacheResult::Hit)
+                CacheLookupEvaluation {
+                    store_allowed: false,
+                    hit: Some(response_bytes),
+                    event_cache_result: QueryEventCacheResult::Hit,
+                    refresh_hints: Vec::new(),
+                }
             }
             ChainLookup::NoData(resolved) => {
                 let response_bytes = self.serialize_cache_hit_negative(
@@ -4768,12 +5311,40 @@ impl ResolveQuery {
                     request,
                 );
                 self.record_cache_hit_metrics(&response_bytes, true);
-                (false, Some(response_bytes), QueryEventCacheResult::Hit)
+                CacheLookupEvaluation {
+                    store_allowed: false,
+                    hit: Some(response_bytes),
+                    event_cache_result: QueryEventCacheResult::Hit,
+                    refresh_hints: Vec::new(),
+                }
             }
             ChainLookup::Miss => {
                 self.metrics.increment(ResolverMetric::CacheMiss);
-                (true, None, QueryEventCacheResult::Miss)
+                CacheLookupEvaluation {
+                    store_allowed: true,
+                    hit: None,
+                    event_cache_result: QueryEventCacheResult::Miss,
+                    refresh_hints: Vec::new(),
+                }
             }
+        }
+    }
+
+    /// Non-blocking, best-effort enqueue: a full (or closed, e.g. no
+    /// worker pool wired up yet) channel counts as a dropped trigger
+    /// (`RefreshQueueFull`), never blocks, never panics. Applies
+    /// independently per hint — one drop from a multi-hop chain doesn't
+    /// affect the others, each already enqueued in its own loop iteration
+    /// by the caller.
+    fn enqueue_refresh_job(&self, hint: cache::RefreshHint) {
+        let job = RefreshJob {
+            domain: hint.domain,
+            qtype: hint.qtype,
+            qclass: hint.qclass,
+        };
+        match self.refresh_sender.try_send(job) {
+            Ok(()) => self.metrics.increment(ResolverMetric::RefreshTriggered),
+            Err(_) => self.metrics.increment(ResolverMetric::RefreshQueueFull),
         }
     }
 
@@ -4828,13 +5399,18 @@ impl ResolveQuery {
         )
     }
 
+    /// Note: `refresh_hints` are carried in the return value rather than
+    /// enqueued here, for the same reason `probe_cache` no longer enqueues
+    /// directly (see its doc comment) -- this follower-side hit still has
+    /// to pass the response-block policy check in `resolve_coalesced_follower`
+    /// before it's genuinely admitted.
     async fn cache_hit_after_coalesced_miss(
         &self,
         request: &ResolveRequest,
         decoded: &DecodedQuery,
         backend_snapshot: &BackendSnapshot,
         miss_key: &MissKey,
-    ) -> Option<Vec<u8>> {
+    ) -> Option<CoalescedFollowerHit> {
         let epoch = backend_snapshot.cache_epoch;
         let lookup = self.cache.lookup_chain(
             &miss_key.0,
@@ -4844,12 +5420,21 @@ impl ResolveQuery {
             epoch,
             self.max_chain_depth,
             request.received_at.0,
+            &self.refresh_config,
         );
         match lookup {
             ChainLookup::Answered(resolved) => {
+                // This is the single-flight *follower* path -- exactly the
+                // concurrent/hot-domain scenario the refresh feature
+                // targets, so hints from here must reach the caller too,
+                // the same as `probe_cache`'s leader-side path.
+                let refresh_hints = resolved.refresh_hints.clone();
                 let response_bytes = self.serialize_cache_hit_answer(decoded, &resolved, request);
                 self.record_cache_hit_metrics(&response_bytes, false);
-                Some(response_bytes)
+                Some(CoalescedFollowerHit {
+                    response_bytes,
+                    refresh_hints,
+                })
             }
             ChainLookup::NxDomain(resolved) => {
                 let response_bytes = self.serialize_cache_hit_negative(
@@ -4859,7 +5444,10 @@ impl ResolveQuery {
                     request,
                 );
                 self.record_cache_hit_metrics(&response_bytes, true);
-                Some(response_bytes)
+                Some(CoalescedFollowerHit {
+                    response_bytes,
+                    refresh_hints: Vec::new(),
+                })
             }
             ChainLookup::NoData(resolved) => {
                 let response_bytes = self.serialize_cache_hit_negative(
@@ -4869,7 +5457,10 @@ impl ResolveQuery {
                     request,
                 );
                 self.record_cache_hit_metrics(&response_bytes, true);
-                Some(response_bytes)
+                Some(CoalescedFollowerHit {
+                    response_bytes,
+                    refresh_hints: Vec::new(),
+                })
             }
             ChainLookup::Miss => None,
         }
@@ -6175,6 +6766,7 @@ impl DomainDnsCache for NoopDnsCache {
         _epoch: u64,
         _max_chain_depth: u8,
         _now: SystemTime,
+        _refresh_config: &crate::config::RefreshConfig,
     ) -> ChainLookup {
         ChainLookup::Miss
     }
@@ -8148,6 +8740,22 @@ pub enum ResolverMetric {
     CacheMissQueryDuration,
     ProtocolError,
     RecursionRefused,
+    /// A hot, near-expiry entry was seen and a `RefreshJob` was enqueued
+    /// (`docs/plans/auto_refresh/`). Pulled forward from section-05's
+    /// scope: needed here since section-04's enqueue path must compile,
+    /// even though the worker pool that consumes these jobs doesn't exist
+    /// yet.
+    RefreshTriggered,
+    /// A refresh trigger fired but the channel was full (or, before
+    /// section-05's worker pool exists, always — every `ResolveQuery` has
+    /// no live receiver until `main.rs` wires one up), so the job was
+    /// dropped. Best-effort by design; no correctness impact.
+    RefreshQueueFull,
+    /// A worker's refetch completed and the entry was re-stored
+    /// (section-06).
+    RefreshSucceeded,
+    /// A worker's refetch failed for any reason (section-06); no retry.
+    RefreshFailed,
 }
 
 #[cfg(test)]
@@ -8156,9 +8764,9 @@ mod tests {
     use std::sync::Mutex;
     use std::sync::mpsc as std_mpsc;
     use std::thread;
-    use tokio::sync::Notify;
+    use tokio::sync::{Barrier, Notify};
 
-    use crate::config::CacheConfig;
+    use crate::config::{CacheConfig, LeakRate, RefreshConfig};
     use crate::protocol::{EdnsInfo, Header, Question, Record, build_a_block_response};
 
     fn a_query(id: u16, name: &str) -> Vec<u8> {
@@ -9824,6 +10432,308 @@ mod tests {
         }
     }
 
+    // Job enqueue tests: section-04-chainlookup-plumbing.
+
+    fn resolver_for_enqueue_tests(metrics: Arc<RecordingMetrics>) -> ResolveQuery {
+        ResolveQuery::new(
+            Arc::new(StandardProtocolCodec::new(1232)),
+            Arc::new(StaticUpstream::new(Err(UpstreamError::Timeout))),
+            Arc::new(BasicResponseFactory),
+            Arc::new(FixedClock(SystemTime::UNIX_EPOCH)),
+            Arc::new(RecordingEvents::default()),
+            metrics,
+        )
+    }
+
+    fn test_refresh_hint(domain: &str) -> cache::RefreshHint {
+        cache::RefreshHint {
+            domain: domain.to_string(),
+            qtype: 1,
+            qclass: 1,
+        }
+    }
+
+    #[tokio::test]
+    async fn enqueue_try_send_succeeds_under_capacity() {
+        let metrics = Arc::new(RecordingMetrics::default());
+        let (sender, mut receiver) = tokio::sync::mpsc::channel(4);
+        let resolver = resolver_for_enqueue_tests(metrics.clone()).with_refresh_sender(sender);
+
+        resolver.enqueue_refresh_job(test_refresh_hint("hot.example.com"));
+
+        assert_eq!(metrics.count(ResolverMetric::RefreshTriggered), 1);
+        assert_eq!(metrics.count(ResolverMetric::RefreshQueueFull), 0);
+        let job = receiver.try_recv().expect("job should be enqueued");
+        assert_eq!(job.domain, "hot.example.com");
+    }
+
+    #[tokio::test]
+    async fn enqueue_drops_and_counts_on_full_channel() {
+        let metrics = Arc::new(RecordingMetrics::default());
+        // Capacity 1, pre-filled, so the next try_send is guaranteed to see
+        // a full channel.
+        let (sender, mut receiver) = tokio::sync::mpsc::channel(1);
+        sender
+            .try_send(RefreshJob {
+                domain: "already-queued.example.com".to_string(),
+                qtype: 1,
+                qclass: 1,
+            })
+            .unwrap();
+        let resolver = resolver_for_enqueue_tests(metrics.clone()).with_refresh_sender(sender);
+
+        resolver.enqueue_refresh_job(test_refresh_hint("dropped.example.com"));
+
+        assert_eq!(metrics.count(ResolverMetric::RefreshTriggered), 0);
+        assert_eq!(metrics.count(ResolverMetric::RefreshQueueFull), 1);
+        // The channel still only has the pre-filled job -- the dropped one
+        // never made it in, and nothing panicked or blocked.
+        let job = receiver.try_recv().expect("pre-filled job still present");
+        assert_eq!(job.domain, "already-queued.example.com");
+        assert!(receiver.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn enqueue_per_hint_independent() {
+        let metrics = Arc::new(RecordingMetrics::default());
+        // Capacity 1, pre-filled, so exactly one of the two hints below
+        // finds room and the other is dropped -- independently.
+        let (sender, mut receiver) = tokio::sync::mpsc::channel(1);
+        let resolver = resolver_for_enqueue_tests(metrics.clone()).with_refresh_sender(sender);
+
+        resolver.enqueue_refresh_job(test_refresh_hint("first.example.com"));
+        resolver.enqueue_refresh_job(test_refresh_hint("second.example.com"));
+
+        assert_eq!(metrics.count(ResolverMetric::RefreshTriggered), 1);
+        assert_eq!(metrics.count(ResolverMetric::RefreshQueueFull), 1);
+        let job = receiver
+            .try_recv()
+            .expect("first hint should have been enqueued");
+        assert_eq!(job.domain, "first.example.com");
+    }
+
+    // Worker pool tests: section-05-worker-pool-metrics.
+    //
+    // `process_refresh_job` is a fixed no-op stub in this section (real
+    // behavior lands in section-06). Rather than a hand-rolled lookalike of
+    // `refresh_worker_loop`, these tests drive the *real*
+    // `spawn_refresh_worker_pool`/`refresh_worker_loop`/`process_refresh_job`
+    // via the `TEST_JOB_HANDLER` thread-local seam, so a real bug in the
+    // production dequeue/spawn/await/panic-isolation path would actually be
+    // caught here.
+
+    fn test_job(domain: &str) -> RefreshJob {
+        RefreshJob {
+            domain: domain.to_string(),
+            qtype: 1,
+            qclass: 1,
+        }
+    }
+
+    fn resolver_for_worker_pool_tests() -> Arc<ResolveQuery> {
+        Arc::new(resolver_for_enqueue_tests(Arc::new(
+            RecordingMetrics::default(),
+        )))
+    }
+
+    #[tokio::test]
+    async fn worker_processes_jobs_sequentially_per_worker() {
+        let (events_tx, mut events_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+        let gate = Arc::new(Notify::new());
+        let gate_for_handler = Arc::clone(&gate);
+        set_test_job_handler(std::sync::Arc::new(move |job: RefreshJob| {
+            let events_tx = events_tx.clone();
+            let gate = Arc::clone(&gate_for_handler);
+            Box::pin(async move {
+                events_tx.send(format!("start:{}", job.domain)).unwrap();
+                if job.domain == "first" {
+                    gate.notified().await;
+                }
+                events_tx.send(format!("done:{}", job.domain)).unwrap();
+            })
+        }));
+
+        let (sender, receiver) = mpsc::channel(4);
+        sender.try_send(test_job("first")).unwrap();
+        sender.try_send(test_job("second")).unwrap();
+        drop(sender); // lets the loop exit once both jobs are drained
+
+        let handles = spawn_refresh_worker_pool(resolver_for_worker_pool_tests(), receiver, 1);
+
+        assert_eq!(events_rx.recv().await.unwrap(), "start:first");
+        // "second" must not start until "first"'s spawned task has been
+        // awaited to completion -- a single worker dequeues sequentially.
+        assert!(events_rx.try_recv().is_err());
+
+        gate.notify_one();
+        assert_eq!(events_rx.recv().await.unwrap(), "done:first");
+        assert_eq!(events_rx.recv().await.unwrap(), "start:second");
+        assert_eq!(events_rx.recv().await.unwrap(), "done:second");
+
+        for handle in handles {
+            handle.await.unwrap();
+        }
+        // TEST_JOB_HANDLER is thread-local, and the test harness can reuse
+        // this OS thread for a later test -- clear it so this stub doesn't
+        // leak into whatever runs next on this thread.
+        clear_test_job_handler();
+    }
+
+    #[tokio::test]
+    async fn worker_panic_isolated_via_joinhandle() {
+        let (events_tx, mut events_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+        set_test_job_handler(std::sync::Arc::new(move |job: RefreshJob| {
+            let events_tx = events_tx.clone();
+            Box::pin(async move {
+                events_tx.send(format!("start:{}", job.domain)).unwrap();
+                if job.domain == "boom" {
+                    panic!("simulated job panic");
+                }
+                events_tx.send(format!("done:{}", job.domain)).unwrap();
+            })
+        }));
+
+        let (sender, receiver) = mpsc::channel(4);
+        sender.try_send(test_job("boom")).unwrap();
+        sender.try_send(test_job("safe")).unwrap();
+        drop(sender);
+
+        let handles = spawn_refresh_worker_pool(resolver_for_worker_pool_tests(), receiver, 1);
+
+        assert_eq!(events_rx.recv().await.unwrap(), "start:boom");
+        // The real worker loop must survive "boom"'s panic (isolated to its
+        // own spawned task/JoinHandle) and go on to dequeue "safe".
+        assert_eq!(events_rx.recv().await.unwrap(), "start:safe");
+        assert_eq!(events_rx.recv().await.unwrap(), "done:safe");
+
+        for handle in handles {
+            handle.await.unwrap();
+        }
+        clear_test_job_handler();
+    }
+
+    #[tokio::test]
+    async fn worker_pool_bounds_total_concurrency_to_worker_count() {
+        const WORKER_COUNT: usize = 3;
+        let (events_tx, mut events_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+        // A barrier sized to exactly `WORKER_COUNT` only ever completes if
+        // all `WORKER_COUNT` jobs are genuinely running concurrently --
+        // proving the pool both reaches and never exceeds this bound (if
+        // fewer ran concurrently, the barrier wait would hang, which the
+        // timeout below turns into a clear test failure instead).
+        let barrier = Arc::new(Barrier::new(WORKER_COUNT));
+        set_test_job_handler(std::sync::Arc::new(move |job: RefreshJob| {
+            let events_tx = events_tx.clone();
+            let barrier = Arc::clone(&barrier);
+            Box::pin(async move {
+                barrier.wait().await;
+                events_tx.send(format!("done:{}", job.domain)).unwrap();
+            })
+        }));
+
+        let (sender, receiver) = mpsc::channel(WORKER_COUNT);
+        for i in 0..WORKER_COUNT {
+            sender.try_send(test_job(&format!("job-{i}"))).unwrap();
+        }
+        drop(sender);
+
+        let handles =
+            spawn_refresh_worker_pool(resolver_for_worker_pool_tests(), receiver, WORKER_COUNT);
+
+        tokio::time::timeout(Duration::from_secs(2), async {
+            for _ in 0..WORKER_COUNT {
+                events_rx.recv().await.unwrap();
+            }
+        })
+        .await
+        .expect("all jobs should complete concurrently well within the timeout");
+
+        for handle in handles {
+            handle.await.unwrap();
+        }
+        clear_test_job_handler();
+    }
+
+    #[tokio::test]
+    async fn worker_pool_shutdown_via_abort() {
+        // Explicitly clears the test hook (rather than relying on it never
+        // having been set) since the test harness's thread pool can reuse
+        // an OS thread across different test functions, and this test
+        // relies on the true production no-op `process_refresh_job` -- not
+        // whatever handler a previous test on this same thread happened to
+        // leave behind.
+        clear_test_job_handler();
+
+        let (_sender, receiver) = mpsc::channel::<RefreshJob>(4);
+        let handles = spawn_refresh_worker_pool(resolver_for_worker_pool_tests(), receiver, 2);
+        for handle in &handles {
+            handle.abort();
+        }
+        for handle in handles {
+            let result = handle.await;
+            assert!(
+                result.is_ok() || result.unwrap_err().is_cancelled(),
+                "aborted worker task should join cleanly (Ok or a cancelled JoinError)"
+            );
+        }
+    }
+
+    /// Regression test for the bug code review found: aborting the outer
+    /// worker-loop task while a job is in flight must also cancel that
+    /// job's own spawned task, not leave it detached running forever (which
+    /// would keep its own `Arc<ResolveQuery>` clone alive and could hang
+    /// shutdown's `event_drain.await`). Uses a job handler that never
+    /// completes on its own (`std::future::pending`) with a drop marker, so
+    /// the only way "job_dropped" is ever sent is if aborting the outer
+    /// `JoinHandle` really did cancel the inner job task too.
+    #[tokio::test]
+    async fn worker_pool_abort_also_cancels_in_flight_job() {
+        clear_test_job_handler();
+
+        struct DropMarker(tokio::sync::mpsc::UnboundedSender<String>);
+        impl Drop for DropMarker {
+            fn drop(&mut self) {
+                let _ = self.0.send("job_dropped".to_string());
+            }
+        }
+
+        let (events_tx, mut events_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+        set_test_job_handler(std::sync::Arc::new(move |job: RefreshJob| {
+            let events_tx = events_tx.clone();
+            Box::pin(async move {
+                events_tx.send(format!("start:{}", job.domain)).unwrap();
+                let _marker = DropMarker(events_tx);
+                std::future::pending::<()>().await;
+            })
+        }));
+
+        let (sender, receiver) = mpsc::channel(4);
+        sender.try_send(test_job("stuck")).unwrap();
+
+        let handles = spawn_refresh_worker_pool(resolver_for_worker_pool_tests(), receiver, 1);
+        assert_eq!(events_rx.recv().await.unwrap(), "start:stuck");
+        // Give the spawned inner job task a scheduling turn so it's
+        // genuinely parked in `pending().await` before aborting the loop.
+        tokio::task::yield_now().await;
+
+        for handle in &handles {
+            handle.abort();
+        }
+        for handle in handles {
+            let _ = handle.await;
+        }
+
+        tokio::time::timeout(Duration::from_secs(2), async {
+            assert_eq!(events_rx.recv().await.unwrap(), "job_dropped");
+        })
+        .await
+        .expect(
+            "aborting the outer worker loop must also cancel its in-flight inner job task, \
+             not leave it detached and running forever",
+        );
+        clear_test_job_handler();
+    }
+
     struct ClientScopedResponsePolicy {
         client_ip: IpAddr,
         domain: DomainSelector,
@@ -10128,6 +11038,7 @@ mod tests {
             _epoch: u64,
             _max_chain_depth: u8,
             _now: SystemTime,
+            _refresh_config: &crate::config::RefreshConfig,
         ) -> ChainLookup {
             self.lookups
                 .lock()
@@ -15907,6 +16818,7 @@ mod tests {
             _epoch: u64,
             _max_chain_depth: u8,
             _now: SystemTime,
+            _refresh_config: &crate::config::RefreshConfig,
         ) -> ChainLookup {
             ChainLookup::Miss
         }
@@ -16334,6 +17246,898 @@ mod tests {
             dnssec_complete: true,
             authoritative: false,
         }
+    }
+
+    // Refresh fetch + store tests: section-06-refresh-fetch-store.
+
+    /// A `RefreshConfig` tuned so any domain that's ever been queried once
+    /// (bucket exists, level >= 1) is immediately "hot" (`hot_threshold_fraction
+    /// = 0.0`), and any live entry is always within the lead window
+    /// (`lead_ratio = 1.0`, `min_lead = 0` -> lead == original_ttl, and
+    /// `remaining_ttl` can never exceed `original_ttl`), with no eligibility
+    /// floor. Used to make a freshly-stored entry trivially eligible for
+    /// refresh without needing to wait for it to actually near expiry.
+    fn permissive_refresh_config() -> RefreshConfig {
+        RefreshConfig {
+            enabled: true,
+            bucket_capacity: 10,
+            leak_rate: LeakRate {
+                units: 1,
+                per: Duration::from_secs(3600),
+            },
+            hit_increment: 1,
+            hot_threshold_fraction: 0.0,
+            lead_ratio: 1.0,
+            min_lead: Duration::from_secs(0),
+            eligibility_floor: Duration::from_secs(0),
+            worker_count: 4,
+            channel_capacity: 256,
+        }
+    }
+
+    fn refresh_job(domain: &str, qtype: u16, qclass: u16) -> RefreshJob {
+        RefreshJob {
+            domain: domain.to_string(),
+            qtype,
+            qclass,
+        }
+    }
+
+    /// Warms `domain`'s popularity bucket by one hit via the real
+    /// `lookup_chain` path (the same side effect a real query has), using
+    /// `service`'s own `refresh_config` -- so a domain queried once becomes
+    /// eligible under `permissive_refresh_config`.
+    fn warm_popularity_via_lookup(
+        service: &ResolveQuery,
+        domain: &str,
+        qtype: u16,
+        qclass: u16,
+        now: SystemTime,
+    ) {
+        service.cache.lookup_chain(
+            domain,
+            qtype,
+            qclass,
+            false,
+            service.backend.current().cache_epoch,
+            service.max_chain_depth,
+            now,
+            &service.refresh_config,
+        );
+    }
+
+    #[tokio::test]
+    async fn build_refresh_query_always_sets_do_flag() {
+        let do_true = build_refresh_query("example.com", A_RECORD_TYPE, 1, true, 1232).unwrap();
+        assert!(do_true.features.dnssec_ok);
+
+        let do_false = build_refresh_query("example.com", A_RECORD_TYPE, 1, false, 1232).unwrap();
+        assert!(!do_false.features.dnssec_ok);
+    }
+
+    #[tokio::test]
+    async fn build_refresh_query_rejects_oversized_label() {
+        let oversized_label = "a".repeat(64);
+        assert!(build_refresh_query(&oversized_label, A_RECORD_TYPE, 1, true, 1232).is_none());
+    }
+
+    /// Regression test for the bug code review found: the previous
+    /// hard-coded 1232-byte EDNS buffer ignored `max_udp_payload_size`, so
+    /// an operator who configured a larger buffer still got refresh queries
+    /// bounded to 1232 -- silently defeating large-DNSSEC-response refresh
+    /// for that operator.
+    #[tokio::test]
+    async fn build_refresh_query_uses_the_configured_udp_payload_size() {
+        let query = build_refresh_query("example.com", A_RECORD_TYPE, 1, true, 4096).unwrap();
+        let edns = query.message.edns.expect("synthetic query must carry EDNS");
+        assert_eq!(edns.udp_payload_size, 4096);
+    }
+
+    #[tokio::test]
+    async fn job_success_advances_expires_at_and_exits_lead_window() {
+        let cache = Arc::new(ShardedDnsCache::new(&CacheConfig {
+            max_entries: 16,
+            shard_count: Some(1),
+        }));
+        let now = SystemTime::UNIX_EPOCH;
+        let domain = "example.com";
+        let mut entry = seed_rrset_entry(&a_record(domain, 60), Duration::from_secs(60), now, 0);
+        entry.expires_at = now + Duration::from_secs(60);
+        let original_expires_at = entry.expires_at;
+        cache.store_response(
+            DecomposedResponse {
+                positive: vec![(domain.to_string(), A_RECORD_TYPE, 1, entry)],
+                negative: None,
+            },
+            0,
+        );
+        let upstream = Arc::new(StaticUpstream::new(Ok(upstream_response(
+            a_response_with_answer(0x1234, domain, 120),
+        ))));
+        let metrics = Arc::new(RecordingMetrics::default());
+        let mut service = resolve_service_with_cache(
+            upstream,
+            Arc::clone(&cache) as Arc<dyn DomainDnsCache>,
+            Arc::new(RecordingEvents::default()),
+            metrics.clone(),
+            1232,
+        );
+        service = service.with_refresh_config(permissive_refresh_config());
+        warm_popularity_via_lookup(&service, domain, A_RECORD_TYPE, 1, now);
+        let service = Arc::new(service);
+
+        process_refresh_job(Arc::clone(&service), refresh_job(domain, A_RECORD_TYPE, 1)).await;
+
+        assert_eq!(metrics.count(ResolverMetric::RefreshSucceeded), 1);
+        assert_eq!(metrics.count(ResolverMetric::RefreshFailed), 0);
+        match cache.lookup_chain(
+            domain,
+            A_RECORD_TYPE,
+            1,
+            false,
+            0,
+            8,
+            now,
+            &RefreshConfig::default(),
+        ) {
+            ChainLookup::Answered(resolved) => {
+                assert!(
+                    resolved.chain[0].1.expires_at > original_expires_at,
+                    "a successful refresh must move expires_at forward"
+                );
+                // Re-probing under the *default* (non-permissive)
+                // RefreshConfig -- rather than the permissive config used
+                // to warm/trigger this test -- is what actually verifies
+                // "exits the lead window": the refreshed entry's remaining
+                // TTL is now 120s, well outside the default config's
+                // ~12s lead window (max(120s * 0.10, 5s)), so it no longer
+                // produces a refresh hint under realistic thresholds.
+                assert!(
+                    resolved.refresh_hints.is_empty(),
+                    "a freshly-refreshed entry must not immediately re-qualify for refresh \
+                     under a realistic (non-permissive) config"
+                );
+            }
+            other => panic!("expected Answered after a successful refresh, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn job_failure_no_retry_leaves_entry_untouched() {
+        let cache = Arc::new(ShardedDnsCache::new(&CacheConfig {
+            max_entries: 16,
+            shard_count: Some(1),
+        }));
+        let now = SystemTime::UNIX_EPOCH;
+        let domain = "example.com";
+        let mut entry = seed_rrset_entry(&a_record(domain, 60), Duration::from_secs(60), now, 0);
+        entry.expires_at = now + Duration::from_secs(60);
+        let original_expires_at = entry.expires_at;
+        cache.store_response(
+            DecomposedResponse {
+                positive: vec![(domain.to_string(), A_RECORD_TYPE, 1, entry)],
+                negative: None,
+            },
+            0,
+        );
+        let upstream = Arc::new(StaticUpstream::new(Err(UpstreamError::Timeout)));
+        let metrics = Arc::new(RecordingMetrics::default());
+        let mut service = resolve_service_with_cache(
+            upstream,
+            Arc::clone(&cache) as Arc<dyn DomainDnsCache>,
+            Arc::new(RecordingEvents::default()),
+            metrics.clone(),
+            1232,
+        );
+        service = service.with_refresh_config(permissive_refresh_config());
+        warm_popularity_via_lookup(&service, domain, A_RECORD_TYPE, 1, now);
+        let service = Arc::new(service);
+
+        process_refresh_job(Arc::clone(&service), refresh_job(domain, A_RECORD_TYPE, 1)).await;
+
+        assert_eq!(metrics.count(ResolverMetric::RefreshFailed), 1);
+        assert_eq!(metrics.count(ResolverMetric::RefreshSucceeded), 0);
+        match cache.lookup_chain(
+            domain,
+            A_RECORD_TYPE,
+            1,
+            false,
+            0,
+            8,
+            now,
+            &RefreshConfig::default(),
+        ) {
+            ChainLookup::Answered(resolved) => {
+                assert_eq!(
+                    resolved.chain[0].1.expires_at, original_expires_at,
+                    "a failed refresh must leave the stale entry untouched, no retry"
+                );
+            }
+            other => panic!("expected the stale entry to remain Answered, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn job_rechecks_lead_window_before_fetch() {
+        // Default RefreshConfig: a fresh (not near-expiry) entry must not
+        // be re-fetched, regardless of popularity.
+        let cache = Arc::new(ShardedDnsCache::new(&CacheConfig {
+            max_entries: 16,
+            shard_count: Some(1),
+        }));
+        let now = SystemTime::UNIX_EPOCH;
+        let domain = "example.com";
+        let mut entry = seed_rrset_entry(&a_record(domain, 300), Duration::from_secs(300), now, 0);
+        entry.expires_at = now + Duration::from_secs(300); // remaining=300s, default lead window is only ~30s
+        cache.store_response(
+            DecomposedResponse {
+                positive: vec![(domain.to_string(), A_RECORD_TYPE, 1, entry)],
+                negative: None,
+            },
+            0,
+        );
+        let upstream = Arc::new(StaticUpstream::new(Err(UpstreamError::Timeout)));
+        let metrics = Arc::new(RecordingMetrics::default());
+        let service = Arc::new(resolve_service_with_cache(
+            upstream.clone(),
+            Arc::clone(&cache) as Arc<dyn DomainDnsCache>,
+            Arc::new(RecordingEvents::default()),
+            metrics.clone(),
+            1232,
+        )); // default RefreshConfig
+
+        process_refresh_job(Arc::clone(&service), refresh_job(domain, A_RECORD_TYPE, 1)).await;
+
+        assert!(upstream.requests.lock().unwrap().is_empty());
+        assert_eq!(metrics.count(ResolverMetric::RefreshSucceeded), 0);
+        assert_eq!(metrics.count(ResolverMetric::RefreshFailed), 0);
+    }
+
+    #[tokio::test]
+    async fn job_aborts_on_epoch_mismatch() {
+        let cache = Arc::new(ShardedDnsCache::new(&CacheConfig {
+            max_entries: 16,
+            shard_count: Some(1),
+        }));
+        let upstream = Arc::new(StaticUpstream::new(Ok(upstream_response(
+            a_response_with_answer(0x1111, "example.com", 60),
+        ))));
+        let metrics = Arc::new(RecordingMetrics::default());
+        let mut service = ResolveQuery::with_cache_and_backend_generation(
+            Arc::new(StandardProtocolCodec::new(1232)),
+            Arc::clone(&cache) as Arc<dyn DomainDnsCache>,
+            CacheTtlPolicy::default(),
+            upstream.clone(),
+            1,
+            Arc::new(BasicResponseFactory),
+            Arc::new(FixedClock(SystemTime::UNIX_EPOCH)),
+            Arc::new(RecordingEvents::default()),
+            metrics.clone(),
+        );
+        service = service.with_refresh_config(permissive_refresh_config());
+        let now = SystemTime::UNIX_EPOCH;
+
+        // Warm the entry under generation 1's namespace via a real query.
+        let _ = service
+            .resolve(ResolveRequest::new(
+                "192.0.2.10".parse().unwrap(),
+                now,
+                a_query(0x1111, "example.com"),
+            ))
+            .await;
+        assert_eq!(cache.domain_count(), 1);
+        let service = Arc::new(service);
+
+        // Reload to a new generation -- bumps the cache epoch and sweeps
+        // the old-namespace entry.
+        let new_upstream = Arc::new(StaticUpstream::new(Err(UpstreamError::Timeout)));
+        service.publish_reload(
+            BackendSnapshot::forwarding(new_upstream, 2),
+            Arc::new(NoopLocalDnsEntries),
+        );
+        assert_eq!(
+            cache.domain_count(),
+            0,
+            "the namespace sweep should have removed the generation-1 entry"
+        );
+
+        process_refresh_job(
+            Arc::clone(&service),
+            refresh_job("example.com", A_RECORD_TYPE, 1),
+        )
+        .await;
+
+        // Aborted before ever fetching: no new upstream request beyond the
+        // one warming call, and no Refresh* metric at all.
+        assert_eq!(upstream.requests.lock().unwrap().len(), 1);
+        assert_eq!(metrics.count(ResolverMetric::RefreshSucceeded), 0);
+        assert_eq!(metrics.count(ResolverMetric::RefreshFailed), 0);
+    }
+
+    #[tokio::test]
+    async fn job_captures_epoch_before_recheck() {
+        let cache = Arc::new(ShardedDnsCache::new(&CacheConfig {
+            max_entries: 16,
+            shard_count: Some(1),
+        }));
+        let now = SystemTime::UNIX_EPOCH;
+        let domain = "example.com";
+        let mut entry = seed_rrset_entry(&a_record(domain, 60), Duration::from_secs(60), now, 0);
+        entry.expires_at = now + Duration::from_secs(60);
+        cache.store_response(
+            DecomposedResponse {
+                positive: vec![(domain.to_string(), A_RECORD_TYPE, 1, entry)],
+                negative: None,
+            },
+            0,
+        );
+        let upstream = Arc::new(StaticUpstream::new(Ok(upstream_response(
+            a_response_with_answer(0x2222, domain, 60),
+        ))));
+        let metrics = Arc::new(RecordingMetrics::default());
+        let mut service = resolve_service_with_cache(
+            upstream,
+            Arc::clone(&cache) as Arc<dyn DomainDnsCache>,
+            Arc::new(RecordingEvents::default()),
+            metrics.clone(),
+            1232,
+        );
+        service = service.with_refresh_config(permissive_refresh_config());
+        warm_popularity_via_lookup(&service, domain, A_RECORD_TYPE, 1, now);
+        let epoch_at_call_time = service.backend.current().cache_epoch;
+        let service = Arc::new(service);
+
+        process_refresh_job(Arc::clone(&service), refresh_job(domain, A_RECORD_TYPE, 1)).await;
+
+        assert_eq!(metrics.count(ResolverMetric::RefreshSucceeded), 1);
+        match cache.lookup_chain(
+            domain,
+            A_RECORD_TYPE,
+            1,
+            false,
+            epoch_at_call_time,
+            8,
+            now,
+            &RefreshConfig::default(),
+        ) {
+            ChainLookup::Answered(_) => {} // stored and visible under the same epoch captured at call time
+            other => panic!(
+                "refresh-stored entry must be visible under the epoch captured once at the \
+                 start of the job, got {other:?}"
+            ),
+        }
+    }
+
+    #[tokio::test]
+    async fn job_fetch_uses_dnssec_ok_true_always() {
+        let cache = Arc::new(ShardedDnsCache::new(&CacheConfig {
+            max_entries: 16,
+            shard_count: Some(1),
+        }));
+        let now = SystemTime::UNIX_EPOCH;
+        let domain = "example.com";
+        // Original entry was stored as DNSSEC-incomplete.
+        let mut entry = seed_rrset_entry(&a_record(domain, 60), Duration::from_secs(60), now, 0);
+        entry.expires_at = now + Duration::from_secs(60);
+        entry.dnssec_complete = false;
+        cache.store_response(
+            DecomposedResponse {
+                positive: vec![(domain.to_string(), A_RECORD_TYPE, 1, entry)],
+                negative: None,
+            },
+            0,
+        );
+        let upstream = Arc::new(StaticUpstream::new(Ok(upstream_response(
+            a_response_with_answer(0x3333, domain, 60),
+        ))));
+        let mut service = resolve_service_with_cache(
+            upstream.clone(),
+            Arc::clone(&cache) as Arc<dyn DomainDnsCache>,
+            Arc::new(RecordingEvents::default()),
+            Arc::new(RecordingMetrics::default()),
+            1232,
+        );
+        service = service.with_refresh_config(permissive_refresh_config());
+        warm_popularity_via_lookup(&service, domain, A_RECORD_TYPE, 1, now);
+        let service = Arc::new(service);
+
+        process_refresh_job(Arc::clone(&service), refresh_job(domain, A_RECORD_TYPE, 1)).await;
+
+        let requests = upstream.requests.lock().unwrap();
+        assert_eq!(requests.len(), 1);
+        assert!(
+            requests[0].query.features.dnssec_ok,
+            "refresh jobs must always fetch with dnssec_ok = true, regardless of the \
+             original entry's dnssec_complete state"
+        );
+    }
+
+    #[tokio::test]
+    async fn job_coalesces_with_concurrent_do_true_client_miss() {
+        let cache = Arc::new(ShardedDnsCache::new(&CacheConfig {
+            max_entries: 16,
+            shard_count: Some(1),
+        }));
+        let now = SystemTime::UNIX_EPOCH;
+        let domain = "example.com";
+        let mut entry = seed_rrset_entry(&a_record(domain, 60), Duration::from_secs(60), now, 0);
+        entry.expires_at = now + Duration::from_secs(60);
+        cache.store_response(
+            DecomposedResponse {
+                positive: vec![(domain.to_string(), A_RECORD_TYPE, 1, entry)],
+                negative: None,
+            },
+            0,
+        );
+        let upstream = Arc::new(BlockingUpstream::new(Ok(upstream_response(
+            a_response_with_answer(0x4444, domain, 60),
+        ))));
+        let metrics = Arc::new(RecordingMetrics::default());
+        let mut service = resolve_service_with_cache(
+            upstream.clone(),
+            Arc::clone(&cache) as Arc<dyn DomainDnsCache>,
+            Arc::new(RecordingEvents::default()),
+            metrics.clone(),
+            1232,
+        );
+        service = service.with_refresh_config(permissive_refresh_config());
+        warm_popularity_via_lookup(&service, domain, A_RECORD_TYPE, 1, now);
+        let service = Arc::new(service);
+
+        let job_handle = {
+            let service = Arc::clone(&service);
+            tokio::spawn(async move {
+                process_refresh_job(service, refresh_job(domain, A_RECORD_TYPE, 1)).await
+            })
+        };
+        upstream.wait_for_requests(1).await;
+
+        // A concurrent caller sharing the identical MissKey (dnssec_ok =
+        // true, same epoch) -- representing a real client miss landing on
+        // the same key while the refresh job's fetch is already in flight.
+        let epoch = service.backend.current().cache_epoch;
+        let miss_key: MissKey = (domain.to_string(), A_RECORD_TYPE, 1, epoch, true);
+        let client_handle = {
+            let service = Arc::clone(&service);
+            tokio::spawn(async move {
+                match service.miss_coalescer.begin(miss_key) {
+                    SingleFlightTicket::Follower { flight } => flight.wait().await,
+                    SingleFlightTicket::Leader { .. } => {
+                        panic!("expected to join as a follower behind the refresh job's leader")
+                    }
+                }
+            })
+        };
+        tokio::task::yield_now().await;
+        assert_eq!(upstream.requests.lock().unwrap().len(), 1);
+        upstream.release.notify_waiters();
+
+        job_handle.await.unwrap();
+        let client_result = client_handle.await.unwrap();
+
+        assert!(client_result.is_ok());
+        assert_eq!(
+            upstream.requests.lock().unwrap().len(),
+            1,
+            "the concurrent DO=true client miss must coalesce onto the refresh job's single \
+             backend fetch, not trigger a second one"
+        );
+        assert_eq!(metrics.count(ResolverMetric::RefreshSucceeded), 1);
+    }
+
+    #[tokio::test]
+    async fn job_does_not_coalesce_with_do_false_client_miss() {
+        let cache = Arc::new(ShardedDnsCache::new(&CacheConfig {
+            max_entries: 16,
+            shard_count: Some(1),
+        }));
+        let now = SystemTime::UNIX_EPOCH;
+        let domain = "example.com";
+        let mut entry = seed_rrset_entry(&a_record(domain, 60), Duration::from_secs(60), now, 0);
+        entry.expires_at = now + Duration::from_secs(60);
+        cache.store_response(
+            DecomposedResponse {
+                positive: vec![(domain.to_string(), A_RECORD_TYPE, 1, entry)],
+                negative: None,
+            },
+            0,
+        );
+        let upstream = Arc::new(BlockingUpstream::new(Ok(upstream_response(
+            a_response_with_answer(0x5555, domain, 60),
+        ))));
+        let metrics = Arc::new(RecordingMetrics::default());
+        let mut service = resolve_service_with_cache(
+            upstream.clone(),
+            Arc::clone(&cache) as Arc<dyn DomainDnsCache>,
+            Arc::new(RecordingEvents::default()),
+            metrics.clone(),
+            1232,
+        );
+        service = service.with_refresh_config(permissive_refresh_config());
+        warm_popularity_via_lookup(&service, domain, A_RECORD_TYPE, 1, now);
+        let service = Arc::new(service);
+
+        let job_handle = {
+            let service = Arc::clone(&service);
+            tokio::spawn(async move {
+                process_refresh_job(service, refresh_job(domain, A_RECORD_TYPE, 1)).await
+            })
+        };
+        upstream.wait_for_requests(1).await;
+
+        // A concurrent DO=false client miss for the same (domain, qtype,
+        // qclass, epoch) -- MissKey's dnssec_ok differs, so this must become
+        // its own independent Leader, not a Follower of the refresh job.
+        let epoch = service.backend.current().cache_epoch;
+        let miss_key: MissKey = (domain.to_string(), A_RECORD_TYPE, 1, epoch, false);
+        let client_handle = {
+            let service = Arc::clone(&service);
+            tokio::spawn(async move {
+                match service.miss_coalescer.begin(miss_key) {
+                    SingleFlightTicket::Leader { key, flight } => {
+                        let leader = SingleFlightLeader::new(
+                            Arc::clone(&service.miss_coalescer),
+                            key,
+                            flight,
+                        );
+                        let synthetic_query =
+                            build_refresh_query(domain, A_RECORD_TYPE, 1, false, 1232).unwrap();
+                        let backend_snapshot = service.backend.current();
+                        let result = service
+                            .resolve_backend(&backend_snapshot, &synthetic_query)
+                            .await;
+                        leader.complete(result.clone());
+                        result
+                    }
+                    SingleFlightTicket::Follower { .. } => {
+                        panic!(
+                            "a DO=false miss must not coalesce with the refresh job's DO=true fetch"
+                        )
+                    }
+                }
+            })
+        };
+        upstream.wait_for_requests(2).await;
+        assert_eq!(upstream.requests.lock().unwrap().len(), 2);
+        upstream.release.notify_waiters();
+
+        job_handle.await.unwrap();
+        let client_result = client_handle.await.unwrap();
+
+        assert!(client_result.is_ok());
+        assert_eq!(upstream.requests.lock().unwrap().len(), 2);
+        assert_eq!(metrics.count(ResolverMetric::RefreshSucceeded), 1);
+    }
+
+    #[tokio::test]
+    async fn job_store_matches_normal_miss_path_shape() {
+        let domain = "refreshed.example.com";
+        let response_bytes = a_response_with_answer(0x6666, domain, 300);
+        let now = SystemTime::UNIX_EPOCH;
+
+        // -- refresh path --
+        let refresh_cache = Arc::new(ShardedDnsCache::new(&CacheConfig {
+            max_entries: 16,
+            shard_count: Some(1),
+        }));
+        let mut entry = seed_rrset_entry(&a_record(domain, 300), Duration::from_secs(300), now, 0);
+        entry.expires_at = now + Duration::from_secs(300);
+        refresh_cache.store_response(
+            DecomposedResponse {
+                positive: vec![(domain.to_string(), A_RECORD_TYPE, 1, entry)],
+                negative: None,
+            },
+            0,
+        );
+        let refresh_upstream = Arc::new(StaticUpstream::new(Ok(upstream_response(
+            response_bytes.clone(),
+        ))));
+        let mut refresh_service = resolve_service_with_cache(
+            refresh_upstream,
+            Arc::clone(&refresh_cache) as Arc<dyn DomainDnsCache>,
+            Arc::new(RecordingEvents::default()),
+            Arc::new(RecordingMetrics::default()),
+            1232,
+        );
+        refresh_service = refresh_service.with_refresh_config(permissive_refresh_config());
+        warm_popularity_via_lookup(&refresh_service, domain, A_RECORD_TYPE, 1, now);
+        let refresh_service = Arc::new(refresh_service);
+        process_refresh_job(
+            Arc::clone(&refresh_service),
+            refresh_job(domain, A_RECORD_TYPE, 1),
+        )
+        .await;
+        let refreshed_entry = match refresh_cache.lookup_chain(
+            domain,
+            A_RECORD_TYPE,
+            1,
+            false,
+            0,
+            8,
+            now,
+            &RefreshConfig::default(),
+        ) {
+            ChainLookup::Answered(resolved) => resolved.chain[0].1.clone(),
+            other => panic!("expected Answered after refresh store, got {other:?}"),
+        };
+
+        // -- normal client-miss path --
+        let normal_cache = Arc::new(ShardedDnsCache::new(&CacheConfig {
+            max_entries: 16,
+            shard_count: Some(1),
+        }));
+        let normal_upstream = Arc::new(StaticUpstream::new(Ok(upstream_response(response_bytes))));
+        let normal_service = resolve_service_with_cache(
+            normal_upstream,
+            Arc::clone(&normal_cache) as Arc<dyn DomainDnsCache>,
+            Arc::new(RecordingEvents::default()),
+            Arc::new(RecordingMetrics::default()),
+            1232,
+        );
+        let _ = normal_service
+            .resolve(ResolveRequest::new(
+                "192.0.2.10".parse().unwrap(),
+                now,
+                a_query_with_edns(0x6666, domain, 1232, true),
+            ))
+            .await;
+        let normal_entry = match normal_cache.lookup_chain(
+            domain,
+            A_RECORD_TYPE,
+            1,
+            true,
+            0,
+            8,
+            now,
+            &RefreshConfig::default(),
+        ) {
+            ChainLookup::Answered(resolved) => resolved.chain[0].1.clone(),
+            other => panic!("expected Answered after normal store, got {other:?}"),
+        };
+
+        assert_eq!(refreshed_entry.records, normal_entry.records);
+        assert_eq!(refreshed_entry.response_code, normal_entry.response_code);
+        assert_eq!(refreshed_entry.minimum_ttl, normal_entry.minimum_ttl);
+        assert_eq!(
+            refreshed_entry.dnssec_complete,
+            normal_entry.dnssec_complete
+        );
+        assert_eq!(
+            refreshed_entry.authoritative, normal_entry.authoritative,
+            "a refresh-triggered store must be structurally indistinguishable from what the \
+             normal client-miss path would have stored for the identical response"
+        );
+    }
+
+    // End-to-end verification: section-07-integration. Unlike the isolated
+    // unit/integration tests above, these drive the *real*
+    // `spawn_refresh_worker_pool` wired through a real channel, proving the
+    // whole chain (bucket increment -> trigger -> hint -> enqueue -> worker
+    // -> fetch -> store -> next lookup sees the refreshed entry) actually
+    // cooperates end to end, not just that each piece works in isolation.
+
+    /// Polls (via `yield_now`, never `sleep`) until `upstream` has recorded
+    /// at least `expected` requests, or panics after a generous bound --
+    /// used to deterministically wait for the background worker pool
+    /// (running concurrently in this test's own runtime) to finish
+    /// processing an enqueued job, without any wall-clock sleep.
+    async fn wait_for_upstream_requests(upstream: &StaticUpstream, expected: usize) {
+        for _ in 0..10_000 {
+            if upstream.requests.lock().unwrap().len() >= expected {
+                return;
+            }
+            tokio::task::yield_now().await;
+        }
+        panic!(
+            "timed out waiting for {expected} upstream request(s), saw {}",
+            upstream.requests.lock().unwrap().len()
+        );
+    }
+
+    /// End-to-end: a hot domain's cache entry gets a background refresh
+    /// fetch without ever costing a client a miss. Honesty note: this test
+    /// uses a fixed `now` passed explicitly to every `ResolveRequest` (no
+    /// `Clock` impl that advances), so it cannot and does not verify
+    /// TTL-boundary timing -- "before expiry" in the name refers to the
+    /// production trigger condition (`wants_refresh`'s lead-window gate,
+    /// exercised via `permissive_refresh_config()`), not to this test
+    /// observing time actually elapse toward `expires_at`. What it does
+    /// verify: the full plumbing fires end-to-end (popularity hit -> hint ->
+    /// enqueue -> worker fetch -> store) and the client-visible read path
+    /// never regresses to a miss because of it.
+    #[tokio::test]
+    async fn e2e_hot_domain_refreshed_before_expiry() {
+        let cache = Arc::new(ShardedDnsCache::new(&CacheConfig {
+            max_entries: 16,
+            shard_count: Some(1),
+        }));
+        let domain = "hot.example.com";
+        let upstream = Arc::new(StaticUpstream::new(Ok(upstream_response(
+            a_response_with_answer(0x1234, domain, 60),
+        ))));
+        let metrics = Arc::new(RecordingMetrics::default());
+        let mut service = resolve_service_with_cache(
+            upstream.clone(),
+            Arc::clone(&cache) as Arc<dyn DomainDnsCache>,
+            Arc::new(RecordingEvents::default()),
+            metrics.clone(),
+            1232,
+        );
+        service = service.with_refresh_config(permissive_refresh_config());
+        let (sender, receiver) = mpsc::channel(4);
+        service = service.with_refresh_sender(sender);
+        let service = Arc::new(service);
+        let workers = spawn_refresh_worker_pool(Arc::clone(&service), receiver, 1);
+
+        let now = SystemTime::UNIX_EPOCH;
+        // First call: genuine cache miss, populates the cache. No hint yet
+        // -- there's nothing cached to have a popularity bucket at all.
+        let first = service
+            .resolve(ResolveRequest::new(
+                "192.0.2.10".parse().unwrap(),
+                now,
+                a_query(0x1111, domain),
+            ))
+            .await;
+        assert_eq!(first.decision.kind, ResolveDecisionKind::Allowed);
+        assert_eq!(upstream.requests.lock().unwrap().len(), 1);
+
+        // Second call: now a cache hit. Under the permissive config, this
+        // hit's own popularity increment immediately crosses hot_threshold
+        // (0), and the entry is always "within lead window" -- producing a
+        // refresh hint, which probe_cache enqueues onto the real channel
+        // the real worker pool above is reading from.
+        let second = service
+            .resolve(ResolveRequest::new(
+                "192.0.2.11".parse().unwrap(),
+                now,
+                a_query(0x2222, domain),
+            ))
+            .await;
+        assert_eq!(second.decision.kind, ResolveDecisionKind::CacheHit);
+
+        // The background worker processes the enqueued job concurrently --
+        // wait for its fetch to land, with no client-visible miss at all.
+        wait_for_upstream_requests(&upstream, 2).await;
+        assert_eq!(metrics.count(ResolverMetric::RefreshTriggered), 1);
+
+        // A third call must still be an ordinary cache hit -- the
+        // background refresh happened without ever costing a client a
+        // miss. Note: under the permissive config this third hit also
+        // qualifies and enqueues its own second refresh job; it's
+        // deliberately not awaited here (no assertion depends on it) --
+        // the worker abort below and the test runtime's teardown make
+        // leaving it in flight harmless.
+        let third = service
+            .resolve(ResolveRequest::new(
+                "192.0.2.12".parse().unwrap(),
+                now,
+                a_query(0x3333, domain),
+            ))
+            .await;
+        assert_eq!(third.decision.kind, ResolveDecisionKind::CacheHit);
+
+        for worker in workers {
+            worker.abort();
+            let _ = worker.await;
+        }
+    }
+
+    #[tokio::test]
+    async fn e2e_cooling_domain_stops_being_refreshed() {
+        let cache = Arc::new(ShardedDnsCache::new(&CacheConfig {
+            max_entries: 16,
+            shard_count: Some(1),
+        }));
+        let domain = "cooling.example.com";
+        let upstream = Arc::new(StaticUpstream::new(Ok(upstream_response(
+            a_response_with_answer(0x4321, domain, 60),
+        ))));
+        let metrics = Arc::new(RecordingMetrics::default());
+        let mut service = resolve_service_with_cache(
+            upstream.clone(),
+            Arc::clone(&cache) as Arc<dyn DomainDnsCache>,
+            Arc::new(RecordingEvents::default()),
+            metrics.clone(),
+            1232,
+        );
+        service = service.with_refresh_config(permissive_refresh_config());
+        let (sender, receiver) = mpsc::channel(4);
+        service = service.with_refresh_sender(sender);
+        let service = Arc::new(service);
+        let workers = spawn_refresh_worker_pool(Arc::clone(&service), receiver, 1);
+        let now = SystemTime::UNIX_EPOCH;
+
+        // Warm the domain hot and let one background refresh land, exactly
+        // as in `e2e_hot_domain_refreshed_before_expiry`.
+        let _ = service
+            .resolve(ResolveRequest::new(
+                "192.0.2.10".parse().unwrap(),
+                now,
+                a_query(0x1111, domain),
+            ))
+            .await;
+        let _ = service
+            .resolve(ResolveRequest::new(
+                "192.0.2.11".parse().unwrap(),
+                now,
+                a_query(0x2222, domain),
+            ))
+            .await;
+        wait_for_upstream_requests(&upstream, 2).await;
+        let requests_after_warm_refresh = upstream.requests.lock().unwrap().len();
+
+        // No further queries at all -- there is no periodic background
+        // scan in this design; refresh is purely reactive to real hits.
+        // Give any (incorrect) spontaneous background activity a generous
+        // window to show up.
+        for _ in 0..1000 {
+            tokio::task::yield_now().await;
+        }
+
+        assert_eq!(
+            upstream.requests.lock().unwrap().len(),
+            requests_after_warm_refresh,
+            "with no further real traffic, nothing should trigger another background refresh"
+        );
+
+        for worker in workers {
+            worker.abort();
+            let _ = worker.await;
+        }
+    }
+
+    #[tokio::test]
+    async fn e2e_disabled_feature_is_true_no_op() {
+        let cache = Arc::new(ShardedDnsCache::new(&CacheConfig {
+            max_entries: 16,
+            shard_count: Some(1),
+        }));
+        let domain = "disabled.example.com";
+        let upstream = Arc::new(StaticUpstream::new(Ok(upstream_response(
+            a_response_with_answer(0x5678, domain, 60),
+        ))));
+        let metrics = Arc::new(RecordingMetrics::default());
+        let mut service = resolve_service_with_cache(
+            upstream.clone(),
+            Arc::clone(&cache) as Arc<dyn DomainDnsCache>,
+            Arc::new(RecordingEvents::default()),
+            metrics.clone(),
+            1232,
+        );
+        // Same thresholds that would trigger refresh in the two tests
+        // above, except disabled -- proving `enabled` is the load-bearing
+        // switch, not incidental.
+        service = service.with_refresh_config(RefreshConfig {
+            enabled: false,
+            ..permissive_refresh_config()
+        });
+        let service = Arc::new(service);
+        let now = SystemTime::UNIX_EPOCH;
+
+        for (id, client_ip) in [
+            (0x1111u16, "192.0.2.10"),
+            (0x2222, "192.0.2.11"),
+            (0x3333, "192.0.2.12"),
+        ] {
+            let _ = service
+                .resolve(ResolveRequest::new(
+                    client_ip.parse().unwrap(),
+                    now,
+                    a_query(id, domain),
+                ))
+                .await;
+        }
+
+        assert_eq!(
+            upstream.requests.lock().unwrap().len(),
+            1,
+            "only the first, genuine cache miss should ever reach the backend"
+        );
+        assert_eq!(metrics.count(ResolverMetric::RefreshTriggered), 0);
+        assert_eq!(metrics.count(ResolverMetric::RefreshQueueFull), 0);
+        assert_eq!(metrics.count(ResolverMetric::RefreshSucceeded), 0);
+        assert_eq!(metrics.count(ResolverMetric::RefreshFailed), 0);
     }
 
     #[tokio::test]
@@ -16881,6 +18685,7 @@ mod tests {
         };
         let resolved = cache::ResolvedAnswer {
             chain: vec![("example.com".to_string(), entry)],
+            refresh_hints: Vec::new(),
         };
         let cache = Arc::new(RecordingCache::with_lookup(ChainLookup::Answered(resolved)));
         let upstream = Arc::new(StaticUpstream::new(Err(UpstreamError::Timeout)));
@@ -16910,6 +18715,291 @@ mod tests {
         assert!(upstream.requests.lock().unwrap().is_empty());
         assert_eq!(metrics.count(ResolverMetric::CacheResponseTruncated), 1);
         assert_eq!(metrics.count(ResolverMetric::CacheHit), 1);
+    }
+
+    /// End-to-end regression test for the seam connecting
+    /// `resolve_from_cache`'s hint production to the actual enqueue: a real
+    /// `.resolve()` call against a cache hit whose `ChainLookup::Answered`
+    /// carries a `refresh_hints` entry must result in a job landing on the
+    /// resolver's `refresh_sender` and a `RefreshTriggered` increment — not
+    /// just `evaluate_cache_lookup`/`enqueue_refresh_job` exercised in
+    /// isolation with hand-built values (code review flagged this seam as
+    /// untested, which is exactly what let a missed call site slip through
+    /// on the coalesced-follower path).
+    #[tokio::test]
+    async fn resolve_cache_hit_with_refresh_hint_enqueues_a_job() {
+        let now = SystemTime::UNIX_EPOCH;
+        let entry = RRsetEntry {
+            records: vec![StoredRecord {
+                rtype: A_RECORD_TYPE,
+                rclass: 1,
+                ttl_at_store: 60,
+                rdata: RecordData::A(std::net::Ipv4Addr::new(192, 0, 2, 1)),
+            }],
+            rrsigs: Vec::new(),
+            response_code: ResponseCode::NoError,
+            minimum_ttl: Duration::from_secs(60),
+            stored_at: now,
+            expires_at: now + Duration::from_secs(60),
+            dnssec_state: Default::default(),
+            cache_epoch: 1,
+            dnssec_complete: true,
+            authoritative: false,
+        };
+        let resolved = cache::ResolvedAnswer {
+            chain: vec![("example.com".to_string(), entry)],
+            refresh_hints: vec![cache::RefreshHint {
+                domain: "example.com".to_string(),
+                qtype: A_RECORD_TYPE,
+                qclass: 1,
+            }],
+        };
+        let cache = Arc::new(RecordingCache::with_lookup(ChainLookup::Answered(resolved)));
+        let upstream = Arc::new(StaticUpstream::new(Err(UpstreamError::Timeout)));
+        let events = Arc::new(RecordingEvents::default());
+        let metrics = Arc::new(RecordingMetrics::default());
+        let (sender, mut receiver) = tokio::sync::mpsc::channel(4);
+        let service = resolve_service_with_cache(upstream, cache, events, metrics.clone(), 1232)
+            .with_refresh_sender(sender);
+
+        let _outcome = service
+            .resolve(ResolveRequest::new(
+                "192.0.2.10".parse().unwrap(),
+                now,
+                a_query(0x4444, "example.com"),
+            ))
+            .await;
+
+        assert_eq!(metrics.count(ResolverMetric::RefreshTriggered), 1);
+        let job = receiver
+            .try_recv()
+            .expect("resolve() should have enqueued the scripted refresh hint");
+        assert_eq!(job.domain, "example.com");
+    }
+
+    /// Regression test for the bug code review found: an RD=0 (cache-only)
+    /// query that happens to hit cache must not trigger a background
+    /// refresh -- refresh is itself a real backend fetch, i.e. exactly the
+    /// "fresh upstream work" RD=0 asks rdns not to do on the client's
+    /// behalf. Same scripted-cache setup as
+    /// `resolve_cache_hit_with_refresh_hint_enqueues_a_job` above, just with
+    /// RD=0 on the query.
+    #[tokio::test]
+    async fn resolve_rd_zero_cache_hit_does_not_enqueue_refresh() {
+        let now = SystemTime::UNIX_EPOCH;
+        let entry = RRsetEntry {
+            records: vec![StoredRecord {
+                rtype: A_RECORD_TYPE,
+                rclass: 1,
+                ttl_at_store: 60,
+                rdata: RecordData::A(std::net::Ipv4Addr::new(192, 0, 2, 1)),
+            }],
+            rrsigs: Vec::new(),
+            response_code: ResponseCode::NoError,
+            minimum_ttl: Duration::from_secs(60),
+            stored_at: now,
+            expires_at: now + Duration::from_secs(60),
+            dnssec_state: Default::default(),
+            cache_epoch: 1,
+            dnssec_complete: true,
+            authoritative: false,
+        };
+        let resolved = cache::ResolvedAnswer {
+            chain: vec![("example.com".to_string(), entry)],
+            refresh_hints: vec![cache::RefreshHint {
+                domain: "example.com".to_string(),
+                qtype: A_RECORD_TYPE,
+                qclass: 1,
+            }],
+        };
+        let cache = Arc::new(RecordingCache::with_lookup(ChainLookup::Answered(resolved)));
+        let upstream = Arc::new(StaticUpstream::new(Err(UpstreamError::Timeout)));
+        let events = Arc::new(RecordingEvents::default());
+        let metrics = Arc::new(RecordingMetrics::default());
+        let (sender, mut receiver) = tokio::sync::mpsc::channel(4);
+        let service = resolve_service_with_cache(upstream, cache, events, metrics.clone(), 1232)
+            .with_refresh_sender(sender);
+
+        let outcome = service
+            .resolve(ResolveRequest::new(
+                "192.0.2.10".parse().unwrap(),
+                now,
+                a_query_without_rd(0x4444, "example.com"),
+            ))
+            .await;
+
+        assert_eq!(
+            outcome.decision.kind,
+            ResolveDecisionKind::CacheHit,
+            "RD=0 still gets served from cache -- only the refresh side effect is gated"
+        );
+        assert_eq!(metrics.count(ResolverMetric::RefreshTriggered), 0);
+        assert!(receiver.try_recv().is_err());
+    }
+
+    /// Regression test for the bug code review found: the single-flight
+    /// *follower* path (`cache_hit_after_coalesced_miss`) must also surface
+    /// `refresh_hints`, not just the leader-side `probe_cache` path — exactly
+    /// the hot/concurrent scenario the refresh feature targets. Checks the
+    /// *returned* hints, not an immediate enqueue: a later review pass found
+    /// enqueueing directly from this function ran before the caller's
+    /// response-policy-block check, so hints are now returned for the caller
+    /// (`resolve_coalesced_follower`) to enqueue only once admitted --
+    /// covered end-to-end by
+    /// `resolve_coalesced_follower_policy_blocked_hit_does_not_enqueue_refresh`
+    /// below.
+    #[tokio::test]
+    async fn cache_hit_after_coalesced_miss_returns_refresh_hints() {
+        let now = SystemTime::UNIX_EPOCH;
+        let entry = RRsetEntry {
+            records: vec![StoredRecord {
+                rtype: A_RECORD_TYPE,
+                rclass: 1,
+                ttl_at_store: 60,
+                rdata: RecordData::A(std::net::Ipv4Addr::new(192, 0, 2, 1)),
+            }],
+            rrsigs: Vec::new(),
+            response_code: ResponseCode::NoError,
+            minimum_ttl: Duration::from_secs(60),
+            stored_at: now,
+            expires_at: now + Duration::from_secs(60),
+            dnssec_state: Default::default(),
+            cache_epoch: 1,
+            dnssec_complete: true,
+            authoritative: false,
+        };
+        let resolved = cache::ResolvedAnswer {
+            chain: vec![("example.com".to_string(), entry)],
+            refresh_hints: vec![cache::RefreshHint {
+                domain: "example.com".to_string(),
+                qtype: A_RECORD_TYPE,
+                qclass: 1,
+            }],
+        };
+        let cache = Arc::new(RecordingCache::with_lookup(ChainLookup::Answered(resolved)));
+        let upstream = Arc::new(StaticUpstream::new(Err(UpstreamError::Timeout)));
+        let events = Arc::new(RecordingEvents::default());
+        let metrics = Arc::new(RecordingMetrics::default());
+        let (sender, mut receiver) = tokio::sync::mpsc::channel(4);
+        let service = resolve_service_with_cache(upstream, cache, events, metrics.clone(), 1232)
+            .with_refresh_sender(sender);
+
+        let message = Message::parse_owned(a_query(0x5555, "example.com")).unwrap();
+        let decoded = DecodedQuery::new(message).unwrap();
+        let request = ResolveRequest::new(
+            "192.0.2.10".parse().unwrap(),
+            now,
+            a_query(0x5555, "example.com"),
+        );
+        let backend_snapshot = service.backend.current();
+        let miss_key: MissKey = (
+            "example.com".to_string(),
+            A_RECORD_TYPE,
+            1,
+            backend_snapshot.cache_epoch,
+            false,
+        );
+
+        let hit = service
+            .cache_hit_after_coalesced_miss(&request, &decoded, &backend_snapshot, &miss_key)
+            .await
+            .expect("scripted lookup is ChainLookup::Answered");
+
+        // Not enqueued by this function itself -- see its doc comment.
+        assert_eq!(metrics.count(ResolverMetric::RefreshTriggered), 0);
+        assert!(receiver.try_recv().is_err());
+        assert_eq!(hit.refresh_hints.len(), 1);
+        assert_eq!(hit.refresh_hints[0].domain, "example.com");
+    }
+
+    /// Regression test for the fix to the bug above: a follower hit whose
+    /// response the policy blocks must not have triggered a background
+    /// refresh fetch for it -- the whole point of moving the enqueue behind
+    /// the policy-block check in `resolve_coalesced_follower`.
+    #[tokio::test]
+    async fn resolve_coalesced_follower_policy_blocked_hit_does_not_enqueue_refresh() {
+        let cache = Arc::new(ShardedDnsCache::new(&CacheConfig {
+            max_entries: 16,
+            shard_count: Some(1),
+        }));
+        let domain = "blocked.example.com";
+        let follower_ip: IpAddr = "192.0.2.11".parse().unwrap();
+        let upstream = Arc::new(BlockingUpstream::new(Ok(upstream_response(
+            a_response_with_answer(0xaaaa, domain, 60),
+        ))));
+        let events = Arc::new(RecordingEvents::default());
+        let metrics = Arc::new(RecordingMetrics::default());
+        let (sender, mut receiver) = tokio::sync::mpsc::channel(4);
+        let mut service = ResolveQuery::with_cache_and_policy(
+            Arc::new(StandardProtocolCodec::new(1232)),
+            Arc::clone(&cache) as Arc<dyn DomainDnsCache>,
+            Arc::new(ClientScopedResponsePolicy {
+                client_ip: follower_ip,
+                domain: DomainSelector::exact(domain).unwrap(),
+                rule_id: "blocked-follower".to_string(),
+            }),
+            Arc::new(NoopLocalDnsEntries),
+            CacheTtlPolicy::default(),
+            upstream.clone(),
+            Arc::new(BasicResponseFactory),
+            Arc::new(FixedClock(SystemTime::UNIX_EPOCH)),
+            events,
+            metrics.clone(),
+        );
+        service = service.with_refresh_config(permissive_refresh_config());
+        service = service.with_refresh_sender(sender);
+        let service = Arc::new(service);
+
+        let leader_ip: IpAddr = "192.0.2.10".parse().unwrap();
+        let leader = {
+            let service = Arc::clone(&service);
+            let query = a_query(0x1111, domain);
+            tokio::spawn(async move {
+                service
+                    .resolve(ResolveRequest::new(
+                        leader_ip,
+                        SystemTime::UNIX_EPOCH,
+                        query,
+                    ))
+                    .await
+            })
+        };
+        upstream.wait_for_requests(1).await;
+
+        let follower = {
+            let service = Arc::clone(&service);
+            let query = a_query(0x2222, domain);
+            tokio::spawn(async move {
+                service
+                    .resolve(ResolveRequest::new(
+                        follower_ip,
+                        SystemTime::UNIX_EPOCH,
+                        query,
+                    ))
+                    .await
+            })
+        };
+        tokio::task::yield_now().await;
+        upstream.release.notify_waiters();
+        let leader_outcome = leader.await.unwrap();
+        let follower_outcome = follower.await.unwrap();
+
+        assert_eq!(
+            leader_outcome.decision.kind,
+            ResolveDecisionKind::Allowed,
+            "the leader took a genuine cache miss -> backend fetch, not a cache hit"
+        );
+        assert!(matches!(
+            follower_outcome.decision.kind,
+            ResolveDecisionKind::Blocked(_)
+        ));
+        assert_eq!(
+            metrics.count(ResolverMetric::RefreshTriggered),
+            0,
+            "the follower's hit was policy-blocked, so no refresh job must have been enqueued \
+             for it"
+        );
+        assert!(receiver.try_recv().is_err());
     }
 
     #[tokio::test]
@@ -19704,6 +21794,7 @@ mod tests {
         let entry = seed_rrset_entry(&record, Duration::from_secs(60), now, 0);
         let resolved = cache::ResolvedAnswer {
             chain: vec![("example.com".to_string(), entry)],
+            refresh_hints: Vec::new(),
         };
         let cache = Arc::new(RecordingCache::with_lookup(ChainLookup::Answered(resolved)));
         let upstream = Arc::new(StaticUpstream::new(Err(UpstreamError::Timeout)));
@@ -19805,6 +21896,7 @@ mod tests {
         let entry = seed_rrset_entry(&record, Duration::from_secs(60), now, 0);
         let resolved = cache::ResolvedAnswer {
             chain: vec![("example.com".to_string(), entry)],
+            refresh_hints: Vec::new(),
         };
         let cache = Arc::new(RecordingCache::with_lookup(ChainLookup::Answered(resolved)));
         let upstream = Arc::new(StaticUpstream::new(Err(UpstreamError::Timeout)));
@@ -19849,6 +21941,7 @@ mod tests {
         let entry = seed_rrset_entry(&record, Duration::from_secs(60), now, 0);
         let resolved = cache::ResolvedAnswer {
             chain: vec![("example.com".to_string(), entry)],
+            refresh_hints: Vec::new(),
         };
         let cache = Arc::new(RecordingCache::with_lookup(ChainLookup::Answered(resolved)));
         let upstream = Arc::new(StaticUpstream::new(Err(UpstreamError::Timeout)));

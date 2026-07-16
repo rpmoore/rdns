@@ -23,8 +23,9 @@ use opentelemetry::metrics::{Counter, Gauge, Histogram, MeterProvider, Observabl
 use opentelemetry_sdk::metrics::SdkMeterProvider;
 use prometheus::Registry;
 use rdns::config::{
-    LocalZoneConfig, MAX_LOCAL_ZONE_FILE_BYTES, ResolutionMode as ConfigResolutionMode,
-    RootHintsSource as ConfigRootHintsSource, RuntimeConfig, parse_local_zone_file,
+    LocalZoneConfig, MAX_LOCAL_ZONE_FILE_BYTES, RefreshConfig,
+    ResolutionMode as ConfigResolutionMode, RootHintsSource as ConfigRootHintsSource,
+    RuntimeConfig, parse_local_zone_file,
 };
 use rdns::delivery::dns::{TcpDnsServer, UdpDnsServer};
 use rdns::delivery::metrics_http::MetricsServer;
@@ -38,6 +39,7 @@ use rdns::resolver::{
     QueryEventRecordResult, QueryEventSink, QueryEventV1, RecursiveResolutionBackend,
     RecursiveResolverConfig, RecursiveRootHint, ResolutionMode as ResolverResolutionMode,
     ResolveQuery, ResolverMetric, ShardedDnsCache, StandardProtocolCodec, SystemClock,
+    spawn_refresh_worker_pool,
 };
 use tokio::task::{JoinError, JoinSet};
 use tracing::{error, info, warn};
@@ -128,30 +130,47 @@ async fn main() -> io::Result<()> {
         .unwrap_or(8);
     let clock: Arc<dyn Clock> = Arc::new(SystemClock);
     let cookie_secret = Arc::new(CookieSecret::generate());
-    let resolver = Arc::new(
-        ResolveQuery::with_cache_policy_and_backend_snapshot(
-            Arc::new(StandardProtocolCodec::new(config.max_udp_payload_size)),
-            Arc::clone(&cache) as Arc<dyn DomainDnsCache>,
-            Arc::new(NoopPolicyEvaluator),
-            local_entries,
-            CacheTtlPolicy::default(),
-            backend_snapshot,
-            Arc::new(BasicResponseFactory),
-            Arc::clone(&clock),
-            Arc::new(StoreRecordingQueryEventSink::new(
-                ChannelQueryEventSink::new(event_tx),
-                Arc::clone(&query_event_store),
-            )),
-            metrics,
-        )
-        .with_max_chain_depth(max_chain_depth)
-        .with_single_flight_shard_count(cache.shard_count())
-        .with_chaos_config(config.chaos.clone())
-        .with_cookie_secret(cookie_secret),
-    );
+    let (refresh_tx, refresh_rx) =
+        tokio::sync::mpsc::channel(refresh_channel_capacity(&config.refresh));
+    let mut resolver_builder = ResolveQuery::with_cache_policy_and_backend_snapshot(
+        Arc::new(StandardProtocolCodec::new(config.max_udp_payload_size)),
+        Arc::clone(&cache) as Arc<dyn DomainDnsCache>,
+        Arc::new(NoopPolicyEvaluator),
+        local_entries,
+        CacheTtlPolicy::default(),
+        backend_snapshot,
+        Arc::new(BasicResponseFactory),
+        Arc::clone(&clock),
+        Arc::new(StoreRecordingQueryEventSink::new(
+            ChannelQueryEventSink::new(event_tx),
+            Arc::clone(&query_event_store),
+        )),
+        metrics,
+    )
+    .with_max_chain_depth(max_chain_depth)
+    .with_single_flight_shard_count(cache.shard_count())
+    .with_chaos_config(config.chaos.clone())
+    .with_cookie_secret(cookie_secret)
+    .with_refresh_config(config.refresh);
+    if config.refresh.enabled {
+        resolver_builder = resolver_builder.with_refresh_sender(refresh_tx);
+    }
+    let resolver = Arc::new(resolver_builder);
 
     let sighup_task =
         spawn_sighup_reload_task(Arc::clone(&resolver), reload_metrics, config_path.clone());
+
+    // Auto-refresh worker pool (`docs/plans/auto_refresh/`): spawned only
+    // when enabled, following `spawn_sighup_reload_task`'s own shutdown
+    // convention (no internal shutdown signal -- the caller `.abort()`s
+    // these at teardown, see `serve_until_shutdown`).
+    let refresh_workers = spawn_refresh_workers_if_enabled(config.refresh.enabled, || {
+        spawn_refresh_worker_pool(
+            Arc::clone(&resolver),
+            refresh_rx,
+            config.refresh.worker_count,
+        )
+    });
 
     let servers =
         UdpDnsServer::bind_configured(&config, Arc::clone(&resolver), Arc::clone(&clock)).await?;
@@ -196,6 +215,7 @@ async fn main() -> io::Result<()> {
         metrics_server,
         resolver,
         sighup_task,
+        refresh_workers,
         event_drain,
     )
     .await
@@ -203,15 +223,16 @@ async fn main() -> io::Result<()> {
 
 /// Runs the bound listeners until `ctrl_c` or a listener task exits, then
 /// tears everything down in dependency order: stop accepting new listener
-/// work, join the listener tasks, stop the SIGHUP reload task, drop the
-/// resolver (closing the query-event channel), and drain the event-recording
-/// task.
+/// work, join the listener tasks, stop the SIGHUP reload task, abort the
+/// auto-refresh worker pool (`docs/plans/auto_refresh/`), drop the resolver
+/// (closing the query-event channel), and drain the event-recording task.
 async fn serve_until_shutdown(
     servers: Vec<UdpDnsServer>,
     tcp_servers: Vec<TcpDnsServer>,
     metrics_server: Option<MetricsServer>,
     resolver: Arc<ResolveQuery>,
     sighup_task: tokio::task::JoinHandle<()>,
+    refresh_workers: Vec<tokio::task::JoinHandle<()>>,
     event_drain: tokio::task::JoinHandle<()>,
 ) -> io::Result<()> {
     let mut shutdown_senders = Vec::with_capacity(servers.len() + tcp_servers.len());
@@ -301,6 +322,11 @@ async fn serve_until_shutdown(
 
     sighup_task.abort();
     let _ = sighup_task.await;
+
+    for worker in refresh_workers {
+        worker.abort();
+        let _ = worker.await;
+    }
 
     drop(resolver);
     match event_drain.await {
@@ -658,6 +684,34 @@ fn spawn_sighup_reload_task(
     tokio::spawn(async {})
 }
 
+/// Gates auto-refresh worker-pool startup on `enabled`: runs `spawn` (which
+/// does the real `spawn_refresh_worker_pool` call) only when `true`, and
+/// returns an empty `Vec` — zero worker tasks spawned, not idle ones —
+/// without calling `spawn` at all when `false`. Split out from `run` so this
+/// gate is independently testable rather than only verifiable by inspection.
+fn spawn_refresh_workers_if_enabled(
+    enabled: bool,
+    spawn: impl FnOnce() -> Vec<tokio::task::JoinHandle<()>>,
+) -> Vec<tokio::task::JoinHandle<()>> {
+    if enabled { spawn() } else { Vec::new() }
+}
+
+/// The capacity to construct the refresh-job `mpsc` channel with.
+/// `RuntimeConfig::validate()` only requires `channel_capacity != 0` when
+/// `refresh.enabled` (review found this loosening otherwise allows a
+/// disabled config to carry a placeholder `channel_capacity = 0`, which
+/// `tokio::sync::mpsc::channel` panics on) -- when disabled, this returns a
+/// harmless `1` instead, since the channel and its receiver are never
+/// actually wired up (`with_refresh_sender`, `spawn_refresh_workers_if_enabled`)
+/// in that case anyway.
+fn refresh_channel_capacity(refresh: &RefreshConfig) -> usize {
+    if refresh.enabled {
+        refresh.channel_capacity
+    } else {
+        1
+    }
+}
+
 fn build_backend_snapshot(
     config: &RuntimeConfig,
     metrics: Arc<dyn MetricsSink>,
@@ -839,6 +893,10 @@ struct OpenTelemetryMetrics {
     dnssec_validation_disabled: Gauge<u64>,
     protocol_error_total: Counter<u64>,
     recursion_refused_total: Counter<u64>,
+    refresh_triggered_total: Counter<u64>,
+    refresh_queue_full_total: Counter<u64>,
+    refresh_succeeded_total: Counter<u64>,
+    refresh_failed_total: Counter<u64>,
     query_duration_seconds: Histogram<f64>,
     recursive_query_duration_seconds: Histogram<f64>,
     cache_hit_query_duration_seconds: Histogram<f64>,
@@ -944,6 +1002,10 @@ impl OpenTelemetryMetrics {
             dnssec_validation_disabled: meter.u64_gauge("dnssec_validation_disabled").build(),
             protocol_error_total: meter.u64_counter("protocol_error_total").build(),
             recursion_refused_total: meter.u64_counter("recursion_refused_total").build(),
+            refresh_triggered_total: meter.u64_counter("refresh_triggered_total").build(),
+            refresh_queue_full_total: meter.u64_counter("refresh_queue_full_total").build(),
+            refresh_succeeded_total: meter.u64_counter("refresh_succeeded_total").build(),
+            refresh_failed_total: meter.u64_counter("refresh_failed_total").build(),
             query_duration_seconds: meter.f64_histogram("query_duration_seconds").build(),
             recursive_query_duration_seconds: meter
                 .f64_histogram("recursive_query_duration_seconds")
@@ -1022,6 +1084,10 @@ impl MetricsSink for OpenTelemetryMetrics {
             }
             ResolverMetric::ProtocolError => self.protocol_error_total.add(1, &[]),
             ResolverMetric::RecursionRefused => self.recursion_refused_total.add(1, &[]),
+            ResolverMetric::RefreshTriggered => self.refresh_triggered_total.add(1, &[]),
+            ResolverMetric::RefreshQueueFull => self.refresh_queue_full_total.add(1, &[]),
+            ResolverMetric::RefreshSucceeded => self.refresh_succeeded_total.add(1, &[]),
+            ResolverMetric::RefreshFailed => self.refresh_failed_total.add(1, &[]),
             ResolverMetric::QueryDuration
             | ResolverMetric::RecursiveQueryDuration
             | ResolverMetric::CacheHitQueryDuration
@@ -1146,6 +1212,55 @@ mod tests {
     }
 
     #[test]
+    fn refresh_workers_not_spawned_when_disabled() {
+        let workers = spawn_refresh_workers_if_enabled(false, || {
+            panic!("spawn closure must not run when refresh is disabled")
+        });
+        assert!(workers.is_empty());
+    }
+
+    #[tokio::test]
+    async fn refresh_workers_spawned_when_enabled() {
+        let mut spawn_called = false;
+        let workers = spawn_refresh_workers_if_enabled(true, || {
+            spawn_called = true;
+            vec![tokio::spawn(async {})]
+        });
+        assert!(spawn_called);
+        assert_eq!(workers.len(), 1);
+        for worker in workers {
+            worker.abort();
+            let _ = worker.await;
+        }
+    }
+
+    /// Regression test for the bug code review found: `RuntimeConfig::validate()`
+    /// only requires `channel_capacity != 0` when `refresh.enabled` (a
+    /// disabled config may legitimately carry a placeholder
+    /// `channel_capacity = 0`), but `tokio::sync::mpsc::channel(0)` panics.
+    /// `refresh_channel_capacity` must substitute a harmless nonzero value
+    /// in that case rather than passing the placeholder straight through.
+    #[test]
+    fn refresh_channel_capacity_substitutes_when_disabled_with_zero_capacity() {
+        let refresh = RefreshConfig {
+            enabled: false,
+            channel_capacity: 0,
+            ..RefreshConfig::default()
+        };
+        assert_eq!(refresh_channel_capacity(&refresh), 1);
+    }
+
+    #[test]
+    fn refresh_channel_capacity_uses_configured_value_when_enabled() {
+        let refresh = RefreshConfig {
+            enabled: true,
+            channel_capacity: 256,
+            ..RefreshConfig::default()
+        };
+        assert_eq!(refresh_channel_capacity(&refresh), 256);
+    }
+
+    #[test]
     fn open_telemetry_cache_gauges_report_approximate_domain_count() {
         // `cache_size`/`cache_capacity` are OpenTelemetry `ObservableGauge`s
         // whose callback only runs when something actually collects
@@ -1173,6 +1288,42 @@ mod tests {
 
         assert_eq!(gauge_value("cache_size"), 0.0);
         assert_eq!(gauge_value("cache_capacity"), 16.0);
+    }
+
+    #[test]
+    fn open_telemetry_refresh_metrics_map_to_distinct_counters() {
+        // Confirms the four `ResolverMetric::Refresh*` variants pulled
+        // forward for auto-refresh (`docs/plans/auto_refresh/`) each
+        // increment their own, distinctly-named counter -- not aliased to
+        // an existing counter or to one of the other three new ones.
+        let cache = Arc::new(ShardedDnsCache::new(&rdns::config::CacheConfig {
+            max_entries: 16,
+            shard_count: Some(1),
+        }));
+        let metrics = OpenTelemetryMetrics::new(Arc::clone(&cache)).expect("metrics exporter");
+
+        metrics.increment(ResolverMetric::RefreshTriggered);
+        metrics.increment(ResolverMetric::RefreshQueueFull);
+        metrics.increment(ResolverMetric::RefreshQueueFull);
+        metrics.increment(ResolverMetric::RefreshSucceeded);
+        metrics.increment(ResolverMetric::RefreshSucceeded);
+        metrics.increment(ResolverMetric::RefreshSucceeded);
+        metrics.increment(ResolverMetric::RefreshFailed);
+
+        let families = metrics.registry.gather();
+        let counter_value = |name: &str| -> f64 {
+            families
+                .iter()
+                .find(|family| family.name() == name)
+                .and_then(|family| family.get_metric().first())
+                .map(|metric| metric.get_counter().value())
+                .unwrap_or_else(|| panic!("missing counter {name}"))
+        };
+
+        assert_eq!(counter_value("refresh_triggered_total"), 1.0);
+        assert_eq!(counter_value("refresh_queue_full_total"), 2.0);
+        assert_eq!(counter_value("refresh_succeeded_total"), 3.0);
+        assert_eq!(counter_value("refresh_failed_total"), 1.0);
     }
 
     #[test]

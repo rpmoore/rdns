@@ -33,6 +33,7 @@ use std::collections::HashSet;
 use std::net::IpAddr;
 use std::time::{Duration, SystemTime};
 
+use crate::config::RefreshConfig;
 use crate::protocol::edns_cookie::{CookieSecret, build_cookie_option, build_server_cookie};
 use crate::protocol::{
     NameCompressor, Record, RecordData, ResponseCode, build_truncated_wire_response,
@@ -46,12 +47,35 @@ use super::shard::HopResult;
 
 const CNAME_RECORD_TYPE: u16 = 5;
 
+/// One cache hop's signal that it currently qualifies for a background
+/// refresh (all three of `wants_refresh`'s gates hold: eligibility floor,
+/// lead window, popularity hot-threshold — see
+/// `docs/knowledge/resolver/caching/auto-refresh.md`).
+/// `qtype`/`qclass` identify the specific record set at `domain` that
+/// should be refetched — for an intermediate CNAME hop this is
+/// `(CNAME_RECORD_TYPE, qclass)`, never the original query's qtype, since
+/// the CNAME record set at that hop's domain is what's actually near
+/// expiry.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct RefreshHint {
+    pub(crate) domain: String,
+    pub(crate) qtype: u16,
+    pub(crate) qclass: u16,
+}
+
 /// Zero or more CNAME hops followed by the terminal `RRsetEntry` matching
 /// the original qtype — or, if qtype == CNAME itself, exactly one hop (the
 /// CNAME's own entry, no further walking past it).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ResolvedAnswer {
     pub(crate) chain: Vec<(String, RRsetEntry)>, // (owner name, entry), in walk order
+    /// One hint per hop in `chain` that independently wants a refresh —
+    /// not just the terminal hop. A CNAME record is itself a positive
+    /// RRset with its own independent expiry, so an intermediate hop can
+    /// need a refresh even while the terminal hop stays fresh (and vice
+    /// versa); collecting a hint per qualifying hop is what a caller
+    /// (`ResolveQuery::probe_cache`, section-04) enqueues jobs from.
+    pub(crate) refresh_hints: Vec<RefreshHint>,
 }
 
 /// A negative result (NXDOMAIN or NODATA), plus whatever CNAME hops were
@@ -126,9 +150,11 @@ pub(crate) fn resolve_from_cache(
     current_epoch: u64,
     max_chain_depth: u8,
     now: SystemTime,
+    refresh_config: &RefreshConfig,
 ) -> ChainLookup {
     let mut current = crate::resolver::normalize_question_name(qname);
     let mut chain: Vec<(String, RRsetEntry)> = Vec::new();
+    let mut refresh_hints: Vec<RefreshHint> = Vec::new();
     let mut visited: HashSet<String> = HashSet::new();
 
     loop {
@@ -152,12 +178,41 @@ pub(crate) fn resolve_from_cache(
         visited.insert(current.clone());
 
         let shard = cache.shard_for(&current);
-        match shard.lookup_hop(&current, qtype, qclass, dnssec_ok, current_epoch, now) {
-            HopResult::Answer(entry) => {
+        match shard.lookup_hop(
+            &current,
+            qtype,
+            qclass,
+            dnssec_ok,
+            current_epoch,
+            now,
+            refresh_config,
+        ) {
+            HopResult::Answer(entry, wants_refresh) => {
+                if wants_refresh {
+                    refresh_hints.push(RefreshHint {
+                        domain: current.clone(),
+                        qtype,
+                        qclass,
+                    });
+                }
                 chain.push((current, entry));
-                return ChainLookup::Answered(ResolvedAnswer { chain });
+                return ChainLookup::Answered(ResolvedAnswer {
+                    chain,
+                    refresh_hints,
+                });
             }
-            HopResult::CnameHop(entry, target) => {
+            HopResult::CnameHop(entry, target, wants_refresh) => {
+                if wants_refresh {
+                    // This hop's own record type is CNAME, not the
+                    // original query's qtype — a refresh job for this hop
+                    // must refetch the CNAME record set at `current`, not
+                    // whatever type was originally queried.
+                    refresh_hints.push(RefreshHint {
+                        domain: current.clone(),
+                        qtype: CNAME_RECORD_TYPE,
+                        qclass,
+                    });
+                }
                 chain.push((current, entry));
                 current = crate::resolver::normalize_question_name(&target);
             }
@@ -895,6 +950,7 @@ mod tests {
         );
         entry.expires_at = stored_at + Duration::from_secs(600);
         let resolved = ResolvedAnswer {
+            refresh_hints: Vec::new(),
             chain: vec![("example.com".to_string(), entry)],
         };
         let wire = question_wire("example.com", A_QTYPE, IN_QCLASS);
@@ -924,6 +980,7 @@ mod tests {
         let mut entry = rrset_entry(vec![a_record(600, 1)], Duration::from_secs(600), stored_at);
         entry.expires_at = stored_at + Duration::from_secs(600); // expires in 10s
         let resolved = ResolvedAnswer {
+            refresh_hints: Vec::new(),
             chain: vec![("example.com".to_string(), entry)],
         };
         let wire = question_wire("example.com", A_QTYPE, IN_QCLASS);
@@ -961,6 +1018,7 @@ mod tests {
             stored_at,
         );
         let resolved = ResolvedAnswer {
+            refresh_hints: Vec::new(),
             chain: vec![("example.com".to_string(), entry)],
         };
         let wire = question_wire("example.com", A_QTYPE, IN_QCLASS);
@@ -990,6 +1048,7 @@ mod tests {
         let now = SystemTime::now();
         let entry = rrset_entry(vec![a_record(300, 1)], Duration::from_secs(300), now);
         let resolved = ResolvedAnswer {
+            refresh_hints: Vec::new(),
             chain: vec![("example.com".to_string(), entry)],
         };
 
@@ -1032,6 +1091,7 @@ mod tests {
         let records: Vec<StoredRecord> = (0..40u8).map(|i| a_record(300, i)).collect();
         let entry = rrset_entry(records, Duration::from_secs(300), now);
         let resolved = ResolvedAnswer {
+            refresh_hints: Vec::new(),
             chain: vec![("example.com".to_string(), entry)],
         };
         let wire = question_wire("example.com", A_QTYPE, IN_QCLASS);
@@ -1093,6 +1153,7 @@ mod tests {
         let now = SystemTime::now();
         let entry = rrset_entry(vec![a_record(300, 1)], Duration::from_secs(300), now);
         let resolved = ResolvedAnswer {
+            refresh_hints: Vec::new(),
             chain: vec![("example.com".to_string(), entry)],
         };
         let wire = question_wire("example.com", A_QTYPE, IN_QCLASS);
@@ -1159,6 +1220,7 @@ mod tests {
         let now = SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000);
         let entry = rrset_entry(vec![a_record(300, 1)], Duration::from_secs(300), now);
         let resolved = ResolvedAnswer {
+            refresh_hints: Vec::new(),
             chain: vec![("example.com".to_string(), entry)],
         };
         let wire = question_wire("example.com", A_QTYPE, IN_QCLASS);
@@ -1207,6 +1269,7 @@ mod tests {
             rrset_entry(vec![a_record(300, 1)], Duration::from_secs(300), now);
         authoritative_entry.authoritative = true;
         let authoritative_resolved = ResolvedAnswer {
+            refresh_hints: Vec::new(),
             chain: vec![("example.com".to_string(), authoritative_entry)],
         };
         let aa_response = assemble_response(
@@ -1229,6 +1292,7 @@ mod tests {
             rrset_entry(vec![a_record(300, 1)], Duration::from_secs(300), now);
         non_authoritative_entry.authoritative = false;
         let non_authoritative_resolved = ResolvedAnswer {
+            refresh_hints: Vec::new(),
             chain: vec![("example.com".to_string(), non_authoritative_entry)],
         };
         let no_aa_response = assemble_response(
@@ -1264,6 +1328,7 @@ mod tests {
             rrset_entry(vec![a_record(300, 1)], Duration::from_secs(300), now);
         non_authoritative_terminal.authoritative = false;
         let mixed_resolved = ResolvedAnswer {
+            refresh_hints: Vec::new(),
             chain: vec![
                 ("alias.example.com".to_string(), authoritative_cname),
                 ("target.example.com".to_string(), non_authoritative_terminal),
@@ -1296,6 +1361,7 @@ mod tests {
         let now = SystemTime::now();
         let entry = rrset_entry(vec![a_record(300, 1)], Duration::from_secs(300), now);
         let resolved = ResolvedAnswer {
+            refresh_hints: Vec::new(),
             chain: vec![("example.com".to_string(), entry)],
         };
         let wire = question_wire("example.com", A_QTYPE, IN_QCLASS);
@@ -1356,6 +1422,7 @@ mod tests {
             },
         }];
         let resolved = ResolvedAnswer {
+            refresh_hints: Vec::new(),
             chain: vec![("example.com".to_string(), entry)],
         };
         let wire = question_wire("example.com", A_QTYPE, IN_QCLASS);
@@ -1393,6 +1460,7 @@ mod tests {
         let mut secure_entry = rrset_entry(vec![a_record(300, 1)], Duration::from_secs(300), now);
         secure_entry.dnssec_state = DnssecState::Secure;
         let resolved = ResolvedAnswer {
+            refresh_hints: Vec::new(),
             chain: vec![("example.com".to_string(), secure_entry)],
         };
         let wire = question_wire("example.com", A_QTYPE, IN_QCLASS);
@@ -1430,6 +1498,7 @@ mod tests {
             rrset_entry(vec![a_record(300, 1)], Duration::from_secs(300), now);
         unvalidated_entry.dnssec_state = DnssecState::Unvalidated;
         let unvalidated_resolved = ResolvedAnswer {
+            refresh_hints: Vec::new(),
             chain: vec![("example.com".to_string(), unvalidated_entry)],
         };
         let unvalidated_response = assemble_response(
@@ -1452,6 +1521,7 @@ mod tests {
         let mut bogus_entry = rrset_entry(vec![a_record(300, 1)], Duration::from_secs(300), now);
         bogus_entry.dnssec_state = DnssecState::Bogus("signature verification failed".to_string());
         let resolved = ResolvedAnswer {
+            refresh_hints: Vec::new(),
             chain: vec![("example.com".to_string(), bogus_entry)],
         };
         let wire = question_wire("example.com", A_QTYPE, IN_QCLASS);
@@ -2332,7 +2402,17 @@ mod tests {
             nxdomain,
         );
 
-        let result = resolve_from_cache(&cache, domain, A_QTYPE, IN_QCLASS, false, 1, 8, now);
+        let result = resolve_from_cache(
+            &cache,
+            domain,
+            A_QTYPE,
+            IN_QCLASS,
+            false,
+            1,
+            8,
+            now,
+            &RefreshConfig::default(),
+        );
 
         assert!(
             matches!(result, ChainLookup::NoData(_)),
@@ -2383,6 +2463,7 @@ mod tests {
             1,
             8,
             now,
+            &RefreshConfig::default(),
         );
         assert!(matches!(answered, ChainLookup::Answered(_)));
 
@@ -2399,6 +2480,7 @@ mod tests {
             1,
             2,
             now,
+            &RefreshConfig::default(),
         );
         assert_eq!(too_shallow, ChainLookup::Miss);
     }
@@ -2448,6 +2530,7 @@ mod tests {
             1,
             3,
             now,
+            &RefreshConfig::default(),
         );
         match exact_boundary {
             ChainLookup::Answered(resolved) => {
@@ -2497,6 +2580,7 @@ mod tests {
             1,
             3,
             now,
+            &RefreshConfig::default(),
         );
         assert_eq!(
             four_restarts_at_boundary,
@@ -2548,9 +2632,15 @@ mod tests {
         );
 
         let result = resolve_from_cache(
-            &cache, &names[0], A_QTYPE, IN_QCLASS, false, 1,
+            &cache,
+            &names[0],
+            A_QTYPE,
+            IN_QCLASS,
+            false,
+            1,
             255, // max_chain_depth: one less than the 256 restarts this chain needs
             now,
+            &RefreshConfig::default(),
         );
 
         assert_eq!(
@@ -2583,6 +2673,7 @@ mod tests {
             1,
             8,
             now,
+            &RefreshConfig::default(),
         );
 
         assert_eq!(result, ChainLookup::Miss);
@@ -2655,6 +2746,7 @@ mod tests {
             1,
             8,
             now,
+            &RefreshConfig::default(),
         );
 
         match result {
@@ -2700,6 +2792,7 @@ mod tests {
             1,
             8,
             now,
+            &RefreshConfig::default(),
         );
 
         assert_eq!(result, ChainLookup::Miss);
@@ -2719,6 +2812,7 @@ mod tests {
             1,
             8,
             now,
+            &RefreshConfig::default(),
         );
 
         assert_eq!(result, ChainLookup::Miss);
@@ -2748,6 +2842,7 @@ mod tests {
             2,
             8,
             now,
+            &RefreshConfig::default(),
         );
 
         assert_eq!(result, ChainLookup::Miss);
@@ -2796,6 +2891,7 @@ mod tests {
             1,
             8,
             now,
+            &RefreshConfig::default(),
         );
 
         match result {
@@ -2853,7 +2949,17 @@ mod tests {
         std::thread::sleep(Duration::from_millis(50));
 
         let start = std::time::Instant::now();
-        let result = resolve_from_cache(&cache, &domain_b, A_QTYPE, IN_QCLASS, false, 1, 8, now);
+        let result = resolve_from_cache(
+            &cache,
+            &domain_b,
+            A_QTYPE,
+            IN_QCLASS,
+            false,
+            1,
+            8,
+            now,
+            &RefreshConfig::default(),
+        );
         let elapsed = start.elapsed();
 
         handle.join().unwrap();
@@ -2863,5 +2969,296 @@ mod tests {
             elapsed < Duration::from_millis(150),
             "lookup against a different shard should not wait on shard A's held lock, took {elapsed:?}"
         );
+    }
+
+    // `RefreshHint`/multi-hop plumbing tests: section-04-chainlookup-plumbing.
+    // `RefreshConfig::default()`: bucket_capacity=10, hot_threshold_fraction=0.5
+    // (hot_threshold=5), lead_ratio=0.10, min_lead=5s, eligibility_floor=15s.
+
+    /// Builds a two-hop chain: `source` (CNAME) -> `target` (A), both with
+    /// `minimum_ttl = 300s`. `source_remaining`/`target_remaining` control
+    /// each hop's remaining TTL independently (via a post-construction
+    /// `expires_at` override), so a test can put either or both hops inside
+    /// the default lead window (<= 30s) independently of the other.
+    fn store_cname_chain(
+        cache: &ShardedDnsCache,
+        source: &str,
+        target: &str,
+        now: SystemTime,
+        source_remaining: Duration,
+        target_remaining: Duration,
+    ) {
+        let mut cname_entry = rrset_entry(
+            vec![StoredRecord {
+                rtype: CNAME_RECORD_TYPE,
+                rclass: IN_QCLASS,
+                ttl_at_store: 300,
+                rdata: RecordData::CNAME(target.to_string()),
+            }],
+            Duration::from_secs(300),
+            now,
+        );
+        cname_entry.expires_at = now + source_remaining;
+        cache
+            .shard_for(source)
+            .store_positive(source, (CNAME_RECORD_TYPE, IN_QCLASS), cname_entry);
+
+        let mut terminal_entry = rrset_entry(vec![a_record(300, 7)], Duration::from_secs(300), now);
+        terminal_entry.expires_at = now + target_remaining;
+        cache
+            .shard_for(target)
+            .store_positive(target, (A_QTYPE, IN_QCLASS), terminal_entry);
+    }
+
+    /// Directly queries `domain` at `qtype` (bypassing chain-following)
+    /// `hit_count` times, so only `domain`'s own popularity bucket
+    /// increments — its chain-mate's popularity is left untouched. Used to
+    /// selectively make one hop "hot" (`RefreshConfig::default()`'s
+    /// `hot_threshold` is 5) without warming the other hop in the same
+    /// chain.
+    fn warm_popularity(
+        cache: &ShardedDnsCache,
+        domain: &str,
+        qtype: u16,
+        now: SystemTime,
+        hits: u32,
+    ) {
+        for _ in 0..hits {
+            resolve_from_cache(
+                cache,
+                domain,
+                qtype,
+                IN_QCLASS,
+                false,
+                1,
+                8,
+                now,
+                &RefreshConfig::default(),
+            );
+        }
+    }
+
+    #[test]
+    fn chain_lookup_no_qualifying_hops_empty_hints() {
+        let cache = cache_with_shard_count(1);
+        let now = SystemTime::now();
+        // Both hops fresh (300s remaining, outside the 30s lead window) and
+        // neither ever queried before now (cold, level 0) -- neither
+        // qualifies.
+        store_cname_chain(
+            &cache,
+            "source.example.com",
+            "target.example.com",
+            now,
+            Duration::from_secs(300),
+            Duration::from_secs(300),
+        );
+
+        let result = resolve_from_cache(
+            &cache,
+            "source.example.com",
+            A_QTYPE,
+            IN_QCLASS,
+            false,
+            1,
+            8,
+            now,
+            &RefreshConfig::default(),
+        );
+
+        match result {
+            ChainLookup::Answered(resolved) => {
+                assert!(resolved.refresh_hints.is_empty());
+            }
+            other => panic!("expected Answered, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn chain_lookup_intermediate_hop_only() {
+        let cache = cache_with_shard_count(1);
+        let now = SystemTime::now();
+        // Source (CNAME) near expiry; target (terminal A) fresh.
+        store_cname_chain(
+            &cache,
+            "source.example.com",
+            "target.example.com",
+            now,
+            Duration::from_secs(20),  // inside the 30s lead window
+            Duration::from_secs(300), // outside
+        );
+        // Warm only the source's popularity above the hot threshold (5).
+        warm_popularity(&cache, "source.example.com", CNAME_RECORD_TYPE, now, 5);
+
+        let result = resolve_from_cache(
+            &cache,
+            "source.example.com",
+            A_QTYPE,
+            IN_QCLASS,
+            false,
+            1,
+            8,
+            now,
+            &RefreshConfig::default(),
+        );
+
+        match result {
+            ChainLookup::Answered(resolved) => {
+                assert_eq!(
+                    resolved.refresh_hints,
+                    vec![RefreshHint {
+                        domain: "source.example.com".to_string(),
+                        qtype: CNAME_RECORD_TYPE,
+                        qclass: IN_QCLASS,
+                    }],
+                    "only the intermediate CNAME hop should produce a hint, not the fresh terminal hop"
+                );
+            }
+            other => panic!("expected Answered, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn chain_lookup_terminal_hop_only() {
+        let cache = cache_with_shard_count(1);
+        let now = SystemTime::now();
+        // Source (CNAME) fresh; target (terminal A) near expiry.
+        store_cname_chain(
+            &cache,
+            "source.example.com",
+            "target.example.com",
+            now,
+            Duration::from_secs(300), // outside the lead window
+            Duration::from_secs(20),  // inside
+        );
+        // Warm only the target's popularity above the hot threshold (5).
+        warm_popularity(&cache, "target.example.com", A_QTYPE, now, 5);
+
+        let result = resolve_from_cache(
+            &cache,
+            "source.example.com",
+            A_QTYPE,
+            IN_QCLASS,
+            false,
+            1,
+            8,
+            now,
+            &RefreshConfig::default(),
+        );
+
+        match result {
+            ChainLookup::Answered(resolved) => {
+                assert_eq!(
+                    resolved.refresh_hints,
+                    vec![RefreshHint {
+                        domain: "target.example.com".to_string(),
+                        qtype: A_QTYPE,
+                        qclass: IN_QCLASS,
+                    }],
+                    "only the terminal hop should produce a hint, not the fresh intermediate hop"
+                );
+            }
+            other => panic!("expected Answered, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn chain_lookup_multi_hop_all_qualifying_hops_produce_hints() {
+        let cache = cache_with_shard_count(1);
+        let now = SystemTime::now();
+        // Both hops near expiry.
+        store_cname_chain(
+            &cache,
+            "source.example.com",
+            "target.example.com",
+            now,
+            Duration::from_secs(20),
+            Duration::from_secs(20),
+        );
+        // Warm both hops' popularity above the hot threshold (5) --
+        // directly, so each domain's own bucket (not the other's) reaches 5.
+        warm_popularity(&cache, "source.example.com", CNAME_RECORD_TYPE, now, 5);
+        warm_popularity(&cache, "target.example.com", A_QTYPE, now, 5);
+
+        let result = resolve_from_cache(
+            &cache,
+            "source.example.com",
+            A_QTYPE,
+            IN_QCLASS,
+            false,
+            1,
+            8,
+            now,
+            &RefreshConfig::default(),
+        );
+
+        match result {
+            ChainLookup::Answered(resolved) => {
+                assert_eq!(
+                    resolved.refresh_hints,
+                    vec![
+                        RefreshHint {
+                            domain: "source.example.com".to_string(),
+                            qtype: CNAME_RECORD_TYPE,
+                            qclass: IN_QCLASS,
+                        },
+                        RefreshHint {
+                            domain: "target.example.com".to_string(),
+                            qtype: A_QTYPE,
+                            qclass: IN_QCLASS,
+                        },
+                    ],
+                    "every qualifying hop must produce its own hint, not just the terminal one \
+                     (this is the regression test for the terminal-only bug found during plan review)"
+                );
+            }
+            other => panic!("expected Answered, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn chain_lookup_no_data_never_carries_hint() {
+        let cache = cache_with_shard_count(1);
+        let now = SystemTime::now();
+        let domain = "nodata.example.com";
+        let key = NegativeKey {
+            qtype: Some(A_QTYPE),
+            qclass: IN_QCLASS,
+        };
+        let negative = NegativeEntry {
+            kind: crate::resolver::NegativeCacheKind::NoData,
+            soa_owner: "example.com".to_string(),
+            soa_record: a_record(3600, 1),
+            soa_rrsig: None,
+            proof_records: Vec::new(),
+            stored_at: now,
+            expires_at: now + Duration::from_secs(3600),
+            cache_epoch: 1,
+            dnssec_complete: true,
+            dnssec_state: DnssecState::Unvalidated,
+            authoritative: false,
+        };
+        cache
+            .shard_for(domain)
+            .store_negative(domain, key, negative);
+
+        let result = resolve_from_cache(
+            &cache,
+            domain,
+            A_QTYPE,
+            IN_QCLASS,
+            false,
+            1,
+            8,
+            now,
+            &RefreshConfig::default(),
+        );
+
+        // `ChainLookup::NoData` wraps `ResolvedNegative`, which structurally
+        // has no `refresh_hints` field at all -- there is nothing to assert
+        // beyond confirming the variant itself, which this match already
+        // does at compile time (a hint field on `ResolvedNegative` would be
+        // a compile error to access here, since it doesn't exist).
+        assert!(matches!(result, ChainLookup::NoData(_)));
     }
 }

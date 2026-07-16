@@ -26,7 +26,10 @@ use serde::Deserialize;
 
 use crate::resolver::{DomainName, LocalDnsEntry, LocalDnsEntryValidationError};
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+// Not `Eq`: `refresh: RefreshConfig` embeds `f32` fields (`hot_threshold_fraction`,
+// `lead_ratio`), and `f32`'s `PartialEq` isn't reflexive (NaN), so `f32` never
+// implements `Eq` — that transitively rules out `#[derive(Eq)]` here too.
+#[derive(Debug, Clone, PartialEq)]
 pub struct RuntimeConfig {
     pub dns_listen: Vec<SocketAddr>,
     pub resolution: ResolutionConfig,
@@ -39,6 +42,7 @@ pub struct RuntimeConfig {
     pub metrics: MetricsConfig,
     pub cache: CacheConfig,
     pub chaos: ChaosConfig,
+    pub refresh: RefreshConfig,
 }
 
 /// Default ceiling on concurrent TCP DNS connections per listener. Shared
@@ -81,6 +85,7 @@ impl RuntimeConfig {
             metrics: MetricsConfig::default_enabled(),
             cache: CacheConfig::default(),
             chaos: ChaosConfig::default(),
+            refresh: RefreshConfig::default(),
         };
         config.validate()?;
         Ok(config)
@@ -109,6 +114,7 @@ impl RuntimeConfig {
             metrics: MetricsConfig::default_enabled(),
             cache: CacheConfig::default(),
             chaos: ChaosConfig::default(),
+            refresh: RefreshConfig::default(),
         }
     }
 
@@ -194,6 +200,9 @@ impl RuntimeConfig {
         }
 
         self.cache.validate()?;
+        if self.refresh.enabled {
+            self.refresh.validate()?;
+        }
 
         if self.chaos.enabled {
             if self.chaos.version_bind.is_empty() {
@@ -440,6 +449,112 @@ impl Default for CacheConfig {
         Self {
             max_entries: 10_000,
             shard_count: None,
+        }
+    }
+}
+
+/// Popularity-bucket leak rate: `units` drained per `per` elapsed duration.
+/// Deliberately not a float ratio — the popularity bucket's drain-rate
+/// arithmetic (`PopularityBucket::drain_and_increment`, owned by
+/// `resolver::cache::shard`) needs to stay in integer arithmetic to avoid
+/// long-uptime rounding drift. Defined here (not in `resolver::cache::shard`)
+/// since it must be `pub` to appear on `RefreshConfig`'s public field, and
+/// `resolver::cache::shard` reuses this same type rather than defining its
+/// own, to avoid two independent leaky-bucket rate types drifting apart.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LeakRate {
+    pub units: u32,
+    pub per: Duration,
+}
+
+/// Configuration for the auto-refresh (proactive TTL-refresh) feature: keeps
+/// genuinely popular domains' cache entries refreshed shortly before they
+/// expire, so a real client query never sees the reactive miss. See
+/// `docs/plans/auto_refresh/` for the full design.
+///
+/// `enabled = false` makes the entire feature a no-op: no `PopularityBucket`
+/// is ever allocated, no worker tasks are spawned, no refresh signal is ever
+/// produced (enforced by the call sites that read this flag — this struct
+/// only carries it).
+// Not `Eq`: `hot_threshold_fraction`/`lead_ratio` are `f32`, and `f32` never
+// implements `Eq` (its `PartialEq` isn't reflexive because of NaN).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct RefreshConfig {
+    pub enabled: bool,
+    pub bucket_capacity: u32,
+    pub leak_rate: LeakRate,
+    pub hit_increment: u32,
+    /// Fraction of `bucket_capacity` a domain's popularity level must reach
+    /// or exceed to be considered "hot." Must be in `0.0..=1.0`.
+    pub hot_threshold_fraction: f32,
+    /// Fraction of a record's original TTL used as the refresh lead window
+    /// (`remaining_ttl <= max(original_ttl * lead_ratio, min_lead)`).
+    pub lead_ratio: f32,
+    pub min_lead: Duration,
+    /// Minimum original TTL for a record to be refresh-eligible at all.
+    pub eligibility_floor: Duration,
+    pub worker_count: usize,
+    pub channel_capacity: usize,
+}
+
+impl RefreshConfig {
+    pub fn validate(&self) -> Result<(), ConfigError> {
+        if !(0.0..=1.0).contains(&self.hot_threshold_fraction) {
+            return Err(ConfigError::InvalidRefreshHotThresholdFraction {
+                value: self.hot_threshold_fraction,
+            });
+        }
+        if !(0.0..=1.0).contains(&self.lead_ratio) {
+            return Err(ConfigError::InvalidRefreshLeadRatio {
+                value: self.lead_ratio,
+            });
+        }
+        if self.bucket_capacity == 0 {
+            return Err(ConfigError::InvalidRefreshBucketCapacity {
+                value: self.bucket_capacity,
+            });
+        }
+        if self.hit_increment == 0 {
+            return Err(ConfigError::InvalidRefreshHitIncrement {
+                value: self.hit_increment,
+            });
+        }
+        if self.leak_rate.units == 0 || self.leak_rate.per.is_zero() {
+            return Err(ConfigError::InvalidRefreshLeakRate {
+                units: self.leak_rate.units,
+                per: self.leak_rate.per,
+            });
+        }
+        if self.worker_count == 0 {
+            return Err(ConfigError::InvalidRefreshWorkerCount {
+                value: self.worker_count,
+            });
+        }
+        if self.channel_capacity == 0 {
+            return Err(ConfigError::InvalidRefreshChannelCapacity {
+                value: self.channel_capacity,
+            });
+        }
+        Ok(())
+    }
+}
+
+impl Default for RefreshConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            bucket_capacity: 10,
+            leak_rate: LeakRate {
+                units: 1,
+                per: Duration::from_secs(60),
+            },
+            hit_increment: 1,
+            hot_threshold_fraction: 0.5,
+            lead_ratio: 0.10,
+            min_lead: Duration::from_secs(5),
+            eligibility_floor: Duration::from_secs(15),
+            worker_count: 4,
+            channel_capacity: 256,
         }
     }
 }
@@ -1222,7 +1337,9 @@ pub fn parse_local_zone_file(
         .collect())
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+// Not `Eq`: `InvalidRefreshHotThresholdFraction` carries an `f32`, and `f32`
+// never implements `Eq` (its `PartialEq` isn't reflexive because of NaN).
+#[derive(Debug, Clone, PartialEq)]
 pub enum ConfigError {
     NoDnsListenAddress,
     InvalidListenAddress {
@@ -1338,6 +1455,28 @@ pub enum ConfigError {
         len: usize,
         max: usize,
     },
+    InvalidRefreshHotThresholdFraction {
+        value: f32,
+    },
+    InvalidRefreshLeadRatio {
+        value: f32,
+    },
+    InvalidRefreshBucketCapacity {
+        value: u32,
+    },
+    InvalidRefreshHitIncrement {
+        value: u32,
+    },
+    InvalidRefreshLeakRate {
+        units: u32,
+        per: Duration,
+    },
+    InvalidRefreshWorkerCount {
+        value: usize,
+    },
+    InvalidRefreshChannelCapacity {
+        value: usize,
+    },
 }
 
 #[derive(Debug, Deserialize)]
@@ -1362,6 +1501,8 @@ struct RawRuntimeConfig {
     cache: Option<RawCacheConfig>,
     #[serde(default)]
     chaos: Option<RawChaosConfig>,
+    #[serde(default)]
+    refresh: Option<RawRefreshConfig>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1405,6 +1546,93 @@ impl RawCacheConfig {
         Ok(CacheConfig {
             max_entries: self.max_entries,
             shard_count: self.shard_count,
+        })
+    }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawRefreshConfig {
+    #[serde(default = "default_true")]
+    enabled: bool,
+    #[serde(default = "default_refresh_bucket_capacity")]
+    bucket_capacity: u32,
+    #[serde(default = "default_refresh_leak_rate_units")]
+    leak_rate_units: u32,
+    #[serde(default = "default_refresh_leak_rate_per_ms")]
+    leak_rate_per_ms: u64,
+    #[serde(default = "default_refresh_hit_increment")]
+    hit_increment: u32,
+    #[serde(default = "default_refresh_hot_threshold_fraction")]
+    hot_threshold_fraction: f32,
+    #[serde(default = "default_refresh_lead_ratio")]
+    lead_ratio: f32,
+    #[serde(default = "default_refresh_min_lead_ms")]
+    min_lead_ms: u64,
+    #[serde(default = "default_refresh_eligibility_floor_ms")]
+    eligibility_floor_ms: u64,
+    #[serde(default = "default_refresh_worker_count")]
+    worker_count: usize,
+    #[serde(default = "default_refresh_channel_capacity")]
+    channel_capacity: usize,
+}
+
+fn default_refresh_bucket_capacity() -> u32 {
+    RefreshConfig::default().bucket_capacity
+}
+
+fn default_refresh_leak_rate_units() -> u32 {
+    RefreshConfig::default().leak_rate.units
+}
+
+fn default_refresh_leak_rate_per_ms() -> u64 {
+    RefreshConfig::default().leak_rate.per.as_millis() as u64
+}
+
+fn default_refresh_hit_increment() -> u32 {
+    RefreshConfig::default().hit_increment
+}
+
+fn default_refresh_hot_threshold_fraction() -> f32 {
+    RefreshConfig::default().hot_threshold_fraction
+}
+
+fn default_refresh_lead_ratio() -> f32 {
+    RefreshConfig::default().lead_ratio
+}
+
+fn default_refresh_min_lead_ms() -> u64 {
+    RefreshConfig::default().min_lead.as_millis() as u64
+}
+
+fn default_refresh_eligibility_floor_ms() -> u64 {
+    RefreshConfig::default().eligibility_floor.as_millis() as u64
+}
+
+fn default_refresh_worker_count() -> usize {
+    RefreshConfig::default().worker_count
+}
+
+fn default_refresh_channel_capacity() -> usize {
+    RefreshConfig::default().channel_capacity
+}
+
+impl RawRefreshConfig {
+    fn try_into_refresh_config(self) -> Result<RefreshConfig, ConfigError> {
+        Ok(RefreshConfig {
+            enabled: self.enabled,
+            bucket_capacity: self.bucket_capacity,
+            leak_rate: LeakRate {
+                units: self.leak_rate_units,
+                per: Duration::from_millis(self.leak_rate_per_ms),
+            },
+            hit_increment: self.hit_increment,
+            hot_threshold_fraction: self.hot_threshold_fraction,
+            lead_ratio: self.lead_ratio,
+            min_lead: Duration::from_millis(self.min_lead_ms),
+            eligibility_floor: Duration::from_millis(self.eligibility_floor_ms),
+            worker_count: self.worker_count,
+            channel_capacity: self.channel_capacity,
         })
     }
 }
@@ -1737,6 +1965,11 @@ impl TryFrom<RawRuntimeConfig> for RuntimeConfig {
             .map(RawChaosConfig::try_into_chaos_config)
             .transpose()?
             .unwrap_or_default();
+        let refresh = raw
+            .refresh
+            .map(RawRefreshConfig::try_into_refresh_config)
+            .transpose()?
+            .unwrap_or_default();
 
         let config = RuntimeConfig {
             dns_listen,
@@ -1750,6 +1983,7 @@ impl TryFrom<RawRuntimeConfig> for RuntimeConfig {
             metrics,
             cache,
             chaos,
+            refresh,
         };
         config.validate()?;
         Ok(config)
@@ -2706,6 +2940,250 @@ a.root-servers.net.      3600000      Aaaa  2001:503:ba3e::2:30
     #[test]
     fn cache_config_validate_accepts_default() {
         assert_eq!(CacheConfig::default().validate(), Ok(()));
+    }
+
+    #[test]
+    fn refresh_config_defaults_match_spec() {
+        let config = RefreshConfig::default();
+
+        assert!(config.enabled);
+        assert_eq!(config.bucket_capacity, 10);
+        assert_eq!(
+            config.leak_rate,
+            LeakRate {
+                units: 1,
+                per: Duration::from_secs(60),
+            }
+        );
+        assert_eq!(config.hit_increment, 1);
+        assert_eq!(config.hot_threshold_fraction, 0.5);
+        assert_eq!(config.lead_ratio, 0.10);
+        assert_eq!(config.min_lead, Duration::from_secs(5));
+        assert_eq!(config.eligibility_floor, Duration::from_secs(15));
+        assert_eq!(config.worker_count, 4);
+        assert_eq!(config.channel_capacity, 256);
+    }
+
+    #[test]
+    fn refresh_config_defaults_when_absent() {
+        let config = RuntimeConfig::from_toml_str(&valid_toml()).unwrap();
+
+        assert_eq!(config.refresh, RefreshConfig::default());
+    }
+
+    #[test]
+    fn refresh_config_explicit_override() {
+        let mut toml = valid_toml();
+        toml.push_str(
+            r#"
+            [refresh]
+            enabled = false
+            bucket_capacity = 20
+            leak_rate_units = 3
+            leak_rate_per_ms = 90000
+            hit_increment = 2
+            hot_threshold_fraction = 0.75
+            lead_ratio = 0.25
+            min_lead_ms = 10000
+            eligibility_floor_ms = 30000
+            worker_count = 8
+            channel_capacity = 512
+            "#,
+        );
+
+        let config = RuntimeConfig::from_toml_str(&toml).unwrap();
+
+        assert_eq!(
+            config.refresh,
+            RefreshConfig {
+                enabled: false,
+                bucket_capacity: 20,
+                leak_rate: LeakRate {
+                    units: 3,
+                    per: Duration::from_millis(90000),
+                },
+                hit_increment: 2,
+                hot_threshold_fraction: 0.75,
+                lead_ratio: 0.25,
+                min_lead: Duration::from_millis(10000),
+                eligibility_floor: Duration::from_millis(30000),
+                worker_count: 8,
+                channel_capacity: 512,
+            }
+        );
+    }
+
+    #[test]
+    fn raw_refresh_config_rejects_unknown_fields() {
+        let mut toml = valid_toml();
+        toml.push_str(
+            r#"
+            [refresh]
+            not_a_real_field = 1
+            "#,
+        );
+
+        assert!(RuntimeConfig::from_toml_str(&toml).is_err());
+    }
+
+    #[test]
+    fn refresh_config_validate_rejects_out_of_range_hot_threshold() {
+        let mut toml = valid_toml();
+        toml.push_str(
+            r#"
+            [refresh]
+            hot_threshold_fraction = 1.5
+            "#,
+        );
+
+        let error = RuntimeConfig::from_toml_str(&toml).unwrap_err();
+        assert_eq!(
+            error,
+            ConfigError::InvalidRefreshHotThresholdFraction { value: 1.5 }
+        );
+    }
+
+    #[test]
+    fn refresh_config_validate_rejects_zero_worker_count() {
+        let mut toml = valid_toml();
+        toml.push_str(
+            r#"
+            [refresh]
+            worker_count = 0
+            "#,
+        );
+
+        let error = RuntimeConfig::from_toml_str(&toml).unwrap_err();
+        assert_eq!(error, ConfigError::InvalidRefreshWorkerCount { value: 0 });
+    }
+
+    #[test]
+    fn refresh_config_validate_rejects_zero_channel_capacity() {
+        let mut toml = valid_toml();
+        toml.push_str(
+            r#"
+            [refresh]
+            channel_capacity = 0
+            "#,
+        );
+
+        let error = RuntimeConfig::from_toml_str(&toml).unwrap_err();
+        assert_eq!(
+            error,
+            ConfigError::InvalidRefreshChannelCapacity { value: 0 }
+        );
+    }
+
+    #[test]
+    fn refresh_config_validate_accepts_default() {
+        assert_eq!(RefreshConfig::default().validate(), Ok(()));
+    }
+
+    /// Regression test for the bug code review found: `RuntimeConfig::validate()`
+    /// ran `self.refresh.validate()` unconditionally, unlike the
+    /// `if self.metrics.enabled`/`if self.chaos.enabled` pattern used
+    /// elsewhere in this same function -- making it impossible to disable
+    /// auto-refresh while leaving other refresh fields at placeholder/zero
+    /// values. `worker_count = 0` alone would otherwise be rejected even
+    /// though a disabled feature never spawns a worker pool at all.
+    #[test]
+    fn refresh_config_disabled_skips_validation() {
+        let mut toml = valid_toml();
+        toml.push_str(
+            r#"
+            [refresh]
+            enabled = false
+            worker_count = 0
+            channel_capacity = 0
+            "#,
+        );
+
+        assert!(RuntimeConfig::from_toml_str(&toml).is_ok());
+    }
+
+    #[test]
+    fn refresh_config_validate_rejects_out_of_range_lead_ratio() {
+        let mut toml = valid_toml();
+        toml.push_str(
+            r#"
+            [refresh]
+            lead_ratio = 1.5
+            "#,
+        );
+
+        let error = RuntimeConfig::from_toml_str(&toml).unwrap_err();
+        assert_eq!(error, ConfigError::InvalidRefreshLeadRatio { value: 1.5 });
+    }
+
+    #[test]
+    fn refresh_config_validate_rejects_zero_bucket_capacity() {
+        let mut toml = valid_toml();
+        toml.push_str(
+            r#"
+            [refresh]
+            bucket_capacity = 0
+            "#,
+        );
+
+        let error = RuntimeConfig::from_toml_str(&toml).unwrap_err();
+        assert_eq!(
+            error,
+            ConfigError::InvalidRefreshBucketCapacity { value: 0 }
+        );
+    }
+
+    #[test]
+    fn refresh_config_validate_rejects_zero_hit_increment() {
+        let mut toml = valid_toml();
+        toml.push_str(
+            r#"
+            [refresh]
+            hit_increment = 0
+            "#,
+        );
+
+        let error = RuntimeConfig::from_toml_str(&toml).unwrap_err();
+        assert_eq!(error, ConfigError::InvalidRefreshHitIncrement { value: 0 });
+    }
+
+    #[test]
+    fn refresh_config_validate_rejects_zero_leak_rate_units() {
+        let mut toml = valid_toml();
+        toml.push_str(
+            r#"
+            [refresh]
+            leak_rate_units = 0
+            "#,
+        );
+
+        let error = RuntimeConfig::from_toml_str(&toml).unwrap_err();
+        assert_eq!(
+            error,
+            ConfigError::InvalidRefreshLeakRate {
+                units: 0,
+                per: Duration::from_secs(60),
+            }
+        );
+    }
+
+    #[test]
+    fn refresh_config_validate_rejects_zero_leak_rate_per() {
+        let mut toml = valid_toml();
+        toml.push_str(
+            r#"
+            [refresh]
+            leak_rate_per_ms = 0
+            "#,
+        );
+
+        let error = RuntimeConfig::from_toml_str(&toml).unwrap_err();
+        assert_eq!(
+            error,
+            ConfigError::InvalidRefreshLeakRate {
+                units: 1,
+                per: Duration::ZERO,
+            }
+        );
     }
 
     #[test]

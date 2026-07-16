@@ -28,15 +28,100 @@
 
 use std::collections::HashMap;
 use std::sync::Mutex;
-use std::time::SystemTime;
+use std::time::{Duration, SystemTime};
 
 use super::entry::{
     DomainNegativeEntries, DomainRecordSets, NegativeEntry, NegativeKey, RRsetEntry,
 };
 use super::lru::ShardLru;
+use crate::config::{LeakRate, RefreshConfig};
 use crate::protocol::RecordData;
 
 const CNAME_RECORD_TYPE: u16 = 5;
+
+/// Per-domain leaky-bucket popularity tracker. Created the first time a
+/// domain is stored (mirroring `ShardLru`'s own on-first-store creation),
+/// drained-then-incremented on every subsequent lookup hit, and removed
+/// alongside the LRU token's own two removal points
+/// (`ShardState::evict_domain`, `ShardState::drop_lru_if_domain_now_empty`)
+/// — this keeps popularity state from drifting out of sync with which
+/// domains still have cached data via those two paths. Note
+/// `sweep_stale_namespace` clears a domain's LRU token directly without
+/// going through either of those two functions, so a bucket can currently
+/// outlive its domain's data when cleared via a namespace sweep instead —
+/// an accepted gap matching the plan's explicit scope (only the two named
+/// removal points are in scope for popularity cleanup).
+///
+/// Granularity is per-domain (qname only), not per-`(qname, qtype, qclass)`
+/// — matching `ShardLru`'s own granularity. A query for any record type
+/// under a domain raises that domain's popularity.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct PopularityBucket {
+    level: u32,
+    last_drained: SystemTime,
+}
+
+impl PopularityBucket {
+    /// A fresh bucket for a domain seen for the first time: zero level,
+    /// drained as of `now`.
+    fn new(now: SystemTime) -> Self {
+        Self {
+            level: 0,
+            last_drained: now,
+        }
+    }
+
+    /// Drains the bucket by elapsed time since `last_drained`, then adds
+    /// `hit_increment`, saturating at `capacity`. Uses integer arithmetic
+    /// throughout (no floats) to avoid long-uptime rounding drift.
+    ///
+    /// `now` must be >= `last_drained` under normal operation; a `now` that
+    /// appears to go backward (clock adjustment) is treated as zero elapsed
+    /// time rather than panicking or underflowing — `last_drained` is never
+    /// moved backward.
+    ///
+    /// Truncation-bias avoidance: converting elapsed time to leaked units
+    /// naively (`elapsed * leak_rate.units / leak_rate.per`, discarding the
+    /// remainder, then setting `last_drained = now`) would silently bias the
+    /// drain low whenever elapsed time is repeatedly smaller than one full
+    /// drain unit. Avoided here by only ever advancing `last_drained` by the
+    /// exact amount of time actually "spent" on the whole leaked units
+    /// applied this call, leaving any leftover sub-unit elapsed time still
+    /// pending against `last_drained` for the next call to pick up — never
+    /// simply resetting `last_drained = now`.
+    fn drain_and_increment(
+        &mut self,
+        now: SystemTime,
+        leak_rate: LeakRate,
+        hit_increment: u32,
+        capacity: u32,
+    ) {
+        let elapsed = now.duration_since(self.last_drained).unwrap_or_default();
+        if leak_rate.units > 0 && !leak_rate.per.is_zero() {
+            let leaked_units_wide =
+                elapsed.as_nanos() * u128::from(leak_rate.units) / leak_rate.per.as_nanos().max(1);
+            let leaked_units = u32::try_from(leaked_units_wide).unwrap_or(u32::MAX);
+            if leaked_units > 0 {
+                self.level = self.level.saturating_sub(leaked_units);
+                let time_spent = leak_rate.per * leaked_units / leak_rate.units;
+                self.last_drained += time_spent;
+            }
+        }
+        self.level = self.level.saturating_add(hit_increment).min(capacity);
+    }
+
+    /// True if `level >= hot_threshold` (an absolute count derived elsewhere
+    /// from `RefreshConfig::hot_threshold_fraction * bucket_capacity` — this
+    /// method just takes the precomputed absolute threshold).
+    fn is_hot(&self, hot_threshold: u32) -> bool {
+        self.level >= hot_threshold
+    }
+
+    #[cfg(test)]
+    fn level(&self) -> u32 {
+        self.level
+    }
+}
 
 /// Result of one hop's lookup within `resolve_from_cache`'s CNAME-chain
 /// walk (`cache::assemble`, section-06) — whatever this shard found (or
@@ -44,15 +129,21 @@ const CNAME_RECORD_TYPE: u16 = 5;
 /// shard's lock.
 #[derive(Debug, Clone)]
 pub(crate) enum HopResult {
-    /// A record set matching the queried `(qtype, qclass)` directly.
-    Answer(RRsetEntry),
+    /// A record set matching the queried `(qtype, qclass)` directly, plus
+    /// whether this hop currently wants a proactive refresh
+    /// (`wants_refresh`, computed inside `lookup_hop` while the lock —
+    /// and this domain's popularity bucket — is already held).
+    Answer(RRsetEntry, bool),
     /// The queried type wasn't found, but a CNAME record set was — carries
-    /// the CNAME's own entry (for the response's answer section) plus the
-    /// extracted target name to continue the walk.
-    CnameHop(RRsetEntry, String),
-    /// NODATA for the queried type at this (existing) name.
+    /// the CNAME's own entry (for the response's answer section), the
+    /// extracted target name to continue the walk, and whether this hop
+    /// wants a proactive refresh.
+    CnameHop(RRsetEntry, String, bool),
+    /// NODATA for the queried type at this (existing) name. Negative
+    /// entries never carry a refresh signal (v1 scope is positive-entries
+    /// only), so there is no bool here.
     NoData(NegativeEntry),
-    /// Whole-name NXDOMAIN at this name.
+    /// Whole-name NXDOMAIN at this name. Same scope note as `NoData`.
     NxDomain(NegativeEntry),
     /// Nothing usable here: absent, expired, or stored under a stale
     /// namespace.
@@ -74,6 +165,7 @@ struct ShardState {
     positive: PositiveShardState,
     negative: NegativeShardState,
     lru: ShardLru,
+    popularity: HashMap<String, PopularityBucket>,
 }
 
 impl ShardState {
@@ -85,6 +177,58 @@ impl ShardState {
         self.positive.domains.remove(domain);
         self.negative.domains.remove(domain);
         self.lru.remove(domain);
+        self.popularity.remove(domain);
+    }
+
+    /// Drains-then-increments `domain`'s popularity bucket, allocating it on
+    /// first hit. A complete no-op — the bucket is never allocated at all,
+    /// not merely "left untouched" — when `enabled` is false.
+    fn record_popularity_hit(
+        &mut self,
+        domain: &str,
+        now: SystemTime,
+        enabled: bool,
+        leak_rate: LeakRate,
+        hit_increment: u32,
+        bucket_capacity: u32,
+    ) {
+        if !enabled {
+            return;
+        }
+        self.popularity
+            .entry(domain.to_string())
+            .or_insert_with(|| PopularityBucket::new(now))
+            .drain_and_increment(now, leak_rate, hit_increment, bucket_capacity);
+    }
+
+    /// Shared by `lookup_hop`'s `Answer`/`CnameHop` branches: records this
+    /// hit against `domain`'s popularity bucket, then evaluates
+    /// `wants_refresh` against the just-updated bucket (so this same hit's
+    /// own increment counts toward its own hot-threshold determination —
+    /// deterministic read-after-write within one lock scope, not a race).
+    fn record_hit_and_check_refresh(
+        &mut self,
+        domain: &str,
+        entry_minimum_ttl: Duration,
+        entry_expires_at: SystemTime,
+        now: SystemTime,
+        refresh_config: &RefreshConfig,
+    ) -> bool {
+        self.record_popularity_hit(
+            domain,
+            now,
+            refresh_config.enabled,
+            refresh_config.leak_rate,
+            refresh_config.hit_increment,
+            refresh_config.bucket_capacity,
+        );
+        let remaining_ttl = entry_expires_at.duration_since(now).unwrap_or_default();
+        wants_refresh(
+            entry_minimum_ttl,
+            remaining_ttl,
+            self.popularity.get(domain),
+            refresh_config,
+        )
     }
 
     /// Evicts the least-recently-touched domain, if any is tracked.
@@ -146,6 +290,7 @@ impl ShardState {
             && !self.negative.domains.contains_key(domain)
         {
             self.lru.remove(domain);
+            self.popularity.remove(domain);
         }
     }
 
@@ -266,6 +411,58 @@ impl ShardState {
         }
         None
     }
+}
+
+/// Pure trigger-formula check — see
+/// `docs/knowledge/resolver/caching/auto-refresh.md` for the full formula.
+/// Given a live entry's own TTL data, the domain's current popularity bucket
+/// (if any — a domain that has never been hit, or whose bucket was evicted
+/// alongside its LRU entry, has no bucket and is therefore never hot), and
+/// refresh-config thresholds, decides whether the entry currently "wants" a
+/// proactive background refresh.
+///
+/// This does not mutate anything, perform any I/O, or take any lock beyond
+/// what the caller already holds — it is a pure function of data the
+/// live-entry probes (`take_live_positive`/`take_live_cname_hop`) already
+/// have in hand. It also does not change what those probes return as the
+/// *served* answer; it only decides whether to *additionally* signal "this
+/// entry wants a refresh" (consumed by section-04's `ChainLookup`/
+/// `RefreshHint` plumbing).
+///
+/// All three independent gates must hold for this to return `true`:
+/// 1. **Eligibility floor**: `original_ttl >= config.eligibility_floor`.
+///    Entries below this floor are never refresh-eligible regardless of
+///    remaining TTL or popularity — this exists to avoid refresh thrash on
+///    very-short-TTL records.
+/// 2. **Lead window**: `remaining_ttl <= max(original_ttl * config.lead_ratio,
+///    config.min_lead)`.
+/// 3. **Popularity**: the domain's bucket, if present, is hot at the
+///    threshold derived from `config.hot_threshold_fraction *
+///    config.bucket_capacity` (rounded to the nearest `u32`); a missing
+///    bucket (`None`) is never hot.
+///
+/// Callers in `lookup_hop` pass the bucket *after* recording the current
+/// hit (`record_hit_and_check_refresh`), so this same hit's own increment
+/// counts toward its own hot-threshold determination — a domain becomes
+/// "hot" and can produce a refresh hint on the very hit that pushes its
+/// bucket over the threshold, not only on a subsequent one. Deterministic
+/// (both happen under the same lock, back-to-back), not a race.
+pub(crate) fn wants_refresh(
+    original_ttl: Duration,
+    remaining_ttl: Duration,
+    bucket: Option<&PopularityBucket>,
+    config: &RefreshConfig,
+) -> bool {
+    if original_ttl < config.eligibility_floor {
+        return false;
+    }
+    let lead = original_ttl.mul_f32(config.lead_ratio).max(config.min_lead);
+    if remaining_ttl > lead {
+        return false;
+    }
+    let hot_threshold =
+        (config.hot_threshold_fraction * config.bucket_capacity as f32).round() as u32;
+    bucket.is_some_and(|b| b.is_hot(hot_threshold))
 }
 
 /// One shard of the sharded DNS cache: its own lock, its own share of the
@@ -402,6 +599,9 @@ impl Shard {
     /// live in the *authority* section and their TTLs play no part in the
     /// SOA-minimum-derived negative TTL computation, hence this dedicated
     /// read-time check.
+    // lookup_hop threads cache-lookup and refresh-eligibility inputs
+    // through one call; splitting adds indirection without benefit.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn lookup_hop(
         &self,
         domain: &str,
@@ -410,6 +610,7 @@ impl Shard {
         dnssec_ok: bool,
         current_epoch: u64,
         now: SystemTime,
+        refresh_config: &RefreshConfig,
     ) -> HopResult {
         let mut state = self.state.lock().unwrap();
         let answer_key = (qtype, qclass);
@@ -424,7 +625,14 @@ impl Shard {
             state.take_live_positive(domain, answer_key, dnssec_ok, current_epoch, now)
         {
             state.lru.touch(domain);
-            return HopResult::Answer(entry);
+            let refresh_wanted = state.record_hit_and_check_refresh(
+                domain,
+                entry.minimum_ttl,
+                entry.expires_at,
+                now,
+                refresh_config,
+            );
+            return HopResult::Answer(entry, refresh_wanted);
         }
 
         if qtype != CNAME_RECORD_TYPE {
@@ -433,7 +641,14 @@ impl Shard {
                 state.take_live_cname_hop(domain, cname_key, dnssec_ok, current_epoch, now)
             {
                 state.lru.touch(domain);
-                return HopResult::CnameHop(entry, target);
+                let refresh_wanted = state.record_hit_and_check_refresh(
+                    domain,
+                    entry.minimum_ttl,
+                    entry.expires_at,
+                    now,
+                    refresh_config,
+                );
+                return HopResult::CnameHop(entry, target, refresh_wanted);
             }
         }
 
@@ -445,6 +660,14 @@ impl Shard {
             state.take_live_negative(domain, &nodata_key, dnssec_ok, current_epoch, now)
         {
             state.lru.touch(domain);
+            state.record_popularity_hit(
+                domain,
+                now,
+                refresh_config.enabled,
+                refresh_config.leak_rate,
+                refresh_config.hit_increment,
+                refresh_config.bucket_capacity,
+            );
             return HopResult::NoData(entry);
         }
 
@@ -456,6 +679,14 @@ impl Shard {
             state.take_live_negative(domain, &nxdomain_key, dnssec_ok, current_epoch, now)
         {
             state.lru.touch(domain);
+            state.record_popularity_hit(
+                domain,
+                now,
+                refresh_config.enabled,
+                refresh_config.leak_rate,
+                refresh_config.hit_increment,
+                refresh_config.bucket_capacity,
+            );
             return HopResult::NxDomain(entry);
         }
 
@@ -536,6 +767,16 @@ impl Shard {
     #[cfg(test)]
     pub(crate) fn has_any_data(&self, domain: &str) -> bool {
         self.state.lock().unwrap().domain_is_tracked(domain)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn popularity_level(&self, domain: &str) -> Option<u32> {
+        self.state
+            .lock()
+            .unwrap()
+            .popularity
+            .get(domain)
+            .map(PopularityBucket::level)
     }
 
     /// Test-only: locks this shard's state and sleeps, to let a
@@ -754,13 +995,29 @@ mod tests {
         shard.store_positive(domain, (A_QTYPE, IN_QCLASS), entry);
         let now = SystemTime::now();
 
-        let do_false_result = shard.lookup_hop(domain, A_QTYPE, IN_QCLASS, false, 1, now);
+        let do_false_result = shard.lookup_hop(
+            domain,
+            A_QTYPE,
+            IN_QCLASS,
+            false,
+            1,
+            now,
+            &test_refresh_config(),
+        );
         assert!(
-            matches!(do_false_result, HopResult::Answer(_)),
+            matches!(do_false_result, HopResult::Answer(_, _)),
             "a DO=false reader may still be served from a dnssec-incomplete entry"
         );
 
-        let do_true_result = shard.lookup_hop(domain, A_QTYPE, IN_QCLASS, true, 1, now);
+        let do_true_result = shard.lookup_hop(
+            domain,
+            A_QTYPE,
+            IN_QCLASS,
+            true,
+            1,
+            now,
+            &test_refresh_config(),
+        );
         assert!(
             matches!(do_true_result, HopResult::Miss),
             "a DO=true reader must not be served from a dnssec-incomplete entry, got {do_true_result:?}"
@@ -776,8 +1033,16 @@ mod tests {
         shard.store_positive(domain, (A_QTYPE, IN_QCLASS), entry);
         let now = SystemTime::now();
 
-        let result = shard.lookup_hop(domain, A_QTYPE, IN_QCLASS, true, 1, now);
-        assert!(matches!(result, HopResult::Answer(_)));
+        let result = shard.lookup_hop(
+            domain,
+            A_QTYPE,
+            IN_QCLASS,
+            true,
+            1,
+            now,
+            &test_refresh_config(),
+        );
+        assert!(matches!(result, HopResult::Answer(_, _)));
     }
 
     #[test]
@@ -795,7 +1060,15 @@ mod tests {
         shard.store_positive(domain, (CNAME_RECORD_TYPE, IN_QCLASS), entry);
         let now = SystemTime::now();
 
-        let do_true_result = shard.lookup_hop(domain, A_QTYPE, IN_QCLASS, true, 1, now);
+        let do_true_result = shard.lookup_hop(
+            domain,
+            A_QTYPE,
+            IN_QCLASS,
+            true,
+            1,
+            now,
+            &test_refresh_config(),
+        );
         assert!(
             matches!(do_true_result, HopResult::Miss),
             "a DO=true reader must not follow a dnssec-incomplete CNAME hop, got {do_true_result:?}"
@@ -815,10 +1088,26 @@ mod tests {
         shard.store_negative(domain, nxdomain_key, entry.clone());
         let now = SystemTime::now();
 
-        let do_false_result = shard.lookup_hop(domain, A_QTYPE, IN_QCLASS, false, 1, now);
+        let do_false_result = shard.lookup_hop(
+            domain,
+            A_QTYPE,
+            IN_QCLASS,
+            false,
+            1,
+            now,
+            &test_refresh_config(),
+        );
         assert!(matches!(do_false_result, HopResult::NxDomain(_)));
 
-        let do_true_result = shard.lookup_hop(domain, A_QTYPE, IN_QCLASS, true, 1, now);
+        let do_true_result = shard.lookup_hop(
+            domain,
+            A_QTYPE,
+            IN_QCLASS,
+            true,
+            1,
+            now,
+            &test_refresh_config(),
+        );
         assert!(
             matches!(do_true_result, HopResult::Miss),
             "a DO=true reader must not be served from a dnssec-incomplete NXDOMAIN entry, got {do_true_result:?}"
@@ -830,7 +1119,15 @@ mod tests {
             qclass: IN_QCLASS,
         };
         shard.store_negative(domain2, nodata_key, entry);
-        let do_true_nodata = shard.lookup_hop(domain2, A_QTYPE, IN_QCLASS, true, 1, now);
+        let do_true_nodata = shard.lookup_hop(
+            domain2,
+            A_QTYPE,
+            IN_QCLASS,
+            true,
+            1,
+            now,
+            &test_refresh_config(),
+        );
         assert!(
             matches!(do_true_nodata, HopResult::Miss),
             "a DO=true reader must not be served from a dnssec-incomplete NODATA entry, got {do_true_nodata:?}"
@@ -896,13 +1193,29 @@ mod tests {
             negative_entry_with_short_lived_proof(stored_at),
         );
 
-        let do_false_result = shard.lookup_hop(nxdomain_domain, A_QTYPE, IN_QCLASS, false, 1, now);
+        let do_false_result = shard.lookup_hop(
+            nxdomain_domain,
+            A_QTYPE,
+            IN_QCLASS,
+            false,
+            1,
+            now,
+            &test_refresh_config(),
+        );
         assert!(
             matches!(do_false_result, HopResult::NxDomain(_)),
             "a DO=false reader may still be served despite the stale proof record, got {do_false_result:?}"
         );
 
-        let do_true_result = shard.lookup_hop(nxdomain_domain, A_QTYPE, IN_QCLASS, true, 1, now);
+        let do_true_result = shard.lookup_hop(
+            nxdomain_domain,
+            A_QTYPE,
+            IN_QCLASS,
+            true,
+            1,
+            now,
+            &test_refresh_config(),
+        );
         assert!(
             matches!(do_true_result, HopResult::Miss),
             "a DO=true reader must not be served an NXDOMAIN entry whose proof record TTL has elapsed, got {do_true_result:?}"
@@ -918,8 +1231,15 @@ mod tests {
             nodata_key,
             negative_entry_with_short_lived_proof(stored_at),
         );
-        let do_true_nodata_result =
-            shard.lookup_hop(nodata_domain, A_QTYPE, IN_QCLASS, true, 1, now);
+        let do_true_nodata_result = shard.lookup_hop(
+            nodata_domain,
+            A_QTYPE,
+            IN_QCLASS,
+            true,
+            1,
+            now,
+            &test_refresh_config(),
+        );
         assert!(
             matches!(do_true_nodata_result, HopResult::Miss),
             "a DO=true reader must not be served a NODATA entry whose proof record TTL has elapsed, got {do_true_nodata_result:?}"
@@ -944,7 +1264,15 @@ mod tests {
             negative_entry_with_short_lived_proof(stored_at),
         );
 
-        let do_true_result = shard.lookup_hop(domain, A_QTYPE, IN_QCLASS, true, 1, now);
+        let do_true_result = shard.lookup_hop(
+            domain,
+            A_QTYPE,
+            IN_QCLASS,
+            true,
+            1,
+            now,
+            &test_refresh_config(),
+        );
         assert!(
             matches!(do_true_result, HopResult::NxDomain(_)),
             "a DO=true reader must still be served while every stored record remains within its own TTL, got {do_true_result:?}"
@@ -978,7 +1306,15 @@ mod tests {
         shard.store_positive(domain, (A_QTYPE, IN_QCLASS), expired_rrset_entry(now));
         assert_eq!(shard.domain_count(), 1);
 
-        let result = shard.lookup_hop(domain, A_QTYPE, IN_QCLASS, false, 1, now);
+        let result = shard.lookup_hop(
+            domain,
+            A_QTYPE,
+            IN_QCLASS,
+            false,
+            1,
+            now,
+            &test_refresh_config(),
+        );
 
         assert!(matches!(result, HopResult::Miss));
         assert!(
@@ -1008,7 +1344,15 @@ mod tests {
         shard.store_positive(domain, (CNAME_RECORD_TYPE, IN_QCLASS), entry);
         assert_eq!(shard.domain_count(), 1);
 
-        let result = shard.lookup_hop(domain, A_QTYPE, IN_QCLASS, false, 1, now);
+        let result = shard.lookup_hop(
+            domain,
+            A_QTYPE,
+            IN_QCLASS,
+            false,
+            1,
+            now,
+            &test_refresh_config(),
+        );
 
         assert!(matches!(result, HopResult::Miss));
         assert!(!shard.contains_positive(domain, (CNAME_RECORD_TYPE, IN_QCLASS)));
@@ -1028,7 +1372,15 @@ mod tests {
         shard.store_negative(domain, nodata_key.clone(), expired_negative_entry(now));
         assert_eq!(shard.domain_count(), 1);
 
-        let result = shard.lookup_hop(domain, A_QTYPE, IN_QCLASS, false, 1, now);
+        let result = shard.lookup_hop(
+            domain,
+            A_QTYPE,
+            IN_QCLASS,
+            false,
+            1,
+            now,
+            &test_refresh_config(),
+        );
 
         assert!(matches!(result, HopResult::Miss));
         assert!(
@@ -1051,7 +1403,15 @@ mod tests {
         shard.store_negative(domain, nxdomain_key.clone(), expired_negative_entry(now));
         assert_eq!(shard.domain_count(), 1);
 
-        let result = shard.lookup_hop(domain, A_QTYPE, IN_QCLASS, false, 1, now);
+        let result = shard.lookup_hop(
+            domain,
+            A_QTYPE,
+            IN_QCLASS,
+            false,
+            1,
+            now,
+            &test_refresh_config(),
+        );
 
         assert!(matches!(result, HopResult::Miss));
         assert!(!shard.contains_negative(domain, &nxdomain_key));
@@ -1073,7 +1433,15 @@ mod tests {
         shard.store_positive(domain, (AAAA_QTYPE, IN_QCLASS), rrset_entry());
         assert_eq!(shard.domain_count(), 1);
 
-        let result = shard.lookup_hop(domain, A_QTYPE, IN_QCLASS, false, 1, now);
+        let result = shard.lookup_hop(
+            domain,
+            A_QTYPE,
+            IN_QCLASS,
+            false,
+            1,
+            now,
+            &test_refresh_config(),
+        );
 
         assert!(matches!(result, HopResult::Miss));
         assert!(!shard.contains_positive(domain, (A_QTYPE, IN_QCLASS)));
@@ -1086,5 +1454,564 @@ mod tests {
             "the domain must remain tracked since it still has live data"
         );
         assert_eq!(shard.domain_count(), 1);
+    }
+
+    // Popularity bucket (leaky bucket) tests: section-01-popularity-bucket.
+
+    fn leak_rate_1_per_60s() -> LeakRate {
+        LeakRate {
+            units: 1,
+            per: Duration::from_secs(60),
+        }
+    }
+
+    #[test]
+    fn popularity_bucket_drains_by_elapsed_time() {
+        let now = SystemTime::now();
+        let mut bucket = PopularityBucket::new(now);
+        // Get the level up to 5 first, with no elapsed time so nothing drains.
+        for _ in 0..5 {
+            bucket.drain_and_increment(now, leak_rate_1_per_60s(), 1, 10);
+        }
+        assert_eq!(bucket.level(), 5);
+
+        // 180s elapsed at 1 unit/60s should drain 3 units, then +1 hit.
+        let later = now + Duration::from_secs(180);
+        bucket.drain_and_increment(later, leak_rate_1_per_60s(), 1, 10);
+        assert_eq!(bucket.level(), 5 - 3 + 1);
+    }
+
+    #[test]
+    fn popularity_bucket_increments_on_hit() {
+        let now = SystemTime::now();
+        let mut bucket = PopularityBucket::new(now);
+        bucket.drain_and_increment(now, leak_rate_1_per_60s(), 1, 10);
+        assert_eq!(bucket.level(), 1);
+        bucket.drain_and_increment(now, leak_rate_1_per_60s(), 1, 10);
+        assert_eq!(bucket.level(), 2);
+    }
+
+    #[test]
+    fn popularity_bucket_saturates_at_capacity() {
+        let now = SystemTime::now();
+        let mut bucket = PopularityBucket::new(now);
+        for _ in 0..50 {
+            bucket.drain_and_increment(now, leak_rate_1_per_60s(), 1, 10);
+        }
+        assert_eq!(bucket.level(), 10);
+    }
+
+    #[test]
+    fn popularity_bucket_drain_no_truncation_bias() {
+        let now = SystemTime::now();
+        let leak_rate = leak_rate_1_per_60s();
+
+        // One big step: fill to capacity, then let 600s elapse in one call.
+        let mut big_step = PopularityBucket::new(now);
+        for _ in 0..10 {
+            big_step.drain_and_increment(now, leak_rate, 1, 10);
+        }
+        let big_step_result_time = now + Duration::from_secs(600);
+        big_step.drain_and_increment(big_step_result_time, leak_rate, 0, 10);
+
+        // Many small steps covering the same total elapsed time (600s),
+        // advanced 60 times in 10s increments.
+        let mut small_steps = PopularityBucket::new(now);
+        for _ in 0..10 {
+            small_steps.drain_and_increment(now, leak_rate, 1, 10);
+        }
+        let mut t = now;
+        for _ in 0..60 {
+            t += Duration::from_secs(10);
+            small_steps.drain_and_increment(t, leak_rate, 0, 10);
+        }
+
+        assert_eq!(
+            big_step.level(),
+            small_steps.level(),
+            "draining in many small sub-unit steps must not bias the cumulative drain \
+             relative to one large step covering the same total elapsed time"
+        );
+    }
+
+    #[test]
+    fn popularity_bucket_treats_backward_clock_as_zero_elapsed() {
+        let now = SystemTime::now();
+        let mut bucket = PopularityBucket::new(now);
+        bucket.drain_and_increment(now, leak_rate_1_per_60s(), 1, 10);
+        assert_eq!(bucket.level(), 1);
+
+        let earlier = now - Duration::from_secs(120);
+        // Should not panic/underflow, and should not drain (treated as zero
+        // elapsed time), so the hit_increment is simply added.
+        bucket.drain_and_increment(earlier, leak_rate_1_per_60s(), 1, 10);
+        assert_eq!(bucket.level(), 2);
+    }
+
+    #[test]
+    fn popularity_cleared_on_evict_domain() {
+        let shard = Shard::new(1);
+        let domain = "popular.example.com";
+        shard.store_positive(domain, (A_QTYPE, IN_QCLASS), rrset_entry());
+        let now = SystemTime::now();
+        shard.lookup_hop(
+            domain,
+            A_QTYPE,
+            IN_QCLASS,
+            false,
+            1,
+            now,
+            &test_refresh_config(),
+        );
+        assert_eq!(shard.popularity_level(domain), Some(1));
+
+        // Force eviction via capacity pressure.
+        shard.store_positive("other.example.com", (A_QTYPE, IN_QCLASS), rrset_entry());
+
+        assert_eq!(shard.popularity_level(domain), None);
+    }
+
+    #[test]
+    fn popularity_cleared_on_drop_lru_if_domain_now_empty() {
+        let shard = Shard::new(4);
+        let domain = "solo-positive.example.com";
+        shard.store_positive(domain, (A_QTYPE, IN_QCLASS), rrset_entry());
+        let now = SystemTime::now();
+        shard.lookup_hop(
+            domain,
+            A_QTYPE,
+            IN_QCLASS,
+            false,
+            1,
+            now,
+            &test_refresh_config(),
+        );
+        assert_eq!(shard.popularity_level(domain), Some(1));
+
+        // Expire the only entry and look it up again, triggering removal
+        // via remove_positive_entry -> drop_lru_if_domain_now_empty.
+        let mut expired = rrset_entry();
+        expired.expires_at = now - Duration::from_secs(1);
+        shard.store_positive(domain, (A_QTYPE, IN_QCLASS), expired);
+        shard.lookup_hop(
+            domain,
+            A_QTYPE,
+            IN_QCLASS,
+            false,
+            1,
+            now,
+            &test_refresh_config(),
+        );
+
+        assert_eq!(shard.popularity_level(domain), None);
+    }
+
+    #[test]
+    fn popularity_not_allocated_when_disabled() {
+        let shard = Shard::new(4);
+        let domain = "disabled.example.com";
+        shard.store_positive(domain, (A_QTYPE, IN_QCLASS), rrset_entry());
+        let now = SystemTime::now();
+
+        // Exercise record_popularity_hit directly with enabled = false via
+        // the shard's internal state, since lookup_hop always passes
+        // enabled = true today (placeholder until section-03 threads real
+        // config through). Access via hold_lock_for_test's lock pattern
+        // would deadlock, so this test targets ShardState directly.
+        let mut state = ShardState::default();
+        state.record_popularity_hit(domain, now, false, leak_rate_1_per_60s(), 1, 10);
+        assert!(!state.popularity.contains_key(domain));
+    }
+
+    #[test]
+    fn is_hot_reflects_configured_threshold() {
+        let now = SystemTime::now();
+        let mut bucket = PopularityBucket::new(now);
+        for _ in 0..5 {
+            bucket.drain_and_increment(now, leak_rate_1_per_60s(), 1, 10);
+        }
+        assert_eq!(bucket.level(), 5);
+        assert!(bucket.is_hot(5));
+        assert!(!bucket.is_hot(6));
+    }
+
+    #[test]
+    fn lookup_hop_hit_increments_popularity_level() {
+        let shard = Shard::new(4);
+        let domain = "hit-tracked.example.com";
+        shard.store_positive(domain, (A_QTYPE, IN_QCLASS), rrset_entry());
+        let now = SystemTime::now();
+
+        assert_eq!(shard.popularity_level(domain), None);
+        shard.lookup_hop(
+            domain,
+            A_QTYPE,
+            IN_QCLASS,
+            false,
+            1,
+            now,
+            &test_refresh_config(),
+        );
+        assert_eq!(shard.popularity_level(domain), Some(1));
+        shard.lookup_hop(
+            domain,
+            A_QTYPE,
+            IN_QCLASS,
+            false,
+            1,
+            now,
+            &test_refresh_config(),
+        );
+        assert_eq!(shard.popularity_level(domain), Some(2));
+    }
+
+    #[test]
+    fn lookup_hop_cname_hop_hit_increments_popularity_level() {
+        let shard = Shard::new(4);
+        let domain = "cname-tracked.example.com";
+        let mut cname_entry = rrset_entry();
+        cname_entry.records = vec![StoredRecord {
+            rtype: CNAME_RECORD_TYPE,
+            rclass: IN_QCLASS,
+            ttl_at_store: 300,
+            rdata: RecordData::CNAME("target.example.com".to_string()),
+        }];
+        shard.store_positive(domain, (CNAME_RECORD_TYPE, IN_QCLASS), cname_entry);
+        let now = SystemTime::now();
+
+        assert_eq!(shard.popularity_level(domain), None);
+        let result = shard.lookup_hop(
+            domain,
+            A_QTYPE,
+            IN_QCLASS,
+            false,
+            1,
+            now,
+            &test_refresh_config(),
+        );
+        assert!(matches!(result, HopResult::CnameHop(_, _, _)));
+        assert_eq!(shard.popularity_level(domain), Some(1));
+    }
+
+    #[test]
+    fn lookup_hop_nodata_hit_increments_popularity_level() {
+        let shard = Shard::new(4);
+        let domain = "nodata-tracked.example.com";
+        let key = NegativeKey {
+            qtype: Some(A_QTYPE),
+            qclass: IN_QCLASS,
+        };
+        let mut nodata_entry = negative_entry();
+        nodata_entry.kind = NegativeCacheKind::NoData;
+        shard.store_negative(domain, key, nodata_entry);
+        let now = SystemTime::now();
+
+        assert_eq!(shard.popularity_level(domain), None);
+        let result = shard.lookup_hop(
+            domain,
+            A_QTYPE,
+            IN_QCLASS,
+            false,
+            1,
+            now,
+            &test_refresh_config(),
+        );
+        assert!(matches!(result, HopResult::NoData(_)));
+        assert_eq!(shard.popularity_level(domain), Some(1));
+    }
+
+    #[test]
+    fn lookup_hop_nxdomain_hit_increments_popularity_level() {
+        let shard = Shard::new(4);
+        let domain = "nxdomain-tracked.example.com";
+        let key = NegativeKey {
+            qtype: None,
+            qclass: IN_QCLASS,
+        };
+        shard.store_negative(domain, key, negative_entry());
+        let now = SystemTime::now();
+
+        assert_eq!(shard.popularity_level(domain), None);
+        let result = shard.lookup_hop(
+            domain,
+            A_QTYPE,
+            IN_QCLASS,
+            false,
+            1,
+            now,
+            &test_refresh_config(),
+        );
+        assert!(matches!(result, HopResult::NxDomain(_)));
+        assert_eq!(shard.popularity_level(domain), Some(1));
+    }
+
+    #[test]
+    fn popularity_bucket_drain_with_non_unit_leak_rate() {
+        // Exercises the `leak_rate.per * leaked_units / leak_rate.units`
+        // reconstruction with a divisor other than 1, to confirm the
+        // truncation-avoidance formula still holds when units != 1.
+        let now = SystemTime::now();
+        let leak_rate = LeakRate {
+            units: 3,
+            per: Duration::from_secs(60),
+        };
+
+        let mut bucket = PopularityBucket::new(now);
+        for _ in 0..10 {
+            bucket.drain_and_increment(now, leak_rate, 1, 10);
+        }
+        assert_eq!(bucket.level(), 10);
+
+        // 60s elapsed at 3 units/60s should drain 3 units, then +1 hit.
+        let later = now + Duration::from_secs(60);
+        bucket.drain_and_increment(later, leak_rate, 1, 10);
+        assert_eq!(bucket.level(), 10 - 3 + 1);
+    }
+
+    // Trigger-formula (`wants_refresh`) tests: section-03-trigger-formula.
+
+    fn test_refresh_config() -> RefreshConfig {
+        RefreshConfig {
+            enabled: true,
+            bucket_capacity: 10,
+            leak_rate: LeakRate {
+                units: 1,
+                per: Duration::from_secs(60),
+            },
+            hit_increment: 1,
+            hot_threshold_fraction: 0.5,
+            lead_ratio: 0.10,
+            min_lead: Duration::from_secs(5),
+            eligibility_floor: Duration::from_secs(15),
+            worker_count: 4,
+            channel_capacity: 256,
+        }
+    }
+
+    fn bucket_at_level(level: u32) -> PopularityBucket {
+        PopularityBucket {
+            level,
+            last_drained: SystemTime::now(),
+        }
+    }
+
+    #[test]
+    fn trigger_requires_eligibility_floor() {
+        let config = test_refresh_config();
+        let hot_bucket = bucket_at_level(10);
+
+        // Original TTL below eligibility_floor (15s): never eligible, even
+        // deep inside what would otherwise be the lead window and hot.
+        let original_ttl = Duration::from_secs(10);
+        let remaining_ttl = Duration::from_secs(1);
+        assert!(!wants_refresh(
+            original_ttl,
+            remaining_ttl,
+            Some(&hot_bucket),
+            &config
+        ));
+    }
+
+    #[test]
+    fn trigger_fires_within_lead_window() {
+        let config = test_refresh_config();
+        let hot_bucket = bucket_at_level(10);
+        let original_ttl = Duration::from_secs(300);
+        // lead = max(300 * 0.10, 5s) = 30s.
+
+        // Just inside the window.
+        assert!(wants_refresh(
+            original_ttl,
+            Duration::from_secs(29),
+            Some(&hot_bucket),
+            &config
+        ));
+        // Just outside the window.
+        assert!(!wants_refresh(
+            original_ttl,
+            Duration::from_secs(31),
+            Some(&hot_bucket),
+            &config
+        ));
+    }
+
+    #[test]
+    fn trigger_requires_hot_popularity() {
+        let config = test_refresh_config();
+        let original_ttl = Duration::from_secs(300);
+        let remaining_ttl = Duration::from_secs(10);
+
+        let cold_bucket = bucket_at_level(0);
+        assert!(!wants_refresh(
+            original_ttl,
+            remaining_ttl,
+            Some(&cold_bucket),
+            &config
+        ));
+
+        let hot_bucket = bucket_at_level(5);
+        assert!(wants_refresh(
+            original_ttl,
+            remaining_ttl,
+            Some(&hot_bucket),
+            &config
+        ));
+    }
+
+    #[test]
+    fn trigger_boundary_at_exact_lead_window_edge() {
+        // lead_ratio = 0.25 is exactly representable in f32 (a power-of-two
+        // fraction), and 400s * 0.25 = 100s is itself an exact integer, so
+        // `original_ttl.mul_f32(lead_ratio)` computes to *exactly* 100s with
+        // no floating-point rounding error — unlike the default config's
+        // 0.10 ratio (not exactly representable in f32), which would make a
+        // remaining_ttl set to the nominal boundary actually land strictly
+        // inside the true (slightly-larger) computed lead, passing this test
+        // under both `<=` and `<` semantics and failing to actually pin the
+        // operator. With an exact boundary, this test can properly assert
+        // `<=` fires and `<` alone would not.
+        let mut config = test_refresh_config();
+        config.lead_ratio = 0.25;
+        config.min_lead = Duration::from_secs(1); // small enough that the ratio term dominates
+        let hot_bucket = bucket_at_level(10);
+        let original_ttl = Duration::from_secs(400);
+        // lead = max(400 * 0.25, 1s) = 100s, computed exactly.
+
+        assert!(
+            wants_refresh(
+                original_ttl,
+                Duration::from_secs(100),
+                Some(&hot_bucket),
+                &config
+            ),
+            "remaining_ttl exactly equal to the lead window must fire (formula is <=, not <)"
+        );
+        assert!(
+            !wants_refresh(
+                original_ttl,
+                Duration::from_millis(100_001),
+                Some(&hot_bucket),
+                &config
+            ),
+            "remaining_ttl just past the lead window must not fire"
+        );
+    }
+
+    #[test]
+    fn trigger_boundary_at_exact_eligibility_floor() {
+        let config = test_refresh_config();
+        let hot_bucket = bucket_at_level(10);
+        // original_ttl exactly equal to eligibility_floor (15s) must still
+        // count as eligible.
+        let original_ttl = config.eligibility_floor;
+        // lead = max(15s * 0.10, 5s) = 5s.
+        let remaining_ttl = Duration::from_secs(5);
+
+        assert!(wants_refresh(
+            original_ttl,
+            remaining_ttl,
+            Some(&hot_bucket),
+            &config
+        ));
+    }
+
+    #[test]
+    fn trigger_no_bucket_is_never_hot() {
+        let config = test_refresh_config();
+        let original_ttl = Duration::from_secs(300);
+        let remaining_ttl = Duration::from_secs(10);
+
+        assert!(!wants_refresh(original_ttl, remaining_ttl, None, &config));
+    }
+
+    #[test]
+    fn trigger_min_lead_dominates_over_small_ratio_lead() {
+        let config = test_refresh_config();
+        let hot_bucket = bucket_at_level(10);
+        // A short-but-still-eligible TTL: 20s * 0.10 = 2s, but min_lead is 5s,
+        // so the effective lead window must be 5s (min_lead dominates).
+        let original_ttl = Duration::from_secs(20);
+
+        assert!(wants_refresh(
+            original_ttl,
+            Duration::from_secs(5),
+            Some(&hot_bucket),
+            &config
+        ));
+        assert!(!wants_refresh(
+            original_ttl,
+            Duration::from_secs(6),
+            Some(&hot_bucket),
+            &config
+        ));
+    }
+
+    #[test]
+    fn trigger_hot_threshold_fraction_zero_makes_any_existing_bucket_hot() {
+        // hot_threshold_fraction = 0.0 is a valid, reachable operator
+        // configuration (RefreshConfig::validate allows the inclusive
+        // 0.0..=1.0 range) that effectively disables the popularity gate:
+        // hot_threshold rounds to 0, so is_hot(0) is trivially true for any
+        // bucket, even one at level 0.
+        let mut config = test_refresh_config();
+        config.hot_threshold_fraction = 0.0;
+        let original_ttl = Duration::from_secs(300);
+        let remaining_ttl = Duration::from_secs(10);
+        let cold_bucket = bucket_at_level(0);
+
+        assert!(wants_refresh(
+            original_ttl,
+            remaining_ttl,
+            Some(&cold_bucket),
+            &config
+        ));
+    }
+
+    #[test]
+    fn trigger_hot_threshold_fraction_one_requires_bucket_at_full_capacity() {
+        // hot_threshold_fraction = 1.0 (the other valid extreme) requires
+        // the bucket to be at exactly bucket_capacity to be considered hot.
+        let mut config = test_refresh_config();
+        config.hot_threshold_fraction = 1.0;
+        let original_ttl = Duration::from_secs(300);
+        let remaining_ttl = Duration::from_secs(10);
+
+        let almost_full_bucket = bucket_at_level(config.bucket_capacity - 1);
+        assert!(!wants_refresh(
+            original_ttl,
+            remaining_ttl,
+            Some(&almost_full_bucket),
+            &config
+        ));
+
+        let full_bucket = bucket_at_level(config.bucket_capacity);
+        assert!(wants_refresh(
+            original_ttl,
+            remaining_ttl,
+            Some(&full_bucket),
+            &config
+        ));
+    }
+
+    #[test]
+    fn trigger_ratio_lead_dominates_over_small_min_lead() {
+        let config = test_refresh_config();
+        let hot_bucket = bucket_at_level(10);
+        // A long TTL: 1000s * 0.10 = 100s, which is larger than min_lead
+        // (5s), so the effective lead window must be 100s (ratio dominates).
+        let original_ttl = Duration::from_secs(1000);
+
+        assert!(wants_refresh(
+            original_ttl,
+            Duration::from_secs(100),
+            Some(&hot_bucket),
+            &config
+        ));
+        assert!(!wants_refresh(
+            original_ttl,
+            Duration::from_secs(101),
+            Some(&hot_bucket),
+            &config
+        ));
     }
 }
