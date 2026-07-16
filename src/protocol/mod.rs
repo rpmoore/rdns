@@ -1252,12 +1252,12 @@ pub(crate) fn build_opt_record(udp_payload_size: u16, dnssec_ok: bool) -> Record
 /// `build_opt_record`, with a pre-built `options` TLV byte vector (e.g. a
 /// COOKIE option from `crate::protocol::edns_cookie::build_cookie_option`)
 /// attached to the OPT record's RDATA instead of always building an
-/// options-less OPT. Will be used by `resolver::mirrored_client_opt_record`/
-/// `message_edns_opt_record` (cache-miss/recursive path, not yet wired up)
-/// once a client cookie needs echoing back to the requester there --
-/// `resolver::cache::assemble::requester_opt_record` (cache-hit path)
-/// already attaches a cookie today by building via `build_opt_record` and
-/// mutating the resulting `EdnsInfo.options` field in place instead.
+/// options-less OPT. Used by `message_edns_opt_record_with_cookie` (backing
+/// `resolver::mirrored_client_opt_record_with_cookie`, the cache-miss/
+/// recursive path) once a client cookie needs echoing back to the
+/// requester there -- `resolver::cache::assemble::requester_opt_record`
+/// (cache-hit path) attaches a cookie by building via `build_opt_record`
+/// and mutating the resulting `EdnsInfo.options` field in place instead.
 pub(crate) fn build_opt_record_with_options(
     udp_payload_size: u16,
     dnssec_ok: bool,
@@ -1320,6 +1320,45 @@ pub(crate) fn message_edns_opt_record(
     let edns = message.edns.as_ref()?;
     let udp_payload_size = responder_udp_payload_size.min(u16::MAX as usize) as u16;
     Some(build_opt_record(udp_payload_size, edns.dnssec_ok))
+}
+
+/// `message_edns_opt_record`, plus RFC 9018 server-cookie construction: if
+/// `message`'s EDNS options carry a well-formed RFC 7873 client cookie
+/// (`edns_cookie::parse_cookie_option`), the returned OPT record's options
+/// carry a freshly-built COOKIE option (`edns_cookie::build_server_cookie` +
+/// `build_cookie_option`) echoing that client cookie back with a fresh
+/// server cookie, instead of the options-less OPT `message_edns_opt_record`
+/// always builds.
+///
+/// A separate function rather than widening `message_edns_opt_record`
+/// in place: that function also backs `build_question_response` and
+/// `build_txt_answer_response` (the statically-configured local-entry
+/// response path), which section 05 of the EDNS-cookie plan explicitly
+/// leaves untouched. Used by `resolver::mirrored_client_opt_record_with_cookie`
+/// on the cache-miss/recursive path, mirroring
+/// `resolver::cache::assemble::requester_opt_record` on the cache-hit path.
+pub(crate) fn message_edns_opt_record_with_cookie(
+    message: &Message,
+    responder_udp_payload_size: usize,
+    cookie_secret: &edns_cookie::CookieSecret,
+    client_ip: std::net::IpAddr,
+    now: std::time::SystemTime,
+) -> Option<Record> {
+    let edns = message.edns.as_ref()?;
+    let udp_payload_size = responder_udp_payload_size.min(u16::MAX as usize) as u16;
+    match edns_cookie::parse_cookie_option(&edns.options) {
+        Some(client_cookie) => {
+            let server_cookie =
+                edns_cookie::build_server_cookie(cookie_secret, client_cookie, client_ip, now);
+            let options = edns_cookie::build_cookie_option(client_cookie, server_cookie);
+            Some(build_opt_record_with_options(
+                udp_payload_size,
+                edns.dnssec_ok,
+                options,
+            ))
+        }
+        None => Some(build_opt_record(udp_payload_size, edns.dnssec_ok)),
+    }
 }
 
 /// Encodes one arbitrary resource record to wire bytes: owner name, type,
