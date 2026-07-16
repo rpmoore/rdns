@@ -19213,6 +19213,125 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn resolve_cache_hit_response_carries_cookie_option_for_cookie_bearing_query() {
+        let now = SystemTime::UNIX_EPOCH;
+        let record = a_record("example.com", 60);
+        let entry = seed_rrset_entry(&record, Duration::from_secs(60), now, 0);
+        let resolved = cache::ResolvedAnswer {
+            chain: vec![("example.com".to_string(), entry)],
+        };
+        let cache = Arc::new(RecordingCache::with_lookup(ChainLookup::Answered(resolved)));
+        let upstream = Arc::new(StaticUpstream::new(Err(UpstreamError::Timeout)));
+        let events = Arc::new(RecordingEvents::default());
+        let metrics = Arc::new(RecordingMetrics::default());
+        let service = resolve_service_with_cache(upstream, cache, events, metrics, 1232);
+        let client_cookie = [0x11u8, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88];
+        let mut cookie_option = vec![0u8, 10, 0, 8];
+        cookie_option.extend_from_slice(&client_cookie);
+
+        let outcome = service
+            .resolve(ResolveRequest::new(
+                "192.0.2.10".parse().unwrap(),
+                now,
+                a_query_with_edns_options(0x7777, "example.com", 1232, false, &cookie_option),
+            ))
+            .await;
+
+        let response = Message::parse(&outcome.response_bytes).unwrap();
+        let opt = response
+            .additionals
+            .iter()
+            .find(|record| matches!(record.record, RecordData::OPT(_)))
+            .expect("cache-hit response to a Cookie-bearing query must carry an OPT record");
+        let RecordData::OPT(edns) = &opt.record else {
+            unreachable!();
+        };
+        let echoed_client_cookie = crate::protocol::edns_cookie::parse_cookie_option(&edns.options)
+            .expect("OPT options must decode to a well-formed COOKIE option");
+        assert_eq!(echoed_client_cookie, client_cookie);
+        assert_eq!(
+            edns.options.len(),
+            4 + 8 + 16,
+            "COOKIE option TLV must carry the 8-byte client cookie plus a 16-byte server cookie"
+        );
+    }
+
+    #[tokio::test]
+    async fn resolve_shared_cache_hit_gives_each_requester_a_distinct_cookie() {
+        let now = SystemTime::UNIX_EPOCH;
+        let record = a_record("example.com", 60);
+        let entry = seed_rrset_entry(&record, Duration::from_secs(60), now, 0);
+        let resolved = cache::ResolvedAnswer {
+            chain: vec![("example.com".to_string(), entry)],
+        };
+        let cache = Arc::new(RecordingCache::with_lookup(ChainLookup::Answered(resolved)));
+        let upstream = Arc::new(StaticUpstream::new(Err(UpstreamError::Timeout)));
+        let events = Arc::new(RecordingEvents::default());
+        let metrics = Arc::new(RecordingMetrics::default());
+        let service = resolve_service_with_cache(upstream, cache, events, metrics, 1232);
+
+        let cookie_a = [0x11u8; 8];
+        let cookie_b = [0x22u8; 8];
+        let mut option_a = vec![0u8, 10, 0, 8];
+        option_a.extend_from_slice(&cookie_a);
+        let mut option_b = vec![0u8, 10, 0, 8];
+        option_b.extend_from_slice(&cookie_b);
+
+        let outcome_a = service
+            .resolve(ResolveRequest::new(
+                "192.0.2.10".parse().unwrap(),
+                now,
+                a_query_with_edns_options(0x7777, "example.com", 1232, false, &option_a),
+            ))
+            .await;
+        let outcome_b = service
+            .resolve(ResolveRequest::new(
+                "192.0.2.11".parse().unwrap(),
+                now,
+                a_query_with_edns_options(0x8888, "example.com", 1232, false, &option_b),
+            ))
+            .await;
+
+        let message_a = Message::parse(&outcome_a.response_bytes).unwrap();
+        let message_b = Message::parse(&outcome_b.response_bytes).unwrap();
+        assert_eq!(
+            message_a.answers, message_b.answers,
+            "both requesters share the same cached answer data"
+        );
+
+        let opt_options = |message: &Message| -> Vec<u8> {
+            let opt = message
+                .additionals
+                .iter()
+                .find(|record| matches!(record.record, RecordData::OPT(_)))
+                .expect("cache-hit response must carry an OPT record");
+            let RecordData::OPT(edns) = &opt.record else {
+                unreachable!();
+            };
+            edns.options.clone()
+        };
+        let options_a = opt_options(&message_a);
+        let options_b = opt_options(&message_b);
+
+        assert_eq!(
+            &options_a[4..12],
+            &cookie_a,
+            "response A must echo requester A's own client cookie"
+        );
+        assert_eq!(
+            &options_b[4..12],
+            &cookie_b,
+            "response B must echo requester B's own client cookie"
+        );
+        assert_ne!(
+            &options_a[12..28],
+            &options_b[12..28],
+            "each requester must get its own freshly-computed server cookie, \
+             never a shared/replayed one"
+        );
+    }
+
+    #[tokio::test]
     async fn resolve_bypasses_cache_for_unsupported_edns_flags_and_version() {
         for request in [
             a_query_with_edns_details(0x7777, "example.com", 1232, false, 0, 1, &[]),
