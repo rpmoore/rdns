@@ -27,16 +27,25 @@
 #![allow(dead_code)]
 
 use std::collections::{BTreeSet, HashMap};
+use std::sync::Arc;
 
 /// Ordered by `(sequence, domain)` so the numerically smallest entry is
 /// always the least-recently-touched domain in this shard.
+///
+/// Domains are stored as `Arc<str>` shared between `order` and
+/// `positions`: a touch of an already-tracked domain is then two BTreeSet
+/// operations plus a refcount bump, with no per-touch `String`
+/// allocations (the old `String`-keyed shape allocated up to three per
+/// touch — one for the removal probe, one for the reinsert, one for the
+/// positions insert). `positions` keeps the sequence *and* the shared
+/// `Arc` so both the remove-old and insert-new steps reuse it.
 #[derive(Debug, Default)]
 pub(crate) struct ShardLru {
-    order: BTreeSet<(u64, String)>,
-    /// Reverse index: domain -> its current sequence number, so a touch
-    /// can find and remove its old position in `order` in O(log n)
-    /// instead of scanning.
-    positions: HashMap<String, u64>,
+    order: BTreeSet<(u64, Arc<str>)>,
+    /// Reverse index: domain -> its current sequence number (plus the
+    /// shared `Arc<str>` key), so a touch can find and remove its old
+    /// position in `order` in O(log n) instead of scanning.
+    positions: HashMap<Arc<str>, u64>,
     next_sequence: u64,
 }
 
@@ -52,28 +61,32 @@ impl ShardLru {
     /// than one entry per domain in `order` — no compaction pass is ever
     /// needed.
     pub(crate) fn touch(&mut self, domain: &str) {
-        if let Some(old_sequence) = self.positions.get(domain).copied() {
-            self.order.remove(&(old_sequence, domain.to_string()));
-        }
         let sequence = self.next_sequence;
         self.next_sequence += 1;
-        self.order.insert((sequence, domain.to_string()));
-        self.positions.insert(domain.to_string(), sequence);
+        let shared: Arc<str> = match self.positions.remove_entry(domain) {
+            Some((shared, old_sequence)) => {
+                self.order.remove(&(old_sequence, Arc::clone(&shared)));
+                shared
+            }
+            None => Arc::from(domain),
+        };
+        self.order.insert((sequence, Arc::clone(&shared)));
+        self.positions.insert(shared, sequence);
     }
 
     /// Removes `domain` from LRU tracking entirely (used when a domain's
     /// last record set/negative entry is deleted, whether by eviction,
     /// expiry, or the namespace sweep in section-05).
     pub(crate) fn remove(&mut self, domain: &str) {
-        if let Some(sequence) = self.positions.remove(domain) {
-            self.order.remove(&(sequence, domain.to_string()));
+        if let Some((shared, sequence)) = self.positions.remove_entry(domain) {
+            self.order.remove(&(sequence, shared));
         }
     }
 
     /// Returns the least-recently-touched domain without removing it, for
     /// the eviction loop to consult.
     pub(crate) fn peek_oldest(&self) -> Option<&str> {
-        self.order.iter().next().map(|(_, domain)| domain.as_str())
+        self.order.iter().next().map(|(_, domain)| &**domain)
     }
 
     /// Number of domains currently tracked by this LRU — used by the
@@ -97,7 +110,7 @@ impl ShardLru {
     pub(crate) fn order_for_test(&self) -> Vec<String> {
         self.order
             .iter()
-            .map(|(_, domain)| domain.clone())
+            .map(|(_, domain)| domain.to_string())
             .collect()
     }
 }
@@ -145,7 +158,7 @@ mod tests {
         assert!(
             !lru.order
                 .iter()
-                .any(|(_, domain)| domain == "a.example.com"),
+                .any(|(_, domain)| &**domain == "a.example.com"),
             "removed domain must not remain in order"
         );
         assert_eq!(lru.len(), 1);

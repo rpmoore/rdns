@@ -86,7 +86,7 @@ epoch backwards or diverge from the other's rule:
 # What "instant invalidation" actually means
 
 The sweep is pure memory reclamation, not what makes stale entries
-unreachable. `Shard::lookup_hop` (`src/resolver/cache/shard.rs:405`)
+unreachable. `Shard::lookup_hop` (`src/resolver/cache/shard.rs:770`)
 checks `entry.cache_epoch == current_epoch` on every single lookup — the
 moment a new `BackendSnapshot` is published, every entry under the old
 epoch fails that check for every subsequent lookup, even though it may
@@ -94,7 +94,7 @@ still physically occupy a slot for a while. The sweep just reclaims that
 memory in bulk later; it is never a prerequisite for correctness.
 
 `sweep_stale_namespace` (`src/resolver/cache/namespace.rs`, per-shard
-logic in `src/resolver/cache/shard.rs:472`) is an O(n) walk across every
+logic in `src/resolver/cache/shard.rs:877`) is an O(n) walk across every
 shard's positive/negative maps, retaining only entries whose
 `cache_epoch` matches. It runs with each shard's own lock, one shard at a
 time — never a single lock over the whole cache — and, per

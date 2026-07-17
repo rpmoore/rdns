@@ -20,13 +20,21 @@ structure entirely.
 ShardedDnsCache { shards: Vec<Shard> }
 Shard { state: Mutex<ShardState>, capacity: usize }
 ShardState {
-    // DomainRecordSets: HashMap<(qtype, qclass), RRsetEntry>
+    // DomainRecordSets: HashMap<(qtype, qclass), Arc<RRsetEntry>>
     positive: HashMap<domain, DomainRecordSets>,
+    // DomainNegativeEntries: HashMap<NegativeKey, Arc<NegativeEntry>>
     negative: HashMap<domain, DomainNegativeEntries>,
     lru: ShardLru,
     popularity: HashMap<domain, PopularityBucket>,
 }
 ```
+
+Entries are stored as `Arc<RRsetEntry>`/`Arc<NegativeEntry>`
+(`src/resolver/cache/entry.rs:34-40,118-122`): a cache hit hands the
+entry out of `Shard::lookup_hop` as an `Arc` clone — a refcount bump
+under the shard lock, not a deep copy of the records — and everything
+downstream (`ChainLookup`'s chains, response assembly) reads it
+immutably through the `Arc`.
 
 One domain name's positive records, negative (NXDOMAIN/NODATA) entries,
 and LRU recency token all live in the same shard, mutated together under
@@ -57,15 +65,15 @@ serve time (`cache::assemble`).
 
 Cache-hit responses serve **remaining time to expiry** as their wire
 TTL, computed per-record by `compute_wire_ttl`
-(`src/resolver/cache/assemble.rs:188-204`), never the raw origin TTL
+(`src/resolver/cache/assemble.rs:245-261`), never the raw origin TTL
 that was stored — per RFC 1035 §3.2.1, a resolver replaying a cached RR
 must decrement the TTL by elapsed time, not repeat the original value
 forever. It is called once per record, independently, from
-`write_rrset` (`assemble.rs:229-263`, positive answers) and
-`write_negative_authority` (`assemble.rs:265-324`, SOA + its RRSIG +
+`write_rrset` (`assemble.rs:295-343`, positive answers) and
+`write_negative_authority` (`assemble.rs:345-404`, SOA + its RRSIG +
 each DNSSEC proof record). Both UDP and TCP responses go through the
 same `assemble_response`/`assemble_negative_response` path
-(`assemble.rs:546`, `:615`) — one wire-TTL-aging code path, shared by
+(`assemble.rs:653`, `:736`) — one wire-TTL-aging code path, shared by
 every transport.
 
 `compute_wire_ttl` combines two independently-bounded quantities and
@@ -83,7 +91,7 @@ computed once, as the minimum origin TTL across every record in the
 response, and applied identically to every hop including the terminal
 record — so a long-TTL terminal record looked up again later, on its
 own, is still capped by whatever chain it was first stored as part of.
-Per the doc comment at `assemble.rs:181-187`: a CNAME chain combines
+Per the doc comment at `assemble.rs:238-244`: a CNAME chain combines
 records from multiple `RRsetEntry`s with different `stored_at` values,
 so a single scalar age applied to an assembled buffer can't represent
 it correctly — hence per-record aging computed directly in Rust rather
@@ -119,13 +127,13 @@ the record's own `ttl_at_store` — so the served wire TTL correctly goes
 to (and stays at) 0 once the origin TTL has elapsed, even though the
 entry itself is still servable under the floor. Covered by a regression
 test, `compute_wire_ttl_never_exceeds_origin_ttl_even_when_floor_extends_entry_lifetime`
-in `src/resolver/cache/assemble.rs:796-822` (see `docs/plans/ttl_remaining/` section 03).
+in `src/resolver/cache/assemble.rs:1042-1068` (see `docs/plans/ttl_remaining/` section 03).
 
 `write_negative_authority`'s per-record `compute_wire_ttl` calls
-(`assemble.rs:265-324` — wire-TTL aging, what gets sent on the wire for
+(`assemble.rs:345-404` — wire-TTL aging, what gets sent on the wire for
 the SOA, its RRSIG, and each DNSSEC proof record) are a different
 computation from `NegativeEntry::dnssec_proof_material_fresh`
-(`src/resolver/cache/entry.rs:224-238` — servability gating, whether a
+(`src/resolver/cache/entry.rs:229-243` — servability gating, whether a
 DO=1 reader may be served this entry at all). Without the latter check,
 a DO=true reader arriving after an individual proof record's own TTL
 elapsed (but before the overall negative TTL elapsed) would still pass
@@ -165,7 +173,7 @@ a hard guarantee rather than an incidental detail.
 part of what's stored in or read from `RRsetEntry`/`NegativeEntry`.** It is
 always rebuilt fresh per request, on both paths:
 
-- Cache-hit: `requester_opt_record` (`src/resolver/cache/assemble.rs:439`),
+- Cache-hit: `requester_opt_record` (`src/resolver/cache/assemble.rs:517`),
   called from all four response builders in that file.
 - Cache-miss/recursive: `mirrored_client_opt_record_with_cookie`
   (`src/resolver/mod.rs:1667`), threaded through
@@ -185,7 +193,7 @@ IP, and the injected `Clock` (never `SystemTime::now()` directly), and
 `build_cookie_option` serializes the TLV — but attach it to the wire
 differently: the cache-hit path builds a plain OPT via `build_opt_record`
 and then mutates the resulting `EdnsInfo.options` field in place
-(`assemble.rs:448-453`), while the cache-miss path builds the options bytes
+(`assemble.rs:524-531`), while the cache-miss path builds the options bytes
 first and passes them straight into `build_opt_record_with_options`
 (`src/protocol/mod.rs:1261`, called from `message_edns_opt_record_with_cookie`
 at `protocol/mod.rs:1354`). Both `build_opt_record` and
@@ -238,12 +246,16 @@ individual record set — evicting a domain removes its positive entries,
 negative entries, and LRU token together (`ShardState::evict_domain`).
 Capacity is domain-count-based, configured via `CacheConfig.max_entries`,
 split across shards by `CacheConfig::shard_capacity` (see
-[sharding](sharding.md)).
+[sharding](sharding.md)). Internally the LRU keys its `order` BTreeSet
+and `positions` reverse index on one shared `Arc<str>` per domain
+(`src/resolver/cache/lru.rs:29-48`), so the per-hit `touch` is two
+O(log n) BTreeSet operations plus refcount bumps with no `String`
+allocations.
 
 # Popularity tracking and auto-refresh
 
 Each domain also has an optional `PopularityBucket` (`ShardState.popularity`,
-`src/resolver/cache/shard.rs:59,168`) feeding a proactive-refresh feature that
+`src/resolver/cache/shard.rs:59,170`) feeding a proactive-refresh feature that
 refetches popular, near-expiry entries before a client would ever see the
 miss. Full design, invariants, and file:line references:
 see [auto-refresh](auto-refresh.md).

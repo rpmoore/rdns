@@ -19,6 +19,7 @@
 //! lives here — that's section-03 (`cache::shard`, `cache::lru`).
 
 use std::collections::HashMap;
+use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
 use crate::protocol::{RecordData, ResponseCode};
@@ -31,7 +32,10 @@ use crate::resolver::NegativeCacheKind;
 /// shard or map it lives in.
 #[derive(Debug, Clone, Default)]
 pub(crate) struct DomainRecordSets {
-    pub(crate) record_sets: HashMap<(u16, u16), RRsetEntry>, // (qtype, qclass) -> entry
+    // (qtype, qclass) -> entry. `Arc` so a cache hit hands the entry out
+    // as a refcount bump instead of deep-cloning records under the shard
+    // lock (`ShardState::take_live_positive`/`take_live_cname_hop`).
+    pub(crate) record_sets: HashMap<(u16, u16), Arc<RRsetEntry>>,
 }
 
 /// One cached RRset: the answer data for exactly one (name, qtype, qclass),
@@ -117,7 +121,8 @@ pub enum DnssecState {
 /// string, but a structurally separate map.
 #[derive(Debug, Clone, Default)]
 pub(crate) struct DomainNegativeEntries {
-    pub(crate) entries: HashMap<NegativeKey, NegativeEntry>,
+    // Same `Arc` rationale as `DomainRecordSets::record_sets`.
+    pub(crate) entries: HashMap<NegativeKey, Arc<NegativeEntry>>,
 }
 
 /// `qtype: None` represents a whole-name NXDOMAIN (RFC 2308) — the name
@@ -280,17 +285,23 @@ mod tests {
 
         domain
             .record_sets
-            .insert((A_QTYPE, IN_QCLASS), a_entry.clone());
+            .insert((A_QTYPE, IN_QCLASS), a_entry.clone().into());
         domain
             .record_sets
-            .insert((AAAA_QTYPE, IN_QCLASS), aaaa_entry.clone());
+            .insert((AAAA_QTYPE, IN_QCLASS), aaaa_entry.clone().into());
 
         assert_eq!(
-            domain.record_sets.get(&(A_QTYPE, IN_QCLASS)),
+            domain
+                .record_sets
+                .get(&(A_QTYPE, IN_QCLASS))
+                .map(Arc::as_ref),
             Some(&a_entry)
         );
         assert_eq!(
-            domain.record_sets.get(&(AAAA_QTYPE, IN_QCLASS)),
+            domain
+                .record_sets
+                .get(&(AAAA_QTYPE, IN_QCLASS))
+                .map(Arc::as_ref),
             Some(&aaaa_entry)
         );
         assert_eq!(domain.record_sets.len(), 2);
@@ -391,11 +402,11 @@ mod tests {
 
         domain.entries.insert(
             nxdomain_key.clone(),
-            negative_entry(NegativeCacheKind::NxDomain),
+            negative_entry(NegativeCacheKind::NxDomain).into(),
         );
         domain.entries.insert(
             nodata_key.clone(),
-            negative_entry(NegativeCacheKind::NoData),
+            negative_entry(NegativeCacheKind::NoData).into(),
         );
 
         assert_eq!(domain.entries.len(), 2);

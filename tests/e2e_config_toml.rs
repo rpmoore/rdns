@@ -1302,6 +1302,56 @@ async fn independent_udp_queries_are_answered_concurrently() {
     server.shutdown().await;
 }
 
+// The production UDP intake path (`UdpDnsServer::bind_configured`, the
+// wiring `main.rs` uses) binds several `SO_REUSEPORT` sockets per
+// configured address on Linux, each with its own serve loop, and the
+// kernel picks which socket receives each datagram. Every other test in
+// this suite drives a single hand-bound socket (`UdpDnsServer::new`), so
+// this is the one test covering that multi-socket wiring end to end: a
+// query must be answered no matter which socket the kernel routes it to,
+// and all sockets must serve from the same shared cache. The canned
+// upstream answers exactly one request and then goes away, so the first
+// query is the only backend fetch permitted -- if any later query missed
+// the shared cache (e.g. per-socket cache state), it would fall through
+// to the dead upstream and come back SERVFAIL instead of an answer. Each
+// query uses a fresh client socket so its source port (an input to the
+// kernel's SO_REUSEPORT flow hash) varies, spreading queries across the
+// bound sockets.
+#[tokio::test]
+async fn multi_socket_udp_listener_answers_from_shared_cache_on_every_socket() {
+    const MULTI_NAME: &str = "multi-socket.rdns.test";
+    let (upstream_addr, _upstream_task) =
+        spawn_canned_upstream(|id| a_response_from_upstream(id, MULTI_NAME, [198, 51, 100, 42]))
+            .await;
+    let server = start_forward_server_multi_socket(&forward_toml(upstream_addr.port())).await;
+
+    for i in 0..20u16 {
+        let id = 0x6100 + i;
+        let request = RawQueryBuilder::new(id, MULTI_NAME, 1).build();
+        let response = send_udp(server.udp_addr, &request).await;
+        let message = parse_response(&response);
+        assert_eq!(message.header.id, id);
+        assert_eq!(
+            message.header.r_code(),
+            NOERROR,
+            "query {i} must succeed (first from the upstream, the rest from the shared cache)"
+        );
+        assert_eq!(
+            message.answers.len(),
+            1,
+            "query {i} must carry the cached answer"
+        );
+        match &message.answers[0].record {
+            RecordData::A(address) => {
+                assert_eq!(*address, std::net::Ipv4Addr::new(198, 51, 100, 42));
+            }
+            other => panic!("expected the cached A record, got {other:?}"),
+        }
+    }
+
+    server.shutdown().await;
+}
+
 const ZONE_ROOT: &str = "zone.rdns.test";
 const ZONE_HOST: &str = "www.zone.rdns.test";
 

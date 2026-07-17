@@ -77,7 +77,7 @@ shard topology, only what's inside the shards ([cache-epoch](cache-epoch.md)).
 # Locking discipline
 
 Each `Shard` is `{ state: Mutex<ShardState>, capacity: usize }`
-(`src/resolver/cache/shard.rs:276`). Every operation — store, lookup,
+(`src/resolver/cache/shard.rs:626`). Every operation — store, lookup,
 one hop of a CNAME-chain walk, the epoch sweep — takes that one shard's
 lock, does its work, and releases it:
 

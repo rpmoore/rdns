@@ -31,7 +31,12 @@ one a given deployment does is a config-time choice, not a per-query one
 - **`delivery`** (`src/delivery/`) — socket and transport I/O.
   `dns.rs` is the UDP listener (bind, receive/send loop, per-request
   concurrency limits, shutdown) and the TCP listener (RFC 7766 makes TCP
-  mandatory, not just a large-response fallback). `upstream.rs` is
+  mandatory, not just a large-response fallback). On Linux,
+  `UdpDnsServer::bind_configured` binds several `SO_REUSEPORT` sockets
+  per configured address (`udp_sockets_per_listener`,
+  `src/delivery/dns.rs:90-113`) so the kernel load-balances datagrams
+  across parallel receive loops instead of funneling all intake through
+  one. `upstream.rs` is
   outbound transport: forwarding to configured upstreams and querying
   recursive authorities, including transaction-ID generation, UDP/TCP
   exchange, timeouts, upstream health/retry, and TCP fallback on

@@ -2371,7 +2371,12 @@ pub(crate) struct RecursiveSynthesisContext {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ResolutionResponse {
-    pub bytes: Vec<u8>,
+    /// The backend response wire bytes. `Bytes` rather than `Vec<u8>` so
+    /// the transport layer can share one allocation between this field and
+    /// `response_message.original_bytes`, and so cloning a
+    /// `ResolutionResponse` (single-flight leader/follower handoff) bumps a
+    /// refcount instead of copying the payload.
+    pub bytes: Bytes,
     pub received_at: SystemTime,
     response_message: Option<Message>,
     pub response_code: Option<ResponseCode>,
@@ -2675,11 +2680,12 @@ pub enum ResolutionNoCacheReason {
 
 impl ResolutionResponse {
     pub fn forwarded_bytes(
-        bytes: Vec<u8>,
+        bytes: impl Into<Bytes>,
         received_at: SystemTime,
         backend_generation: u64,
         backend_name: impl Into<String>,
     ) -> Self {
+        let bytes = bytes.into();
         let backend_name = backend_name.into();
         match Message::parse(&bytes) {
             Ok(message) => Self::forwarded_parsed_bytes(
@@ -2696,14 +2702,15 @@ impl ResolutionResponse {
     }
 
     pub(crate) fn forwarded_message(
-        bytes: Vec<u8>,
+        bytes: impl Into<Bytes>,
         response_message: Message,
         received_at: SystemTime,
         backend_generation: u64,
         backend_name: impl Into<String>,
     ) -> Self {
+        let bytes = bytes.into();
         let backend_name = backend_name.into();
-        if response_message.original_bytes.as_ref() != bytes.as_slice() {
+        if !same_bytes(&response_message.original_bytes, &bytes) {
             return Self::forwarded_bytes(bytes, received_at, backend_generation, backend_name);
         }
         Self::forwarded_parsed_bytes(
@@ -2716,7 +2723,7 @@ impl ResolutionResponse {
     }
 
     fn forwarded_parsed_bytes(
-        bytes: Vec<u8>,
+        bytes: Bytes,
         response_message: Message,
         received_at: SystemTime,
         backend_generation: u64,
@@ -2742,7 +2749,7 @@ impl ResolutionResponse {
     }
 
     fn unparsed_forwarded_bytes(
-        bytes: Vec<u8>,
+        bytes: Bytes,
         received_at: SystemTime,
         backend_generation: u64,
         backend_name: impl Into<String>,
@@ -2780,7 +2787,7 @@ impl ResolutionResponse {
                 &authority_response.message,
                 configured_max_udp_payload_size,
             )?;
-        let bytes = response_message.original_bytes.to_vec();
+        let bytes = response_message.original_bytes.clone();
         let response_code = response_code(&response_message);
         let final_question = QuestionKey::from_message(&response_message);
         let canonical_chain = canonical_chain_from_response(&response_message);
@@ -5583,7 +5590,11 @@ impl ResolveQuery {
             return (decision, response_bytes);
         }
 
-        let mut response_bytes = response.bytes;
+        // `to_vec` here is a genuine per-request copy, not waste: this
+        // response may be shared with coalesced followers (the `Bytes`
+        // payload is refcounted across them), and the id/RD rewrite below
+        // is per-requester, so each serve needs its own mutable buffer.
+        let mut response_bytes = response.bytes.to_vec();
         // This response may be the coalescing leader's own fetch result,
         // reused verbatim for a follower whose request wasn't identical to
         // the leader's (see `resolve_coalesced_follower` ->
@@ -6389,13 +6400,21 @@ impl ResolutionMode {
     }
 }
 
+/// Content equality between two `Bytes`, with a pointer fast path: the
+/// transport layer now shares one allocation between a response's `bytes`
+/// and its parsed message's `original_bytes`, so the common case is the
+/// same buffer and needs no O(n) memcmp.
+fn same_bytes(a: &Bytes, b: &Bytes) -> bool {
+    (a.as_ptr() == b.as_ptr() && a.len() == b.len()) || a == b
+}
+
 fn validate_backend_response(
     response: &mut ResolutionResponse,
     query: &DecodedQuery,
 ) -> Option<Message> {
     if let Some(message) = response.response_message.take() {
         validate_backend_response_message(&message, query)?;
-        if message.original_bytes.as_ref() != response.bytes.as_slice() {
+        if !same_bytes(&message.original_bytes, &response.bytes) {
             return None;
         }
         return Some(message);
@@ -6452,7 +6471,7 @@ fn backend_query_with_configured_udp_limit(
 /// ran with (`request.received_at`) — lookup, response assembly
 /// (`cache::assemble::write_rrset`), and this classification all share that
 /// one instant, so they can never disagree about staleness.
-fn chain_contains_stale(chain: &[(String, cache::RRsetEntry)], now: SystemTime) -> bool {
+fn chain_contains_stale(chain: &[(String, Arc<cache::RRsetEntry>)], now: SystemTime) -> bool {
     chain.iter().any(|(_, entry)| entry.expires_at <= now)
 }
 
@@ -7789,6 +7808,16 @@ impl RecursiveAuthorityResponse {
 struct DelegationEntry {
     endpoints: Vec<SocketAddr>,
     expires_at: Instant,
+    /// Which `insertion_order` slot owns this entry: `insert` stamps every
+    /// stored entry with a fresh sequence and pushes a matching
+    /// `(qclass, owner, sequence)` slot, and eviction only honors a slot
+    /// whose sequence still matches the live entry. A slot left behind by
+    /// an earlier generation of the same zone cut (the entry expired, was
+    /// lazily removed by `lookup`, or was replaced by a refresh) has a
+    /// stale sequence and is skipped/compacted instead of evicting the
+    /// fresh entry — without this, FIFO eviction through a stale slot
+    /// would delete a just-refreshed live delegation (wrong victim).
+    sequence: u64,
 }
 
 /// Hard cap on distinct zone-cut entries the delegation cache will retain.
@@ -7805,26 +7834,117 @@ const DELEGATION_CACHE_MAX_TTL_SECONDS: u32 = 24 * 60 * 60;
 
 #[derive(Default)]
 struct DelegationCacheState {
-    entries: HashMap<String, DelegationEntry>,
-    insertion_order: VecDeque<String>,
+    /// Two-level map (qclass -> owner -> entry) rather than a flat map
+    /// keyed on a `format!("{qclass}:{owner}")` string: the outer map has
+    /// a handful of keys in practice (almost always just IN), and the
+    /// inner map's `String` keys let `lookup` probe each zone suffix with
+    /// a borrowed `&str` — no per-suffix key allocation per lookup.
+    entries: HashMap<u16, HashMap<String, DelegationEntry>>,
+    /// FIFO of `(qclass, owner, sequence)` slots, deliberately *not*
+    /// deduped on insert (the old unconditional per-insert `retain` was an
+    /// O(capacity) scan on every referral store): a refresh strands the
+    /// previous generation's slot with a now-stale sequence, and stale
+    /// slots are skipped at eviction time (`DelegationEntry::sequence`),
+    /// dropped when they surface at the front (`purge_front`), and
+    /// reclaimed in bulk by `compact` once the queue outgrows
+    /// `2 * max_entries` — so queue growth stays bounded even while the
+    /// entry count sits below capacity.
+    insertion_order: VecDeque<(u16, String, u64)>,
+    next_sequence: u64,
 }
 
 impl DelegationCacheState {
-    /// Purges expired entries, then evicts oldest-inserted entries (FIFO)
-    /// until at or under `max_entries`. Also trims stale duplicate keys out
-    /// of `insertion_order` so it can't grow unbounded from repeated
-    /// refreshes of the same zone cut.
+    fn total_entries(&self) -> usize {
+        self.entries.values().map(HashMap::len).sum()
+    }
+
+    /// Removes one `(qclass, owner)` entry, dropping the emptied inner map
+    /// with it. Shared by every removal site so the two-level-map cleanup
+    /// invariant lives in one place.
+    fn remove_entry(&mut self, qclass: u16, owner: &str) {
+        if let Some(by_owner) = self.entries.get_mut(&qclass) {
+            by_owner.remove(owner);
+            if by_owner.is_empty() {
+                self.entries.remove(&qclass);
+            }
+        }
+    }
+
+    /// Whether `sequence` still identifies the live entry for
+    /// `(qclass, owner)` — false for a slot stranded by expiry, lazy
+    /// removal, or a refresh.
+    fn slot_is_live(&self, qclass: u16, owner: &str, sequence: u64) -> bool {
+        self.entries
+            .get(&qclass)
+            .and_then(|by_owner| by_owner.get(owner))
+            .is_some_and(|entry| entry.sequence == sequence)
+    }
+
+    /// Opportunistic expiry purge, amortized O(1) per insert: pops slots
+    /// off the FIFO front while they are stale (dangling or superseded) or
+    /// name an expired live entry, removing the entry in the latter case.
+    /// FIFO order isn't strict expiry order, so this doesn't catch every
+    /// expired entry immediately — `lookup`'s lazy removal and
+    /// `evict`/`compact` cover the rest.
+    fn purge_front(&mut self, now: Instant) {
+        while let Some((front_qclass, front_owner, front_sequence)) = self.insertion_order.front() {
+            let live = self.slot_is_live(*front_qclass, front_owner, *front_sequence);
+            let expired = live
+                && self
+                    .entries
+                    .get(front_qclass)
+                    .and_then(|by_owner| by_owner.get(front_owner))
+                    .is_some_and(|entry| entry.expires_at <= now);
+            if live && !expired {
+                break;
+            }
+            let (front_qclass, front_owner, _) = self
+                .insertion_order
+                .pop_front()
+                .expect("front() just returned Some");
+            if expired {
+                self.remove_entry(front_qclass, &front_owner);
+            }
+        }
+    }
+
+    /// Purges expired entries, then evicts oldest-inserted live entries
+    /// (FIFO, skipping stale slots — see `DelegationEntry::sequence`)
+    /// until at or under `max_entries`, then compacts the slot queue.
+    /// Only called once an insert actually pushes the cache over capacity
+    /// — running it on every insert (the previous shape) made each
+    /// referral store an O(capacity) full scan.
     fn evict(&mut self, max_entries: usize) {
         let now = Instant::now();
-        self.entries.retain(|_, entry| entry.expires_at > now);
-        while self.entries.len() > max_entries {
-            let Some(key) = self.insertion_order.pop_front() else {
+        for by_owner in self.entries.values_mut() {
+            by_owner.retain(|_, entry| entry.expires_at > now);
+        }
+        self.entries.retain(|_, by_owner| !by_owner.is_empty());
+        let mut total = self.total_entries();
+        while total > max_entries {
+            let Some((qclass, owner, sequence)) = self.insertion_order.pop_front() else {
                 break;
             };
-            self.entries.remove(&key);
+            if self.slot_is_live(qclass, &owner, sequence) {
+                self.remove_entry(qclass, &owner);
+                total -= 1;
+            }
         }
-        self.insertion_order
-            .retain(|key| self.entries.contains_key(key));
+        self.compact();
+    }
+
+    /// Drops every slot that no longer identifies a live entry. O(queue
+    /// length), so callers gate it: `evict` (already over capacity) and
+    /// `insert`'s queue-growth trigger (queue past `2 * max_entries`,
+    /// making the scan amortized O(1) per insert).
+    fn compact(&mut self) {
+        let entries = &self.entries;
+        self.insertion_order.retain(|(qclass, owner, sequence)| {
+            entries
+                .get(qclass)
+                .and_then(|by_owner| by_owner.get(owner))
+                .is_some_and(|entry| entry.sequence == *sequence)
+        });
     }
 }
 
@@ -7846,23 +7966,29 @@ impl DelegationCache {
             return;
         }
         let ttl_seconds = ttl_seconds.min(DELEGATION_CACHE_MAX_TTL_SECONDS);
-        let key = delegation_cache_key(&owner, qclass);
-        let expires_at = Instant::now() + Duration::from_secs(u64::from(ttl_seconds));
+        let now = Instant::now();
+        let expires_at = now + Duration::from_secs(u64::from(ttl_seconds));
         let mut state = self.state.lock().unwrap();
-        state.entries.insert(
-            key.clone(),
+        state.purge_front(now);
+        let sequence = state.next_sequence;
+        state.next_sequence += 1;
+        // A refresh of an already-live key strands the previous slot with a
+        // stale sequence rather than scanning the queue to dedupe it — see
+        // `DelegationCacheState::insertion_order`.
+        state.entries.entry(qclass).or_default().insert(
+            owner.clone(),
             DelegationEntry {
                 endpoints,
                 expires_at,
+                sequence,
             },
         );
-        // A refresh of an already-live key must not leave a second, stale
-        // entry behind in insertion_order -- evict() only drops keys whose
-        // entry is gone, so a duplicate for a key that's never evicted (kept
-        // alive by repeated refreshes) would otherwise accumulate forever.
-        state.insertion_order.retain(|existing| existing != &key);
-        state.insertion_order.push_back(key);
-        state.evict(self.max_entries);
+        state.insertion_order.push_back((qclass, owner, sequence));
+        if state.total_entries() > self.max_entries {
+            state.evict(self.max_entries);
+        } else if state.insertion_order.len() > (2 * self.max_entries).max(8) {
+            state.compact();
+        }
     }
 
     /// Longest-suffix match against cached zone cuts, e.g. for "www.example.com"
@@ -7874,24 +8000,35 @@ impl DelegationCache {
     fn lookup(&self, qname: &str, qclass: u16) -> Option<(String, Vec<SocketAddr>)> {
         let now = Instant::now();
         let mut state = self.state.lock().unwrap();
+        let by_owner = state.entries.get_mut(&qclass)?;
+        let mut matched = None;
         for suffix in zone_suffixes(qname) {
-            let key = delegation_cache_key(suffix, qclass);
-            match state.entries.get(&key) {
+            match by_owner.get(suffix) {
                 Some(entry) if entry.expires_at > now => {
-                    return Some((suffix.to_string(), entry.endpoints.clone()));
+                    matched = Some((suffix.to_string(), entry.endpoints.clone()));
+                    break;
                 }
                 Some(_) => {
-                    state.entries.remove(&key);
+                    // Expired: drop lazily. Its `insertion_order` slot is
+                    // now stale and gets skipped/reclaimed by
+                    // `purge_front`/`evict`/`compact`.
+                    by_owner.remove(suffix);
                 }
                 None => {}
             }
         }
-        None
+        // Uphold `remove_entry`'s emptied-inner-map invariant here too: if
+        // lazy expiry just removed this qclass's last entry, drop the outer
+        // key rather than parking an empty map on it.
+        if by_owner.is_empty() {
+            state.entries.remove(&qclass);
+        }
+        matched
     }
 
     #[cfg(test)]
     fn len(&self) -> usize {
-        self.state.lock().unwrap().entries.len()
+        self.state.lock().unwrap().total_entries()
     }
 
     #[cfg(test)]
@@ -7900,20 +8037,22 @@ impl DelegationCache {
     }
 
     #[cfg(test)]
+    fn qclass_key_count(&self) -> usize {
+        self.state.lock().unwrap().entries.len()
+    }
+
+    #[cfg(test)]
     fn ttl_remaining_secs(&self, qname: &str, qclass: u16) -> Option<u64> {
         let now = Instant::now();
         let state = self.state.lock().unwrap();
+        let by_owner = state.entries.get(&qclass)?;
         for suffix in zone_suffixes(qname) {
-            if let Some(entry) = state.entries.get(&delegation_cache_key(suffix, qclass)) {
+            if let Some(entry) = by_owner.get(suffix) {
                 return Some(entry.expires_at.saturating_duration_since(now).as_secs());
             }
         }
         None
     }
-}
-
-fn delegation_cache_key(owner: &str, qclass: u16) -> String {
-    format!("{qclass}:{owner}")
 }
 
 fn zone_suffixes(qname: &str) -> impl Iterator<Item = &str> {
@@ -18837,7 +18976,7 @@ mod tests {
             authoritative: false,
         };
         let resolved = cache::ResolvedAnswer {
-            chain: vec![("example.com".to_string(), entry)],
+            chain: vec![("example.com".to_string(), entry.into())],
             refresh_hints: Vec::new(),
         };
         let cache = Arc::new(RecordingCache::with_lookup(ChainLookup::Answered(resolved)));
@@ -18900,7 +19039,7 @@ mod tests {
             authoritative: false,
         };
         let resolved = cache::ResolvedAnswer {
-            chain: vec![("example.com".to_string(), entry)],
+            chain: vec![("example.com".to_string(), entry.into())],
             refresh_hints: vec![cache::RefreshHint {
                 domain: "example.com".to_string(),
                 qtype: A_RECORD_TYPE,
@@ -18958,7 +19097,7 @@ mod tests {
             authoritative: false,
         };
         let resolved = cache::ResolvedAnswer {
-            chain: vec![("example.com".to_string(), entry)],
+            chain: vec![("example.com".to_string(), entry.into())],
             refresh_hints: vec![cache::RefreshHint {
                 domain: "example.com".to_string(),
                 qtype: A_RECORD_TYPE,
@@ -19022,7 +19161,7 @@ mod tests {
             authoritative: false,
         };
         let resolved = cache::ResolvedAnswer {
-            chain: vec![("example.com".to_string(), entry)],
+            chain: vec![("example.com".to_string(), entry.into())],
             refresh_hints: vec![cache::RefreshHint {
                 domain: "example.com".to_string(),
                 qtype: A_RECORD_TYPE,
@@ -21995,7 +22134,7 @@ mod tests {
     async fn resolve_rejects_backend_response_when_metadata_and_bytes_drift() {
         let cache = Arc::new(RecordingCache::with_lookup(ChainLookup::Miss));
         let mut response = upstream_response(a_response_with_answer(0x5555, "example.com", 60));
-        response.bytes = a_response_with_answer(0x5555, "other.example", 60);
+        response.bytes = a_response_with_answer(0x5555, "other.example", 60).into();
         let upstream = Arc::new(StaticUpstream::new(Ok(response)));
         let events = Arc::new(RecordingEvents::default());
         let metrics = Arc::new(RecordingMetrics::default());
@@ -22084,7 +22223,7 @@ mod tests {
         let record = a_record("example.com", 60);
         let entry = seed_rrset_entry(&record, Duration::from_secs(60), now, 0);
         let resolved = cache::ResolvedAnswer {
-            chain: vec![("example.com".to_string(), entry)],
+            chain: vec![("example.com".to_string(), entry.into())],
             refresh_hints: Vec::new(),
         };
         let cache = Arc::new(RecordingCache::with_lookup(ChainLookup::Answered(resolved)));
@@ -22186,7 +22325,7 @@ mod tests {
         let record = a_record("example.com", 60);
         let entry = seed_rrset_entry(&record, Duration::from_secs(60), now, 0);
         let resolved = cache::ResolvedAnswer {
-            chain: vec![("example.com".to_string(), entry)],
+            chain: vec![("example.com".to_string(), entry.into())],
             refresh_hints: Vec::new(),
         };
         let cache = Arc::new(RecordingCache::with_lookup(ChainLookup::Answered(resolved)));
@@ -22231,7 +22370,7 @@ mod tests {
         let record = a_record("example.com", 60);
         let entry = seed_rrset_entry(&record, Duration::from_secs(60), now, 0);
         let resolved = cache::ResolvedAnswer {
-            chain: vec![("example.com".to_string(), entry)],
+            chain: vec![("example.com".to_string(), entry.into())],
             refresh_hints: Vec::new(),
         };
         let cache = Arc::new(RecordingCache::with_lookup(ChainLookup::Answered(resolved)));
@@ -23053,14 +23192,115 @@ mod tests {
 
         // Refreshing the same live delegation many times (e.g. repeated
         // referrals for names under one already-cached zone) must not leave
-        // stale duplicate keys behind in the FIFO eviction order -- that
-        // would bypass the capacity cap even while entries.len() stays 1.
+        // stale duplicate slots behind in the FIFO eviction order without
+        // bound -- that would bypass the capacity cap even while
+        // entries.len() stays 1. Each refresh strands the previous slot
+        // with a stale sequence, and the next insert's `purge_front` pops
+        // it, so the queue oscillates between 1 and 2 slots instead of
+        // being deduped to exactly 1 by an O(capacity) scan per insert.
         for _ in 0..1000 {
             cache.insert("example.com".to_string(), 1, endpoints.clone(), 300);
         }
 
         assert_eq!(cache.len(), 1);
-        assert_eq!(cache.insertion_order_len(), 1);
+        assert!(
+            cache.insertion_order_len() <= 2,
+            "expected at most one live and one just-stranded slot, got {}",
+            cache.insertion_order_len()
+        );
+    }
+
+    // Regression test for the empty-inner-map leak in lookup's lazy expiry
+    // removal (PR #149 review): removing a qclass's last entry must drop
+    // the outer qclass key too, matching `remove_entry`'s invariant, so
+    // distinct qclasses can't accumulate empty maps.
+    #[tokio::test(start_paused = true)]
+    async fn delegation_cache_lookup_lazy_removal_drops_emptied_qclass_map() {
+        let cache = DelegationCache::new(DEFAULT_DELEGATION_CACHE_CAPACITY);
+        let endpoints = vec!["203.0.113.10:53".parse::<SocketAddr>().unwrap()];
+        const CHAOS_QCLASS: u16 = 3;
+        cache.insert("chaos.example".to_string(), CHAOS_QCLASS, endpoints, 1);
+        assert_eq!(cache.qclass_key_count(), 1);
+
+        tokio::time::advance(Duration::from_millis(1100)).await;
+        assert!(cache.lookup("chaos.example", CHAOS_QCLASS).is_none());
+
+        assert_eq!(
+            cache.qclass_key_count(),
+            0,
+            "lazy expiry removal of a qclass's last entry must drop the outer qclass key"
+        );
+    }
+
+    // Regression test for the stale-slot wrong-victim eviction bug: a zone
+    // cut that expires, is lazily removed by lookup(), and is then
+    // re-learned leaves its old FIFO slot behind with a stale sequence. An
+    // over-capacity eviction popping that stale slot must not delete the
+    // freshly re-learned live entry -- it must skip the stale slot and
+    // evict the genuinely oldest live entry instead.
+    #[tokio::test(start_paused = true)]
+    async fn delegation_cache_eviction_skips_stale_slots_of_relearned_zones() {
+        let cache = DelegationCache::new(2);
+        let endpoints = vec!["203.0.113.10:53".parse::<SocketAddr>().unwrap()];
+
+        // churn.example's slot lands at the FIFO front, stable.example's
+        // behind it.
+        cache.insert("churn.example".to_string(), 1, endpoints.clone(), 1);
+        cache.insert("stable.example".to_string(), 1, endpoints.clone(), 300);
+
+        // churn.example expires and is lazily removed by a lookup, leaving
+        // its front slot stale.
+        tokio::time::advance(Duration::from_millis(1100)).await;
+        assert!(cache.lookup("churn.example", 1).is_none());
+        assert_eq!(cache.len(), 1);
+
+        // Re-learn churn.example fresh, then push the cache over capacity.
+        cache.insert("churn.example".to_string(), 1, endpoints.clone(), 300);
+        cache.insert("newcomer.example".to_string(), 1, endpoints, 300);
+
+        // FIFO says stable.example (the oldest live entry) is the victim;
+        // the just-re-learned churn.example must survive even though its
+        // stale slot predated stable.example's.
+        assert_eq!(cache.len(), 2);
+        assert!(
+            cache.lookup("churn.example", 1).is_some(),
+            "freshly re-learned zone cut must not be evicted through its stale slot"
+        );
+        assert!(cache.lookup("stable.example", 1).is_none());
+        assert!(cache.lookup("newcomer.example", 1).is_some());
+    }
+
+    // Regression test for unbounded insertion_order growth while under
+    // capacity: a long-TTL entry at the FIFO front blocks `purge_front`,
+    // and a short-TTL zone churning through expire -> lazy lookup removal
+    // -> re-learn strands one stale slot per cycle. The queue-length
+    // compaction trigger must keep the slot queue bounded even though the
+    // live entry count never approaches capacity (so over-capacity
+    // eviction never runs).
+    #[tokio::test(start_paused = true)]
+    async fn delegation_cache_slot_queue_stays_bounded_under_churn_below_capacity() {
+        let max_entries = 4;
+        let cache = DelegationCache::new(max_entries);
+        let endpoints = vec!["203.0.113.10:53".parse::<SocketAddr>().unwrap()];
+
+        cache.insert(
+            "front-blocker.example".to_string(),
+            1,
+            endpoints.clone(),
+            86_400,
+        );
+        for _ in 0..100 {
+            cache.insert("churn.example".to_string(), 1, endpoints.clone(), 1);
+            tokio::time::advance(Duration::from_millis(1100)).await;
+            assert!(cache.lookup("churn.example", 1).is_none());
+        }
+
+        assert!(
+            cache.insertion_order_len() <= 2 * max_entries + 1,
+            "slot queue must stay bounded by the compaction trigger, got {}",
+            cache.insertion_order_len()
+        );
+        assert!(cache.lookup("front-blocker.example", 1).is_some());
     }
 
     #[tokio::test(start_paused = true)]

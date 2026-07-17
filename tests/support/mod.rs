@@ -37,11 +37,11 @@ use rdns::delivery::dns::{TcpDnsServer, UdpDnsServer};
 use rdns::delivery::upstream::{ForwardingResolutionBackend, RecursiveAuthorityTransportClient};
 use rdns::protocol::{Message, Record, RecordData, encode_tcp_frame};
 use rdns::resolver::{
-    BackendHealth, BackendSnapshot, BasicResponseFactory, CacheTtlPolicy, Clock, DomainName,
-    InMemoryLocalDnsEntries, LocalDnsEntries, MetricsSink, NoopDnsCache, NoopPolicyEvaluator,
-    QueryEventRecordResult, QueryEventSink, QueryEventV1, RecursiveResolutionBackend,
-    RecursiveResolverConfig, RecursiveRootHint, ResolutionMode, ResolveQuery, ResolverMetric,
-    StandardProtocolCodec,
+    BackendHealth, BackendSnapshot, BasicResponseFactory, CacheTtlPolicy, Clock, DomainDnsCache,
+    DomainName, InMemoryLocalDnsEntries, LocalDnsEntries, MetricsSink, NoopDnsCache,
+    NoopPolicyEvaluator, QueryEventRecordResult, QueryEventSink, QueryEventV1,
+    RecursiveResolutionBackend, RecursiveResolverConfig, RecursiveRootHint, ResolutionMode,
+    ResolveQuery, ResolverMetric, ShardedDnsCache, StandardProtocolCodec,
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpStream, UdpSocket};
@@ -248,12 +248,18 @@ pub async fn start_forward_server_with_zone_file(
     start_forward_server_with_local_entries(config, local_entries).await
 }
 
-async fn start_forward_server_with_local_entries(
-    config: RuntimeConfig,
+/// Builds the forward-mode `ResolveQuery` every forward-mode starter
+/// shares, differing only in the injected cache and local entries — one
+/// construction site so resolver-wiring changes (new constructor arg, new
+/// snapshot field) can't silently drift between the single-socket and
+/// multi-socket harnesses.
+fn build_forward_resolver(
+    config: &RuntimeConfig,
+    cache: Arc<dyn DomainDnsCache>,
     local_entries: Arc<dyn LocalDnsEntries>,
-) -> RunningServer {
+) -> Arc<ResolveQuery> {
     let backend = Arc::new(
-        ForwardingResolutionBackend::from_runtime_config(&config)
+        ForwardingResolutionBackend::from_runtime_config(config)
             .expect("fixture forwarding backend config is valid"),
     );
     // Explicit `BackendSnapshot` tagged `ResolutionMode::Forward` --
@@ -270,10 +276,10 @@ async fn start_forward_server_with_local_entries(
         BackendHealth::Healthy,
         Some(config.backend_cache_namespace()),
     );
-    let resolver = Arc::new(
+    Arc::new(
         ResolveQuery::with_cache_policy_and_backend_snapshot(
             Arc::new(StandardProtocolCodec::new(config.max_udp_payload_size)),
-            Arc::new(NoopDnsCache),
+            cache,
             Arc::new(NoopPolicyEvaluator),
             local_entries,
             CacheTtlPolicy::default(),
@@ -284,8 +290,81 @@ async fn start_forward_server_with_local_entries(
             Arc::new(NoopMetrics),
         )
         .with_chaos_config(config.chaos.clone()),
-    );
+    )
+}
+
+async fn start_forward_server_with_local_entries(
+    config: RuntimeConfig,
+    local_entries: Arc<dyn LocalDnsEntries>,
+) -> RunningServer {
+    let resolver = build_forward_resolver(&config, Arc::new(NoopDnsCache), local_entries);
     spawn_servers(&config, resolver).await
+}
+
+/// A forward-mode instance whose UDP side went through the production
+/// `UdpDnsServer::bind_configured` path — on Linux that is several
+/// `SO_REUSEPORT` sockets on one address, each with its own serve loop,
+/// with the kernel picking which socket receives each datagram. All
+/// sockets share one resolver (and one real `ShardedDnsCache`), unlike
+/// `RunningServer`, which binds a single socket via `UdpDnsServer::new`.
+pub struct RunningMultiSocketUdpServer {
+    pub udp_addr: SocketAddr,
+    shutdowns: Vec<oneshot::Sender<()>>,
+    tasks: Vec<JoinHandle<std::io::Result<()>>>,
+}
+
+impl RunningMultiSocketUdpServer {
+    pub async fn shutdown(self) {
+        for shutdown in self.shutdowns {
+            let _ = shutdown.send(());
+        }
+        for task in self.tasks {
+            task.await
+                .expect("udp server task panicked")
+                .expect("udp server task returned an error");
+        }
+    }
+}
+
+/// Like `start_forward_server`, but UDP-only, bound through
+/// `UdpDnsServer::bind_configured` (the wiring `main.rs` actually uses)
+/// and backed by a real `ShardedDnsCache` instead of `NoopDnsCache`, so a
+/// test can assert that queries are answered regardless of which
+/// kernel-selected socket receives them and that every socket serves from
+/// the same cache.
+pub async fn start_forward_server_multi_socket(toml_body: &str) -> RunningMultiSocketUdpServer {
+    let toml = with_allocated_dns_listen(toml_body).await;
+    let config = RuntimeConfig::from_toml_str(&toml).expect("fixture TOML parses and validates");
+    let resolver = build_forward_resolver(
+        &config,
+        Arc::new(ShardedDnsCache::new(&config.cache)),
+        Arc::new(InMemoryLocalDnsEntries::new(Vec::new())),
+    );
+    let clock: Arc<dyn Clock> = Arc::new(SystemClock);
+    let servers = UdpDnsServer::bind_configured(&config, resolver, clock)
+        .await
+        .expect("bind configured udp listener sockets");
+    let udp_addr = servers[0]
+        .local_addr()
+        .expect("configured udp server local addr");
+    let mut shutdowns = Vec::with_capacity(servers.len());
+    let mut tasks = Vec::with_capacity(servers.len());
+    for server in servers {
+        let (shutdown, shutdown_rx) = oneshot::channel();
+        shutdowns.push(shutdown);
+        tasks.push(tokio::spawn(async move {
+            server
+                .serve_until(async {
+                    let _ = shutdown_rx.await;
+                })
+                .await
+        }));
+    }
+    RunningMultiSocketUdpServer {
+        udp_addr,
+        shutdowns,
+        tasks,
+    }
 }
 
 /// Starts a recursive-mode server from literal TOML text whose

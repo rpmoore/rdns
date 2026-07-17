@@ -27,7 +27,7 @@
 #![allow(dead_code)]
 
 use std::collections::HashMap;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime};
 
 use super::entry::{
@@ -132,19 +132,21 @@ pub(crate) enum HopResult {
     /// A record set matching the queried `(qtype, qclass)` directly, plus
     /// whether this hop currently wants a proactive refresh
     /// (`wants_refresh`, computed inside `lookup_hop` while the lock —
-    /// and this domain's popularity bucket — is already held).
-    Answer(RRsetEntry, bool),
+    /// and this domain's popularity bucket — is already held). Entries are
+    /// handed out as `Arc` clones of the shard's stored value (a refcount
+    /// bump under the lock, not a deep copy).
+    Answer(Arc<RRsetEntry>, bool),
     /// The queried type wasn't found, but a CNAME record set was — carries
     /// the CNAME's own entry (for the response's answer section), the
     /// extracted target name to continue the walk, and whether this hop
     /// wants a proactive refresh.
-    CnameHop(RRsetEntry, String, bool),
+    CnameHop(Arc<RRsetEntry>, String, bool),
     /// NODATA for the queried type at this (existing) name. Negative
     /// entries never carry a refresh signal (v1 scope is positive-entries
     /// only), so there is no bool here.
-    NoData(NegativeEntry),
+    NoData(Arc<NegativeEntry>),
     /// Whole-name NXDOMAIN at this name. Same scope note as `NoData`.
-    NxDomain(NegativeEntry),
+    NxDomain(Arc<NegativeEntry>),
     /// Nothing usable here: absent, expired, or stored under a stale
     /// namespace.
     Miss,
@@ -195,10 +197,16 @@ impl ShardState {
         if !enabled {
             return;
         }
-        self.popularity
-            .entry(domain.to_string())
-            .or_insert_with(|| PopularityBucket::new(now))
-            .drain_and_increment(now, leak_rate, hit_increment, bucket_capacity);
+        // `get_mut` before falling back to insertion: the bucket already
+        // exists on every hit but the first, and the `entry` API would
+        // allocate an owned key for each of those hits just to discard it.
+        if let Some(bucket) = self.popularity.get_mut(domain) {
+            bucket.drain_and_increment(now, leak_rate, hit_increment, bucket_capacity);
+            return;
+        }
+        let mut bucket = PopularityBucket::new(now);
+        bucket.drain_and_increment(now, leak_rate, hit_increment, bucket_capacity);
+        self.popularity.insert(domain.to_string(), bucket);
     }
 
     /// Shared by `lookup_hop`'s `Answer`/`CnameHop` branches: records this
@@ -356,7 +364,7 @@ impl ShardState {
         current_epoch: u64,
         now: SystemTime,
         stale_window: Option<Duration>,
-    ) -> Option<(RRsetEntry, bool)> {
+    ) -> Option<(Arc<RRsetEntry>, bool)> {
         let expired = match self
             .positive
             .domains
@@ -405,7 +413,7 @@ impl ShardState {
         current_epoch: u64,
         now: SystemTime,
         stale_window: Option<Duration>,
-    ) -> Option<(RRsetEntry, String, bool)> {
+    ) -> Option<(Arc<RRsetEntry>, String, bool)> {
         let cname_target = |entry: &RRsetEntry| {
             entry.records.iter().find_map(|record| match &record.rdata {
                 RecordData::CNAME(target) => Some(target.clone()),
@@ -459,7 +467,7 @@ impl ShardState {
         dnssec_ok: bool,
         current_epoch: u64,
         now: SystemTime,
-    ) -> Option<NegativeEntry> {
+    ) -> Option<Arc<NegativeEntry>> {
         let expired = match self
             .negative
             .domains
@@ -660,7 +668,7 @@ impl Shard {
             .entry(domain.to_string())
             .or_default()
             .record_sets
-            .insert(key, entry);
+            .insert(key, Arc::new(entry));
         state.lru.touch(domain);
     }
 
@@ -679,7 +687,7 @@ impl Shard {
             .entry(domain.to_string())
             .or_default()
             .entries
-            .insert(key, entry);
+            .insert(key, Arc::new(entry));
         state.lru.touch(domain);
     }
 

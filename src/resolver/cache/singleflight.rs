@@ -244,7 +244,7 @@ mod tests {
 
     fn sample_response(marker: &str) -> ResolutionResponse {
         ResolutionResponse {
-            bytes: marker.as_bytes().to_vec(),
+            bytes: marker.as_bytes().to_vec().into(),
             received_at: SystemTime::now(),
             response_message: None,
             response_code: None,
@@ -308,7 +308,7 @@ mod tests {
 
         for handle in wait_handles {
             let result = handle.await.unwrap().expect("expected Ok result");
-            assert_eq!(result.bytes, b"resolved");
+            assert_eq!(result.bytes.as_ref(), b"resolved");
         }
     }
 
