@@ -1153,16 +1153,30 @@ impl SourceIpLabels {
     }
 
     /// The attribute set for `source_ip`, or `None` when labeling is
-    /// disabled (callers emit unlabeled). Lock poisoning degrades to
-    /// unlabeled emission rather than panicking a query task.
+    /// disabled (callers emit unlabeled). A poisoned lock is recovered
+    /// with `into_inner` (the cached attribute sets are plain data,
+    /// valid regardless of where a panicking thread stopped) rather
+    /// than degrading to unlabeled emission, which would break the
+    /// each-family-consistently-labeled-or-not invariant
+    /// (`docs/knowledge/resolver/metrics-source-ip.md`) — flagged by
+    /// Copilot review on PR #150.
     fn attributes(&self, source_ip: IpAddr) -> Option<[KeyValue; 1]> {
         if !self.enabled {
             return None;
         }
-        if let Some(attributes) = self.interned.read().ok()?.get(&source_ip) {
-            return Some(attributes.clone());
+        {
+            let interned = self
+                .interned
+                .read()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if let Some(attributes) = interned.get(&source_ip) {
+                return Some(attributes.clone());
+            }
         }
-        let mut interned = self.interned.write().ok()?;
+        let mut interned = self
+            .interned
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         if let Some(attributes) = interned.get(&source_ip) {
             return Some(attributes.clone());
         }

@@ -20,12 +20,12 @@ query payload.
 
 # The sink contract
 
-`MetricsSink` (`src/resolver/mod.rs:8924`) has two emission tiers:
+`MetricsSink` (`src/resolver/mod.rs:8928`) has two emission tiers:
 
 * `increment` / `observe_duration` — unlabeled, used for metrics emitted
   from background or shared work.
 * `increment_with_source` / `observe_duration_with_source`
-  (`src/resolver/mod.rs:8943`) — per-query variants carrying the client
+  (`src/resolver/mod.rs:8949`) — per-query variants carrying the client
   IP. Both have default impls that discard the IP and delegate to the
   unlabeled methods, so sinks that don't label by source (the Noop
   sinks, test recorders) need no changes.
@@ -44,7 +44,7 @@ Labeled (every emission has a real client request in scope):
 `CacheResponseTruncated`, `CacheMiss`, `CacheBypass`,
 `CacheCoalescedMiss`, and the duration histograms `QueryDuration`,
 `CacheHitQueryDuration`, `CacheMissQueryDuration` (emitted in `finish`,
-`src/resolver/mod.rs:6143`). Cache-hit counters funnel through
+`src/resolver/mod.rs:6179`). Cache-hit counters funnel through
 `record_cache_hit_metrics`, which takes the client IP as a parameter
 (`src/resolver/mod.rs:5407`).
 
@@ -56,7 +56,7 @@ Unlabeled, deliberately:
   `prepare_backend_result`; labeling would attribute a shared fetch to
   an arbitrary client (flagged by Codex review on PR #150).
 * `CacheStore` / `CacheNegativeStore` / `CacheStoreSkipped` —
-  `store_cache_response` (`src/resolver/mod.rs:6073`) is shared with the
+  `store_cache_response` (`src/resolver/mod.rs:6077`) is shared with the
   auto-refresh worker, which calls it with a synthetic request whose
   client IP is `0.0.0.0` (`src/resolver/mod.rs:4006`). Labeling would
   either split the family or attribute refresh stores to a fake client.
@@ -65,7 +65,7 @@ Unlabeled, deliberately:
   even though a client's hit is what enqueues the job.
 * `QueryEventAccepted`..`QueryEventSampled` — event-queue accounting.
 * `Recursive*` metrics and `RecursiveQueryDuration` — emitted deep in
-  `RecursiveResolutionBackend` (`src/resolver/mod.rs:8161`), which has
+  `RecursiveResolutionBackend` (`src/resolver/mod.rs:8107`), which has
   no client context (and one recursion can serve coalesced queries from
   several clients).
 * Gauges (`backend_generation`, `cache_size`, …) — process state.
