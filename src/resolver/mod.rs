@@ -4491,7 +4491,8 @@ impl ResolveQuery {
     }
 
     pub async fn resolve(&self, mut request: ResolveRequest) -> ResolveOutcome {
-        self.metrics.increment(ResolverMetric::QueryReceived);
+        self.metrics
+            .increment_with_source(ResolverMetric::QueryReceived, request.client_ip);
         let started_at = self.clock.now();
         let (backend_snapshot, local_entries) = {
             let _gate = self
@@ -4620,7 +4621,8 @@ impl ResolveQuery {
                 error,
                 recovered_message,
             }) => {
-                self.metrics.increment(ResolverMetric::ProtocolError);
+                self.metrics
+                    .increment_with_source(ResolverMetric::ProtocolError, request.client_ip);
                 let decision = ResolveDecision {
                     client_ip: request.client_ip,
                     question: None,
@@ -4662,7 +4664,8 @@ impl ResolveQuery {
         else {
             return None;
         };
-        self.metrics.increment(ResolverMetric::QueryBlocked);
+        self.metrics
+            .increment_with_source(ResolverMetric::QueryBlocked, request.client_ip);
         let decision = ResolveDecision {
             client_ip: request.client_ip,
             question: Some(question.clone()),
@@ -4714,7 +4717,8 @@ impl ResolveQuery {
             CHAOS_ANSWER_TTL,
             self.protocol.configured_max_udp_payload_size(),
         );
-        self.metrics.increment(ResolverMetric::QueryAllowed);
+        self.metrics
+            .increment_with_source(ResolverMetric::QueryAllowed, request.client_ip);
         let decision = ResolveDecision {
             client_ip: request.client_ip,
             question: Some(question.clone()),
@@ -4768,7 +4772,8 @@ impl ResolveQuery {
             }
             LocalDnsLookup::NoMatch => return None,
         };
-        self.metrics.increment(ResolverMetric::QueryAllowed);
+        self.metrics
+            .increment_with_source(ResolverMetric::QueryAllowed, request.client_ip);
         let decision = ResolveDecision {
             client_ip: request.client_ip,
             question: Some(question.clone()),
@@ -4813,7 +4818,8 @@ impl ResolveQuery {
         event_cache_result: Option<QueryEventCacheResult>,
         backend_snapshot: &BackendSnapshot,
     ) -> ResolveOutcome {
-        self.metrics.increment(ResolverMetric::RecursionRefused);
+        self.metrics
+            .increment_with_source(ResolverMetric::RecursionRefused, request.client_ip);
         let decision = ResolveDecision {
             client_ip: request.client_ip,
             question: Some(question),
@@ -4865,7 +4871,8 @@ impl ResolveQuery {
         refresh_hints: Vec<cache::RefreshHint>,
     ) -> ResolveOutcome {
         if let Some(block) = self.response_bytes_policy_block(request.client_ip, &response_bytes) {
-            self.metrics.increment(ResolverMetric::QueryBlocked);
+            self.metrics
+                .increment_with_source(ResolverMetric::QueryBlocked, request.client_ip);
             let decision = ResolveDecision {
                 client_ip: request.client_ip,
                 question: Some(question.clone()),
@@ -4898,7 +4905,8 @@ impl ResolveQuery {
             question: Some(question.clone()),
             kind: ResolveDecisionKind::CacheHit,
         };
-        self.metrics.increment(ResolverMetric::QueryAllowed);
+        self.metrics
+            .increment_with_source(ResolverMetric::QueryAllowed, request.client_ip);
         self.finish_uniform(
             started_at,
             request,
@@ -5011,7 +5019,8 @@ impl ResolveQuery {
         event_cache_result: Option<QueryEventCacheResult>,
         flight: Arc<InFlightMiss>,
     ) -> ResolveOutcome {
-        self.metrics.increment(ResolverMetric::CacheCoalescedMiss);
+        self.metrics
+            .increment_with_source(ResolverMetric::CacheCoalescedMiss, request.client_ip);
         let backend_result = flight.wait().await;
         let Some(CoalescedFollowerHit {
             response_bytes,
@@ -5037,7 +5046,8 @@ impl ResolveQuery {
         };
 
         if let Some(block) = self.response_bytes_policy_block(request.client_ip, &response_bytes) {
-            self.metrics.increment(ResolverMetric::QueryBlocked);
+            self.metrics
+                .increment_with_source(ResolverMetric::QueryBlocked, request.client_ip);
             let decision = ResolveDecision {
                 client_ip: request.client_ip,
                 question: Some(question),
@@ -5080,7 +5090,8 @@ impl ResolveQuery {
             question: Some(question),
             kind: ResolveDecisionKind::CacheHit,
         };
-        self.metrics.increment(ResolverMetric::QueryAllowed);
+        self.metrics
+            .increment_with_source(ResolverMetric::QueryAllowed, request.client_ip);
         self.finish(
             started_at,
             request,
@@ -5221,8 +5232,10 @@ impl ResolveQuery {
         decoded: &DecodedQuery,
     ) -> CacheProbe {
         if !cache_supported(decoded) {
-            self.metrics.increment(ResolverMetric::CacheBypass);
-            self.metrics.increment(ResolverMetric::CacheMiss);
+            self.metrics
+                .increment_with_source(ResolverMetric::CacheBypass, request.client_ip);
+            self.metrics
+                .increment_with_source(ResolverMetric::CacheMiss, request.client_ip);
             return CacheProbe {
                 miss_key: None,
                 hit: None,
@@ -5320,7 +5333,7 @@ impl ResolveQuery {
                 let refresh_hints = resolved.refresh_hints.clone();
                 let stale = chain_contains_stale(&resolved.chain, request.received_at.0);
                 let response_bytes = self.serialize_cache_hit_answer(decoded, &resolved, request);
-                self.record_cache_hit_metrics(&response_bytes, false, stale);
+                self.record_cache_hit_metrics(&response_bytes, false, stale, request.client_ip);
                 CacheLookupEvaluation {
                     store_allowed: false,
                     hit: Some(response_bytes),
@@ -5336,7 +5349,7 @@ impl ResolveQuery {
                     ResponseCode::NxDomain,
                     request,
                 );
-                self.record_cache_hit_metrics(&response_bytes, true, stale);
+                self.record_cache_hit_metrics(&response_bytes, true, stale, request.client_ip);
                 CacheLookupEvaluation {
                     store_allowed: false,
                     hit: Some(response_bytes),
@@ -5352,7 +5365,7 @@ impl ResolveQuery {
                     ResponseCode::NoError,
                     request,
                 );
-                self.record_cache_hit_metrics(&response_bytes, true, stale);
+                self.record_cache_hit_metrics(&response_bytes, true, stale, request.client_ip);
                 CacheLookupEvaluation {
                     store_allowed: false,
                     hit: Some(response_bytes),
@@ -5361,7 +5374,8 @@ impl ResolveQuery {
                 }
             }
             ChainLookup::Miss => {
-                self.metrics.increment(ResolverMetric::CacheMiss);
+                self.metrics
+                    .increment_with_source(ResolverMetric::CacheMiss, request.client_ip);
                 CacheLookupEvaluation {
                     store_allowed: true,
                     hit: None,
@@ -5390,17 +5404,26 @@ impl ResolveQuery {
         }
     }
 
-    fn record_cache_hit_metrics(&self, response_bytes: &[u8], negative: bool, stale: bool) {
-        self.metrics.increment(ResolverMetric::CacheHit);
+    fn record_cache_hit_metrics(
+        &self,
+        response_bytes: &[u8],
+        negative: bool,
+        stale: bool,
+        client_ip: IpAddr,
+    ) {
+        self.metrics
+            .increment_with_source(ResolverMetric::CacheHit, client_ip);
         if negative {
-            self.metrics.increment(ResolverMetric::CacheNegativeHit);
+            self.metrics
+                .increment_with_source(ResolverMetric::CacheNegativeHit, client_ip);
         }
         if stale {
-            self.metrics.increment(ResolverMetric::CacheStaleHit);
+            self.metrics
+                .increment_with_source(ResolverMetric::CacheStaleHit, client_ip);
         }
         if response_is_truncated(response_bytes) {
             self.metrics
-                .increment(ResolverMetric::CacheResponseTruncated);
+                .increment_with_source(ResolverMetric::CacheResponseTruncated, client_ip);
         }
     }
 
@@ -5476,7 +5499,7 @@ impl ResolveQuery {
                 let refresh_hints = resolved.refresh_hints.clone();
                 let stale = chain_contains_stale(&resolved.chain, request.received_at.0);
                 let response_bytes = self.serialize_cache_hit_answer(decoded, &resolved, request);
-                self.record_cache_hit_metrics(&response_bytes, false, stale);
+                self.record_cache_hit_metrics(&response_bytes, false, stale, request.client_ip);
                 Some(CoalescedFollowerHit {
                     response_bytes,
                     refresh_hints,
@@ -5491,7 +5514,7 @@ impl ResolveQuery {
                     request,
                 );
                 let stale = chain_contains_stale(&resolved.chain, request.received_at.0);
-                self.record_cache_hit_metrics(&response_bytes, true, stale);
+                self.record_cache_hit_metrics(&response_bytes, true, stale, request.client_ip);
                 Some(CoalescedFollowerHit {
                     response_bytes,
                     refresh_hints: Vec::new(),
@@ -5506,7 +5529,7 @@ impl ResolveQuery {
                     request,
                 );
                 let stale = chain_contains_stale(&resolved.chain, request.received_at.0);
-                self.record_cache_hit_metrics(&response_bytes, true, stale);
+                self.record_cache_hit_metrics(&response_bytes, true, stale, request.client_ip);
                 Some(CoalescedFollowerHit {
                     response_bytes,
                     refresh_hints: Vec::new(),
@@ -5574,9 +5597,11 @@ impl ResolveQuery {
             return self.backend_failure_response(request, decoded, question);
         };
 
-        self.metrics.increment(ResolverMetric::UpstreamSuccess);
+        self.metrics
+            .increment_with_source(ResolverMetric::UpstreamSuccess, request.client_ip);
         if let Some(block) = self.response_policy_block(request.client_ip, &response_message) {
-            self.metrics.increment(ResolverMetric::QueryBlocked);
+            self.metrics
+                .increment_with_source(ResolverMetric::QueryBlocked, request.client_ip);
             let decision = ResolveDecision {
                 client_ip: request.client_ip,
                 question: Some(question),
@@ -6000,7 +6025,8 @@ impl ResolveQuery {
             question: Some(question),
             kind: ResolveDecisionKind::Allowed,
         };
-        self.metrics.increment(ResolverMetric::QueryAllowed);
+        self.metrics
+            .increment_with_source(ResolverMetric::QueryAllowed, request.client_ip);
         (decision, response_bytes)
     }
 
@@ -6030,7 +6056,8 @@ impl ResolveQuery {
         decoded: &DecodedQuery,
         question: QuestionKey,
     ) -> (ResolveDecision, Vec<u8>) {
-        self.metrics.increment(ResolverMetric::UpstreamFailure);
+        self.metrics
+            .increment_with_source(ResolverMetric::UpstreamFailure, request.client_ip);
         let decision = ResolveDecision {
             client_ip: request.client_ip,
             question: Some(question),
@@ -6145,18 +6172,27 @@ impl ResolveQuery {
         self.record_query_event(event);
         self.metrics.record_backend_status(&self.backend.status());
         if let Some(duration) = latency {
-            self.metrics
-                .observe_duration(ResolverMetric::QueryDuration, duration);
+            self.metrics.observe_duration_with_source(
+                ResolverMetric::QueryDuration,
+                duration,
+                request.client_ip,
+            );
             match latency_cache_result {
                 // A stale serve is latency-wise a hit: answered from cache
                 // memory, backend work deferred to the background refresh.
                 Some(QueryEventCacheResult::Hit) | Some(QueryEventCacheResult::Stale) => {
-                    self.metrics
-                        .observe_duration(ResolverMetric::CacheHitQueryDuration, duration);
+                    self.metrics.observe_duration_with_source(
+                        ResolverMetric::CacheHitQueryDuration,
+                        duration,
+                        request.client_ip,
+                    );
                 }
                 Some(QueryEventCacheResult::Miss) | Some(QueryEventCacheResult::Expired) => {
-                    self.metrics
-                        .observe_duration(ResolverMetric::CacheMissQueryDuration, duration);
+                    self.metrics.observe_duration_with_source(
+                        ResolverMetric::CacheMissQueryDuration,
+                        duration,
+                        request.client_ip,
+                    );
                 }
                 // Bypass/Unavailable didn't go through a normal cache lookup, and
                 // None covers protocol errors/policy blocks/local answers — none
@@ -8891,6 +8927,33 @@ pub trait MetricsSink: Send + Sync {
     fn observe_duration(&self, metric: ResolverMetric, duration: Duration);
 
     fn record_backend_status(&self, _status: &BackendStatus) {}
+
+    /// Per-query variant of `increment` carrying the requesting client's
+    /// source IP, so sinks can label the metric by where the query came
+    /// from. The resolver calls this (never plain `increment`) for every
+    /// metric that is scoped to a single client query; metrics emitted
+    /// from background work (refresh workers, event-queue accounting,
+    /// recursion internals, cache stores shared with the refresh path)
+    /// stay on the unlabeled `increment` so each metric family is
+    /// consistently labeled or consistently not.
+    ///
+    /// Sinks that don't label by source keep this default, which discards
+    /// the IP. Sinks that do should note the cardinality cost: one time
+    /// series per distinct client IP per metric.
+    fn increment_with_source(&self, metric: ResolverMetric, _source_ip: IpAddr) {
+        self.increment(metric);
+    }
+
+    /// Per-query variant of `observe_duration`; same contract as
+    /// `increment_with_source`.
+    fn observe_duration_with_source(
+        &self,
+        metric: ResolverMetric,
+        duration: Duration,
+        _source_ip: IpAddr,
+    ) {
+        self.observe_duration(metric, duration);
+    }
 }
 
 pub struct NoopMetricsSink;
@@ -10626,6 +10689,8 @@ mod tests {
         increments: Mutex<Vec<ResolverMetric>>,
         durations: Mutex<Vec<(ResolverMetric, Duration)>>,
         backend_statuses: Mutex<Vec<BackendStatus>>,
+        source_increments: Mutex<Vec<(ResolverMetric, IpAddr)>>,
+        source_durations: Mutex<Vec<(ResolverMetric, IpAddr)>>,
     }
 
     impl MetricsSink for RecordingMetrics {
@@ -10639,6 +10704,31 @@ mod tests {
 
         fn record_backend_status(&self, status: &BackendStatus) {
             self.backend_statuses.lock().unwrap().push(status.clone());
+        }
+
+        // The `*_with_source` overrides also feed the unlabeled vectors so
+        // `count`/`duration_count` keep seeing every emission regardless of
+        // which variant the resolver used — mirroring how a real sink's
+        // labeled series still roll up into the same metric family.
+        fn increment_with_source(&self, metric: ResolverMetric, source_ip: IpAddr) {
+            self.source_increments
+                .lock()
+                .unwrap()
+                .push((metric, source_ip));
+            self.increment(metric);
+        }
+
+        fn observe_duration_with_source(
+            &self,
+            metric: ResolverMetric,
+            duration: Duration,
+            source_ip: IpAddr,
+        ) {
+            self.source_durations
+                .lock()
+                .unwrap()
+                .push((metric, source_ip));
+            self.observe_duration(metric, duration);
         }
     }
 
@@ -10680,6 +10770,57 @@ mod tests {
             domain: domain.to_string(),
             qtype: 1,
             qclass: 1,
+        }
+    }
+
+    /// Per-client-query metrics reach the sink through the `*_with_source`
+    /// variants carrying the requesting client's IP, so a labeling sink
+    /// (like main.rs's OpenTelemetry one) can attribute traffic to where
+    /// it came from. Asserts both that the expected metrics arrive with
+    /// the IP and that no per-query emission ever carries a different one.
+    #[tokio::test]
+    async fn per_query_metrics_carry_client_source_ip() {
+        let metrics = Arc::new(RecordingMetrics::default());
+        let resolver = resolver_for_enqueue_tests(metrics.clone());
+        let client_ip: IpAddr = "192.0.2.77".parse().unwrap();
+
+        // Upstream is a hardwired timeout, so this exercises the full miss
+        // path: received -> cache miss -> upstream failure -> durations.
+        resolver
+            .resolve(ResolveRequest::new(
+                client_ip,
+                SystemTime::UNIX_EPOCH,
+                a_query(7, "example.com"),
+            ))
+            .await;
+
+        let source_increments = metrics.source_increments.lock().unwrap().clone();
+        for expected in [
+            ResolverMetric::QueryReceived,
+            ResolverMetric::CacheMiss,
+            ResolverMetric::UpstreamFailure,
+        ] {
+            assert!(
+                source_increments.contains(&(expected, client_ip)),
+                "{expected:?} should be recorded with the client source ip, got {source_increments:?}"
+            );
+        }
+        for (metric, ip) in &source_increments {
+            assert_eq!(
+                *ip, client_ip,
+                "{metric:?} was recorded with a source ip other than the requesting client's"
+            );
+        }
+
+        let source_durations = metrics.source_durations.lock().unwrap().clone();
+        for expected in [
+            ResolverMetric::QueryDuration,
+            ResolverMetric::CacheMissQueryDuration,
+        ] {
+            assert!(
+                source_durations.contains(&(expected, client_ip)),
+                "{expected:?} should be observed with the client source ip, got {source_durations:?}"
+            );
         }
     }
 
