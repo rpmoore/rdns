@@ -386,12 +386,17 @@ impl ShardState {
 
     /// `take_live_positive`'s sibling for the CNAME-hop candidate: same
     /// single-probe expired/live/stale/absent decision, plus extracting the
-    /// CNAME's target name from the entry's records. An entry
+    /// CNAME's target name from the entry's records. A *live* entry
     /// whose records don't actually contain a CNAME (unexpected/corrupt
     /// data) is treated as absent for this call — same as before — without
-    /// being removed, since only genuine TTL expiry warrants removal here;
-    /// that applies to a stale-servable candidate too (kept in place, since
-    /// TTL expiry alone isn't what disqualified it).
+    /// being removed, since only genuine TTL expiry warrants removal here.
+    /// An *expired* (stale-servable) entry with no extractable CNAME is
+    /// evicted instead: it already satisfies the one removal criterion (TTL
+    /// expiry), and serving it stale — the only thing that justified keeping
+    /// an expired entry — is impossible without a target, so leaving it
+    /// would park unusable expired data in the shard until the stale window
+    /// ran out, where the pre-serve-stale code cleaned it up on first read
+    /// (PR #142 review finding).
     fn take_live_cname_hop(
         &mut self,
         domain: &str,
@@ -416,12 +421,12 @@ impl ShardState {
             None => return None,
             Some(entry) if entry.expires_at <= now => {
                 match stale_servability(entry, dnssec_ok, current_epoch, now, stale_window) {
-                    StaleServability::Servable => {
-                        if let Some(target) = cname_target(entry) {
-                            return Some((entry.clone(), target, true));
-                        }
-                        return None;
-                    }
+                    StaleServability::Servable => match cname_target(entry) {
+                        Some(target) => return Some((entry.clone(), target, true)),
+                        // Admitted as stale-servable but nothing to serve:
+                        // expired + unusable ⇒ evict (see doc comment).
+                        None => true,
+                    },
                     StaleServability::KeepButMiss => return None,
                     StaleServability::Evict => true,
                 }
@@ -2124,6 +2129,38 @@ mod tests {
             }
             other => panic!("expected stale CnameHop, got {other:?}"),
         }
+    }
+
+    /// An expired CNAME-slot entry admitted as stale-servable but carrying
+    /// no extractable CNAME (corrupt/unexpected rdata) must be evicted at
+    /// read time, not left parked until the stale window ends — it is
+    /// expired (the one removal criterion) and cannot serve any stale
+    /// reader on this path (PR #142 review finding).
+    #[test]
+    fn lookup_hop_evicts_stale_cname_slot_entry_with_no_extractable_target() {
+        let shard = stale_shard();
+        let domain = "corrupt-alias.example.com";
+        let now = SystemTime::now();
+        let cname_key = (CNAME_RECORD_TYPE, IN_QCLASS);
+        // Stored under the CNAME key, but the records hold an A rdata —
+        // no target to extract.
+        shard.store_positive(domain, cname_key, expired_rrset_entry(now));
+
+        let result = shard.lookup_hop(
+            domain,
+            A_QTYPE,
+            IN_QCLASS,
+            false,
+            1,
+            now,
+            &test_refresh_config(),
+        );
+
+        assert!(matches!(result, HopResult::Miss));
+        assert!(
+            !shard.contains_positive(domain, cname_key),
+            "an expired, unservable CNAME-slot entry must be evicted, not parked for the window"
+        );
     }
 
     #[test]
