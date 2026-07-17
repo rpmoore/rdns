@@ -2323,8 +2323,20 @@ fn hex_nibble(byte: u8) -> Result<u8, ResolutionBackendError> {
     }
 }
 
+/// Applies the configured floor/ceiling to a response-derived TTL. A TTL of
+/// exactly 0 is exempt from the floor: RFC 1035 §3.2.1 (and RFC 2308 §5 for
+/// negative answers) defines TTL 0 as "this transaction only", so a
+/// configured `min_positive_ttl`/`min_negative_ttl` must not resurrect it
+/// into a cacheable lifetime — flooring it would keep transaction-only data
+/// servable (at wire TTL 0) until the floor expired, and would sidestep the
+/// serve-stale TTL-0 eviction guard, which only sees entries *after* expiry
+/// (PR #142 review finding). Left at 0, the entry expires at store time and
+/// the first lookup evicts it.
 fn apply_ttl_bounds(ttl: Duration, min_ttl: Option<Duration>, max_ttl: Duration) -> Duration {
     let capped = ttl.min(max_ttl);
+    if ttl.is_zero() {
+        return capped;
+    }
     match min_ttl {
         Some(min_ttl) => capped.max(min_ttl).min(max_ttl),
         None => capped,
@@ -2906,7 +2918,10 @@ pub struct QueryEventV1 {
 }
 
 impl QueryEventV1 {
-    pub const SCHEMA_VERSION: u8 = 5;
+    // v6: `cache_result` gained the `Stale` value (RFC 8767 serve-stale) —
+    // bumped so strict consumers validating the v5 enum get a version
+    // signal instead of an unexpected variant.
+    pub const SCHEMA_VERSION: u8 = 6;
 
     #[allow(clippy::too_many_arguments)]
     pub fn from_decision(
@@ -3024,6 +3039,11 @@ impl QueryEventOutcome {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub enum QueryEventCacheResult {
     Hit,
+    /// A hit that served at least one expired entry under RFC 8767
+    /// serve-stale. (A background refresh is *typically* signaled too, but
+    /// not guaranteed — the enqueue is best-effort and some paths drop
+    /// hints; see `docs/knowledge/resolver/caching/serve-stale.md`.)
+    Stale,
     Miss,
     Expired,
     Bypass,
@@ -3571,6 +3591,11 @@ struct CacheLookupEvaluation {
 struct CoalescedFollowerHit {
     response_bytes: Vec<u8>,
     refresh_hints: Vec<cache::RefreshHint>,
+    /// `Hit` or `Stale` — what the follower's re-probe actually found, so
+    /// the audit event matches what was served (the stale-hit *metric* is
+    /// already recorded inside `cache_hit_after_coalesced_miss`; without
+    /// this field the event would hard-code `Hit` and disagree with it).
+    event_cache_result: QueryEventCacheResult,
 }
 
 /// One background refresh attempt: a domain/qtype/qclass to refetch and
@@ -4984,6 +5009,7 @@ impl ResolveQuery {
         let Some(CoalescedFollowerHit {
             response_bytes,
             refresh_hints,
+            event_cache_result: served_cache_result,
         }) = self
             .cache_hit_after_coalesced_miss(request, decoded, backend_snapshot, &miss_key)
             .await
@@ -5022,11 +5048,12 @@ impl ResolveQuery {
                     decoded_original_question_name(decoded),
                     decision,
                     response_bytes,
-                    Some(QueryEventCacheResult::Hit),
-                    // Audit event says Hit (correctly — this was served from the
-                    // cache entry the leader just populated), but latency here
-                    // is dominated by `flight.wait().await` above, not a fast
+                    // What the re-probe actually found (`Hit`, or `Stale` if
+                    // the leader-populated entry already expired relative to
+                    // this follower's own received_at), but latency here is
+                    // dominated by `flight.wait().await` above, not a fast
                     // cache lookup, so bucket it by the pre-coalescing result.
+                    Some(served_cache_result),
                     event_cache_result,
                     Some(QueryEventBackend::from_snapshot(backend_snapshot)),
                 )
@@ -5053,9 +5080,11 @@ impl ResolveQuery {
             decoded_original_question_name(decoded),
             decision,
             response_bytes,
-            Some(QueryEventCacheResult::Hit),
-            // Same reasoning as above: this follower waited on the leader's
-            // full backend round trip, so its latency isn't cache-hit latency.
+            // Same reasoning as above: the audit result is what the re-probe
+            // actually found, while latency buckets by the pre-coalescing
+            // result since this follower waited on the leader's full backend
+            // round trip.
+            Some(served_cache_result),
             event_cache_result,
             Some(QueryEventBackend::from_snapshot(backend_snapshot)),
         )
@@ -5263,8 +5292,11 @@ impl ResolveQuery {
     ///
     /// Unlike the old flat `CacheLookup`, `ChainLookup` has no
     /// `Expired`/`Unavailable` variants: `resolve_from_cache` (section-06)
-    /// rejects an expired or stale-namespace match inline and folds it
-    /// into `Miss` before ever returning it, and the new cache has no
+    /// folds a stale-namespace match — and, with serve-stale disabled or
+    /// beyond the stale window, an expired match — into `Miss` before ever
+    /// returning it (an expired *positive* entry inside the RFC 8767 stale
+    /// window is instead returned as an `Answered` stale serve, classified
+    /// here via `chain_contains_stale`), and the new cache has no
     /// external dependency that could make it "unavailable" (it's
     /// in-process memory, not a service call) — so
     /// `ResolverMetric::CacheExpired`/`CacheUnavailable` are no longer
@@ -5279,42 +5311,45 @@ impl ResolveQuery {
         match lookup {
             ChainLookup::Answered(resolved) => {
                 let refresh_hints = resolved.refresh_hints.clone();
+                let stale = chain_contains_stale(&resolved.chain, request.received_at.0);
                 let response_bytes = self.serialize_cache_hit_answer(decoded, &resolved, request);
-                self.record_cache_hit_metrics(&response_bytes, false);
+                self.record_cache_hit_metrics(&response_bytes, false, stale);
                 CacheLookupEvaluation {
                     store_allowed: false,
                     hit: Some(response_bytes),
-                    event_cache_result: QueryEventCacheResult::Hit,
+                    event_cache_result: cache_hit_event_result(stale),
                     refresh_hints,
                 }
             }
             ChainLookup::NxDomain(resolved) => {
+                let stale = chain_contains_stale(&resolved.chain, request.received_at.0);
                 let response_bytes = self.serialize_cache_hit_negative(
                     decoded,
                     &resolved,
                     ResponseCode::NxDomain,
                     request,
                 );
-                self.record_cache_hit_metrics(&response_bytes, true);
+                self.record_cache_hit_metrics(&response_bytes, true, stale);
                 CacheLookupEvaluation {
                     store_allowed: false,
                     hit: Some(response_bytes),
-                    event_cache_result: QueryEventCacheResult::Hit,
+                    event_cache_result: cache_hit_event_result(stale),
                     refresh_hints: Vec::new(),
                 }
             }
             ChainLookup::NoData(resolved) => {
+                let stale = chain_contains_stale(&resolved.chain, request.received_at.0);
                 let response_bytes = self.serialize_cache_hit_negative(
                     decoded,
                     &resolved,
                     ResponseCode::NoError,
                     request,
                 );
-                self.record_cache_hit_metrics(&response_bytes, true);
+                self.record_cache_hit_metrics(&response_bytes, true, stale);
                 CacheLookupEvaluation {
                     store_allowed: false,
                     hit: Some(response_bytes),
-                    event_cache_result: QueryEventCacheResult::Hit,
+                    event_cache_result: cache_hit_event_result(stale),
                     refresh_hints: Vec::new(),
                 }
             }
@@ -5348,10 +5383,13 @@ impl ResolveQuery {
         }
     }
 
-    fn record_cache_hit_metrics(&self, response_bytes: &[u8], negative: bool) {
+    fn record_cache_hit_metrics(&self, response_bytes: &[u8], negative: bool, stale: bool) {
         self.metrics.increment(ResolverMetric::CacheHit);
         if negative {
             self.metrics.increment(ResolverMetric::CacheNegativeHit);
+        }
+        if stale {
+            self.metrics.increment(ResolverMetric::CacheStaleHit);
         }
         if response_is_truncated(response_bytes) {
             self.metrics
@@ -5429,11 +5467,13 @@ impl ResolveQuery {
                 // targets, so hints from here must reach the caller too,
                 // the same as `probe_cache`'s leader-side path.
                 let refresh_hints = resolved.refresh_hints.clone();
+                let stale = chain_contains_stale(&resolved.chain, request.received_at.0);
                 let response_bytes = self.serialize_cache_hit_answer(decoded, &resolved, request);
-                self.record_cache_hit_metrics(&response_bytes, false);
+                self.record_cache_hit_metrics(&response_bytes, false, stale);
                 Some(CoalescedFollowerHit {
                     response_bytes,
                     refresh_hints,
+                    event_cache_result: cache_hit_event_result(stale),
                 })
             }
             ChainLookup::NxDomain(resolved) => {
@@ -5443,10 +5483,12 @@ impl ResolveQuery {
                     ResponseCode::NxDomain,
                     request,
                 );
-                self.record_cache_hit_metrics(&response_bytes, true);
+                let stale = chain_contains_stale(&resolved.chain, request.received_at.0);
+                self.record_cache_hit_metrics(&response_bytes, true, stale);
                 Some(CoalescedFollowerHit {
                     response_bytes,
                     refresh_hints: Vec::new(),
+                    event_cache_result: cache_hit_event_result(stale),
                 })
             }
             ChainLookup::NoData(resolved) => {
@@ -5456,10 +5498,12 @@ impl ResolveQuery {
                     ResponseCode::NoError,
                     request,
                 );
-                self.record_cache_hit_metrics(&response_bytes, true);
+                let stale = chain_contains_stale(&resolved.chain, request.received_at.0);
+                self.record_cache_hit_metrics(&response_bytes, true, stale);
                 Some(CoalescedFollowerHit {
                     response_bytes,
                     refresh_hints: Vec::new(),
+                    event_cache_result: cache_hit_event_result(stale),
                 })
             }
             ChainLookup::Miss => None,
@@ -6093,7 +6137,9 @@ impl ResolveQuery {
             self.metrics
                 .observe_duration(ResolverMetric::QueryDuration, duration);
             match latency_cache_result {
-                Some(QueryEventCacheResult::Hit) => {
+                // A stale serve is latency-wise a hit: answered from cache
+                // memory, backend work deferred to the background refresh.
+                Some(QueryEventCacheResult::Hit) | Some(QueryEventCacheResult::Stale) => {
                     self.metrics
                         .observe_duration(ResolverMetric::CacheHitQueryDuration, duration);
                 }
@@ -6399,6 +6445,23 @@ fn backend_query_with_configured_udp_limit(
         opt.udp_payload_size = bounded_payload;
     }
     query
+}
+
+/// Whether any hop of a cache-hit chain is an expired entry admitted under
+/// RFC 8767 serve-stale. `now` must be the same timestamp the lookup itself
+/// ran with (`request.received_at`) — lookup, response assembly
+/// (`cache::assemble::write_rrset`), and this classification all share that
+/// one instant, so they can never disagree about staleness.
+fn chain_contains_stale(chain: &[(String, cache::RRsetEntry)], now: SystemTime) -> bool {
+    chain.iter().any(|(_, entry)| entry.expires_at <= now)
+}
+
+fn cache_hit_event_result(stale: bool) -> QueryEventCacheResult {
+    if stale {
+        QueryEventCacheResult::Stale
+    } else {
+        QueryEventCacheResult::Hit
+    }
 }
 
 fn cache_supported(query: &DecodedQuery) -> bool {
@@ -8713,6 +8776,11 @@ pub enum ResolverMetric {
     CacheStoreSkipped,
     CacheNegativeStore,
     CacheNegativeHit,
+    /// A cache hit whose response includes at least one expired entry
+    /// served under RFC 8767 serve-stale (`docs/knowledge/resolver/caching/`).
+    /// Incremented *in addition to* `CacheHit`, mirroring how
+    /// `CacheNegativeHit` subdivides hits rather than replacing them.
+    CacheStaleHit,
     CacheResponseTruncated,
     CacheCoalescedMiss,
     QueryEventAccepted,
@@ -8960,6 +9028,29 @@ mod tests {
     }
 
     struct FixedClock(SystemTime);
+
+    /// A test clock whose `now` can be advanced mid-test — needed by the
+    /// serve-stale end-to-end test, where `process_refresh_job`'s
+    /// eligibility recheck runs against the *clock's* now (as production
+    /// does), which must agree with the synthetic request timestamps that
+    /// made the entry stale in the first place.
+    struct SettableClock(Mutex<SystemTime>);
+
+    impl SettableClock {
+        fn new(start: SystemTime) -> Self {
+            Self(Mutex::new(start))
+        }
+
+        fn set(&self, now: SystemTime) {
+            *self.0.lock().unwrap() = now;
+        }
+    }
+
+    impl Clock for SettableClock {
+        fn now(&self) -> SystemTime {
+            *self.0.lock().unwrap()
+        }
+    }
 
     impl Clock for FixedClock {
         fn now(&self) -> SystemTime {
@@ -14038,6 +14129,7 @@ mod tests {
             Arc::new(ShardedDnsCache::new(&CacheConfig {
                 max_entries: 10,
                 shard_count: Some(1),
+                ..CacheConfig::default()
             })),
             CacheTtlPolicy::default(),
             BackendSnapshot::new(
@@ -14122,6 +14214,7 @@ mod tests {
             Arc::new(ShardedDnsCache::new(&CacheConfig {
                 max_entries: 10,
                 shard_count: Some(1),
+                ..CacheConfig::default()
             })),
             CacheTtlPolicy::default(),
             BackendSnapshot::new(
@@ -14994,6 +15087,47 @@ mod tests {
         assert_eq!(
             policy.ttl_for_response(&low).unwrap().0,
             Duration::from_secs(20)
+        );
+    }
+
+    /// A configured `min_positive_ttl` floor must not lift an origin TTL of
+    /// exactly 0 (RFC 1035 §3.2.1: "this transaction only") into a cacheable
+    /// lifetime — flooring it would keep transaction-only data servable
+    /// until the floor expired and would sidestep the serve-stale TTL-0
+    /// eviction guard, which only inspects entries after expiry (PR #142
+    /// review finding).
+    #[test]
+    fn ttl_policy_floor_does_not_lift_zero_origin_ttl() {
+        let policy = CacheTtlPolicy::new(
+            Duration::from_secs(3600),
+            Some(Duration::from_secs(120)),
+            Duration::from_secs(3600),
+            Some(Duration::from_secs(120)),
+            None,
+        );
+
+        let zero_positive = response_message(
+            ResponseCode::NoError,
+            vec![a_record("example.com", 0)],
+            Vec::new(),
+        );
+        assert_eq!(
+            policy.ttl_for_response(&zero_positive).unwrap().0,
+            Duration::ZERO,
+            "a TTL-0 answer must stay uncacheable despite the floor"
+        );
+
+        // Same rule for the negative floor: a SOA-minimum of 0 (RFC 2308
+        // §5) means "do not negatively cache", floor or no floor.
+        let zero_negative = response_message(
+            ResponseCode::NxDomain,
+            Vec::new(),
+            vec![soa_record("example.com", 0, 0)],
+        );
+        assert_eq!(
+            policy.ttl_for_response(&zero_negative).unwrap().0,
+            Duration::ZERO,
+            "a SOA-minimum-0 negative answer must stay uncacheable despite the floor"
         );
     }
 
@@ -17338,6 +17472,7 @@ mod tests {
         let cache = Arc::new(ShardedDnsCache::new(&CacheConfig {
             max_entries: 16,
             shard_count: Some(1),
+            ..CacheConfig::default()
         }));
         let now = SystemTime::UNIX_EPOCH;
         let domain = "example.com";
@@ -17407,6 +17542,7 @@ mod tests {
         let cache = Arc::new(ShardedDnsCache::new(&CacheConfig {
             max_entries: 16,
             shard_count: Some(1),
+            ..CacheConfig::default()
         }));
         let now = SystemTime::UNIX_EPOCH;
         let domain = "example.com";
@@ -17464,6 +17600,7 @@ mod tests {
         let cache = Arc::new(ShardedDnsCache::new(&CacheConfig {
             max_entries: 16,
             shard_count: Some(1),
+            ..CacheConfig::default()
         }));
         let now = SystemTime::UNIX_EPOCH;
         let domain = "example.com";
@@ -17498,6 +17635,7 @@ mod tests {
         let cache = Arc::new(ShardedDnsCache::new(&CacheConfig {
             max_entries: 16,
             shard_count: Some(1),
+            ..CacheConfig::default()
         }));
         let upstream = Arc::new(StaticUpstream::new(Ok(upstream_response(
             a_response_with_answer(0x1111, "example.com", 60),
@@ -17559,6 +17697,7 @@ mod tests {
         let cache = Arc::new(ShardedDnsCache::new(&CacheConfig {
             max_entries: 16,
             shard_count: Some(1),
+            ..CacheConfig::default()
         }));
         let now = SystemTime::UNIX_EPOCH;
         let domain = "example.com";
@@ -17613,6 +17752,7 @@ mod tests {
         let cache = Arc::new(ShardedDnsCache::new(&CacheConfig {
             max_entries: 16,
             shard_count: Some(1),
+            ..CacheConfig::default()
         }));
         let now = SystemTime::UNIX_EPOCH;
         let domain = "example.com";
@@ -17657,6 +17797,7 @@ mod tests {
         let cache = Arc::new(ShardedDnsCache::new(&CacheConfig {
             max_entries: 16,
             shard_count: Some(1),
+            ..CacheConfig::default()
         }));
         let now = SystemTime::UNIX_EPOCH;
         let domain = "example.com";
@@ -17730,6 +17871,7 @@ mod tests {
         let cache = Arc::new(ShardedDnsCache::new(&CacheConfig {
             max_entries: 16,
             shard_count: Some(1),
+            ..CacheConfig::default()
         }));
         let now = SystemTime::UNIX_EPOCH;
         let domain = "example.com";
@@ -17819,6 +17961,7 @@ mod tests {
         let refresh_cache = Arc::new(ShardedDnsCache::new(&CacheConfig {
             max_entries: 16,
             shard_count: Some(1),
+            ..CacheConfig::default()
         }));
         let mut entry = seed_rrset_entry(&a_record(domain, 300), Duration::from_secs(300), now, 0);
         entry.expires_at = now + Duration::from_secs(300);
@@ -17865,6 +18008,7 @@ mod tests {
         let normal_cache = Arc::new(ShardedDnsCache::new(&CacheConfig {
             max_entries: 16,
             shard_count: Some(1),
+            ..CacheConfig::default()
         }));
         let normal_upstream = Arc::new(StaticUpstream::new(Ok(upstream_response(response_bytes))));
         let normal_service = resolve_service_with_cache(
@@ -17950,6 +18094,7 @@ mod tests {
         let cache = Arc::new(ShardedDnsCache::new(&CacheConfig {
             max_entries: 16,
             shard_count: Some(1),
+            ..CacheConfig::default()
         }));
         let domain = "hot.example.com";
         let upstream = Arc::new(StaticUpstream::new(Ok(upstream_response(
@@ -18028,6 +18173,7 @@ mod tests {
         let cache = Arc::new(ShardedDnsCache::new(&CacheConfig {
             max_entries: 16,
             shard_count: Some(1),
+            ..CacheConfig::default()
         }));
         let domain = "cooling.example.com";
         let upstream = Arc::new(StaticUpstream::new(Ok(upstream_response(
@@ -18092,6 +18238,7 @@ mod tests {
         let cache = Arc::new(ShardedDnsCache::new(&CacheConfig {
             max_entries: 16,
             shard_count: Some(1),
+            ..CacheConfig::default()
         }));
         let domain = "disabled.example.com";
         let upstream = Arc::new(StaticUpstream::new(Ok(upstream_response(
@@ -18145,6 +18292,7 @@ mod tests {
         let cache = Arc::new(ShardedDnsCache::new(&CacheConfig {
             max_entries: 16,
             shard_count: Some(1),
+            ..CacheConfig::default()
         }));
         let now = SystemTime::UNIX_EPOCH;
         let epoch = 0u64;
@@ -18417,6 +18565,7 @@ mod tests {
         let cache = Arc::new(ShardedDnsCache::new(&CacheConfig {
             max_entries: 16,
             shard_count: Some(1),
+            ..CacheConfig::default()
         }));
         let epoch = 0u64;
         let now = SystemTime::UNIX_EPOCH;
@@ -18480,6 +18629,7 @@ mod tests {
         let cache = Arc::new(ShardedDnsCache::new(&CacheConfig {
             max_entries: 16,
             shard_count: Some(1),
+            ..CacheConfig::default()
         }));
         let epoch = 0u64;
         let now = SystemTime::UNIX_EPOCH;
@@ -18519,6 +18669,7 @@ mod tests {
         let cache = Arc::new(ShardedDnsCache::new(&CacheConfig {
             max_entries: 16,
             shard_count: Some(1),
+            ..CacheConfig::default()
         }));
         let epoch = 0u64;
         let now = SystemTime::UNIX_EPOCH;
@@ -18558,6 +18709,7 @@ mod tests {
         let cache = Arc::new(ShardedDnsCache::new(&CacheConfig {
             max_entries: 16,
             shard_count: Some(1),
+            ..CacheConfig::default()
         }));
         let epoch = 0u64;
         let now = SystemTime::UNIX_EPOCH;
@@ -18600,6 +18752,7 @@ mod tests {
         let cache = Arc::new(ShardedDnsCache::new(&CacheConfig {
             max_entries: 16,
             shard_count: Some(1),
+            ..CacheConfig::default()
         }));
         let epoch = 0u64;
         let now = SystemTime::UNIX_EPOCH;
@@ -18921,6 +19074,7 @@ mod tests {
         let cache = Arc::new(ShardedDnsCache::new(&CacheConfig {
             max_entries: 16,
             shard_count: Some(1),
+            ..CacheConfig::default()
         }));
         let domain = "blocked.example.com";
         let follower_ip: IpAddr = "192.0.2.11".parse().unwrap();
@@ -19004,9 +19158,14 @@ mod tests {
 
     #[tokio::test]
     async fn resolve_treats_expired_cache_backend_hit_as_miss() {
+        // Serve-stale off: pins the original expired-means-miss behavior.
+        // The serve-stale-on counterpart is
+        // `resolve_serves_stale_hit_then_background_refresh_restores_freshness`.
         let cache = Arc::new(ShardedDnsCache::new(&CacheConfig {
             max_entries: 16,
             shard_count: Some(1),
+            serve_stale_enabled: false,
+            ..CacheConfig::default()
         }));
         let epoch = 0u64;
         let stored_at = SystemTime::UNIX_EPOCH;
@@ -19042,11 +19201,123 @@ mod tests {
         assert_eq!(metrics.count(ResolverMetric::CacheStore), 1);
     }
 
+    /// Full RFC 8767 serve-stale cycle under the default (serve-stale-on)
+    /// config: a query for an expired-but-in-window entry is answered
+    /// immediately from cache with the 30s stale wire TTL and enqueues a
+    /// refresh job; processing that job refetches and re-stores; the next
+    /// query is an ordinary live hit serving aged origin TTL again.
+    #[tokio::test]
+    async fn resolve_serves_stale_hit_then_background_refresh_restores_freshness() {
+        clear_test_job_handler();
+        let cache = Arc::new(ShardedDnsCache::new(&CacheConfig {
+            max_entries: 16,
+            shard_count: Some(1),
+            ..CacheConfig::default()
+        }));
+        let domain = "stale-e2e.example.com";
+        let upstream = Arc::new(StaticUpstream::new(Ok(upstream_response(
+            a_response_with_answer(0x4444, domain, 60),
+        ))));
+        let metrics = Arc::new(RecordingMetrics::default());
+        let t0 = SystemTime::UNIX_EPOCH;
+        let clock = Arc::new(SettableClock::new(t0));
+        let (sender, mut receiver) = mpsc::channel(4);
+        let service = Arc::new(
+            ResolveQuery::with_cache(
+                Arc::new(StandardProtocolCodec::new(1232)),
+                Arc::clone(&cache) as Arc<dyn DomainDnsCache>,
+                CacheTtlPolicy::default(),
+                upstream.clone(),
+                Arc::new(BasicResponseFactory),
+                Arc::clone(&clock) as Arc<dyn Clock>,
+                Arc::new(RecordingEvents::default()),
+                metrics.clone(),
+            )
+            .with_refresh_sender(sender),
+        );
+
+        // t0: genuine miss populates the cache (origin TTL 60 ⇒ expires
+        // at t0+60).
+        let first = service
+            .resolve(ResolveRequest::new(
+                "192.0.2.10".parse().unwrap(),
+                t0,
+                a_query(0x4444, domain),
+            ))
+            .await;
+        assert_eq!(first.decision.kind, ResolveDecisionKind::Allowed);
+        assert_eq!(upstream.requests.lock().unwrap().len(), 1);
+
+        // t0+61: entry expired 1s ago, well inside the default 1-day stale
+        // window — served as a hit, stale wire TTL, refresh job enqueued,
+        // and no inline backend round trip.
+        let t_stale = t0 + Duration::from_secs(61);
+        clock.set(t_stale);
+        let second = service
+            .resolve(ResolveRequest::new(
+                "192.0.2.11".parse().unwrap(),
+                t_stale,
+                a_query(0x5555, domain),
+            ))
+            .await;
+        assert_eq!(second.decision.kind, ResolveDecisionKind::CacheHit);
+        let parsed = Message::parse(&second.response_bytes).unwrap();
+        assert_eq!(
+            parsed.answers[0].ttl,
+            cache::STALE_WIRE_TTL_SECS,
+            "stale records must serve the RFC 8767 fixed stale TTL"
+        );
+        assert_eq!(metrics.count(ResolverMetric::CacheHit), 1);
+        assert_eq!(metrics.count(ResolverMetric::CacheStaleHit), 1);
+        assert_eq!(
+            metrics.count(ResolverMetric::CacheMiss),
+            1,
+            "only the initial population was a miss — the stale serve must not count as one"
+        );
+        assert_eq!(metrics.count(ResolverMetric::RefreshTriggered), 1);
+        assert_eq!(
+            upstream.requests.lock().unwrap().len(),
+            1,
+            "a stale serve must never pay an inline backend round trip"
+        );
+
+        // Drive the enqueued refresh to completion, exactly as a worker
+        // would — the job's eligibility recheck must accept the stale
+        // entry (its refresh signal is unconditional) and re-store.
+        let job = receiver
+            .try_recv()
+            .expect("a stale serve must enqueue a refresh job");
+        process_refresh_job(Arc::clone(&service), job).await;
+        assert_eq!(upstream.requests.lock().unwrap().len(), 2);
+        assert_eq!(metrics.count(ResolverMetric::RefreshSucceeded), 1);
+
+        // t0+62: the refreshed entry serves as an ordinary live hit again,
+        // aged origin TTL (60 − 1), not the stale TTL.
+        let t_after = t0 + Duration::from_secs(62);
+        clock.set(t_after);
+        let third = service
+            .resolve(ResolveRequest::new(
+                "192.0.2.12".parse().unwrap(),
+                t_after,
+                a_query(0x6666, domain),
+            ))
+            .await;
+        assert_eq!(third.decision.kind, ResolveDecisionKind::CacheHit);
+        let parsed = Message::parse(&third.response_bytes).unwrap();
+        assert_eq!(parsed.answers[0].ttl, 59);
+        assert_eq!(
+            metrics.count(ResolverMetric::CacheStaleHit),
+            1,
+            "the post-refresh query is a fresh hit, not another stale serve"
+        );
+    }
+
     #[tokio::test]
     async fn resolve_coalesces_duplicate_cache_misses() {
         let cache = Arc::new(ShardedDnsCache::new(&CacheConfig {
             max_entries: 16,
             shard_count: Some(1),
+            ..CacheConfig::default()
         }));
         let upstream = Arc::new(BlockingUpstream::new(Ok(upstream_response(
             a_response_with_answer(0xaaaa, "example.com", 60),
@@ -19127,6 +19398,7 @@ mod tests {
         let cache = Arc::new(ShardedDnsCache::new(&CacheConfig {
             max_entries: 16,
             shard_count: Some(1),
+            ..CacheConfig::default()
         }));
         let response = upstream_response(a_response_with_answer(0xaaaa, "example.com", 60));
         let upstream = Arc::new(BlockingUpstream::new(Ok(response)));
@@ -19203,6 +19475,7 @@ mod tests {
         let cache = Arc::new(ShardedDnsCache::new(&CacheConfig {
             max_entries: 16,
             shard_count: Some(1),
+            ..CacheConfig::default()
         }));
         let mut response = upstream_response(a_response_with_answer(0xaaaa, "example.com", 60));
         // Not cacheable, so the follower can't get a fresh cache-hit
@@ -19297,6 +19570,7 @@ mod tests {
         let cache = Arc::new(ShardedDnsCache::new(&CacheConfig {
             max_entries: 0,
             shard_count: Some(1),
+            ..CacheConfig::default()
         }));
         let question = QuestionKey::new("example.com", A_RECORD_TYPE, 1);
         let response_with_do = response_message_for_question(
@@ -19449,6 +19723,7 @@ mod tests {
         let cache = Arc::new(ShardedDnsCache::new(&CacheConfig {
             max_entries: 0,
             shard_count: Some(1),
+            ..CacheConfig::default()
         }));
         let question = QuestionKey::new("example.com", A_RECORD_TYPE, 1);
         let response_with_do = response_message_for_question(
@@ -19583,6 +19858,7 @@ mod tests {
         let cache = Arc::new(ShardedDnsCache::new(&CacheConfig {
             max_entries: 0,
             shard_count: Some(1),
+            ..CacheConfig::default()
         }));
         let question = QuestionKey::new("example.com", A_RECORD_TYPE, 1);
         // No DNSSEC-type records at all, so a DO=false filter pass is
@@ -19707,6 +19983,7 @@ mod tests {
         let cache = Arc::new(ShardedDnsCache::new(&CacheConfig {
             max_entries: 0,
             shard_count: Some(1),
+            ..CacheConfig::default()
         }));
         let question = QuestionKey::new("example.com", A_RECORD_TYPE, 1);
         let response = response_message_for_question(
@@ -19825,6 +20102,7 @@ mod tests {
         let cache = Arc::new(ShardedDnsCache::new(&CacheConfig {
             max_entries: 0,
             shard_count: Some(1),
+            ..CacheConfig::default()
         }));
         let question = QuestionKey::new("example.com", A_RECORD_TYPE, 1);
         let transport = Arc::new(ScriptedAuthorityTransport::new([Ok(
@@ -19886,6 +20164,7 @@ mod tests {
         let cache = Arc::new(ShardedDnsCache::new(&CacheConfig {
             max_entries: 0,
             shard_count: Some(1),
+            ..CacheConfig::default()
         }));
         let question = QuestionKey::new("example.com", A_RECORD_TYPE, 1);
         let response = response_message_for_question(
@@ -20089,6 +20368,7 @@ mod tests {
         let cache = Arc::new(ShardedDnsCache::new(&CacheConfig {
             max_entries: 0,
             shard_count: Some(1),
+            ..CacheConfig::default()
         }));
         let question = QuestionKey::new("example.com", A_RECORD_TYPE, 1);
         // 13 A records, no DNSSEC-type records at all (so a DO=false
@@ -20266,6 +20546,7 @@ mod tests {
         let cache = Arc::new(ShardedDnsCache::new(&CacheConfig {
             max_entries: 0,
             shard_count: Some(1),
+            ..CacheConfig::default()
         }));
         let question = QuestionKey::new("example.com", A_RECORD_TYPE, 1);
         // 13 A records, no DNSSEC-type records at all (so a DO=false
@@ -20577,6 +20858,7 @@ mod tests {
         let cache = Arc::new(ShardedDnsCache::new(&CacheConfig {
             max_entries: 16,
             shard_count: Some(1),
+            ..CacheConfig::default()
         }));
         let question = QuestionKey::new("example.com", A_RECORD_TYPE, 1);
         let response_without_do = response_message_for_question(
@@ -20726,6 +21008,7 @@ mod tests {
         let cache = Arc::new(ShardedDnsCache::new(&CacheConfig {
             max_entries: 16,
             shard_count: Some(1),
+            ..CacheConfig::default()
         }));
         let upstream = Arc::new(BlockingUpstream::new(Ok(upstream_response(
             a_response_with_answer(0xaaaa, "example.com", 60),
@@ -20808,6 +21091,7 @@ mod tests {
         let cache = Arc::new(ShardedDnsCache::new(&CacheConfig {
             max_entries: 16,
             shard_count: Some(1),
+            ..CacheConfig::default()
         }));
         let question = QuestionKey::new("example.com", A_RECORD_TYPE, 1);
         let response_with_rrsig = response_message_for_question(
@@ -20907,6 +21191,7 @@ mod tests {
         let cache = Arc::new(ShardedDnsCache::new(&CacheConfig {
             max_entries: 16,
             shard_count: Some(1),
+            ..CacheConfig::default()
         }));
         let alias = QuestionKey::new("alias.example.com", A_RECORD_TYPE, 1);
         let target = QuestionKey::new("target.example.com", A_RECORD_TYPE, 1);
@@ -20986,6 +21271,7 @@ mod tests {
         let cache = Arc::new(ShardedDnsCache::new(&CacheConfig {
             max_entries: 16,
             shard_count: Some(1),
+            ..CacheConfig::default()
         }));
         let question = QuestionKey::new("example.com", A_RECORD_TYPE, 1);
         let transport = Arc::new(ScriptedAuthorityTransport::new([Ok(
@@ -21049,6 +21335,7 @@ mod tests {
         let cache = Arc::new(ShardedDnsCache::new(&CacheConfig {
             max_entries: 16,
             shard_count: Some(1),
+            ..CacheConfig::default()
         }));
         let alias = QuestionKey::new("alias.example.com", DNSKEY_RECORD_TYPE, 1);
         let target = QuestionKey::new("target.example.com", DNSKEY_RECORD_TYPE, 1);
@@ -21116,6 +21403,7 @@ mod tests {
         let cache = Arc::new(ShardedDnsCache::new(&CacheConfig {
             max_entries: 16,
             shard_count: Some(1),
+            ..CacheConfig::default()
         }));
         let question = QuestionKey::new("example.com", A_RECORD_TYPE, 1);
         let response_message = response_message_for_question(
@@ -21164,6 +21452,7 @@ mod tests {
         let cache = Arc::new(ShardedDnsCache::new(&CacheConfig {
             max_entries: 16,
             shard_count: Some(1),
+            ..CacheConfig::default()
         }));
         let question = QuestionKey::new("alias.example", A_RECORD_TYPE, 1);
         let response_message = response_message_for_question(
@@ -21564,6 +21853,7 @@ mod tests {
             Arc::new(ShardedDnsCache::new(&CacheConfig {
                 max_entries: 16,
                 shard_count: Some(1),
+                ..CacheConfig::default()
             })),
             CacheTtlPolicy::default(),
             first_backend.clone(),
@@ -21627,6 +21917,7 @@ mod tests {
         let cache = Arc::new(ShardedDnsCache::new(&CacheConfig {
             max_entries: 16,
             shard_count: Some(1),
+            ..CacheConfig::default()
         }));
         let upstream = Arc::new(StaticUpstream::new(Ok(upstream_response(
             a_response_with_answer(0x1111, "example.com", 60),
@@ -22400,6 +22691,7 @@ mod tests {
         let cache = Arc::new(ShardedDnsCache::new(&CacheConfig {
             max_entries: 16,
             shard_count: Some(1),
+            ..CacheConfig::default()
         }));
         let upstream = Arc::new(StaticUpstream::new(Err(UpstreamError::Timeout)));
         let events = Arc::new(RecordingEvents::default());

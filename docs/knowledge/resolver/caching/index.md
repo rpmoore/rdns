@@ -10,3 +10,5 @@
   all, and what that means for reload invalidation.
 * [auto-refresh](auto-refresh.md) - Proactive cache refresh for popular domains nearing TTL expiry:
   popularity tracking, the trigger formula, and the background worker pool.
+* [serve-stale](serve-stale.md) - RFC 8767: expired-but-recently-cached positive answers served
+  immediately (30s wire TTL) with an unconditional background refresh.

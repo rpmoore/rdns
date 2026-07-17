@@ -137,6 +137,7 @@ fn concurrent_cache_access_across_shards_scales_with_thread_count() {
         let cache = Arc::new(ShardedDnsCache::new(&CacheConfig {
             max_entries: 100_000,
             shard_count: None,
+            ..CacheConfig::default()
         }));
         let operations_per_thread = total_operations / thread_count;
 

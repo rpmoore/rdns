@@ -231,6 +231,46 @@ impl ShardState {
         )
     }
 
+    /// `record_hit_and_check_refresh`, generalized over staleness: a live
+    /// hit runs the normal three-gate `wants_refresh` formula; a stale hit
+    /// still records the popularity hit (a stale serve is real client
+    /// demand) but wants a refresh *unconditionally* — stale data was just
+    /// served, so refetching is mandatory, not a popularity-gated
+    /// optimization (RFC 8767 §4: attempt to refresh whenever stale data
+    /// is served). Gated on `refresh_config.enabled` because the refresh
+    /// worker pool is the only machinery that can execute the refetch;
+    /// `RuntimeConfig::validate` rejects serve-stale without it, so this
+    /// gate is unreachable in a validated config and exists only to keep
+    /// directly-constructed (test) configs from signaling refreshes nobody
+    /// can service.
+    fn record_hit_and_check_refresh_maybe_stale(
+        &mut self,
+        domain: &str,
+        entry: &RRsetEntry,
+        stale: bool,
+        now: SystemTime,
+        refresh_config: &RefreshConfig,
+    ) -> bool {
+        if stale {
+            self.record_popularity_hit(
+                domain,
+                now,
+                refresh_config.enabled,
+                refresh_config.leak_rate,
+                refresh_config.hit_increment,
+                refresh_config.bucket_capacity,
+            );
+            return refresh_config.enabled;
+        }
+        self.record_hit_and_check_refresh(
+            domain,
+            entry.minimum_ttl,
+            entry.expires_at,
+            now,
+            refresh_config,
+        )
+    }
+
     /// Evicts the least-recently-touched domain, if any is tracked.
     fn evict_oldest(&mut self) {
         if let Some(oldest) = self.lru.peek_oldest() {
@@ -298,9 +338,12 @@ impl ShardState {
     /// `domain`/`key` in the positive map exactly once and, from that one
     /// borrow, decides in-place whether the candidate is expired (removing
     /// it via `remove_positive_entry` and returning `None`), live and
-    /// usable (cloning it out and returning `Some`), or neither (a
-    /// namespace mismatch or DO-incompleteness, left in place for other
-    /// requesters/namespaces — returning `None` without removing anything).
+    /// usable (cloning it out and returning `Some((entry, false))`),
+    /// expired-but-stale-servable (cloning it out and returning
+    /// `Some((entry, true))` — see `stale_servability` for exactly when),
+    /// or neither (a namespace mismatch or DO-incompleteness, left in
+    /// place for other requesters/namespaces — returning `None` without
+    /// removing anything).
     /// Replaces the previous two-probe shape (an `is_some_and` expiry
     /// precheck followed by a second, independent `.filter(..).cloned()`
     /// lookup) that double-locked-and-hashed the common cache-hit path just
@@ -312,7 +355,8 @@ impl ShardState {
         dnssec_ok: bool,
         current_epoch: u64,
         now: SystemTime,
-    ) -> Option<RRsetEntry> {
+        stale_window: Option<Duration>,
+    ) -> Option<(RRsetEntry, bool)> {
         let expired = match self
             .positive
             .domains
@@ -320,10 +364,16 @@ impl ShardState {
             .and_then(|record_sets| record_sets.record_sets.get(&key))
         {
             None => return None,
-            Some(entry) if entry.expires_at <= now => true,
+            Some(entry) if entry.expires_at <= now => {
+                match stale_servability(entry, dnssec_ok, current_epoch, now, stale_window) {
+                    StaleServability::Servable => return Some((entry.clone(), true)),
+                    StaleServability::KeepButMiss => return None,
+                    StaleServability::Evict => true,
+                }
+            }
             Some(entry) => {
                 if entry.cache_epoch == current_epoch && (!dnssec_ok || entry.dnssec_complete) {
-                    return Some(entry.clone());
+                    return Some((entry.clone(), false));
                 }
                 false
             }
@@ -335,11 +385,18 @@ impl ShardState {
     }
 
     /// `take_live_positive`'s sibling for the CNAME-hop candidate: same
-    /// single-probe expired/live/absent decision, plus extracting the
-    /// CNAME's target name from the live entry's records. A live entry
+    /// single-probe expired/live/stale/absent decision, plus extracting the
+    /// CNAME's target name from the entry's records. A *live* entry
     /// whose records don't actually contain a CNAME (unexpected/corrupt
     /// data) is treated as absent for this call — same as before — without
     /// being removed, since only genuine TTL expiry warrants removal here.
+    /// An *expired* (stale-servable) entry with no extractable CNAME is
+    /// evicted instead: it already satisfies the one removal criterion (TTL
+    /// expiry), and serving it stale — the only thing that justified keeping
+    /// an expired entry — is impossible without a target, so leaving it
+    /// would park unusable expired data in the shard until the stale window
+    /// ran out, where the pre-serve-stale code cleaned it up on first read
+    /// (PR #142 review finding).
     fn take_live_cname_hop(
         &mut self,
         domain: &str,
@@ -347,7 +404,14 @@ impl ShardState {
         dnssec_ok: bool,
         current_epoch: u64,
         now: SystemTime,
-    ) -> Option<(RRsetEntry, String)> {
+        stale_window: Option<Duration>,
+    ) -> Option<(RRsetEntry, String, bool)> {
+        let cname_target = |entry: &RRsetEntry| {
+            entry.records.iter().find_map(|record| match &record.rdata {
+                RecordData::CNAME(target) => Some(target.clone()),
+                _ => None,
+            })
+        };
         let expired = match self
             .positive
             .domains
@@ -355,16 +419,24 @@ impl ShardState {
             .and_then(|record_sets| record_sets.record_sets.get(&key))
         {
             None => return None,
-            Some(entry) if entry.expires_at <= now => true,
+            Some(entry) if entry.expires_at <= now => {
+                match stale_servability(entry, dnssec_ok, current_epoch, now, stale_window) {
+                    StaleServability::Servable => match cname_target(entry) {
+                        Some(target) => return Some((entry.clone(), target, true)),
+                        // Admitted as stale-servable but nothing to serve:
+                        // expired + unusable ⇒ evict (see doc comment).
+                        None => true,
+                    },
+                    StaleServability::KeepButMiss => return None,
+                    StaleServability::Evict => true,
+                }
+            }
             Some(entry) => {
-                if entry.cache_epoch == current_epoch && (!dnssec_ok || entry.dnssec_complete) {
-                    let target = entry.records.iter().find_map(|record| match &record.rdata {
-                        RecordData::CNAME(target) => Some(target.clone()),
-                        _ => None,
-                    });
-                    if let Some(target) = target {
-                        return Some((entry.clone(), target));
-                    }
+                if entry.cache_epoch == current_epoch
+                    && (!dnssec_ok || entry.dnssec_complete)
+                    && let Some(target) = cname_target(entry)
+                {
+                    return Some((entry.clone(), target, false));
                 }
                 false
             }
@@ -411,6 +483,79 @@ impl ShardState {
         }
         None
     }
+}
+
+/// What to do with a positive entry found *expired* (`expires_at <= now`)
+/// during a lookup, under RFC 8767 serve-stale. Only TTL expiry routes
+/// through this — live entries never reach it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StaleServability {
+    /// Within the stale window and admissible for *this* reader: serve it
+    /// (with the stale wire TTL, `cache::assemble::STALE_WIRE_TTL_SECS`)
+    /// and signal an unconditional background refresh.
+    Servable,
+    /// Within the stale window but not admissible for this reader (a
+    /// DO=true reader vs. `dnssec_complete == false`): a miss for this
+    /// caller, but the entry stays — a DO=false reader can still be
+    /// stale-served from it.
+    KeepButMiss,
+    /// Not stale-servable by anyone — serve-stale disabled, beyond the
+    /// window, stamped with a stale epoch, or carrying any record whose
+    /// *origin* TTL (`StoredRecord::ttl_at_store`) was 0 (RFC 1035: TTL 0
+    /// means "this transaction only", so it must never outlive its expiry,
+    /// let alone be served stale — checked per record, since a
+    /// `min_positive_ttl` floor makes the entry-level `minimum_ttl` nonzero
+    /// even for such records). Evict at read time, exactly as every
+    /// expired entry was before serve-stale existed.
+    Evict,
+}
+
+/// Decides `StaleServability` for one expired positive entry. Epoch
+/// equality is required even for stale service: an epoch mismatch means
+/// resolution-affecting config changed since this was stored, and RFC 8767
+/// staleness is about *time*, never about serving answers a config change
+/// already invalidated. `checked_add` guards the window arithmetic — an
+/// overflowing `expires_at + window` (corrupt clock territory) fails
+/// closed to `Evict` rather than panicking.
+fn stale_servability(
+    entry: &RRsetEntry,
+    dnssec_ok: bool,
+    current_epoch: u64,
+    now: SystemTime,
+    stale_window: Option<Duration>,
+) -> StaleServability {
+    let Some(window) = stale_window else {
+        return StaleServability::Evict;
+    };
+    if entry.cache_epoch != current_epoch {
+        return StaleServability::Evict;
+    }
+    // The TTL-0 exclusion checks each stored record's own origin TTL
+    // (`ttl_at_store`), not `entry.minimum_ttl`: with a configured
+    // `min_positive_ttl` floor, `minimum_ttl` is the policy-bounded cache
+    // lifetime, which the floor makes nonzero even for a record the origin
+    // published with TTL 0 — exactly the record RFC 1035 says must not
+    // outlive its transaction. RRSIGs are included since a DO=true stale
+    // serve would put them on the wire too.
+    let has_zero_origin_ttl = entry
+        .records
+        .iter()
+        .chain(entry.rrsigs.iter())
+        .any(|record| record.ttl_at_store == 0);
+    if has_zero_origin_ttl {
+        return StaleServability::Evict;
+    }
+    let within_window = entry
+        .expires_at
+        .checked_add(window)
+        .is_some_and(|stale_until| now < stale_until);
+    if !within_window {
+        return StaleServability::Evict;
+    }
+    if dnssec_ok && !entry.dnssec_complete {
+        return StaleServability::KeepButMiss;
+    }
+    StaleServability::Servable
 }
 
 /// Pure trigger-formula check — see
@@ -473,13 +618,25 @@ pub(crate) fn wants_refresh(
 pub(crate) struct Shard {
     state: Mutex<ShardState>,
     capacity: usize,
+    /// RFC 8767 serve-stale window: how long past `expires_at` a positive
+    /// entry remains servable (with a background refresh) instead of being
+    /// evicted at read time. `None` disables serve-stale entirely,
+    /// restoring the original expired-means-evict lookup behavior. Fixed at
+    /// construction from `CacheConfig` (`serve_stale_enabled`/`max_stale`)
+    /// — startup-only, like shard count and capacity.
+    stale_window: Option<Duration>,
 }
 
 impl Shard {
     pub(crate) fn new(capacity: usize) -> Self {
+        Self::with_stale_window(capacity, None)
+    }
+
+    pub(crate) fn with_stale_window(capacity: usize, stale_window: Option<Duration>) -> Self {
         Self {
             state: Mutex::new(ShardState::default()),
             capacity,
+            stale_window,
         }
     }
 
@@ -621,14 +778,19 @@ impl Shard {
         // (expired candidates are removed from `state` from inside that
         // same call), rather than a separate expiry precheck followed by a
         // second, independent lookup for the live/filtered case.
-        if let Some(entry) =
-            state.take_live_positive(domain, answer_key, dnssec_ok, current_epoch, now)
-        {
+        if let Some((entry, stale)) = state.take_live_positive(
+            domain,
+            answer_key,
+            dnssec_ok,
+            current_epoch,
+            now,
+            self.stale_window,
+        ) {
             state.lru.touch(domain);
-            let refresh_wanted = state.record_hit_and_check_refresh(
+            let refresh_wanted = state.record_hit_and_check_refresh_maybe_stale(
                 domain,
-                entry.minimum_ttl,
-                entry.expires_at,
+                &entry,
+                stale,
                 now,
                 refresh_config,
             );
@@ -637,14 +799,19 @@ impl Shard {
 
         if qtype != CNAME_RECORD_TYPE {
             let cname_key = (CNAME_RECORD_TYPE, qclass);
-            if let Some((entry, target)) =
-                state.take_live_cname_hop(domain, cname_key, dnssec_ok, current_epoch, now)
-            {
+            if let Some((entry, target, stale)) = state.take_live_cname_hop(
+                domain,
+                cname_key,
+                dnssec_ok,
+                current_epoch,
+                now,
+                self.stale_window,
+            ) {
                 state.lru.touch(domain);
-                let refresh_wanted = state.record_hit_and_check_refresh(
+                let refresh_wanted = state.record_hit_and_check_refresh_maybe_stale(
                     domain,
-                    entry.minimum_ttl,
-                    entry.expires_at,
+                    &entry,
+                    stale,
                     now,
                     refresh_config,
                 );
@@ -1768,6 +1935,285 @@ mod tests {
         assert_eq!(bucket.level(), 10 - 3 + 1);
     }
 
+    // RFC 8767 serve-stale tests: expired-but-in-window positive entries
+    // are served (with an unconditional refresh signal) instead of being
+    // evicted at read time; everything outside `stale_servability`'s
+    // Servable arm behaves exactly as before serve-stale existed.
+
+    const STALE_TEST_WINDOW: Duration = Duration::from_secs(3600);
+
+    fn stale_shard() -> Shard {
+        Shard::with_stale_window(4, Some(STALE_TEST_WINDOW))
+    }
+
+    #[test]
+    fn lookup_hop_serves_stale_positive_within_window_with_unconditional_refresh() {
+        let shard = stale_shard();
+        let domain = "stale.example.com";
+        let now = SystemTime::now();
+        shard.store_positive(domain, (A_QTYPE, IN_QCLASS), expired_rrset_entry(now));
+
+        let result = shard.lookup_hop(
+            domain,
+            A_QTYPE,
+            IN_QCLASS,
+            false,
+            1,
+            now,
+            &test_refresh_config(),
+        );
+
+        // The domain has no popularity history at all — a stale serve must
+        // still want a refresh, since the popularity gate only applies to
+        // pre-expiry prefetch, never to just-served stale data.
+        assert!(
+            matches!(result, HopResult::Answer(_, true)),
+            "expected stale Answer with unconditional refresh, got {result:?}"
+        );
+        assert!(
+            shard.contains_positive(domain, (A_QTYPE, IN_QCLASS)),
+            "a stale-served entry must stay cached for the next reader"
+        );
+    }
+
+    #[test]
+    fn lookup_hop_evicts_expired_positive_beyond_stale_window() {
+        let shard = stale_shard();
+        let domain = "beyond.example.com";
+        let now = SystemTime::now();
+        let mut entry = rrset_entry();
+        entry.stored_at = now - STALE_TEST_WINDOW - Duration::from_secs(600);
+        entry.expires_at = now - STALE_TEST_WINDOW - Duration::from_secs(300);
+        shard.store_positive(domain, (A_QTYPE, IN_QCLASS), entry);
+
+        let result = shard.lookup_hop(
+            domain,
+            A_QTYPE,
+            IN_QCLASS,
+            false,
+            1,
+            now,
+            &test_refresh_config(),
+        );
+
+        assert!(matches!(result, HopResult::Miss));
+        assert!(!shard.contains_positive(domain, (A_QTYPE, IN_QCLASS)));
+    }
+
+    #[test]
+    fn lookup_hop_evicts_stale_entry_with_mismatched_epoch() {
+        // Staleness is about time, not config identity: an entry stamped
+        // with an old epoch is invalid for every reader regardless of the
+        // window, and eviction at read time matches the pre-serve-stale
+        // expired path.
+        let shard = stale_shard();
+        let domain = "old-epoch.example.com";
+        let now = SystemTime::now();
+        shard.store_positive(domain, (A_QTYPE, IN_QCLASS), expired_rrset_entry(now));
+
+        let result = shard.lookup_hop(
+            domain,
+            A_QTYPE,
+            IN_QCLASS,
+            false,
+            2, // entries above were stored with cache_epoch 1
+            now,
+            &test_refresh_config(),
+        );
+
+        assert!(matches!(result, HopResult::Miss));
+        assert!(!shard.contains_positive(domain, (A_QTYPE, IN_QCLASS)));
+    }
+
+    #[test]
+    fn lookup_hop_stale_do_true_reader_misses_but_entry_survives_for_do_false() {
+        let shard = stale_shard();
+        let domain = "stale-do.example.com";
+        let now = SystemTime::now();
+        let mut entry = expired_rrset_entry(now);
+        entry.dnssec_complete = false;
+        shard.store_positive(domain, (A_QTYPE, IN_QCLASS), entry);
+
+        let do_true = shard.lookup_hop(
+            domain,
+            A_QTYPE,
+            IN_QCLASS,
+            true,
+            1,
+            now,
+            &test_refresh_config(),
+        );
+        assert!(
+            matches!(do_true, HopResult::Miss),
+            "a DO=true reader must not be stale-served dnssec-incomplete data"
+        );
+        assert!(
+            shard.contains_positive(domain, (A_QTYPE, IN_QCLASS)),
+            "the DO filter is not grounds for eviction — a DO=false reader can still use this"
+        );
+
+        let do_false = shard.lookup_hop(
+            domain,
+            A_QTYPE,
+            IN_QCLASS,
+            false,
+            1,
+            now,
+            &test_refresh_config(),
+        );
+        assert!(matches!(do_false, HopResult::Answer(_, true)));
+    }
+
+    #[test]
+    fn lookup_hop_never_stale_serves_zero_origin_ttl_entry() {
+        // RFC 1035: TTL 0 means "use for this transaction only" — such a
+        // record must never outlive its expiry, stale window or not. The
+        // entry deliberately models a configured `min_positive_ttl` floor:
+        // `minimum_ttl` is the *policy-bounded* cache lifetime and is
+        // nonzero here, so only the per-record origin TTL
+        // (`ttl_at_store == 0`) can catch this — a guard on
+        // `minimum_ttl.is_zero()` would wrongly stale-serve it (PR #142
+        // review finding).
+        let shard = stale_shard();
+        let domain = "ttl-zero.example.com";
+        let now = SystemTime::now();
+        let mut entry = expired_rrset_entry(now);
+        entry.minimum_ttl = Duration::from_secs(60); // floored lifetime
+        for record in &mut entry.records {
+            record.ttl_at_store = 0; // origin published TTL 0
+        }
+        shard.store_positive(domain, (A_QTYPE, IN_QCLASS), entry);
+
+        let result = shard.lookup_hop(
+            domain,
+            A_QTYPE,
+            IN_QCLASS,
+            false,
+            1,
+            now,
+            &test_refresh_config(),
+        );
+
+        assert!(matches!(result, HopResult::Miss));
+        assert!(!shard.contains_positive(domain, (A_QTYPE, IN_QCLASS)));
+    }
+
+    #[test]
+    fn lookup_hop_serves_stale_cname_hop_within_window() {
+        let shard = stale_shard();
+        let domain = "stale-alias.example.com";
+        let now = SystemTime::now();
+        let mut entry = expired_rrset_entry(now);
+        entry.records = vec![StoredRecord {
+            rtype: CNAME_RECORD_TYPE,
+            rclass: IN_QCLASS,
+            ttl_at_store: 300,
+            rdata: RecordData::CNAME("target.example.com".to_string()),
+        }];
+        shard.store_positive(domain, (CNAME_RECORD_TYPE, IN_QCLASS), entry);
+
+        let result = shard.lookup_hop(
+            domain,
+            A_QTYPE,
+            IN_QCLASS,
+            false,
+            1,
+            now,
+            &test_refresh_config(),
+        );
+
+        match result {
+            HopResult::CnameHop(_, target, refresh_wanted) => {
+                assert_eq!(target, "target.example.com");
+                assert!(refresh_wanted, "stale CNAME hop must want a refresh");
+            }
+            other => panic!("expected stale CnameHop, got {other:?}"),
+        }
+    }
+
+    /// An expired CNAME-slot entry admitted as stale-servable but carrying
+    /// no extractable CNAME (corrupt/unexpected rdata) must be evicted at
+    /// read time, not left parked until the stale window ends — it is
+    /// expired (the one removal criterion) and cannot serve any stale
+    /// reader on this path (PR #142 review finding).
+    #[test]
+    fn lookup_hop_evicts_stale_cname_slot_entry_with_no_extractable_target() {
+        let shard = stale_shard();
+        let domain = "corrupt-alias.example.com";
+        let now = SystemTime::now();
+        let cname_key = (CNAME_RECORD_TYPE, IN_QCLASS);
+        // Stored under the CNAME key, but the records hold an A rdata —
+        // no target to extract.
+        shard.store_positive(domain, cname_key, expired_rrset_entry(now));
+
+        let result = shard.lookup_hop(
+            domain,
+            A_QTYPE,
+            IN_QCLASS,
+            false,
+            1,
+            now,
+            &test_refresh_config(),
+        );
+
+        assert!(matches!(result, HopResult::Miss));
+        assert!(
+            !shard.contains_positive(domain, cname_key),
+            "an expired, unservable CNAME-slot entry must be evicted, not parked for the window"
+        );
+    }
+
+    #[test]
+    fn lookup_hop_negative_entries_are_never_stale_served() {
+        // v1 scope: RFC 8767 §5 flags stale negative answers (especially
+        // NXDOMAIN) as the risky case, so expired negative entries keep the
+        // original evict-at-read behavior even inside the stale window.
+        let shard = stale_shard();
+        let domain = "stale-nx.example.com";
+        let now = SystemTime::now();
+        let key = NegativeKey {
+            qtype: None,
+            qclass: IN_QCLASS,
+        };
+        shard.store_negative(domain, key.clone(), expired_negative_entry(now));
+
+        let result = shard.lookup_hop(
+            domain,
+            A_QTYPE,
+            IN_QCLASS,
+            false,
+            1,
+            now,
+            &test_refresh_config(),
+        );
+
+        assert!(matches!(result, HopResult::Miss));
+        assert!(!shard.contains_negative(domain, &key));
+    }
+
+    #[test]
+    fn lookup_hop_with_stale_disabled_keeps_original_expired_eviction() {
+        // `Shard::new` (no window) must behave byte-for-byte like the
+        // pre-serve-stale code: expired ⇒ evict ⇒ miss.
+        let shard = Shard::new(4);
+        let domain = "no-stale.example.com";
+        let now = SystemTime::now();
+        shard.store_positive(domain, (A_QTYPE, IN_QCLASS), expired_rrset_entry(now));
+
+        let result = shard.lookup_hop(
+            domain,
+            A_QTYPE,
+            IN_QCLASS,
+            false,
+            1,
+            now,
+            &test_refresh_config(),
+        );
+
+        assert!(matches!(result, HopResult::Miss));
+        assert!(!shard.contains_positive(domain, (A_QTYPE, IN_QCLASS)));
+    }
+
     // Trigger-formula (`wants_refresh`) tests: section-03-trigger-formula.
 
     fn test_refresh_config() -> RefreshConfig {
@@ -1856,6 +2302,46 @@ mod tests {
             Some(&hot_bucket),
             &config
         ));
+    }
+
+    /// Pins the *shipped* `RefreshConfig::default()` gate (not the local
+    /// `test_refresh_config` fixture) to a realistic small-network access
+    /// pattern: a domain queried once every two minutes must become hot.
+    /// The original defaults (threshold 5 against a 1-per-minute leak)
+    /// required a sustained >1 query/min, which client-side stub caches
+    /// make nearly unreachable in practice — live counters showed exactly
+    /// one refresh ever triggered. This test fails if the defaults ever
+    /// regress to a gate that steady 1-per-2-min demand can't pass.
+    #[test]
+    fn shipped_defaults_let_a_two_minute_interval_domain_reach_hot() {
+        let config = RefreshConfig::default();
+        let hot_threshold =
+            (config.hot_threshold_fraction * config.bucket_capacity as f32).round() as u32;
+
+        let start = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000);
+        let mut bucket = PopularityBucket::new(start);
+        let mut hot_after = None;
+        for hit in 0..10u64 {
+            let now = start + Duration::from_secs(120 * hit);
+            bucket.drain_and_increment(
+                now,
+                config.leak_rate,
+                config.hit_increment,
+                config.bucket_capacity,
+            );
+            if bucket.is_hot(hot_threshold) {
+                hot_after = Some(hit + 1);
+                break;
+            }
+        }
+        let hot_after = hot_after.expect(
+            "a domain queried every 2 minutes should reach the hot threshold \
+             under the shipped defaults",
+        );
+        assert!(
+            hot_after <= 2,
+            "expected hot within 2 hits at a 2-minute interval, took {hot_after}"
+        );
     }
 
     #[test]

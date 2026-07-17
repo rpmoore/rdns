@@ -137,7 +137,7 @@ async fn main() -> io::Result<()> {
         Arc::clone(&cache) as Arc<dyn DomainDnsCache>,
         Arc::new(NoopPolicyEvaluator),
         local_entries,
-        CacheTtlPolicy::default(),
+        cache_ttl_policy_from_config(&config.cache),
         backend_snapshot,
         Arc::new(BasicResponseFactory),
         Arc::clone(&clock),
@@ -712,6 +712,25 @@ fn refresh_channel_capacity(refresh: &RefreshConfig) -> usize {
     }
 }
 
+/// The one place `[cache]`'s TTL-bound fields become the resolver's
+/// `CacheTtlPolicy`. Bounds are already validated (`CacheConfig::validate`,
+/// via `RuntimeConfig::validate`) before this runs.
+fn cache_ttl_policy_from_config(cache: &rdns::config::CacheConfig) -> CacheTtlPolicy {
+    CacheTtlPolicy::new(
+        cache.max_positive_ttl,
+        cache.min_positive_ttl,
+        cache.max_negative_ttl,
+        cache.min_negative_ttl,
+        // failure_ttl (opt-in ServFail caching) is deliberately not
+        // config-exposed: the sharded cache has no stored shape for a
+        // SERVFAIL (`ttl_for_response` classifies it with no negative
+        // metadata and no answers, so `decompose_response_for_store`
+        // produces nothing to store), making the knob inert today.
+        // Expose it only once a failure-entry store/lookup path exists.
+        None,
+    )
+}
+
 fn build_backend_snapshot(
     config: &RuntimeConfig,
     metrics: Arc<dyn MetricsSink>,
@@ -867,6 +886,7 @@ struct OpenTelemetryMetrics {
     cache_store_skipped_total: Counter<u64>,
     cache_negative_store_total: Counter<u64>,
     cache_negative_hit_total: Counter<u64>,
+    cache_stale_hit_total: Counter<u64>,
     cache_response_truncated_total: Counter<u64>,
     cache_coalesced_miss_total: Counter<u64>,
     query_event_accepted_total: Counter<u64>,
@@ -950,6 +970,7 @@ impl OpenTelemetryMetrics {
             cache_store_skipped_total: meter.u64_counter("cache_store_skipped_total").build(),
             cache_negative_store_total: meter.u64_counter("cache_negative_store_total").build(),
             cache_negative_hit_total: meter.u64_counter("cache_negative_hit_total").build(),
+            cache_stale_hit_total: meter.u64_counter("cache_stale_hit_total").build(),
             cache_response_truncated_total: meter
                 .u64_counter("cache_response_truncated_total")
                 .build(),
@@ -1037,6 +1058,7 @@ impl MetricsSink for OpenTelemetryMetrics {
             ResolverMetric::CacheStoreSkipped => self.cache_store_skipped_total.add(1, &[]),
             ResolverMetric::CacheNegativeStore => self.cache_negative_store_total.add(1, &[]),
             ResolverMetric::CacheNegativeHit => self.cache_negative_hit_total.add(1, &[]),
+            ResolverMetric::CacheStaleHit => self.cache_stale_hit_total.add(1, &[]),
             ResolverMetric::CacheResponseTruncated => {
                 self.cache_response_truncated_total.add(1, &[])
             }
@@ -1250,6 +1272,19 @@ mod tests {
         assert_eq!(refresh_channel_capacity(&refresh), 1);
     }
 
+    /// Pins `CacheConfig`'s TTL defaults to `CacheTtlPolicy::default()`:
+    /// the two are defined in different modules (`config` can't depend on
+    /// `resolver`'s type), so this is the one place drift between them
+    /// would surface. An operator who sets no `[cache]` TTL field must get
+    /// exactly the policy the resolver has always defaulted to.
+    #[test]
+    fn cache_config_default_ttls_match_cache_ttl_policy_default() {
+        assert_eq!(
+            cache_ttl_policy_from_config(&rdns::config::CacheConfig::default()),
+            CacheTtlPolicy::default()
+        );
+    }
+
     #[test]
     fn refresh_channel_capacity_uses_configured_value_when_enabled() {
         let refresh = RefreshConfig {
@@ -1273,6 +1308,7 @@ mod tests {
         let cache = Arc::new(ShardedDnsCache::new(&rdns::config::CacheConfig {
             max_entries: 16,
             shard_count: Some(1),
+            ..rdns::config::CacheConfig::default()
         }));
         let metrics = OpenTelemetryMetrics::new(Arc::clone(&cache)).expect("metrics exporter");
 
@@ -1299,6 +1335,7 @@ mod tests {
         let cache = Arc::new(ShardedDnsCache::new(&rdns::config::CacheConfig {
             max_entries: 16,
             shard_count: Some(1),
+            ..rdns::config::CacheConfig::default()
         }));
         let metrics = OpenTelemetryMetrics::new(Arc::clone(&cache)).expect("metrics exporter");
 

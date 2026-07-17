@@ -31,6 +31,8 @@ use crate::config::RefreshConfig;
 use shard::Shard;
 
 pub use assemble::ChainLookup;
+#[cfg(test)]
+pub(crate) use assemble::STALE_WIRE_TTL_SECS;
 pub(crate) use assemble::{
     RefreshHint, ResolvedAnswer, ResolvedNegative, assemble_negative_response, assemble_response,
 };
@@ -49,11 +51,16 @@ impl ShardedDnsCache {
     /// Builds one `Shard` per `config.resolved_shard_count()`, splitting
     /// `config.max_entries` across them via `config.shard_capacity` (the
     /// exact remainder-distributed formula from section-01 — not
-    /// recomputed here).
+    /// recomputed here). Each shard also carries the RFC 8767 serve-stale
+    /// window (`None` when `serve_stale_enabled` is off), fixed for the
+    /// process lifetime like the shard count itself.
     pub fn new(config: &crate::config::CacheConfig) -> Self {
+        let stale_window = config.serve_stale_enabled.then_some(config.max_stale);
         let shard_count = config.resolved_shard_count();
         let shards = (0..shard_count)
-            .map(|index| Shard::new(config.shard_capacity(index, shard_count)))
+            .map(|index| {
+                Shard::with_stale_window(config.shard_capacity(index, shard_count), stale_window)
+            })
             .collect();
         Self { shards }
     }
@@ -306,6 +313,7 @@ mod tests {
         let config = crate::config::CacheConfig {
             max_entries: 5,
             shard_count: Some(64),
+            ..crate::config::CacheConfig::default()
         };
         let cache = ShardedDnsCache::new(&config);
         assert_eq!(

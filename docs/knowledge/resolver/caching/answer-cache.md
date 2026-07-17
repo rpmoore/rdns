@@ -42,7 +42,7 @@ concurrency.
 | Field | Purpose |
 |---|---|
 | `records` / `soa_record` + proof records | The actual RRset or negative-cache proof material. |
-| `stored_at` / `expires_at` | TTL bookkeeping — `expires_at` is checked on every lookup and read-time expiry deletes the entry immediately (not just filters it out), see `Shard::lookup_hop`. |
+| `stored_at` / `expires_at` | TTL bookkeeping — `expires_at` is checked on every lookup; an expired entry is served stale (within the [serve-stale](serve-stale.md) window, positive entries only), kept-but-missed (in-window but DO-filtered for *this* reader — a DO=true reader vs. `dnssec_complete == false` misses while the entry stays for DO=false readers), or deleted immediately at read time (not just filtered out), see `Shard::lookup_hop`/`stale_servability`. |
 | `dnssec_state` | RFC 6840 §3.1 validation state; stays `Unvalidated` until real DNSSEC validation exists — orthogonal to everything else in this document. |
 | `dnssec_complete` | Whether this entry was populated by a fetch that actually requested DNSSEC material (DO=1). A DO=1 reader must never be served an entry where this is `false`, even if TTL-valid — see `Shard::lookup_hop`'s DO-aware filtering. |
 | `authoritative` | The backend response's own AA bit, replayed on a cache hit. |
@@ -91,6 +91,26 @@ than reused from a buffer-level `age_response_ttls`/`cap_response_ttls`
 helper. This edge case is covered by a regression test,
 `resolve_caps_terminal_record_ttl_to_chain_wide_ceiling_on_standalone_lookup`
 in `src/resolver/mod.rs:16380-16442` (see `docs/plans/ttl_remaining/` section 03).
+
+`CacheTtlPolicy`'s bounds are operator-configurable since the
+serve-stale/TTL-config change: `[cache] max_positive_ttl_secs`,
+`min_positive_ttl_secs`, `max_negative_ttl_secs`, `min_negative_ttl_secs`
+(`RawCacheConfig`, `src/config/mod.rs`; wired in `main.rs`,
+`cache_ttl_policy_from_config`). Ceilings are capped at 30 days
+(`MAX_CACHE_TTL_CEILING`) so a fat-fingered value can't overflow
+`stored_at + ttl` at store time; `failure_ttl` is deliberately *not*
+exposed — the sharded cache has no stored shape for a SERVFAIL, so the
+knob would be inert (see the comment in `cache_ttl_policy_from_config`).
+Every `[cache]` field is startup-only: a SIGHUP reload ignores changes
+here. Defaults are pinned to `CacheTtlPolicy::default()` by
+`cache_config_default_ttls_match_cache_ttl_policy_default` (`src/main.rs`).
+
+An origin TTL of exactly 0 is exempt from both floors
+(`apply_ttl_bounds`, `src/resolver/mod.rs`): RFC 1035 §3.2.1 / RFC 2308
+§5 define TTL 0 as "this transaction only", so a floor must not lift it
+into a cacheable lifetime — the entry stores already-expired and the
+first lookup evicts it (pinned by
+`ttl_policy_floor_does_not_lift_zero_origin_ttl`).
 
 Even when a `min_positive_ttl` floor extends an entry's actual cache
 lifetime (`expires_at`) well past what the record's own origin TTL

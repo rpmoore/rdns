@@ -75,8 +75,20 @@ changing what's actually served. All three gates must hold:
    config.min_lead)` (defaults 10% / 5s).
 3. **Popularity**: the domain's bucket, if present, is hot — `level >=
    hot_threshold`, where `hot_threshold = round(hot_threshold_fraction *
-   bucket_capacity)` (default 50% of capacity 10, i.e. 5). A missing bucket
-   is never hot.
+   bucket_capacity)` (default 20% of capacity 10, i.e. 2, against a default
+   leak of 1 per 5 minutes — two queries landing within ~5 minutes make a
+   domain hot; the original 5-of-10 threshold against a 1-per-minute leak
+   required a sustained >1 query/min, which client-side stub caches made
+   nearly unreachable, and live counters showed the trigger firing
+   approximately never — pinned by
+   `shipped_defaults_let_a_two_minute_interval_domain_reach_hot`,
+   `src/resolver/cache/shard.rs`). A missing bucket is never hot.
+
+Exception: a hop served under [serve-stale](serve-stale.md) signals a
+refresh *unconditionally*, bypassing all three gates
+(`ShardState::record_hit_and_check_refresh_maybe_stale`) — stale data was
+just served, so the refetch is mandatory, not a popularity-gated
+optimization.
 
 Callers pass the bucket *after* recording the current hit
 (`ShardState::record_hit_and_check_refresh`, `shard.rs:209-232`), so a
