@@ -42,15 +42,19 @@ Labeled (every emission has a real client request in scope):
 `QueryReceived`, `QueryAllowed`, `QueryBlocked`, `ProtocolError`,
 `RecursionRefused`, `CacheHit`, `CacheNegativeHit`, `CacheStaleHit`,
 `CacheResponseTruncated`, `CacheMiss`, `CacheBypass`,
-`CacheCoalescedMiss`, `UpstreamSuccess`, `UpstreamFailure`, and the
-duration histograms `QueryDuration`, `CacheHitQueryDuration`,
-`CacheMissQueryDuration` (emitted in `finish`,
+`CacheCoalescedMiss`, and the duration histograms `QueryDuration`,
+`CacheHitQueryDuration`, `CacheMissQueryDuration` (emitted in `finish`,
 `src/resolver/mod.rs:6143`). Cache-hit counters funnel through
 `record_cache_hit_metrics`, which takes the client IP as a parameter
 (`src/resolver/mod.rs:5407`).
 
 Unlabeled, deliberately:
 
+* `UpstreamSuccess` / `UpstreamFailure` — single-flight coalescing runs
+  one backend fetch for concurrent same-key misses, and only the
+  race-winning leader's request reaches the increment in
+  `prepare_backend_result`; labeling would attribute a shared fetch to
+  an arbitrary client (flagged by Codex review on PR #150).
 * `CacheStore` / `CacheNegativeStore` / `CacheStoreSkipped` —
   `store_cache_response` (`src/resolver/mod.rs:6073`) is shared with the
   auto-refresh worker, which calls it with a synthetic request whose
@@ -69,19 +73,30 @@ Unlabeled, deliberately:
 # The Prometheus sink
 
 `OpenTelemetryMetrics` in `src/main.rs` maps each `ResolverMetric` to
-its instrument via `counter_for`/`histogram_for` (`src/main.rs:1050`);
-the labeled variants attach `source_ip_attributes`
-(`src/main.rs:1125`), producing series like
+its instrument via `counter_for`/`histogram_for`; the labeled variants
+fetch their attribute set from `SourceIpLabels`, producing series like
 `query_received_total{source_ip="192.168.1.50"}`.
 
-# Cardinality caveat
+`SourceIpLabels` interns one `Arc`-backed attribute set per distinct
+client IP, so the hot path formats an IP once and every later emission
+is a refcount bump, not an allocation (per-request allocation concern
+from Codex review on PR #150).
 
-One time series per distinct client IP per labeled metric, and source
-addresses of UDP queries are spoofable — so exposure to untrusted /
-internet-scale client populations can grow the registry without bound.
-Accepted for rdns's target deployment (LAN-scale resolver with a known
-client population); revisit (hash, allowlist, or top-N the label) if
-that changes.
+# Cardinality bounds
+
+Two guards keep spoofable UDP source addresses from growing the
+registry without bound (Codex review, PR #150):
+
+* `[metrics].source_ip_labels = false` (`MetricsConfig`,
+  `src/config/mod.rs`) disables the label entirely — per-query
+  emissions fold into the unlabeled series. Default `true`.
+* `MAX_SOURCE_IP_SERIES` (1024, `src/main.rs`): once that many distinct
+  IPs are interned, further IPs share a single `source_ip="other"`
+  series and are never inserted into the cache.
+
+Operators exposing rdns beyond a bounded LAN client population should
+disable the label or accept the capped worst case (~1025 series per
+labeled family).
 
 # Tests
 
@@ -91,3 +106,8 @@ that changes.
 * `open_telemetry_source_variants_label_series_by_source_ip` (main.rs
   tests) — asserts the Prometheus registry splits series by `source_ip`
   for counters and histograms.
+* `source_ip_labels_cap_distinct_ips_and_reuse_interned_attributes` and
+  `source_ip_labels_disabled_emits_unlabeled_series` (main.rs tests) —
+  pin the cardinality cap/overflow behavior and the config off-switch.
+* `metrics_config_source_ip_labels_defaults_on_and_can_be_disabled`
+  (config tests) — pins the `[metrics].source_ip_labels` default.

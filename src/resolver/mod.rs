@@ -5597,8 +5597,13 @@ impl ResolveQuery {
             return self.backend_failure_response(request, decoded, question);
         };
 
-        self.metrics
-            .increment_with_source(ResolverMetric::UpstreamSuccess, request.client_ip);
+        // Deliberately unlabeled: with single-flight coalescing this
+        // increment only runs for whichever client's request ended up as
+        // the fetch leader (followers re-probe the cache and never reach
+        // here), so a `source_ip` label would attribute a shared backend
+        // fetch to an arbitrary race winner. `UpstreamFailure` in
+        // `backend_failure_response` stays unlabeled for the same reason.
+        self.metrics.increment(ResolverMetric::UpstreamSuccess);
         if let Some(block) = self.response_policy_block(request.client_ip, &response_message) {
             self.metrics
                 .increment_with_source(ResolverMetric::QueryBlocked, request.client_ip);
@@ -6056,8 +6061,7 @@ impl ResolveQuery {
         decoded: &DecodedQuery,
         question: QuestionKey,
     ) -> (ResolveDecision, Vec<u8>) {
-        self.metrics
-            .increment_with_source(ResolverMetric::UpstreamFailure, request.client_ip);
+        self.metrics.increment(ResolverMetric::UpstreamFailure);
         let decision = ResolveDecision {
             client_ip: request.client_ip,
             question: Some(question),
@@ -8932,10 +8936,12 @@ pub trait MetricsSink: Send + Sync {
     /// source IP, so sinks can label the metric by where the query came
     /// from. The resolver calls this (never plain `increment`) for every
     /// metric that is scoped to a single client query; metrics emitted
-    /// from background work (refresh workers, event-queue accounting,
-    /// recursion internals, cache stores shared with the refresh path)
-    /// stay on the unlabeled `increment` so each metric family is
-    /// consistently labeled or consistently not.
+    /// from background or shared work (refresh workers, event-queue
+    /// accounting, recursion internals, cache stores shared with the
+    /// refresh path, and upstream fetches — which single-flight
+    /// coalescing shares across clients) stay on the unlabeled
+    /// `increment` so each metric family is consistently labeled or
+    /// consistently not.
     ///
     /// Sinks that don't label by source keep this default, which discards
     /// the IP. Sinks that do should note the cardinality cost: one time
@@ -10795,11 +10801,7 @@ mod tests {
             .await;
 
         let source_increments = metrics.source_increments.lock().unwrap().clone();
-        for expected in [
-            ResolverMetric::QueryReceived,
-            ResolverMetric::CacheMiss,
-            ResolverMetric::UpstreamFailure,
-        ] {
+        for expected in [ResolverMetric::QueryReceived, ResolverMetric::CacheMiss] {
             assert!(
                 source_increments.contains(&(expected, client_ip)),
                 "{expected:?} should be recorded with the client source ip, got {source_increments:?}"
@@ -10811,6 +10813,16 @@ mod tests {
                 "{metric:?} was recorded with a source ip other than the requesting client's"
             );
         }
+        // Upstream fetch metrics stay unlabeled: single-flight coalescing
+        // shares one fetch across clients, so attributing it to a single
+        // source IP would be race-dependent.
+        assert_eq!(metrics.count(ResolverMetric::UpstreamFailure), 1);
+        assert!(
+            !source_increments
+                .iter()
+                .any(|(metric, _)| *metric == ResolverMetric::UpstreamFailure),
+            "UpstreamFailure must not carry a source ip label"
+        );
 
         let source_durations = metrics.source_durations.lock().unwrap().clone();
         for expected in [

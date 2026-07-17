@@ -12,11 +12,12 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::io;
 use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::RwLock;
 use std::time::{Duration, SystemTime};
 
 use opentelemetry::KeyValue;
@@ -108,7 +109,7 @@ async fn main() -> io::Result<()> {
     let (metrics, metrics_registry): (Arc<dyn MetricsSink>, Registry) = if !config.metrics.enabled {
         (Arc::new(NoopMetrics), Registry::new())
     } else {
-        match OpenTelemetryMetrics::new(Arc::clone(&cache)) {
+        match OpenTelemetryMetrics::new(Arc::clone(&cache), config.metrics.source_ip_labels) {
             Ok(m) => {
                 let registry = m.registry.clone();
                 (Arc::new(m), registry)
@@ -875,6 +876,7 @@ impl MetricsSink for NoopMetrics {
 struct OpenTelemetryMetrics {
     _provider: SdkMeterProvider,
     registry: Registry,
+    source_ip_labels: SourceIpLabels,
     query_received_total: Counter<u64>,
     query_allowed_total: Counter<u64>,
     query_blocked_total: Counter<u64>,
@@ -927,7 +929,7 @@ struct OpenTelemetryMetrics {
 }
 
 impl OpenTelemetryMetrics {
-    fn new(cache: Arc<ShardedDnsCache>) -> Result<Self, String> {
+    fn new(cache: Arc<ShardedDnsCache>, source_ip_labels: bool) -> Result<Self, String> {
         let registry = Registry::new();
         // Our counter instrument names already end in `_total` (chosen to read
         // correctly as Prometheus metric names directly); without this, the
@@ -959,6 +961,7 @@ impl OpenTelemetryMetrics {
         Ok(Self {
             _provider: provider,
             registry,
+            source_ip_labels: SourceIpLabels::new(source_ip_labels),
             query_received_total: meter.u64_counter("query_received_total").build(),
             query_allowed_total: meter.u64_counter("query_allowed_total").build(),
             query_blocked_total: meter.u64_counter("query_blocked_total").build(),
@@ -1117,13 +1120,60 @@ impl OpenTelemetryMetrics {
     }
 }
 
-/// The attribute set attached by the `*_with_source` sink methods: the
-/// requesting client's IP, so operators can see where queries originate.
-/// One time series per distinct client IP per metric — acceptable for the
-/// LAN-scale client populations rdns targets, but the reason the resolver
-/// only uses these methods for per-client-query metrics.
-fn source_ip_attributes(source_ip: IpAddr) -> [KeyValue; 1] {
-    [KeyValue::new("source_ip", source_ip.to_string())]
+/// How many distinct client IPs may get their own `source_ip`-labeled
+/// time series before further IPs collapse into the shared
+/// `source_ip="other"` series. UDP source addresses are spoofable, so
+/// without a cap a flood of forged sources could grow the metrics
+/// registry (and scrape size) without bound.
+const MAX_SOURCE_IP_SERIES: usize = 1024;
+
+const SOURCE_IP_OVERFLOW_VALUE: &str = "other";
+
+/// The `source_ip` attribute sets attached by the `*_with_source` sink
+/// methods, interned per client IP so the DNS hot path formats each IP
+/// once — every later emission reuses the cached `Arc`-backed `KeyValue`
+/// (a refcount bump, not an allocation). Interning doubles as the
+/// cardinality bound: once `MAX_SOURCE_IP_SERIES` distinct IPs are
+/// cached, further IPs share the `"other"` attribute set and are never
+/// inserted. `[metrics].source_ip_labels = false` disables labeling
+/// entirely, folding per-query emissions into the unlabeled series.
+struct SourceIpLabels {
+    enabled: bool,
+    interned: RwLock<HashMap<IpAddr, [KeyValue; 1]>>,
+    overflow: [KeyValue; 1],
+}
+
+impl SourceIpLabels {
+    fn new(enabled: bool) -> Self {
+        Self {
+            enabled,
+            interned: RwLock::new(HashMap::new()),
+            overflow: [KeyValue::new("source_ip", SOURCE_IP_OVERFLOW_VALUE)],
+        }
+    }
+
+    /// The attribute set for `source_ip`, or `None` when labeling is
+    /// disabled (callers emit unlabeled). Lock poisoning degrades to
+    /// unlabeled emission rather than panicking a query task.
+    fn attributes(&self, source_ip: IpAddr) -> Option<[KeyValue; 1]> {
+        if !self.enabled {
+            return None;
+        }
+        if let Some(attributes) = self.interned.read().ok()?.get(&source_ip) {
+            return Some(attributes.clone());
+        }
+        let mut interned = self.interned.write().ok()?;
+        if let Some(attributes) = interned.get(&source_ip) {
+            return Some(attributes.clone());
+        }
+        if interned.len() >= MAX_SOURCE_IP_SERIES {
+            return Some(self.overflow.clone());
+        }
+        let value: std::sync::Arc<str> = std::sync::Arc::from(source_ip.to_string());
+        let attributes = [KeyValue::new("source_ip", value)];
+        interned.insert(source_ip, attributes.clone());
+        Some(attributes)
+    }
 }
 
 impl MetricsSink for OpenTelemetryMetrics {
@@ -1141,7 +1191,10 @@ impl MetricsSink for OpenTelemetryMetrics {
 
     fn increment_with_source(&self, metric: ResolverMetric, source_ip: IpAddr) {
         if let Some(counter) = self.counter_for(metric) {
-            counter.add(1, &source_ip_attributes(source_ip));
+            match self.source_ip_labels.attributes(source_ip) {
+                Some(attributes) => counter.add(1, &attributes),
+                None => counter.add(1, &[]),
+            }
         }
     }
 
@@ -1152,7 +1205,10 @@ impl MetricsSink for OpenTelemetryMetrics {
         source_ip: IpAddr,
     ) {
         if let Some(histogram) = self.histogram_for(metric) {
-            histogram.record(duration.as_secs_f64(), &source_ip_attributes(source_ip));
+            match self.source_ip_labels.attributes(source_ip) {
+                Some(attributes) => histogram.record(duration.as_secs_f64(), &attributes),
+                None => histogram.record(duration.as_secs_f64(), &[]),
+            }
         }
     }
 
@@ -1327,7 +1383,8 @@ mod tests {
             shard_count: Some(1),
             ..rdns::config::CacheConfig::default()
         }));
-        let metrics = OpenTelemetryMetrics::new(Arc::clone(&cache)).expect("metrics exporter");
+        let metrics =
+            OpenTelemetryMetrics::new(Arc::clone(&cache), true).expect("metrics exporter");
 
         let families = metrics.registry.gather();
         let gauge_value = |name: &str| -> f64 {
@@ -1354,7 +1411,8 @@ mod tests {
             shard_count: Some(1),
             ..rdns::config::CacheConfig::default()
         }));
-        let metrics = OpenTelemetryMetrics::new(Arc::clone(&cache)).expect("metrics exporter");
+        let metrics =
+            OpenTelemetryMetrics::new(Arc::clone(&cache), true).expect("metrics exporter");
 
         metrics.increment(ResolverMetric::RefreshTriggered);
         metrics.increment(ResolverMetric::RefreshQueueFull);
@@ -1387,7 +1445,8 @@ mod tests {
             shard_count: Some(1),
             ..rdns::config::CacheConfig::default()
         }));
-        let metrics = OpenTelemetryMetrics::new(Arc::clone(&cache)).expect("metrics exporter");
+        let metrics =
+            OpenTelemetryMetrics::new(Arc::clone(&cache), true).expect("metrics exporter");
 
         let first: IpAddr = "192.0.2.10".parse().unwrap();
         let second: IpAddr = "2001:db8::7".parse().unwrap();
@@ -1437,6 +1496,65 @@ mod tests {
             })
             .expect("histogram series labeled with source_ip");
         assert_eq!(labeled.get_histogram().get_sample_count(), 1);
+    }
+
+    /// Interning returns the identical attribute set for repeats of one
+    /// IP, and IPs past `MAX_SOURCE_IP_SERIES` collapse into the shared
+    /// `source_ip="other"` set instead of growing the cache — the
+    /// cardinality bound review asked for on PR #150.
+    #[test]
+    fn source_ip_labels_cap_distinct_ips_and_reuse_interned_attributes() {
+        let labels = SourceIpLabels::new(true);
+
+        let ip: IpAddr = "192.0.2.1".parse().unwrap();
+        let first = labels.attributes(ip).expect("labeling enabled");
+        let second = labels.attributes(ip).expect("labeling enabled");
+        assert_eq!(first, second);
+        assert_eq!(first[0].value.as_str(), "192.0.2.1");
+
+        // Fill the cache to the cap (one slot is already taken above),
+        // then confirm the next distinct IP gets the overflow value and
+        // is not inserted.
+        for n in 0..(MAX_SOURCE_IP_SERIES - 1) {
+            let filler = IpAddr::from([10, (n >> 16) as u8, (n >> 8) as u8, n as u8]);
+            labels.attributes(filler).expect("labeling enabled");
+        }
+        assert_eq!(labels.interned.read().unwrap().len(), MAX_SOURCE_IP_SERIES);
+
+        let overflow_ip: IpAddr = "203.0.113.9".parse().unwrap();
+        let overflowed = labels.attributes(overflow_ip).expect("labeling enabled");
+        assert_eq!(overflowed[0].value.as_str(), SOURCE_IP_OVERFLOW_VALUE);
+        assert_eq!(labels.interned.read().unwrap().len(), MAX_SOURCE_IP_SERIES);
+    }
+
+    /// `[metrics].source_ip_labels = false` folds per-query emissions
+    /// into the unlabeled series instead of dropping them.
+    #[test]
+    fn source_ip_labels_disabled_emits_unlabeled_series() {
+        let cache = Arc::new(ShardedDnsCache::new(&rdns::config::CacheConfig {
+            max_entries: 16,
+            shard_count: Some(1),
+            ..rdns::config::CacheConfig::default()
+        }));
+        let metrics =
+            OpenTelemetryMetrics::new(Arc::clone(&cache), false).expect("metrics exporter");
+
+        metrics.increment_with_source(ResolverMetric::QueryReceived, "192.0.2.10".parse().unwrap());
+
+        let families = metrics.registry.gather();
+        let family = families
+            .iter()
+            .find(|family| family.name() == "query_received_total")
+            .expect("query_received_total family");
+        let metric = family.get_metric().first().expect("one series");
+        assert_eq!(metric.get_counter().value(), 1.0);
+        assert!(
+            !metric
+                .get_label()
+                .iter()
+                .any(|label| label.name() == "source_ip"),
+            "disabled labeling must not attach source_ip"
+        );
     }
 
     #[test]
