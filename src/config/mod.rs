@@ -207,8 +207,11 @@ impl RuntimeConfig {
         // pool — with refresh disabled there is nothing to execute it, and
         // clients would be handed the same stale answer (30s wire TTL,
         // never updating) until the whole stale window ran out. Reject the
-        // combination rather than degrade silently.
-        if self.cache.serve_stale_enabled && !self.refresh.enabled {
+        // combination rather than degrade silently. A zero-capacity cache
+        // (`max_entries = 0`) is exempt: it can never retain an entry, so
+        // there is nothing to stale-serve and nothing for a refresh worker
+        // to do — a no-cache/no-refresh config stays valid.
+        if self.cache.serve_stale_enabled && self.cache.max_entries > 0 && !self.refresh.enabled {
             return Err(ConfigError::ServeStaleRequiresRefresh);
         }
 
@@ -355,6 +358,12 @@ fn default_chaos_version_bind() -> String {
 /// Capacity is counted in domains, not individual cached record sets — a
 /// domain with multiple cached qtypes still occupies one slot.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Every `[cache]` field is applied at startup only: shard layout, TTL
+/// policy, and the serve-stale window are all fixed for the process
+/// lifetime, and a SIGHUP reload silently ignores changes here (only
+/// resolution/upstreams/local entries hot-reload — see
+/// `apply_reload_result` in `main.rs`). Changing any of these requires a
+/// restart.
 pub struct CacheConfig {
     /// Total domain-count capacity across the whole cache. Replaces the
     /// `main.rs` `DEFAULT_CACHE_ENTRIES` constant. Default: 10_000,
@@ -380,10 +389,6 @@ pub struct CacheConfig {
     pub max_negative_ttl: Duration,
     /// Optional floor on negative-cache lifetime. Default: none.
     pub min_negative_ttl: Option<Duration>,
-    /// Optional opt-in TTL for caching upstream ServFail responses (the
-    /// resolver additionally caps this at its own `MAX_FAILURE_CACHE_TTL`).
-    /// Default: none (failures are never cached).
-    pub failure_ttl: Option<Duration>,
     /// Whether an expired-but-recently-cached positive answer may be served
     /// immediately (with a short wire TTL) while a background refresh
     /// refetches it — RFC 8767 "serve stale". Default: true.
@@ -487,6 +492,20 @@ impl CacheConfig {
                 field: "max_negative_ttl_secs",
             });
         }
+        if self.max_positive_ttl > MAX_CACHE_TTL_CEILING {
+            return Err(ConfigError::InvalidCacheTtlCeilingTooLarge {
+                field: "max_positive_ttl_secs",
+                value: self.max_positive_ttl,
+                max: MAX_CACHE_TTL_CEILING,
+            });
+        }
+        if self.max_negative_ttl > MAX_CACHE_TTL_CEILING {
+            return Err(ConfigError::InvalidCacheTtlCeilingTooLarge {
+                field: "max_negative_ttl_secs",
+                value: self.max_negative_ttl,
+                max: MAX_CACHE_TTL_CEILING,
+            });
+        }
         if let Some(floor) = self.min_positive_ttl
             && floor > self.max_positive_ttl
         {
@@ -503,13 +522,6 @@ impl CacheConfig {
                 field: "min_negative_ttl_secs",
                 floor,
                 ceiling: self.max_negative_ttl,
-            });
-        }
-        if let Some(failure_ttl) = self.failure_ttl
-            && failure_ttl.is_zero()
-        {
-            return Err(ConfigError::InvalidCacheTtlBound {
-                field: "failure_ttl_secs",
             });
         }
         // Only meaningful when the feature is on: a disabled serve-stale
@@ -536,7 +548,6 @@ impl Default for CacheConfig {
             min_positive_ttl: None,
             max_negative_ttl: Duration::from_secs(60 * 60),
             min_negative_ttl: None,
-            failure_ttl: None,
             serve_stale_enabled: true,
             max_stale: Duration::from_secs(24 * 60 * 60),
         }
@@ -1552,6 +1563,11 @@ pub enum ConfigError {
     InvalidCacheTtlBound {
         field: &'static str,
     },
+    InvalidCacheTtlCeilingTooLarge {
+        field: &'static str,
+        value: Duration,
+        max: Duration,
+    },
     InvalidCacheTtlFloor {
         field: &'static str,
         floor: Duration,
@@ -1655,8 +1671,6 @@ struct RawCacheConfig {
     max_negative_ttl_secs: u64,
     #[serde(default)]
     min_negative_ttl_secs: Option<u64>,
-    #[serde(default)]
-    failure_ttl_secs: Option<u64>,
     #[serde(default = "default_true")]
     serve_stale_enabled: bool,
     #[serde(default = "default_cache_max_stale_secs")]
@@ -1688,7 +1702,6 @@ impl RawCacheConfig {
             min_positive_ttl: self.min_positive_ttl_secs.map(Duration::from_secs),
             max_negative_ttl: Duration::from_secs(self.max_negative_ttl_secs),
             min_negative_ttl: self.min_negative_ttl_secs.map(Duration::from_secs),
-            failure_ttl: self.failure_ttl_secs.map(Duration::from_secs),
             serve_stale_enabled: self.serve_stale_enabled,
             max_stale: Duration::from_secs(self.max_stale_secs),
         })
@@ -2171,6 +2184,14 @@ const MAX_UDP_PAYLOAD_SIZE: usize = 4096;
 /// startup allocation, particularly since `max_entries = 0` (caching
 /// disabled) leaves `shard_count` otherwise uncapped.
 const MAX_CACHE_SHARD_COUNT: usize = 65_536;
+/// Upper bound on the configurable positive/negative TTL ceilings. 30 days
+/// is far beyond any sane cache lifetime for a home resolver, while keeping
+/// `stored_at + ttl` (entry-expiry arithmetic in `build_rrset_entry`)
+/// comfortably clear of `SystemTime` overflow — an unvalidated
+/// `max_positive_ttl_secs = u64::MAX` would otherwise panic on the first
+/// store, not at startup. Floors are validated `<=` their ceilings, so this
+/// one bound covers all four TTL fields.
+const MAX_CACHE_TTL_CEILING: Duration = Duration::from_secs(30 * 24 * 60 * 60);
 /// Upper bound on `CacheConfig::max_stale`: RFC 8767 §5 recommends bounding
 /// staleness "on the order of days, not weeks" — 7 days is the outer edge of
 /// that guidance, and anything larger is more likely a units mistake
@@ -2955,7 +2976,6 @@ a.root-servers.net.      3600000      Aaaa  2001:503:ba3e::2:30
             min_positive_ttl_secs = 120
             max_negative_ttl_secs = 300
             min_negative_ttl_secs = 30
-            failure_ttl_secs = 5
             serve_stale_enabled = false
             max_stale_secs = 7200
             "#,
@@ -2970,7 +2990,6 @@ a.root-servers.net.      3600000      Aaaa  2001:503:ba3e::2:30
                 min_positive_ttl: Some(Duration::from_secs(120)),
                 max_negative_ttl: Duration::from_secs(300),
                 min_negative_ttl: Some(Duration::from_secs(30)),
-                failure_ttl: Some(Duration::from_secs(5)),
                 serve_stale_enabled: false,
                 max_stale: Duration::from_secs(7200),
                 ..CacheConfig::default()
@@ -3041,16 +3060,33 @@ a.root-servers.net.      3600000      Aaaa  2001:503:ba3e::2:30
     }
 
     #[test]
-    fn cache_config_rejects_zero_failure_ttl() {
-        let mut toml = valid_toml();
-        toml.push_str("\n[cache]\nfailure_ttl_secs = 0\n");
-        let error = RuntimeConfig::from_toml_str(&toml).unwrap_err();
-        assert_eq!(
-            error,
-            ConfigError::InvalidCacheTtlBound {
-                field: "failure_ttl_secs",
+    fn cache_config_rejects_ttl_ceiling_beyond_cap() {
+        for (field, max_ok) in [
+            ("max_positive_ttl_secs", 30 * 24 * 60 * 60u64),
+            ("max_negative_ttl_secs", 30 * 24 * 60 * 60u64),
+        ] {
+            // At the cap: accepted.
+            let mut toml = valid_toml();
+            toml.push_str(&format!("\n[cache]\n{field} = {max_ok}\n"));
+            RuntimeConfig::from_toml_str(&toml).unwrap();
+
+            // One past the cap: rejected — and critically, so is a
+            // fat-fingered u64::MAX, which would otherwise panic on
+            // `stored_at + ttl` at the first store instead of at startup.
+            for bad in [max_ok + 1, u64::MAX] {
+                let mut toml = valid_toml();
+                toml.push_str(&format!("\n[cache]\n{field} = {bad}\n"));
+                let error = RuntimeConfig::from_toml_str(&toml).unwrap_err();
+                assert_eq!(
+                    error,
+                    ConfigError::InvalidCacheTtlCeilingTooLarge {
+                        field,
+                        value: Duration::from_secs(bad),
+                        max: MAX_CACHE_TTL_CEILING,
+                    }
+                );
             }
-        );
+        }
     }
 
     #[test]
@@ -3062,6 +3098,13 @@ a.root-servers.net.      3600000      Aaaa  2001:503:ba3e::2:30
 
         let mut toml = valid_toml();
         toml.push_str("\n[cache]\nserve_stale_enabled = false\n\n[refresh]\nenabled = false\n");
+        RuntimeConfig::from_toml_str(&toml).unwrap();
+
+        // A zero-capacity cache can never retain (let alone stale-serve) an
+        // entry, so no-cache/no-refresh configs stay valid even with
+        // serve-stale left at its enabled default.
+        let mut toml = valid_toml();
+        toml.push_str("\n[cache]\nmax_entries = 0\n\n[refresh]\nenabled = false\n");
         RuntimeConfig::from_toml_str(&toml).unwrap();
     }
 

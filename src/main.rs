@@ -721,7 +721,13 @@ fn cache_ttl_policy_from_config(cache: &rdns::config::CacheConfig) -> CacheTtlPo
         cache.min_positive_ttl,
         cache.max_negative_ttl,
         cache.min_negative_ttl,
-        cache.failure_ttl,
+        // failure_ttl (opt-in ServFail caching) is deliberately not
+        // config-exposed: the sharded cache has no stored shape for a
+        // SERVFAIL (`ttl_for_response` classifies it with no negative
+        // metadata and no answers, so `decompose_response_for_store`
+        // produces nothing to store), making the knob inert today.
+        // Expose it only once a failure-entry store/lookup path exists.
+        None,
     )
 }
 

@@ -495,10 +495,13 @@ enum StaleServability {
     /// stale-served from it.
     KeepButMiss,
     /// Not stale-servable by anyone — serve-stale disabled, beyond the
-    /// window, stamped with a stale epoch, or a zero-origin-TTL record
-    /// (RFC 1035: TTL 0 means "this transaction only", so it must never
-    /// outlive its expiry, let alone be served stale). Evict at read time,
-    /// exactly as every expired entry was before serve-stale existed.
+    /// window, stamped with a stale epoch, or carrying any record whose
+    /// *origin* TTL (`StoredRecord::ttl_at_store`) was 0 (RFC 1035: TTL 0
+    /// means "this transaction only", so it must never outlive its expiry,
+    /// let alone be served stale — checked per record, since a
+    /// `min_positive_ttl` floor makes the entry-level `minimum_ttl` nonzero
+    /// even for such records). Evict at read time, exactly as every
+    /// expired entry was before serve-stale existed.
     Evict,
 }
 
@@ -519,7 +522,22 @@ fn stale_servability(
     let Some(window) = stale_window else {
         return StaleServability::Evict;
     };
-    if entry.cache_epoch != current_epoch || entry.minimum_ttl.is_zero() {
+    if entry.cache_epoch != current_epoch {
+        return StaleServability::Evict;
+    }
+    // The TTL-0 exclusion checks each stored record's own origin TTL
+    // (`ttl_at_store`), not `entry.minimum_ttl`: with a configured
+    // `min_positive_ttl` floor, `minimum_ttl` is the policy-bounded cache
+    // lifetime, which the floor makes nonzero even for a record the origin
+    // published with TTL 0 — exactly the record RFC 1035 says must not
+    // outlive its transaction. RRSIGs are included since a DO=true stale
+    // serve would put them on the wire too.
+    let has_zero_origin_ttl = entry
+        .records
+        .iter()
+        .chain(entry.rrsigs.iter())
+        .any(|record| record.ttl_at_store == 0);
+    if has_zero_origin_ttl {
         return StaleServability::Evict;
     }
     let within_window = entry
@@ -2044,12 +2062,21 @@ mod tests {
     #[test]
     fn lookup_hop_never_stale_serves_zero_origin_ttl_entry() {
         // RFC 1035: TTL 0 means "use for this transaction only" — such a
-        // record must never outlive its expiry, stale window or not.
+        // record must never outlive its expiry, stale window or not. The
+        // entry deliberately models a configured `min_positive_ttl` floor:
+        // `minimum_ttl` is the *policy-bounded* cache lifetime and is
+        // nonzero here, so only the per-record origin TTL
+        // (`ttl_at_store == 0`) can catch this — a guard on
+        // `minimum_ttl.is_zero()` would wrongly stale-serve it (PR #142
+        // review finding).
         let shard = stale_shard();
         let domain = "ttl-zero.example.com";
         let now = SystemTime::now();
         let mut entry = expired_rrset_entry(now);
-        entry.minimum_ttl = Duration::ZERO;
+        entry.minimum_ttl = Duration::from_secs(60); // floored lifetime
+        for record in &mut entry.records {
+            record.ttl_at_store = 0; // origin published TTL 0
+        }
         shard.store_positive(domain, (A_QTYPE, IN_QCLASS), entry);
 
         let result = shard.lookup_hop(

@@ -31,7 +31,9 @@ feature is on. `RuntimeConfig::validate` rejects
 (`ConfigError::ServeStaleRequiresRefresh`): the background refetch runs
 on the auto-refresh worker pool, and serving stale without any way to
 refresh would hand clients the same aging answer until the window ran
-out.
+out. Exception: `max_entries = 0` (caching disabled) skips this check —
+a zero-capacity cache can never retain an entry, so no-cache/no-refresh
+configs remain valid.
 
 # Admission: `stale_servability`
 
@@ -50,9 +52,13 @@ decides one of three outcomes:
   from it (mirroring the live-path DO filter, which is also not grounds
   for eviction).
 - **`Evict`** — serve-stale disabled, beyond the window, stamped with a
-  stale epoch, or a zero-origin-TTL record (RFC 1035: TTL 0 means "this
-  transaction only"). Removed at read time, byte-for-byte the original
-  pre-serve-stale behavior.
+  stale epoch, or carrying any record/RRSIG whose *origin* TTL
+  (`StoredRecord::ttl_at_store`) was 0 (RFC 1035: TTL 0 means "this
+  transaction only"). The check is per record, not `entry.minimum_ttl`:
+  with a `min_positive_ttl` floor configured, `minimum_ttl` is the
+  policy-bounded lifetime and is nonzero even for origin-TTL-0 records
+  (PR #142 review finding). Removed at read time, byte-for-byte the
+  original pre-serve-stale behavior.
 
 Epoch equality is required even for stale service: RFC 8767 staleness is
 about *time*, never about resurrecting answers a config change already
@@ -111,7 +117,10 @@ anticipates.
 - `ResolverMetric::CacheStaleHit` → `cache_stale_hit_total` (main.rs):
   incremented *in addition to* `cache_hit_total`, the same
   subdivision pattern as `cache_negative_hit_total`.
-- Query events record `QueryEventCacheResult::Stale` instead of `Hit`.
+- Query events record `QueryEventCacheResult::Stale` instead of `Hit`
+  (including on the singleflight-follower path, which carries the
+  re-probe's result through `CoalescedFollowerHit.event_cache_result`);
+  `QueryEventV1::SCHEMA_VERSION` bumped 5 → 6 for the new enum value.
 - Latency histograms count a stale serve as a cache hit
   (`CacheHitQueryDuration`) — answered from memory, backend deferred.
 

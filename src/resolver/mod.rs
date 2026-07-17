@@ -2906,7 +2906,10 @@ pub struct QueryEventV1 {
 }
 
 impl QueryEventV1 {
-    pub const SCHEMA_VERSION: u8 = 5;
+    // v6: `cache_result` gained the `Stale` value (RFC 8767 serve-stale) —
+    // bumped so strict consumers validating the v5 enum get a version
+    // signal instead of an unexpected variant.
+    pub const SCHEMA_VERSION: u8 = 6;
 
     #[allow(clippy::too_many_arguments)]
     pub fn from_decision(
@@ -3574,6 +3577,11 @@ struct CacheLookupEvaluation {
 struct CoalescedFollowerHit {
     response_bytes: Vec<u8>,
     refresh_hints: Vec<cache::RefreshHint>,
+    /// `Hit` or `Stale` — what the follower's re-probe actually found, so
+    /// the audit event matches what was served (the stale-hit *metric* is
+    /// already recorded inside `cache_hit_after_coalesced_miss`; without
+    /// this field the event would hard-code `Hit` and disagree with it).
+    event_cache_result: QueryEventCacheResult,
 }
 
 /// One background refresh attempt: a domain/qtype/qclass to refetch and
@@ -4987,6 +4995,7 @@ impl ResolveQuery {
         let Some(CoalescedFollowerHit {
             response_bytes,
             refresh_hints,
+            event_cache_result: served_cache_result,
         }) = self
             .cache_hit_after_coalesced_miss(request, decoded, backend_snapshot, &miss_key)
             .await
@@ -5025,11 +5034,12 @@ impl ResolveQuery {
                     decoded_original_question_name(decoded),
                     decision,
                     response_bytes,
-                    Some(QueryEventCacheResult::Hit),
-                    // Audit event says Hit (correctly — this was served from the
-                    // cache entry the leader just populated), but latency here
-                    // is dominated by `flight.wait().await` above, not a fast
+                    // What the re-probe actually found (`Hit`, or `Stale` if
+                    // the leader-populated entry already expired relative to
+                    // this follower's own received_at), but latency here is
+                    // dominated by `flight.wait().await` above, not a fast
                     // cache lookup, so bucket it by the pre-coalescing result.
+                    Some(served_cache_result),
                     event_cache_result,
                     Some(QueryEventBackend::from_snapshot(backend_snapshot)),
                 )
@@ -5056,9 +5066,11 @@ impl ResolveQuery {
             decoded_original_question_name(decoded),
             decision,
             response_bytes,
-            Some(QueryEventCacheResult::Hit),
-            // Same reasoning as above: this follower waited on the leader's
-            // full backend round trip, so its latency isn't cache-hit latency.
+            // Same reasoning as above: the audit result is what the re-probe
+            // actually found, while latency buckets by the pre-coalescing
+            // result since this follower waited on the leader's full backend
+            // round trip.
+            Some(served_cache_result),
             event_cache_result,
             Some(QueryEventBackend::from_snapshot(backend_snapshot)),
         )
@@ -5444,6 +5456,7 @@ impl ResolveQuery {
                 Some(CoalescedFollowerHit {
                     response_bytes,
                     refresh_hints,
+                    event_cache_result: cache_hit_event_result(stale),
                 })
             }
             ChainLookup::NxDomain(resolved) => {
@@ -5458,6 +5471,7 @@ impl ResolveQuery {
                 Some(CoalescedFollowerHit {
                     response_bytes,
                     refresh_hints: Vec::new(),
+                    event_cache_result: cache_hit_event_result(stale),
                 })
             }
             ChainLookup::NoData(resolved) => {
@@ -5472,6 +5486,7 @@ impl ResolveQuery {
                 Some(CoalescedFollowerHit {
                     response_bytes,
                     refresh_hints: Vec::new(),
+                    event_cache_result: cache_hit_event_result(stale),
                 })
             }
             ChainLookup::Miss => None,

@@ -94,10 +94,15 @@ in `src/resolver/mod.rs:16380-16442` (see `docs/plans/ttl_remaining/` section 03
 
 `CacheTtlPolicy`'s bounds are operator-configurable since the
 serve-stale/TTL-config change: `[cache] max_positive_ttl_secs`,
-`min_positive_ttl_secs`, `max_negative_ttl_secs`, `min_negative_ttl_secs`,
-and opt-in `failure_ttl_secs` (`RawCacheConfig`, `src/config/mod.rs`;
-wired in `main.rs`, `cache_ttl_policy_from_config`). Defaults are pinned
-to `CacheTtlPolicy::default()` by
+`min_positive_ttl_secs`, `max_negative_ttl_secs`, `min_negative_ttl_secs`
+(`RawCacheConfig`, `src/config/mod.rs`; wired in `main.rs`,
+`cache_ttl_policy_from_config`). Ceilings are capped at 30 days
+(`MAX_CACHE_TTL_CEILING`) so a fat-fingered value can't overflow
+`stored_at + ttl` at store time; `failure_ttl` is deliberately *not*
+exposed — the sharded cache has no stored shape for a SERVFAIL, so the
+knob would be inert (see the comment in `cache_ttl_policy_from_config`).
+Every `[cache]` field is startup-only: a SIGHUP reload ignores changes
+here. Defaults are pinned to `CacheTtlPolicy::default()` by
 `cache_config_default_ttls_match_cache_ttl_policy_default` (`src/main.rs`).
 
 Even when a `min_positive_ttl` floor extends an entry's actual cache
