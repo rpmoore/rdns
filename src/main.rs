@@ -12,10 +12,12 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::io;
+use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::RwLock;
 use std::time::{Duration, SystemTime};
 
 use opentelemetry::KeyValue;
@@ -107,7 +109,7 @@ async fn main() -> io::Result<()> {
     let (metrics, metrics_registry): (Arc<dyn MetricsSink>, Registry) = if !config.metrics.enabled {
         (Arc::new(NoopMetrics), Registry::new())
     } else {
-        match OpenTelemetryMetrics::new(Arc::clone(&cache)) {
+        match OpenTelemetryMetrics::new(Arc::clone(&cache), config.metrics.source_ip_labels) {
             Ok(m) => {
                 let registry = m.registry.clone();
                 (Arc::new(m), registry)
@@ -874,6 +876,7 @@ impl MetricsSink for NoopMetrics {
 struct OpenTelemetryMetrics {
     _provider: SdkMeterProvider,
     registry: Registry,
+    source_ip_labels: SourceIpLabels,
     query_received_total: Counter<u64>,
     query_allowed_total: Counter<u64>,
     query_blocked_total: Counter<u64>,
@@ -926,7 +929,7 @@ struct OpenTelemetryMetrics {
 }
 
 impl OpenTelemetryMetrics {
-    fn new(cache: Arc<ShardedDnsCache>) -> Result<Self, String> {
+    fn new(cache: Arc<ShardedDnsCache>, source_ip_labels: bool) -> Result<Self, String> {
         let registry = Registry::new();
         // Our counter instrument names already end in `_total` (chosen to read
         // correctly as Prometheus metric names directly); without this, the
@@ -958,6 +961,7 @@ impl OpenTelemetryMetrics {
         Ok(Self {
             _provider: provider,
             registry,
+            source_ip_labels: SourceIpLabels::new(source_ip_labels),
             query_received_total: meter.u64_counter("query_received_total").build(),
             query_allowed_total: meter.u64_counter("query_allowed_total").build(),
             query_blocked_total: meter.u64_counter("query_blocked_total").build(),
@@ -1043,99 +1047,192 @@ impl OpenTelemetryMetrics {
     }
 }
 
-impl MetricsSink for OpenTelemetryMetrics {
-    fn increment(&self, metric: ResolverMetric) {
-        match metric {
-            ResolverMetric::QueryReceived => self.query_received_total.add(1, &[]),
-            ResolverMetric::QueryAllowed => self.query_allowed_total.add(1, &[]),
-            ResolverMetric::QueryBlocked => self.query_blocked_total.add(1, &[]),
-            ResolverMetric::CacheHit => self.cache_hit_total.add(1, &[]),
-            ResolverMetric::CacheMiss => self.cache_miss_total.add(1, &[]),
-            ResolverMetric::CacheExpired => self.cache_expired_total.add(1, &[]),
-            ResolverMetric::CacheBypass => self.cache_bypass_total.add(1, &[]),
-            ResolverMetric::CacheUnavailable => self.cache_unavailable_total.add(1, &[]),
-            ResolverMetric::CacheStore => self.cache_store_total.add(1, &[]),
-            ResolverMetric::CacheStoreSkipped => self.cache_store_skipped_total.add(1, &[]),
-            ResolverMetric::CacheNegativeStore => self.cache_negative_store_total.add(1, &[]),
-            ResolverMetric::CacheNegativeHit => self.cache_negative_hit_total.add(1, &[]),
-            ResolverMetric::CacheStaleHit => self.cache_stale_hit_total.add(1, &[]),
-            ResolverMetric::CacheResponseTruncated => {
-                self.cache_response_truncated_total.add(1, &[])
-            }
-            ResolverMetric::CacheCoalescedMiss => self.cache_coalesced_miss_total.add(1, &[]),
-            ResolverMetric::QueryEventAccepted => self.query_event_accepted_total.add(1, &[]),
-            ResolverMetric::QueryEventDisabled => self.query_event_disabled_total.add(1, &[]),
-            ResolverMetric::QueryEventDroppedNewest => {
-                self.query_event_dropped_newest_total.add(1, &[])
-            }
-            ResolverMetric::QueryEventDroppedOldest => {
-                self.query_event_dropped_oldest_total.add(1, &[])
-            }
-            ResolverMetric::QueryEventSampled => self.query_event_sampled_total.add(1, &[]),
-            ResolverMetric::UpstreamSuccess => self.upstream_success_total.add(1, &[]),
-            ResolverMetric::UpstreamFailure => self.upstream_failure_total.add(1, &[]),
-            ResolverMetric::RecursiveQuery => self.recursive_query_total.add(1, &[]),
-            ResolverMetric::RecursiveAuthorityAttempt => {
-                self.recursive_authority_attempt_total.add(1, &[])
-            }
-            ResolverMetric::RecursiveAuthorityTimeout => {
-                self.recursive_authority_timeout_total.add(1, &[])
-            }
-            ResolverMetric::RecursiveAuthorityError => {
-                self.recursive_authority_error_total.add(1, &[])
-            }
-            ResolverMetric::RecursiveBailiwickReject => {
-                self.recursive_bailiwick_reject_total.add(1, &[])
-            }
-            ResolverMetric::RecursiveLameDelegation => {
-                self.recursive_lame_delegation_total.add(1, &[])
-            }
-            ResolverMetric::RecursiveReferralLoop => self.recursive_referral_loop_total.add(1, &[]),
-            ResolverMetric::RecursiveLimitHit => self.recursive_limit_hit_total.add(1, &[]),
+impl OpenTelemetryMetrics {
+    /// The counter instrument backing `metric`, or `None` for the
+    /// duration metrics (which are histograms, see `histogram_for`).
+    fn counter_for(&self, metric: ResolverMetric) -> Option<&Counter<u64>> {
+        Some(match metric {
+            ResolverMetric::QueryReceived => &self.query_received_total,
+            ResolverMetric::QueryAllowed => &self.query_allowed_total,
+            ResolverMetric::QueryBlocked => &self.query_blocked_total,
+            ResolverMetric::CacheHit => &self.cache_hit_total,
+            ResolverMetric::CacheMiss => &self.cache_miss_total,
+            ResolverMetric::CacheExpired => &self.cache_expired_total,
+            ResolverMetric::CacheBypass => &self.cache_bypass_total,
+            ResolverMetric::CacheUnavailable => &self.cache_unavailable_total,
+            ResolverMetric::CacheStore => &self.cache_store_total,
+            ResolverMetric::CacheStoreSkipped => &self.cache_store_skipped_total,
+            ResolverMetric::CacheNegativeStore => &self.cache_negative_store_total,
+            ResolverMetric::CacheNegativeHit => &self.cache_negative_hit_total,
+            ResolverMetric::CacheStaleHit => &self.cache_stale_hit_total,
+            ResolverMetric::CacheResponseTruncated => &self.cache_response_truncated_total,
+            ResolverMetric::CacheCoalescedMiss => &self.cache_coalesced_miss_total,
+            ResolverMetric::QueryEventAccepted => &self.query_event_accepted_total,
+            ResolverMetric::QueryEventDisabled => &self.query_event_disabled_total,
+            ResolverMetric::QueryEventDroppedNewest => &self.query_event_dropped_newest_total,
+            ResolverMetric::QueryEventDroppedOldest => &self.query_event_dropped_oldest_total,
+            ResolverMetric::QueryEventSampled => &self.query_event_sampled_total,
+            ResolverMetric::UpstreamSuccess => &self.upstream_success_total,
+            ResolverMetric::UpstreamFailure => &self.upstream_failure_total,
+            ResolverMetric::RecursiveQuery => &self.recursive_query_total,
+            ResolverMetric::RecursiveAuthorityAttempt => &self.recursive_authority_attempt_total,
+            ResolverMetric::RecursiveAuthorityTimeout => &self.recursive_authority_timeout_total,
+            ResolverMetric::RecursiveAuthorityError => &self.recursive_authority_error_total,
+            ResolverMetric::RecursiveBailiwickReject => &self.recursive_bailiwick_reject_total,
+            ResolverMetric::RecursiveLameDelegation => &self.recursive_lame_delegation_total,
+            ResolverMetric::RecursiveReferralLoop => &self.recursive_referral_loop_total,
+            ResolverMetric::RecursiveLimitHit => &self.recursive_limit_hit_total,
             ResolverMetric::RecursiveTcpFallbackAttempt => {
-                self.recursive_tcp_fallback_attempt_total.add(1, &[])
+                &self.recursive_tcp_fallback_attempt_total
             }
             ResolverMetric::RecursiveTcpFallbackSuccess => {
-                self.recursive_tcp_fallback_success_total.add(1, &[])
+                &self.recursive_tcp_fallback_success_total
             }
             ResolverMetric::RecursiveTcpFallbackFailure => {
-                self.recursive_tcp_fallback_failure_total.add(1, &[])
+                &self.recursive_tcp_fallback_failure_total
             }
             ResolverMetric::RecursiveTcpFallbackTimeout => {
-                self.recursive_tcp_fallback_timeout_total.add(1, &[])
+                &self.recursive_tcp_fallback_timeout_total
             }
-            ResolverMetric::ProtocolError => self.protocol_error_total.add(1, &[]),
-            ResolverMetric::RecursionRefused => self.recursion_refused_total.add(1, &[]),
-            ResolverMetric::RefreshTriggered => self.refresh_triggered_total.add(1, &[]),
-            ResolverMetric::RefreshQueueFull => self.refresh_queue_full_total.add(1, &[]),
-            ResolverMetric::RefreshSucceeded => self.refresh_succeeded_total.add(1, &[]),
-            ResolverMetric::RefreshFailed => self.refresh_failed_total.add(1, &[]),
+            ResolverMetric::ProtocolError => &self.protocol_error_total,
+            ResolverMetric::RecursionRefused => &self.recursion_refused_total,
+            ResolverMetric::RefreshTriggered => &self.refresh_triggered_total,
+            ResolverMetric::RefreshQueueFull => &self.refresh_queue_full_total,
+            ResolverMetric::RefreshSucceeded => &self.refresh_succeeded_total,
+            ResolverMetric::RefreshFailed => &self.refresh_failed_total,
             ResolverMetric::QueryDuration
             | ResolverMetric::RecursiveQueryDuration
             | ResolverMetric::CacheHitQueryDuration
-            | ResolverMetric::CacheMissQueryDuration => {}
+            | ResolverMetric::CacheMissQueryDuration => return None,
+        })
+    }
+
+    /// The histogram instrument backing `metric`, or `None` for the
+    /// counter metrics.
+    fn histogram_for(&self, metric: ResolverMetric) -> Option<&Histogram<f64>> {
+        match metric {
+            ResolverMetric::QueryDuration => Some(&self.query_duration_seconds),
+            ResolverMetric::RecursiveQueryDuration => Some(&self.recursive_query_duration_seconds),
+            ResolverMetric::CacheHitQueryDuration => Some(&self.cache_hit_query_duration_seconds),
+            ResolverMetric::CacheMissQueryDuration => Some(&self.cache_miss_query_duration_seconds),
+            _ => None,
+        }
+    }
+}
+
+/// How many distinct client IPs may get their own `source_ip`-labeled
+/// time series before further IPs collapse into the shared
+/// `source_ip="other"` series. UDP source addresses are spoofable, so
+/// without a cap a flood of forged sources could grow the metrics
+/// registry (and scrape size) without bound.
+const MAX_SOURCE_IP_SERIES: usize = 1024;
+
+const SOURCE_IP_OVERFLOW_VALUE: &str = "other";
+
+/// The `source_ip` attribute sets attached by the `*_with_source` sink
+/// methods, interned per client IP so the DNS hot path formats each IP
+/// once — every later emission reuses the cached `Arc`-backed `KeyValue`
+/// (a refcount bump, not an allocation). Interning doubles as the
+/// cardinality bound: once `MAX_SOURCE_IP_SERIES` distinct IPs are
+/// cached, further IPs share the `"other"` attribute set and are never
+/// inserted. `[metrics].source_ip_labels = false` disables labeling
+/// entirely, folding per-query emissions into the unlabeled series.
+struct SourceIpLabels {
+    enabled: bool,
+    interned: RwLock<HashMap<IpAddr, [KeyValue; 1]>>,
+    overflow: [KeyValue; 1],
+}
+
+impl SourceIpLabels {
+    fn new(enabled: bool) -> Self {
+        Self {
+            enabled,
+            interned: RwLock::new(HashMap::new()),
+            overflow: [KeyValue::new("source_ip", SOURCE_IP_OVERFLOW_VALUE)],
+        }
+    }
+
+    /// The attribute set for `source_ip`, or `None` when labeling is
+    /// disabled (callers emit unlabeled). A poisoned lock is recovered
+    /// with `into_inner` (the cached attribute sets are plain data,
+    /// valid regardless of where a panicking thread stopped) rather
+    /// than degrading to unlabeled emission, which would break the
+    /// each-family-consistently-labeled-or-not invariant
+    /// (`docs/knowledge/resolver/metrics-source-ip.md`) — flagged by
+    /// Copilot review on PR #150.
+    fn attributes(&self, source_ip: IpAddr) -> Option<[KeyValue; 1]> {
+        if !self.enabled {
+            return None;
+        }
+        {
+            let interned = self
+                .interned
+                .read()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if let Some(attributes) = interned.get(&source_ip) {
+                return Some(attributes.clone());
+            }
+            // Cap reached: overflow IPs are never inserted, so serve them
+            // from the shared read lock. Without this, once the map fills,
+            // every uncached IP — i.e. every emission during the spoofed-
+            // source flood the cap exists to absorb — would escalate to
+            // the exclusive write lock just to re-derive `"other"`,
+            // serializing metric emission across all query tasks exactly
+            // when load is highest.
+            if interned.len() >= MAX_SOURCE_IP_SERIES {
+                return Some(self.overflow.clone());
+            }
+        }
+        let mut interned = self
+            .interned
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(attributes) = interned.get(&source_ip) {
+            return Some(attributes.clone());
+        }
+        if interned.len() >= MAX_SOURCE_IP_SERIES {
+            return Some(self.overflow.clone());
+        }
+        let value: std::sync::Arc<str> = std::sync::Arc::from(source_ip.to_string());
+        let attributes = [KeyValue::new("source_ip", value)];
+        interned.insert(source_ip, attributes.clone());
+        Some(attributes)
+    }
+}
+
+impl MetricsSink for OpenTelemetryMetrics {
+    fn increment(&self, metric: ResolverMetric) {
+        if let Some(counter) = self.counter_for(metric) {
+            counter.add(1, &[]);
         }
     }
 
     fn observe_duration(&self, metric: ResolverMetric, duration: Duration) {
-        match metric {
-            ResolverMetric::QueryDuration => {
-                self.query_duration_seconds
-                    .record(duration.as_secs_f64(), &[]);
+        if let Some(histogram) = self.histogram_for(metric) {
+            histogram.record(duration.as_secs_f64(), &[]);
+        }
+    }
+
+    fn increment_with_source(&self, metric: ResolverMetric, source_ip: IpAddr) {
+        if let Some(counter) = self.counter_for(metric) {
+            match self.source_ip_labels.attributes(source_ip) {
+                Some(attributes) => counter.add(1, &attributes),
+                None => counter.add(1, &[]),
             }
-            ResolverMetric::RecursiveQueryDuration => {
-                self.recursive_query_duration_seconds
-                    .record(duration.as_secs_f64(), &[]);
+        }
+    }
+
+    fn observe_duration_with_source(
+        &self,
+        metric: ResolverMetric,
+        duration: Duration,
+        source_ip: IpAddr,
+    ) {
+        if let Some(histogram) = self.histogram_for(metric) {
+            match self.source_ip_labels.attributes(source_ip) {
+                Some(attributes) => histogram.record(duration.as_secs_f64(), &attributes),
+                None => histogram.record(duration.as_secs_f64(), &[]),
             }
-            ResolverMetric::CacheHitQueryDuration => {
-                self.cache_hit_query_duration_seconds
-                    .record(duration.as_secs_f64(), &[]);
-            }
-            ResolverMetric::CacheMissQueryDuration => {
-                self.cache_miss_query_duration_seconds
-                    .record(duration.as_secs_f64(), &[]);
-            }
-            _ => {}
         }
     }
 
@@ -1310,7 +1407,8 @@ mod tests {
             shard_count: Some(1),
             ..rdns::config::CacheConfig::default()
         }));
-        let metrics = OpenTelemetryMetrics::new(Arc::clone(&cache)).expect("metrics exporter");
+        let metrics =
+            OpenTelemetryMetrics::new(Arc::clone(&cache), true).expect("metrics exporter");
 
         let families = metrics.registry.gather();
         let gauge_value = |name: &str| -> f64 {
@@ -1337,7 +1435,8 @@ mod tests {
             shard_count: Some(1),
             ..rdns::config::CacheConfig::default()
         }));
-        let metrics = OpenTelemetryMetrics::new(Arc::clone(&cache)).expect("metrics exporter");
+        let metrics =
+            OpenTelemetryMetrics::new(Arc::clone(&cache), true).expect("metrics exporter");
 
         metrics.increment(ResolverMetric::RefreshTriggered);
         metrics.increment(ResolverMetric::RefreshQueueFull);
@@ -1361,6 +1460,125 @@ mod tests {
         assert_eq!(counter_value("refresh_queue_full_total"), 2.0);
         assert_eq!(counter_value("refresh_succeeded_total"), 3.0);
         assert_eq!(counter_value("refresh_failed_total"), 1.0);
+    }
+
+    #[test]
+    fn open_telemetry_source_variants_label_series_by_source_ip() {
+        let cache = Arc::new(ShardedDnsCache::new(&rdns::config::CacheConfig {
+            max_entries: 16,
+            shard_count: Some(1),
+            ..rdns::config::CacheConfig::default()
+        }));
+        let metrics =
+            OpenTelemetryMetrics::new(Arc::clone(&cache), true).expect("metrics exporter");
+
+        let first: IpAddr = "192.0.2.10".parse().unwrap();
+        let second: IpAddr = "2001:db8::7".parse().unwrap();
+        metrics.increment_with_source(ResolverMetric::QueryReceived, first);
+        metrics.increment_with_source(ResolverMetric::QueryReceived, first);
+        metrics.increment_with_source(ResolverMetric::QueryReceived, second);
+        metrics.observe_duration_with_source(
+            ResolverMetric::QueryDuration,
+            Duration::from_millis(5),
+            first,
+        );
+
+        let families = metrics.registry.gather();
+        let series_value = |name: &str, ip: &str| -> f64 {
+            families
+                .iter()
+                .find(|family| family.name() == name)
+                .and_then(|family| {
+                    family.get_metric().iter().find(|metric| {
+                        metric
+                            .get_label()
+                            .iter()
+                            .any(|label| label.name() == "source_ip" && label.value() == ip)
+                    })
+                })
+                .map(|metric| metric.get_counter().value())
+                .unwrap_or_else(|| panic!("missing {name} series with source_ip={ip}"))
+        };
+
+        // One counter family, one series per distinct client IP.
+        assert_eq!(series_value("query_received_total", "192.0.2.10"), 2.0);
+        assert_eq!(series_value("query_received_total", "2001:db8::7"), 1.0);
+
+        // The duration histogram carries the same label.
+        let histogram_family = families
+            .iter()
+            .find(|family| family.name() == "query_duration_seconds")
+            .expect("query_duration_seconds family");
+        let labeled = histogram_family
+            .get_metric()
+            .iter()
+            .find(|metric| {
+                metric
+                    .get_label()
+                    .iter()
+                    .any(|label| label.name() == "source_ip" && label.value() == "192.0.2.10")
+            })
+            .expect("histogram series labeled with source_ip");
+        assert_eq!(labeled.get_histogram().get_sample_count(), 1);
+    }
+
+    /// Interning returns the identical attribute set for repeats of one
+    /// IP, and IPs past `MAX_SOURCE_IP_SERIES` collapse into the shared
+    /// `source_ip="other"` set instead of growing the cache — the
+    /// cardinality bound review asked for on PR #150.
+    #[test]
+    fn source_ip_labels_cap_distinct_ips_and_reuse_interned_attributes() {
+        let labels = SourceIpLabels::new(true);
+
+        let ip: IpAddr = "192.0.2.1".parse().unwrap();
+        let first = labels.attributes(ip).expect("labeling enabled");
+        let second = labels.attributes(ip).expect("labeling enabled");
+        assert_eq!(first, second);
+        assert_eq!(first[0].value.as_str(), "192.0.2.1");
+
+        // Fill the cache to the cap (one slot is already taken above),
+        // then confirm the next distinct IP gets the overflow value and
+        // is not inserted.
+        for n in 0..(MAX_SOURCE_IP_SERIES - 1) {
+            let filler = IpAddr::from([10, (n >> 16) as u8, (n >> 8) as u8, n as u8]);
+            labels.attributes(filler).expect("labeling enabled");
+        }
+        assert_eq!(labels.interned.read().unwrap().len(), MAX_SOURCE_IP_SERIES);
+
+        let overflow_ip: IpAddr = "203.0.113.9".parse().unwrap();
+        let overflowed = labels.attributes(overflow_ip).expect("labeling enabled");
+        assert_eq!(overflowed[0].value.as_str(), SOURCE_IP_OVERFLOW_VALUE);
+        assert_eq!(labels.interned.read().unwrap().len(), MAX_SOURCE_IP_SERIES);
+    }
+
+    /// `[metrics].source_ip_labels = false` folds per-query emissions
+    /// into the unlabeled series instead of dropping them.
+    #[test]
+    fn source_ip_labels_disabled_emits_unlabeled_series() {
+        let cache = Arc::new(ShardedDnsCache::new(&rdns::config::CacheConfig {
+            max_entries: 16,
+            shard_count: Some(1),
+            ..rdns::config::CacheConfig::default()
+        }));
+        let metrics =
+            OpenTelemetryMetrics::new(Arc::clone(&cache), false).expect("metrics exporter");
+
+        metrics.increment_with_source(ResolverMetric::QueryReceived, "192.0.2.10".parse().unwrap());
+
+        let families = metrics.registry.gather();
+        let family = families
+            .iter()
+            .find(|family| family.name() == "query_received_total")
+            .expect("query_received_total family");
+        let metric = family.get_metric().first().expect("one series");
+        assert_eq!(metric.get_counter().value(), 1.0);
+        assert!(
+            !metric
+                .get_label()
+                .iter()
+                .any(|label| label.name() == "source_ip"),
+            "disabled labeling must not attach source_ip"
+        );
     }
 
     #[test]

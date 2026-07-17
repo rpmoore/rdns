@@ -307,6 +307,12 @@ pub struct MetricsConfig {
     pub enabled: bool,
     pub listen: SocketAddr,
     pub max_connections: usize,
+    /// Whether per-query metrics carry a `source_ip` label identifying the
+    /// requesting client. On by default; operators exposing rdns to large
+    /// or untrusted client populations can disable it to avoid per-client
+    /// time series entirely (the emitting sink additionally caps distinct
+    /// labeled IPs — see `main.rs`'s `MAX_SOURCE_IP_SERIES`).
+    pub source_ip_labels: bool,
 }
 
 impl MetricsConfig {
@@ -315,6 +321,7 @@ impl MetricsConfig {
             enabled: true,
             listen: default_metrics_listen_addr(),
             max_connections: DEFAULT_METRICS_MAX_CONNECTIONS,
+            source_ip_labels: true,
         }
     }
 }
@@ -1642,6 +1649,8 @@ struct RawMetricsConfig {
     listen: String,
     #[serde(default = "default_metrics_max_connections")]
     max_connections: usize,
+    #[serde(default = "default_true")]
+    source_ip_labels: bool,
 }
 
 fn default_metrics_listen() -> String {
@@ -1801,6 +1810,7 @@ impl RawMetricsConfig {
             enabled: self.enabled,
             listen: parse_socket_addr(&self.listen)?,
             max_connections: self.max_connections,
+            source_ip_labels: self.source_ip_labels,
         })
     }
 }
@@ -3141,8 +3151,25 @@ a.root-servers.net.      3600000      Aaaa  2001:503:ba3e::2:30
                 enabled: true,
                 listen: SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 9090),
                 max_connections: 32,
+                source_ip_labels: true,
             }
         );
+    }
+
+    #[test]
+    fn metrics_config_source_ip_labels_defaults_on_and_can_be_disabled() {
+        let config = RuntimeConfig::from_toml_str(&valid_toml()).unwrap();
+        assert!(config.metrics.source_ip_labels);
+
+        let mut toml = valid_toml();
+        toml.push_str(
+            r#"
+            [metrics]
+            source_ip_labels = false
+            "#,
+        );
+        let config = RuntimeConfig::from_toml_str(&toml).unwrap();
+        assert!(!config.metrics.source_ip_labels);
     }
 
     #[test]
