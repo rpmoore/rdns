@@ -227,10 +227,22 @@ impl UdpDnsServer {
             // divided budget would cap a single busy downstream (e.g. a
             // stub resolver or NAT'd site sending from one source socket)
             // at 1/socket_count of the configured in-flight limit while the
-            // sibling sockets' permits sat idle. Sharing keeps both the
-            // aggregate and the per-flow behavior identical to the old
-            // single-socket shape.
-            let in_flight = Arc::new(Semaphore::new(DEFAULT_MAX_IN_FLIGHT_REQUESTS));
+            // sibling sockets' permits sat idle.
+            //
+            // Capacity is padded by `sockets_per_listener - 1`: each serve
+            // loop deliberately acquires its permit *before* blocking in
+            // `recv_from` (`receive_permitted_datagram` — permit-first is
+            // what makes a cancelled `select!` iteration lose only a
+            // semaphore wait, never an already-received datagram, mirroring
+            // the TCP accept loop's pending-permit pattern), so each idle
+            // socket parks holding one permit. The old single-socket shape
+            // had exactly one such parked permit inside its budget; the
+            // padding keeps the *usable* request budget at
+            // `DEFAULT_MAX_IN_FLIGHT_REQUESTS` with N parked receivers
+            // instead of silently shrinking it by N-1.
+            let in_flight = Arc::new(Semaphore::new(
+                DEFAULT_MAX_IN_FLIGHT_REQUESTS + (sockets_per_listener - 1),
+            ));
             for _ in 0..sockets_per_listener {
                 let socket = bind_listener_socket(*address).await?;
                 servers.push(Self::with_shared_in_flight(
