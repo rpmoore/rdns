@@ -1172,6 +1172,16 @@ impl SourceIpLabels {
             if let Some(attributes) = interned.get(&source_ip) {
                 return Some(attributes.clone());
             }
+            // Cap reached: overflow IPs are never inserted, so serve them
+            // from the shared read lock. Without this, once the map fills,
+            // every uncached IP — i.e. every emission during the spoofed-
+            // source flood the cap exists to absorb — would escalate to
+            // the exclusive write lock just to re-derive `"other"`,
+            // serializing metric emission across all query tasks exactly
+            // when load is highest.
+            if interned.len() >= MAX_SOURCE_IP_SERIES {
+                return Some(self.overflow.clone());
+            }
         }
         let mut interned = self
             .interned
