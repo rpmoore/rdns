@@ -42,7 +42,7 @@ concurrency.
 | Field | Purpose |
 |---|---|
 | `records` / `soa_record` + proof records | The actual RRset or negative-cache proof material. |
-| `stored_at` / `expires_at` | TTL bookkeeping — `expires_at` is checked on every lookup; an expired entry is either served stale (within the [serve-stale](serve-stale.md) window, positive entries only) or deleted immediately at read time (not just filtered out), see `Shard::lookup_hop`/`stale_servability`. |
+| `stored_at` / `expires_at` | TTL bookkeeping — `expires_at` is checked on every lookup; an expired entry is served stale (within the [serve-stale](serve-stale.md) window, positive entries only), kept-but-missed (in-window but DO-filtered for *this* reader — a DO=true reader vs. `dnssec_complete == false` misses while the entry stays for DO=false readers), or deleted immediately at read time (not just filtered out), see `Shard::lookup_hop`/`stale_servability`. |
 | `dnssec_state` | RFC 6840 §3.1 validation state; stays `Unvalidated` until real DNSSEC validation exists — orthogonal to everything else in this document. |
 | `dnssec_complete` | Whether this entry was populated by a fetch that actually requested DNSSEC material (DO=1). A DO=1 reader must never be served an entry where this is `false`, even if TTL-valid — see `Shard::lookup_hop`'s DO-aware filtering. |
 | `authoritative` | The backend response's own AA bit, replayed on a cache hit. |

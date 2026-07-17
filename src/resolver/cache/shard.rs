@@ -2302,8 +2302,8 @@ mod tests {
              under the shipped defaults",
         );
         assert!(
-            hot_after <= 3,
-            "expected hot within 3 hits at a 2-minute interval, took {hot_after}"
+            hot_after <= 2,
+            "expected hot within 2 hits at a 2-minute interval, took {hot_after}"
         );
     }
 

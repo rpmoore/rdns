@@ -15,8 +15,11 @@ Before this feature, `Shard::lookup_hop` evicted every expired entry at
 read time and the client paid a full backend round trip (~95ms observed
 vs ~24µs for a hit). With serve-stale, a positive entry that expired
 within the configured window is served immediately — with a fixed short
-wire TTL — and a background refresh is signaled unconditionally, so the
-*next* query gets fresh data. This is RFC 8767 behavior, and the primary
+wire TTL — and a background refresh is signaled unconditionally, so a
+subsequent query typically gets fresh data (the refresh is asynchronous
+and best-effort: it can be delayed, coalesced, dropped on a full
+channel, or fail, in which case later queries keep being served stale
+until one succeeds or the window ends). This is RFC 8767 behavior, and the primary
 lever for keeping average-case latency low for domains whose TTL is
 shorter than their query interval (which always missed before, and which
 the [auto-refresh](auto-refresh.md) popularity gate structurally could
@@ -110,7 +113,22 @@ TTLs, stale hops serve 30s.
 DNSSEC note: stale RRSIGs are served as stored; signature validity
 windows are absolute timestamps unaffected by TTL, so a validating
 client fails closed on genuinely lapsed signatures exactly as RFC 8767
-anticipates.
+anticipates. This resolver performs no local DNSSEC validation —
+`dnssec_state` is only ever `Unvalidated` in production stores
+(`build_rrset_entry`), so the `dnssec_ad_bit` AD=1 path is unreachable
+for cached entries, stale or live. If local validation ever starts
+assigning `Secure`, stale service must additionally revalidate RRSIG
+inception/expiration before asserting AD (RFC 4035 §4.3) — flagged here
+so that feature inherits the requirement.
+
+Refresh attempt rate under upstream failure: a failed refresh leaves the
+stale entry in place, so each subsequent client query for that name
+re-enqueues one refresh attempt. That backend attempt rate is bounded by
+the client's own query rate for the name — identical to what the same
+queries would have cost as inline misses before serve-stale existed —
+and concurrent attempts still coalesce via singleflight. A per-key
+refresh cooldown (RFC 8767 §5 suggests ~30s between failed-resolution
+retries) is deliberately deferred until measured need.
 
 # Observability
 
