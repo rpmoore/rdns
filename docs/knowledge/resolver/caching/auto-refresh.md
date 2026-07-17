@@ -26,14 +26,14 @@ alternatives: `docs/plans/auto_refresh/`.
 `PopularityBucket` (`src/resolver/cache/shard.rs:59-124`) is an integer
 leaky-bucket counter — `level: u32` + `last_drained: SystemTime` — stored in
 a new `ShardState.popularity: HashMap<String, PopularityBucket>` field
-(`shard.rs:164,168`), at the same level as `ShardLru`. It's
+(`shard.rs:169,170`), at the same level as `ShardLru`. It's
 drained-then-incremented (`PopularityBucket::drain_and_increment`,
 `shard.rs:92-111`) on every cache hit, at the same 4 call sites
 `state.lru.touch(domain)` already runs inside `Shard::lookup_hop`
-(`shard.rs:621-633,641-648` for the `Answer`/`CnameHop` branches, via the
-shared `ShardState::record_hit_and_check_refresh` helper, `shard.rs:209-232`;
+(`shard.rs:798,819` for the `Answer`/`CnameHop` branches, via the
+shared `ShardState::record_hit_and_check_refresh` helper, `shard.rs:217-240`;
 `NoData`/`NxDomain` branches still call `record_popularity_hit` directly,
-`shard.rs:184-203`, since negative entries never produce a refresh signal —
+`shard.rs:188-215`, since negative entries never produce a refresh signal —
 see below). Granularity is per-domain (qname only), matching `ShardLru`'s
 own granularity — any query for the domain, any record type, raises its
 popularity.
@@ -46,8 +46,8 @@ the same elapsed time.
 
 **Lifecycle**: a bucket is created on first hit and removed at exactly the
 same two points a domain's `ShardLru` token is removed —
-`ShardState::evict_domain` (`shard.rs:176`) and
-`ShardState::drop_lru_if_domain_now_empty` (`shard.rs:288`) — so popularity
+`ShardState::evict_domain` (`shard.rs:178`) and
+`ShardState::drop_lru_if_domain_now_empty` (`shard.rs:336`) — so popularity
 state can never outlive a domain's cached data through either of those
 paths. Accepted gap: `sweep_stale_namespace` clears a domain's LRU token
 directly without going through either function, so a bucket can currently
@@ -61,7 +61,7 @@ merely left untouched.
 
 # Trigger formula: three independent gates
 
-`wants_refresh` (`src/resolver/cache/shard.rs:449-465`) is a pure function
+`wants_refresh` (`src/resolver/cache/shard.rs:603-619`) is a pure function
 (no I/O, no lock beyond what the caller already holds) checked alongside
 the existing `entry.expires_at <= now` liveness check, deciding whether a
 live entry should *additionally* signal "this wants a refresh" without
@@ -91,7 +91,7 @@ just served, so the refetch is mandatory, not a popularity-gated
 optimization.
 
 Callers pass the bucket *after* recording the current hit
-(`ShardState::record_hit_and_check_refresh`, `shard.rs:209-232`), so a
+(`ShardState::record_hit_and_check_refresh`, `shard.rs:217-240`), so a
 hit's own increment counts toward its own hot-threshold determination —
 deterministic (both happen under the same lock, back-to-back), not a race.
 **Known feedback-loop caveat**: the auto-refresh worker's own eligibility
@@ -119,7 +119,7 @@ imports it rather than defining its own copy.
 is one hop's signal that it currently qualifies. `ChainLookup::Answered`
 carries `refresh_hints: Vec<RefreshHint>` (`assemble.rs:77`) — **every**
 qualifying positive hop in a CNAME chain gets its own hint during
-`resolve_from_cache`'s walk (`assemble.rs:143-...`), not just the terminal
+`resolve_from_cache`'s walk (`assemble.rs:147-...`), not just the terminal
 hop. This is a load-bearing invariant, not an implementation detail: a
 CNAME record is itself a positive RRset with its own independent expiry, so
 an intermediate hop can need a refresh even while the terminal hop stays

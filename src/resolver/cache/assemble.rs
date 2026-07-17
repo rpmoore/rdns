@@ -31,6 +31,7 @@
 
 use std::collections::HashSet;
 use std::net::IpAddr;
+use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
 use crate::config::RefreshConfig;
@@ -68,7 +69,9 @@ pub(crate) struct RefreshHint {
 /// CNAME's own entry, no further walking past it).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ResolvedAnswer {
-    pub(crate) chain: Vec<(String, RRsetEntry)>, // (owner name, entry), in walk order
+    // (owner name, entry), in walk order. Entries are `Arc` clones of the
+    // shards' stored values — see `HopResult`.
+    pub(crate) chain: Vec<(String, Arc<RRsetEntry>)>,
     /// One hint per hop in `chain` that independently wants a refresh —
     /// not just the terminal hop. A CNAME record is itself a positive
     /// RRset with its own independent expiry, so an intermediate hop can
@@ -99,9 +102,9 @@ pub struct ResolvedAnswer {
 /// this field split fixed.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ResolvedNegative {
-    pub(crate) chain: Vec<(String, RRsetEntry)>,
+    pub(crate) chain: Vec<(String, Arc<RRsetEntry>)>,
     pub(crate) terminal_name: String,
-    pub(crate) negative: NegativeEntry,
+    pub(crate) negative: Arc<NegativeEntry>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -153,7 +156,7 @@ pub(crate) fn resolve_from_cache(
     refresh_config: &RefreshConfig,
 ) -> ChainLookup {
     let mut current = crate::resolver::normalize_question_name(qname);
-    let mut chain: Vec<(String, RRsetEntry)> = Vec::new();
+    let mut chain: Vec<(String, Arc<RRsetEntry>)> = Vec::new();
     let mut refresh_hints: Vec<RefreshHint> = Vec::new();
     let mut visited: HashSet<String> = HashSet::new();
 
@@ -266,11 +269,11 @@ fn compute_wire_ttl(
 /// terminal `NegativeEntry`'s own `authoritative` bit, and a negative
 /// result with zero CNAME hops must not have its AA bit forced false just
 /// because `chain` happened to be empty.
-fn chain_authoritative(chain: &[(String, RRsetEntry)]) -> bool {
+fn chain_authoritative(chain: &[(String, Arc<RRsetEntry>)]) -> bool {
     chain.iter().all(|(_, entry)| entry.authoritative)
 }
 
-fn chain_answer_count(chain: &[(String, RRsetEntry)], dnssec_ok: bool) -> u16 {
+fn chain_answer_count(chain: &[(String, Arc<RRsetEntry>)], dnssec_ok: bool) -> u16 {
     chain
         .iter()
         .map(|(_, entry)| {
@@ -420,7 +423,7 @@ fn negative_authority_count(negative: &NegativeEntry, dnssec_ok: bool) -> u16 {
 /// below instead — using this function alone for a negative result would
 /// only ever inspect its CNAME hops, never the terminal NXDOMAIN/NODATA
 /// entry's own `dnssec_state`.
-fn dnssec_servfail_check(chain: &[(String, RRsetEntry)], features: &QueryFeatures) -> bool {
+fn dnssec_servfail_check(chain: &[(String, Arc<RRsetEntry>)], features: &QueryFeatures) -> bool {
     if features.checking_disabled {
         return false;
     }
@@ -442,7 +445,7 @@ fn dnssec_servfail_check(chain: &[(String, RRsetEntry)], features: &QueryFeature
 /// path — a CD=1 requester has explicitly asked to see potentially-bogus
 /// data itself.
 fn negative_dnssec_servfail_check(
-    chain: &[(String, RRsetEntry)],
+    chain: &[(String, Arc<RRsetEntry>)],
     negative: &NegativeEntry,
     features: &QueryFeatures,
 ) -> bool {
@@ -463,7 +466,7 @@ fn negative_dnssec_servfail_check(
 /// alone is the complete set of entries to check. For `ResolvedNegative`,
 /// whose terminal result is a `NegativeEntry` (with its own `dnssec_state`,
 /// not part of `chain`), see `negative_dnssec_ad_bit` below instead.
-fn dnssec_ad_bit(chain: &[(String, RRsetEntry)], features: &QueryFeatures) -> bool {
+fn dnssec_ad_bit(chain: &[(String, Arc<RRsetEntry>)], features: &QueryFeatures) -> bool {
     if !(features.dnssec_ok || features.authenticated_data) {
         return false;
     }
@@ -481,7 +484,7 @@ fn dnssec_ad_bit(chain: &[(String, RRsetEntry)], features: &QueryFeatures) -> bo
 /// validate, so the "nothing to have validated" rule that empty-guards
 /// `dnssec_ad_bit` doesn't apply.
 fn negative_dnssec_ad_bit(
-    chain: &[(String, RRsetEntry)],
+    chain: &[(String, Arc<RRsetEntry>)],
     negative: &NegativeEntry,
     features: &QueryFeatures,
 ) -> bool {
@@ -983,7 +986,7 @@ mod tests {
         entry.expires_at = stored_at + Duration::from_secs(600);
         let resolved = ResolvedAnswer {
             refresh_hints: Vec::new(),
-            chain: vec![("example.com".to_string(), entry)],
+            chain: vec![("example.com".to_string(), entry.into())],
         };
         let wire = question_wire("example.com", A_QTYPE, IN_QCLASS);
 
@@ -1013,7 +1016,7 @@ mod tests {
         entry.expires_at = stored_at + Duration::from_secs(600); // expires in 10s
         let resolved = ResolvedAnswer {
             refresh_hints: Vec::new(),
-            chain: vec![("example.com".to_string(), entry)],
+            chain: vec![("example.com".to_string(), entry.into())],
         };
         let wire = question_wire("example.com", A_QTYPE, IN_QCLASS);
 
@@ -1051,7 +1054,7 @@ mod tests {
         );
         let resolved = ResolvedAnswer {
             refresh_hints: Vec::new(),
-            chain: vec![("example.com".to_string(), entry)],
+            chain: vec![("example.com".to_string(), entry.into())],
         };
         let wire = question_wire("example.com", A_QTYPE, IN_QCLASS);
 
@@ -1081,7 +1084,7 @@ mod tests {
         let entry = rrset_entry(vec![a_record(300, 1)], Duration::from_secs(300), now);
         let resolved = ResolvedAnswer {
             refresh_hints: Vec::new(),
-            chain: vec![("example.com".to_string(), entry)],
+            chain: vec![("example.com".to_string(), entry.into())],
         };
 
         let lower_wire = question_wire("example.com", A_QTYPE, IN_QCLASS);
@@ -1124,7 +1127,7 @@ mod tests {
         let entry = rrset_entry(records, Duration::from_secs(300), now);
         let resolved = ResolvedAnswer {
             refresh_hints: Vec::new(),
-            chain: vec![("example.com".to_string(), entry)],
+            chain: vec![("example.com".to_string(), entry.into())],
         };
         let wire = question_wire("example.com", A_QTYPE, IN_QCLASS);
 
@@ -1186,7 +1189,7 @@ mod tests {
         let entry = rrset_entry(vec![a_record(300, 1)], Duration::from_secs(300), now);
         let resolved = ResolvedAnswer {
             refresh_hints: Vec::new(),
-            chain: vec![("example.com".to_string(), entry)],
+            chain: vec![("example.com".to_string(), entry.into())],
         };
         let wire = question_wire("example.com", A_QTYPE, IN_QCLASS);
 
@@ -1253,7 +1256,7 @@ mod tests {
         let entry = rrset_entry(vec![a_record(300, 1)], Duration::from_secs(300), now);
         let resolved = ResolvedAnswer {
             refresh_hints: Vec::new(),
-            chain: vec![("example.com".to_string(), entry)],
+            chain: vec![("example.com".to_string(), entry.into())],
         };
         let wire = question_wire("example.com", A_QTYPE, IN_QCLASS);
         let client_cookie: ClientCookie = [0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88];
@@ -1302,7 +1305,7 @@ mod tests {
         authoritative_entry.authoritative = true;
         let authoritative_resolved = ResolvedAnswer {
             refresh_hints: Vec::new(),
-            chain: vec![("example.com".to_string(), authoritative_entry)],
+            chain: vec![("example.com".to_string(), authoritative_entry.into())],
         };
         let aa_response = assemble_response(
             1,
@@ -1325,7 +1328,7 @@ mod tests {
         non_authoritative_entry.authoritative = false;
         let non_authoritative_resolved = ResolvedAnswer {
             refresh_hints: Vec::new(),
-            chain: vec![("example.com".to_string(), non_authoritative_entry)],
+            chain: vec![("example.com".to_string(), non_authoritative_entry.into())],
         };
         let no_aa_response = assemble_response(
             1,
@@ -1362,8 +1365,11 @@ mod tests {
         let mixed_resolved = ResolvedAnswer {
             refresh_hints: Vec::new(),
             chain: vec![
-                ("alias.example.com".to_string(), authoritative_cname),
-                ("target.example.com".to_string(), non_authoritative_terminal),
+                ("alias.example.com".to_string(), authoritative_cname.into()),
+                (
+                    "target.example.com".to_string(),
+                    non_authoritative_terminal.into(),
+                ),
             ],
         };
         let mixed_wire = question_wire("alias.example.com", A_QTYPE, IN_QCLASS);
@@ -1394,7 +1400,7 @@ mod tests {
         let entry = rrset_entry(vec![a_record(300, 1)], Duration::from_secs(300), now);
         let resolved = ResolvedAnswer {
             refresh_hints: Vec::new(),
-            chain: vec![("example.com".to_string(), entry)],
+            chain: vec![("example.com".to_string(), entry.into())],
         };
         let wire = question_wire("example.com", A_QTYPE, IN_QCLASS);
 
@@ -1455,7 +1461,7 @@ mod tests {
         }];
         let resolved = ResolvedAnswer {
             refresh_hints: Vec::new(),
-            chain: vec![("example.com".to_string(), entry)],
+            chain: vec![("example.com".to_string(), entry.into())],
         };
         let wire = question_wire("example.com", A_QTYPE, IN_QCLASS);
 
@@ -1493,7 +1499,7 @@ mod tests {
         secure_entry.dnssec_state = DnssecState::Secure;
         let resolved = ResolvedAnswer {
             refresh_hints: Vec::new(),
-            chain: vec![("example.com".to_string(), secure_entry)],
+            chain: vec![("example.com".to_string(), secure_entry.into())],
         };
         let wire = question_wire("example.com", A_QTYPE, IN_QCLASS);
 
@@ -1531,7 +1537,7 @@ mod tests {
         unvalidated_entry.dnssec_state = DnssecState::Unvalidated;
         let unvalidated_resolved = ResolvedAnswer {
             refresh_hints: Vec::new(),
-            chain: vec![("example.com".to_string(), unvalidated_entry)],
+            chain: vec![("example.com".to_string(), unvalidated_entry.into())],
         };
         let unvalidated_response = assemble_response(
             1,
@@ -1554,7 +1560,7 @@ mod tests {
         bogus_entry.dnssec_state = DnssecState::Bogus("signature verification failed".to_string());
         let resolved = ResolvedAnswer {
             refresh_hints: Vec::new(),
-            chain: vec![("example.com".to_string(), bogus_entry)],
+            chain: vec![("example.com".to_string(), bogus_entry.into())],
         };
         let wire = question_wire("example.com", A_QTYPE, IN_QCLASS);
 
@@ -1651,7 +1657,7 @@ mod tests {
         let resolved = ResolvedNegative {
             chain: Vec::new(),
             terminal_name: "nx.example.com".to_string(),
-            negative,
+            negative: negative.into(),
         };
         let wire = question_wire("nx.example.com", A_QTYPE, IN_QCLASS);
 
@@ -1708,7 +1714,7 @@ mod tests {
         let resolved = ResolvedNegative {
             chain: Vec::new(),
             terminal_name: "nx.example.com".to_string(),
-            negative: bogus_negative,
+            negative: bogus_negative.into(),
         };
         let wire = question_wire("nx.example.com", A_QTYPE, IN_QCLASS);
 
@@ -1766,7 +1772,7 @@ mod tests {
         let resolved = ResolvedNegative {
             chain: Vec::new(),
             terminal_name: "example.com".to_string(),
-            negative: bogus_negative,
+            negative: bogus_negative.into(),
         };
         let wire = question_wire("example.com", A_QTYPE, IN_QCLASS);
 
@@ -1829,7 +1835,7 @@ mod tests {
         let resolved = ResolvedNegative {
             chain: Vec::new(),
             terminal_name: covered_name.to_string(),
-            negative,
+            negative: negative.into(),
         };
         let wire = question_wire(covered_name, A_QTYPE, IN_QCLASS);
 
@@ -1922,7 +1928,7 @@ mod tests {
         let resolved = ResolvedNegative {
             chain: Vec::new(),
             terminal_name: covered_name.to_string(),
-            negative,
+            negative: negative.into(),
         };
         let wire = question_wire(covered_name, A_QTYPE, IN_QCLASS);
 
@@ -2031,9 +2037,9 @@ mod tests {
             vec![("proof-owner.example.com".to_string(), proof)],
         );
         let resolved = ResolvedNegative {
-            chain: vec![("target.example.com".to_string(), cname_entry)],
+            chain: vec![("target.example.com".to_string(), cname_entry.into())],
             terminal_name: "target.example.com".to_string(),
-            negative,
+            negative: negative.into(),
         };
         let wire = question_wire("target.example.com", A_QTYPE, IN_QCLASS);
 
@@ -2105,7 +2111,7 @@ mod tests {
         let resolved = ResolvedNegative {
             chain: Vec::new(),
             terminal_name: "nx.example.com".to_string(),
-            negative,
+            negative: negative.into(),
         };
         let wire = question_wire("nx.example.com", A_QTYPE, IN_QCLASS);
         let mut do_features = features(true);
@@ -2156,7 +2162,7 @@ mod tests {
         let resolved = ResolvedNegative {
             chain: Vec::new(),
             terminal_name: "nx.example.com".to_string(),
-            negative,
+            negative: negative.into(),
         };
         let wire = question_wire("nx.example.com", A_QTYPE, IN_QCLASS);
 
@@ -2216,7 +2222,7 @@ mod tests {
         let resolved = ResolvedNegative {
             chain: Vec::new(),
             terminal_name: "nx.example.com".to_string(),
-            negative,
+            negative: negative.into(),
         };
         let wire = question_wire("nx.example.com", A_QTYPE, IN_QCLASS);
 
@@ -2269,7 +2275,7 @@ mod tests {
         let resolved = ResolvedNegative {
             chain: Vec::new(),
             terminal_name: "nx.example.com".to_string(),
-            negative: secure_negative,
+            negative: secure_negative.into(),
         };
         let wire = question_wire("nx.example.com", A_QTYPE, IN_QCLASS);
 
@@ -2314,7 +2320,7 @@ mod tests {
         let unvalidated_resolved = ResolvedNegative {
             chain: Vec::new(),
             terminal_name: "nx.example.com".to_string(),
-            negative: unvalidated_negative,
+            negative: unvalidated_negative.into(),
         };
         let unvalidated_response = assemble_negative_response(
             1,
@@ -2350,9 +2356,9 @@ mod tests {
         let mut secure_negative_with_chain = negative_entry(now, 3600, None, Vec::new());
         secure_negative_with_chain.dnssec_state = DnssecState::Secure;
         let resolved_with_secure_chain = ResolvedNegative {
-            chain: vec![("alias.example.com".to_string(), secure_cname)],
+            chain: vec![("alias.example.com".to_string(), secure_cname.into())],
             terminal_name: "target.example.com".to_string(),
-            negative: secure_negative_with_chain,
+            negative: secure_negative_with_chain.into(),
         };
         let chain_wire = question_wire("alias.example.com", A_QTYPE, IN_QCLASS);
         let secure_chain_response = assemble_negative_response(
@@ -2386,9 +2392,9 @@ mod tests {
         let mut secure_negative_after_unvalidated_hop = negative_entry(now, 3600, None, Vec::new());
         secure_negative_after_unvalidated_hop.dnssec_state = DnssecState::Secure;
         let resolved_with_unvalidated_hop = ResolvedNegative {
-            chain: vec![("alias.example.com".to_string(), unvalidated_cname)],
+            chain: vec![("alias.example.com".to_string(), unvalidated_cname.into())],
             terminal_name: "target.example.com".to_string(),
-            negative: secure_negative_after_unvalidated_hop,
+            negative: secure_negative_after_unvalidated_hop.into(),
         };
         let mixed_response = assemble_negative_response(
             1,
@@ -2746,7 +2752,7 @@ mod tests {
         assert_eq!(
             result,
             ChainLookup::Answered(ResolvedAnswer {
-                chain: vec![("stale.example.com".to_string(), entry)],
+                chain: vec![("stale.example.com".to_string(), entry.into())],
                 refresh_hints: vec![RefreshHint {
                     domain: "stale.example.com".to_string(),
                     qtype: A_QTYPE,

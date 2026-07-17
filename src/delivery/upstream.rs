@@ -288,7 +288,11 @@ impl ForwardingResolutionBackend {
         rewrite_response_id(&mut response_bytes, attempt.client_id)
             .map_err(|_| UpstreamError::MalformedResponse)?;
         response.header.id = attempt.client_id;
-        response.original_bytes = Bytes::copy_from_slice(&response_bytes);
+        // One shared allocation for the response payload: `original_bytes`
+        // and the `UpstreamResponse` bytes are the same `Bytes` (refcount
+        // bump), not two full copies of the wire response.
+        let response_bytes = Bytes::from(response_bytes);
+        response.original_bytes = response_bytes.clone();
 
         Ok(UpstreamResponse::forwarded_message(
             response_bytes,
@@ -633,7 +637,9 @@ async fn resolve_tcp_fallback(
     rewrite_response_id(&mut response_bytes, client_id)
         .map_err(|_| UpstreamError::MalformedResponse)?;
     response.header.id = client_id;
-    response.original_bytes = Bytes::copy_from_slice(&response_bytes);
+    // Same shared-allocation shape as `resolve_attempt`'s UDP path.
+    let response_bytes = Bytes::from(response_bytes);
+    response.original_bytes = response_bytes.clone();
     Ok(UpstreamResponse::forwarded_message(
         response_bytes,
         response,

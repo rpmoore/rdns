@@ -86,6 +86,29 @@ async fn bind_listener_socket(address: SocketAddr) -> io::Result<UdpSocket> {
     UdpSocket::bind(address).await
 }
 
+/// How many `SO_REUSEPORT` sockets to bind per configured UDP listen
+/// address. On Linux the kernel load-balances incoming datagrams across
+/// every socket bound to the same address, so binding one socket (each
+/// with its own serial recv loop) per core — capped, since intake
+/// parallelism past a handful of loops stops being the bottleneck —
+/// removes the single-receive-loop ceiling on packet intake. On other
+/// platforms `SO_REUSEPORT` provides no UDP load-balancing (see
+/// `bind_listener_socket`), so extra sockets on one address would either
+/// fail to bind or sit idle.
+#[cfg(target_os = "linux")]
+fn udp_sockets_per_listener() -> usize {
+    const MAX_UDP_SOCKETS_PER_LISTENER: usize = 8;
+    std::thread::available_parallelism()
+        .map(|parallelism| parallelism.get())
+        .unwrap_or(1)
+        .min(MAX_UDP_SOCKETS_PER_LISTENER)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn udp_sockets_per_listener() -> usize {
+    1
+}
+
 /// Bind a TCP listener socket for the DNS listener.
 ///
 /// Mirrors `bind_listener_socket`'s `SO_REUSEPORT` handling for UDP. Without
@@ -120,7 +143,14 @@ pub struct UdpDnsServer {
     clock: Arc<dyn Clock>,
     listener: Option<SocketAddr>,
     max_request_size: usize,
-    max_in_flight_requests: usize,
+    /// In-flight request budget. Held as a shared `Arc` (not a bare count)
+    /// so `bind_configured` can hand every `SO_REUSEPORT` socket of one
+    /// listen address the *same* semaphore: the kernel routes all of a
+    /// single client flow's datagrams to one socket (4-tuple hash), so a
+    /// per-socket split would cut that flow's effective budget to
+    /// `1/socket_count` of the configured cap while the other sockets'
+    /// permits sat idle.
+    in_flight: Arc<Semaphore>,
 }
 
 impl UdpDnsServer {
@@ -146,6 +176,22 @@ impl UdpDnsServer {
         max_request_size: usize,
         max_in_flight_requests: usize,
     ) -> Self {
+        Self::with_shared_in_flight(
+            socket,
+            resolver,
+            clock,
+            max_request_size,
+            Arc::new(Semaphore::new(max_in_flight_requests)),
+        )
+    }
+
+    fn with_shared_in_flight(
+        socket: UdpSocket,
+        resolver: Arc<ResolveQuery>,
+        clock: Arc<dyn Clock>,
+        max_request_size: usize,
+        in_flight: Arc<Semaphore>,
+    ) -> Self {
         let listener = socket.local_addr().ok();
         Self {
             socket: Arc::new(socket),
@@ -153,7 +199,7 @@ impl UdpDnsServer {
             clock,
             listener,
             max_request_size,
-            max_in_flight_requests,
+            in_flight,
         }
     }
 
@@ -172,17 +218,29 @@ impl UdpDnsServer {
         resolver: Arc<ResolveQuery>,
         clock: Arc<dyn Clock>,
     ) -> io::Result<Vec<Self>> {
-        let mut servers = Vec::with_capacity(config.dns_listen.len());
+        let sockets_per_listener = udp_sockets_per_listener();
+        let mut servers = Vec::with_capacity(config.dns_listen.len() * sockets_per_listener);
         for address in &config.dns_listen {
-            servers.push(
-                Self::bind(
-                    *address,
+            // One semaphore *shared* across this address's sockets, not a
+            // per-socket split of the budget: SO_REUSEPORT routes each
+            // client flow's datagrams to one socket by 4-tuple hash, so a
+            // divided budget would cap a single busy downstream (e.g. a
+            // stub resolver or NAT'd site sending from one source socket)
+            // at 1/socket_count of the configured in-flight limit while the
+            // sibling sockets' permits sat idle. Sharing keeps both the
+            // aggregate and the per-flow behavior identical to the old
+            // single-socket shape.
+            let in_flight = Arc::new(Semaphore::new(DEFAULT_MAX_IN_FLIGHT_REQUESTS));
+            for _ in 0..sockets_per_listener {
+                let socket = bind_listener_socket(*address).await?;
+                servers.push(Self::with_shared_in_flight(
+                    socket,
                     resolver.clone(),
                     clock.clone(),
                     config.max_udp_payload_size,
-                )
-                .await?,
-            );
+                    Arc::clone(&in_flight),
+                ));
+            }
         }
         Ok(servers)
     }
@@ -196,15 +254,21 @@ impl UdpDnsServer {
         S: Future<Output = ()>,
     {
         tokio::pin!(shutdown);
-        let semaphore = Arc::new(Semaphore::new(self.max_in_flight_requests));
+        let semaphore = Arc::clone(&self.in_flight);
         let mut tasks = JoinSet::new();
+        // One receive buffer reused across the whole serve loop (receives
+        // are serial per socket): each datagram then costs one exact-size
+        // copy of the bytes actually received, not a fresh zeroed
+        // `max_request_size` allocation whose full capacity stays alive for
+        // the request task's lifetime.
+        let mut recv_buffer = vec![0; self.max_request_size];
         loop {
             // The `join_next()` branch is guarded so it's never polled while
             // `tasks` is empty; an unguarded call would resolve to `None`
             // immediately and busy-loop the select.
             tokio::select! {
                 _ = &mut shutdown => break,
-                result = self.receive_permitted_datagram(semaphore.clone()) => {
+                result = self.receive_permitted_datagram(semaphore.clone(), &mut recv_buffer) => {
                     if !self.spawn_received_datagram(result?, &mut tasks) {
                         break;
                     }
@@ -238,17 +302,16 @@ impl UdpDnsServer {
     async fn receive_permitted_datagram(
         &self,
         semaphore: Arc<Semaphore>,
+        recv_buffer: &mut [u8],
     ) -> io::Result<Option<ReceivedDatagram>> {
         let permit = match semaphore.acquire_owned().await {
             Ok(permit) => permit,
             Err(_) => return Ok(None),
         };
-        let mut request_bytes = vec![0; self.max_request_size];
-        let (request_len, source) = self.socket.recv_from(&mut request_bytes).await?;
-        request_bytes.truncate(request_len);
+        let (request_len, source) = self.socket.recv_from(recv_buffer).await?;
         Ok(Some(ReceivedDatagram {
             permit,
-            request_bytes,
+            request_bytes: recv_buffer[..request_len].to_vec(),
             source,
         }))
     }
@@ -1138,9 +1201,18 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(servers.len(), 2);
-        assert_eq!(servers[0].local_addr().unwrap(), first_address);
-        assert_eq!(servers[1].local_addr().unwrap(), second_address);
+        // Each configured address gets `udp_sockets_per_listener()` SO_REUSEPORT
+        // sockets (1 on non-Linux), grouped in configuration order.
+        let per_listener = udp_sockets_per_listener();
+        assert_eq!(servers.len(), 2 * per_listener);
+        for (index, server) in servers.iter().enumerate() {
+            let expected = if index < per_listener {
+                first_address
+            } else {
+                second_address
+            };
+            assert_eq!(server.local_addr().unwrap(), expected);
+        }
     }
 
     async fn tcp_send_query(stream: &mut TcpStream, query: &[u8]) {

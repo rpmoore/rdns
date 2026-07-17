@@ -12,3 +12,5 @@
   popularity tracking, the trigger formula, and the background worker pool.
 * [serve-stale](serve-stale.md) - RFC 8767: expired-but-recently-cached positive answers served
   immediately (30s wire TTL) with an unconditional background refresh.
+* [delegation-cache](delegation-cache.md) - Recursive mode's zone-cut cache (learned NS/glue
+  endpoints): lazy expiry, sequence-stamped FIFO eviction, bounded slot queue.
