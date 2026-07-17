@@ -3,6 +3,7 @@ version = 1
 [[annotations]]
 path = [
     ".agents/**",
+    ".claude/settings.json",
     ".github/**",
     ".gitignore",
     "AGENTS.md",
