@@ -4,6 +4,7 @@ version = 1
 path = [
     ".agents/**",
     ".claude/settings.json",
+    ".claude/skills/**",
     ".github/**",
     ".gitignore",
     "AGENTS.md",
