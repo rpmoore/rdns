@@ -105,6 +105,13 @@ Every `[cache]` field is startup-only: a SIGHUP reload ignores changes
 here. Defaults are pinned to `CacheTtlPolicy::default()` by
 `cache_config_default_ttls_match_cache_ttl_policy_default` (`src/main.rs`).
 
+An origin TTL of exactly 0 is exempt from both floors
+(`apply_ttl_bounds`, `src/resolver/mod.rs`): RFC 1035 §3.2.1 / RFC 2308
+§5 define TTL 0 as "this transaction only", so a floor must not lift it
+into a cacheable lifetime — the entry stores already-expired and the
+first lookup evicts it (pinned by
+`ttl_policy_floor_does_not_lift_zero_origin_ttl`).
+
 Even when a `min_positive_ttl` floor extends an entry's actual cache
 lifetime (`expires_at`) well past what the record's own origin TTL
 alone would justify, `compute_wire_ttl`'s `aged` term still comes from

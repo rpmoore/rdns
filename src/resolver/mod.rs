@@ -2323,8 +2323,20 @@ fn hex_nibble(byte: u8) -> Result<u8, ResolutionBackendError> {
     }
 }
 
+/// Applies the configured floor/ceiling to a response-derived TTL. A TTL of
+/// exactly 0 is exempt from the floor: RFC 1035 §3.2.1 (and RFC 2308 §5 for
+/// negative answers) defines TTL 0 as "this transaction only", so a
+/// configured `min_positive_ttl`/`min_negative_ttl` must not resurrect it
+/// into a cacheable lifetime — flooring it would keep transaction-only data
+/// servable (at wire TTL 0) until the floor expired, and would sidestep the
+/// serve-stale TTL-0 eviction guard, which only sees entries *after* expiry
+/// (PR #142 review finding). Left at 0, the entry expires at store time and
+/// the first lookup evicts it.
 fn apply_ttl_bounds(ttl: Duration, min_ttl: Option<Duration>, max_ttl: Duration) -> Duration {
     let capped = ttl.min(max_ttl);
+    if ttl.is_zero() {
+        return capped;
+    }
     match min_ttl {
         Some(min_ttl) => capped.max(min_ttl).min(max_ttl),
         None => capped,
@@ -3028,7 +3040,9 @@ impl QueryEventOutcome {
 pub enum QueryEventCacheResult {
     Hit,
     /// A hit that served at least one expired entry under RFC 8767
-    /// serve-stale (a background refresh was signaled alongside it).
+    /// serve-stale. (A background refresh is *typically* signaled too, but
+    /// not guaranteed — the enqueue is best-effort and some paths drop
+    /// hints; see `docs/knowledge/resolver/caching/serve-stale.md`.)
     Stale,
     Miss,
     Expired,
@@ -5278,8 +5292,11 @@ impl ResolveQuery {
     ///
     /// Unlike the old flat `CacheLookup`, `ChainLookup` has no
     /// `Expired`/`Unavailable` variants: `resolve_from_cache` (section-06)
-    /// rejects an expired or stale-namespace match inline and folds it
-    /// into `Miss` before ever returning it, and the new cache has no
+    /// folds a stale-namespace match — and, with serve-stale disabled or
+    /// beyond the stale window, an expired match — into `Miss` before ever
+    /// returning it (an expired *positive* entry inside the RFC 8767 stale
+    /// window is instead returned as an `Answered` stale serve, classified
+    /// here via `chain_contains_stale`), and the new cache has no
     /// external dependency that could make it "unavailable" (it's
     /// in-process memory, not a service call) — so
     /// `ResolverMetric::CacheExpired`/`CacheUnavailable` are no longer
@@ -15070,6 +15087,47 @@ mod tests {
         assert_eq!(
             policy.ttl_for_response(&low).unwrap().0,
             Duration::from_secs(20)
+        );
+    }
+
+    /// A configured `min_positive_ttl` floor must not lift an origin TTL of
+    /// exactly 0 (RFC 1035 §3.2.1: "this transaction only") into a cacheable
+    /// lifetime — flooring it would keep transaction-only data servable
+    /// until the floor expired and would sidestep the serve-stale TTL-0
+    /// eviction guard, which only inspects entries after expiry (PR #142
+    /// review finding).
+    #[test]
+    fn ttl_policy_floor_does_not_lift_zero_origin_ttl() {
+        let policy = CacheTtlPolicy::new(
+            Duration::from_secs(3600),
+            Some(Duration::from_secs(120)),
+            Duration::from_secs(3600),
+            Some(Duration::from_secs(120)),
+            None,
+        );
+
+        let zero_positive = response_message(
+            ResponseCode::NoError,
+            vec![a_record("example.com", 0)],
+            Vec::new(),
+        );
+        assert_eq!(
+            policy.ttl_for_response(&zero_positive).unwrap().0,
+            Duration::ZERO,
+            "a TTL-0 answer must stay uncacheable despite the floor"
+        );
+
+        // Same rule for the negative floor: a SOA-minimum of 0 (RFC 2308
+        // §5) means "do not negatively cache", floor or no floor.
+        let zero_negative = response_message(
+            ResponseCode::NxDomain,
+            Vec::new(),
+            vec![soa_record("example.com", 0, 0)],
+        );
+        assert_eq!(
+            policy.ttl_for_response(&zero_negative).unwrap().0,
+            Duration::ZERO,
+            "a SOA-minimum-0 negative answer must stay uncacheable despite the floor"
         );
     }
 
