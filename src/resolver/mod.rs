@@ -8001,10 +8001,12 @@ impl DelegationCache {
         let now = Instant::now();
         let mut state = self.state.lock().unwrap();
         let by_owner = state.entries.get_mut(&qclass)?;
+        let mut matched = None;
         for suffix in zone_suffixes(qname) {
             match by_owner.get(suffix) {
                 Some(entry) if entry.expires_at > now => {
-                    return Some((suffix.to_string(), entry.endpoints.clone()));
+                    matched = Some((suffix.to_string(), entry.endpoints.clone()));
+                    break;
                 }
                 Some(_) => {
                     // Expired: drop lazily. Its `insertion_order` slot is
@@ -8015,7 +8017,13 @@ impl DelegationCache {
                 None => {}
             }
         }
-        None
+        // Uphold `remove_entry`'s emptied-inner-map invariant here too: if
+        // lazy expiry just removed this qclass's last entry, drop the outer
+        // key rather than parking an empty map on it.
+        if by_owner.is_empty() {
+            state.entries.remove(&qclass);
+        }
+        matched
     }
 
     #[cfg(test)]
@@ -8026,6 +8034,11 @@ impl DelegationCache {
     #[cfg(test)]
     fn insertion_order_len(&self) -> usize {
         self.state.lock().unwrap().insertion_order.len()
+    }
+
+    #[cfg(test)]
+    fn qclass_key_count(&self) -> usize {
+        self.state.lock().unwrap().entries.len()
     }
 
     #[cfg(test)]
@@ -23194,6 +23207,28 @@ mod tests {
             cache.insertion_order_len() <= 2,
             "expected at most one live and one just-stranded slot, got {}",
             cache.insertion_order_len()
+        );
+    }
+
+    // Regression test for the empty-inner-map leak in lookup's lazy expiry
+    // removal (PR #149 review): removing a qclass's last entry must drop
+    // the outer qclass key too, matching `remove_entry`'s invariant, so
+    // distinct qclasses can't accumulate empty maps.
+    #[tokio::test(start_paused = true)]
+    async fn delegation_cache_lookup_lazy_removal_drops_emptied_qclass_map() {
+        let cache = DelegationCache::new(DEFAULT_DELEGATION_CACHE_CAPACITY);
+        let endpoints = vec!["203.0.113.10:53".parse::<SocketAddr>().unwrap()];
+        const CHAOS_QCLASS: u16 = 3;
+        cache.insert("chaos.example".to_string(), CHAOS_QCLASS, endpoints, 1);
+        assert_eq!(cache.qclass_key_count(), 1);
+
+        tokio::time::advance(Duration::from_millis(1100)).await;
+        assert!(cache.lookup("chaos.example", CHAOS_QCLASS).is_none());
+
+        assert_eq!(
+            cache.qclass_key_count(),
+            0,
+            "lazy expiry removal of a qclass's last entry must drop the outer qclass key"
         );
     }
 
