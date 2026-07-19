@@ -134,6 +134,21 @@ async fn main() -> io::Result<()> {
     let cookie_secret = Arc::new(CookieSecret::generate());
     let (refresh_tx, refresh_rx) =
         tokio::sync::mpsc::channel(refresh_channel_capacity(&config.refresh));
+    // `ResolveQuery::with_trust_anchors` is deliberately NOT called here yet.
+    // `DnssecValidationMode` (`config/mod.rs`) currently only has a
+    // `Disabled` variant -- there is no config-level way to opt into
+    // validation yet, so wiring real trust anchors in unconditionally would
+    // make every `ResolutionMode::Recursive` fetch validate regardless of
+    // that mode, with no kill switch. Confirmed against a live recursive
+    // instance: ordinary (unsigned) domains started coming back SERVFAIL,
+    // since a domain with no DS/DNSKEY chain validates as `Bogus` in some
+    // paths, not `Insecure`, and `dnssec_servfail_check` then forces
+    // SERVFAIL for any CD=0 requester -- a severe regression for the
+    // current (validation-off) default. Section-05 (`DnssecValidationMode::
+    // Enabled`, defaulted on deliberately, with its own rollout/metrics
+    // story) is where this gets wired live; until then the mechanism stays
+    // built and tested (`ResolveQuery::validate_for_store`) but unreachable
+    // in production, matching every existing `ResolveQuery` default.
     let mut resolver_builder = ResolveQuery::with_cache_policy_and_backend_snapshot(
         Arc::new(StandardProtocolCodec::new(config.max_udp_payload_size)),
         Arc::clone(&cache) as Arc<dyn DomainDnsCache>,
@@ -153,7 +168,8 @@ async fn main() -> io::Result<()> {
     .with_single_flight_shard_count(cache.shard_count())
     .with_chaos_config(config.chaos.clone())
     .with_cookie_secret(cookie_secret)
-    .with_refresh_config(config.refresh);
+    .with_refresh_config(config.refresh)
+    .with_dnssec_validation_deadline(config.per_query_deadline);
     if config.refresh.enabled {
         resolver_builder = resolver_builder.with_refresh_sender(refresh_tx);
     }

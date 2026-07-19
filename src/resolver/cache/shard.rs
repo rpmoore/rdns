@@ -31,7 +31,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime};
 
 use super::entry::{
-    DomainNegativeEntries, DomainRecordSets, NegativeEntry, NegativeKey, RRsetEntry,
+    DnssecState, DomainNegativeEntries, DomainRecordSets, NegativeEntry, NegativeKey, RRsetEntry,
 };
 use super::lru::ShardLru;
 use crate::config::{LeakRate, RefreshConfig};
@@ -536,6 +536,14 @@ fn stale_servability(
         return StaleServability::Evict;
     };
     if entry.cache_epoch != current_epoch {
+        return StaleServability::Evict;
+    }
+    // A `Bogus` entry must never be served via serve-stale, regardless of
+    // window or TTL state -- serving a known-tampered response past its
+    // expiration defeats the point of validating it in the first place.
+    // Checked early, ahead of the window/zero-TTL checks below, since no
+    // other condition can make a `Bogus` entry servable.
+    if matches!(entry.dnssec_state, DnssecState::Bogus(_)) {
         return StaleServability::Evict;
     }
     // The TTL-0 exclusion checks each stored record's own origin TTL
@@ -1981,6 +1989,66 @@ mod tests {
         assert!(
             shard.contains_positive(domain, (A_QTYPE, IN_QCLASS)),
             "a stale-served entry must stay cached for the next reader"
+        );
+    }
+
+    #[test]
+    fn lookup_hop_evicts_expired_bogus_entry_instead_of_serving_stale() {
+        // section-04 (A6): a `Bogus` entry must never be served via
+        // serve-stale, even within the window that would otherwise make it
+        // servable -- serving a known-tampered response past its expiration
+        // defeats the point of validating it.
+        let shard = stale_shard();
+        let domain = "bogus-stale.example.com";
+        let now = SystemTime::now();
+        let mut entry = expired_rrset_entry(now);
+        entry.dnssec_state = DnssecState::Bogus("signature verification failed".to_string());
+        shard.store_positive(domain, (A_QTYPE, IN_QCLASS), entry);
+
+        let result = shard.lookup_hop(
+            domain,
+            A_QTYPE,
+            IN_QCLASS,
+            false,
+            1,
+            now,
+            &test_refresh_config(),
+        );
+
+        assert!(
+            matches!(result, HopResult::Miss),
+            "expected a Bogus expired entry to be evicted rather than stale-served, got {result:?}"
+        );
+        assert!(
+            !shard.contains_positive(domain, (A_QTYPE, IN_QCLASS)),
+            "a Bogus entry excluded from serve-stale must not remain cached"
+        );
+    }
+
+    #[test]
+    fn lookup_hop_serves_stale_secure_entry_unaffected_by_bogus_exclusion() {
+        // No-regression check: `Secure`/`Insecure` entries keep today's
+        // serve-stale behavior unchanged by the new Bogus exclusion above.
+        let shard = stale_shard();
+        let domain = "secure-stale.example.com";
+        let now = SystemTime::now();
+        let mut entry = expired_rrset_entry(now);
+        entry.dnssec_state = DnssecState::Secure;
+        shard.store_positive(domain, (A_QTYPE, IN_QCLASS), entry);
+
+        let result = shard.lookup_hop(
+            domain,
+            A_QTYPE,
+            IN_QCLASS,
+            false,
+            1,
+            now,
+            &test_refresh_config(),
+        );
+
+        assert!(
+            matches!(result, HopResult::Answer(_, true)),
+            "expected a Secure expired entry to still be stale-served, got {result:?}"
         );
     }
 

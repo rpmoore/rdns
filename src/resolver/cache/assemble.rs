@@ -1553,6 +1553,58 @@ mod tests {
         assert!(!Message::parse(&unvalidated_response).unwrap().header.ad());
     }
 
+    // section-04 (A6): no-regression check requested by the plan --
+    // `dnssec_ad_bit` never reads `checking_disabled` at all, so a Secure
+    // entry's AD-bit output must be identical for CD=0 and CD=1 requesters
+    // (unlike `dnssec_servfail_check`, which does gate on it).
+    #[test]
+    fn assemble_response_ad_bit_for_secure_entry_unaffected_by_cd_bit() {
+        let now = SystemTime::now();
+        let mut secure_entry = rrset_entry(vec![a_record(300, 1)], Duration::from_secs(300), now);
+        secure_entry.dnssec_state = DnssecState::Secure;
+        let resolved = ResolvedAnswer {
+            refresh_hints: Vec::new(),
+            chain: vec![("example.com".to_string(), secure_entry.into())],
+        };
+        let wire = question_wire("example.com", A_QTYPE, IN_QCLASS);
+
+        let mut checking_disabled = features(true);
+        checking_disabled.checking_disabled = true;
+        let with_cd = assemble_response(
+            1,
+            &wire,
+            &checking_disabled,
+            &resolved,
+            now,
+            false,
+            4096,
+            &test_cookie_secret(),
+            test_client_ip(),
+        );
+        assert!(
+            Message::parse(&with_cd).unwrap().header.ad(),
+            "a Secure entry's AD bit must still be set for a CD=1 requester that also set DO"
+        );
+
+        let mut checking_enabled = features(true);
+        checking_enabled.checking_disabled = false;
+        let with_ce = assemble_response(
+            1,
+            &wire,
+            &checking_enabled,
+            &resolved,
+            now,
+            false,
+            4096,
+            &test_cookie_secret(),
+            test_client_ip(),
+        );
+        assert!(
+            Message::parse(&with_ce).unwrap().header.ad(),
+            "a Secure entry's AD bit must be identical for a CD=0 requester"
+        );
+    }
+
     #[test]
     fn assemble_response_servfails_on_bogus_when_checking_enabled() {
         let now = SystemTime::now();
@@ -1599,6 +1651,58 @@ mod tests {
         let served_parsed = Message::parse(&served_response).unwrap();
         assert_eq!(served_parsed.header.r_code(), ResponseCode::NoError as u8);
         assert_eq!(served_parsed.answers.len(), 1);
+    }
+
+    // section-04 (A8): coverage for `dnssec_servfail_check`'s existing
+    // `.any()` aggregation with a genuine multi-hop chain -- prior coverage
+    // (`assemble_response_servfails_on_bogus_when_checking_enabled` above)
+    // only ever used a single-entry chain. Proves the chain-level verdict
+    // reflects the worst state in the chain (one Secure hop, one Bogus hop
+    // -> SERVFAIL), not just that a lone Bogus entry triggers it.
+    #[test]
+    fn assemble_response_servfails_on_mixed_state_cname_chain_with_any_bogus_hop() {
+        let now = SystemTime::now();
+        let mut secure_hop = rrset_entry(
+            vec![StoredRecord {
+                rtype: CNAME_RECORD_TYPE,
+                rclass: IN_QCLASS,
+                ttl_at_store: 300,
+                rdata: RecordData::CNAME("target.example.com".to_string()),
+            }],
+            Duration::from_secs(300),
+            now,
+        );
+        secure_hop.dnssec_state = DnssecState::Secure;
+        let mut bogus_hop = rrset_entry(vec![a_record(300, 1)], Duration::from_secs(300), now);
+        bogus_hop.dnssec_state = DnssecState::Bogus("signature verification failed".to_string());
+        let resolved = ResolvedAnswer {
+            refresh_hints: Vec::new(),
+            chain: vec![
+                ("alias.example.com".to_string(), secure_hop.into()),
+                ("target.example.com".to_string(), bogus_hop.into()),
+            ],
+        };
+        let wire = question_wire("alias.example.com", A_QTYPE, IN_QCLASS);
+
+        let checking_enabled = features(false);
+        let response = assemble_response(
+            1,
+            &wire,
+            &checking_enabled,
+            &resolved,
+            now,
+            false,
+            4096,
+            &test_cookie_secret(),
+            test_client_ip(),
+        );
+        let parsed = Message::parse(&response).unwrap();
+        assert_eq!(
+            parsed.header.r_code(),
+            ResponseCode::ServFail as u8,
+            "a Bogus hop anywhere in the chain must force SERVFAIL, even alongside a Secure hop"
+        );
+        assert_eq!(parsed.answers.len(), 0);
     }
 
     fn soa_record(ttl: u32) -> StoredRecord {

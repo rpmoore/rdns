@@ -14,9 +14,10 @@
 
 //! Core DNSSEC validation: runs a fully-synthesized recursive response
 //! through `domain`'s validator and maps the verdict onto this codebase's
-//! `DnssecState`. Does not wire into cache-entry construction, CD-bit
-//! gating, or metrics -- see `docs/plans/sec_work/sections/`
-//! section-04/05/06 for those.
+//! `DnssecState`. Wired into cache-entry construction by
+//! `ResolveQuery::validate_for_store` (`resolver/mod.rs`, section-04); CD-bit
+//! gating already existed independently (`resolver/cache/assemble.rs`) and
+//! metrics are section-05 -- see `docs/plans/sec_work/sections/` for both.
 //!
 //! The validator's own DS/DNSKEY chase queries are bridged onto
 //! `ResolutionBackend::resolve` (the same root-to-authority recursive
@@ -59,10 +60,6 @@ const MAX_BOGUS_VALIDITY: Duration = Duration::from_secs(30);
 
 /// Builds the `domain` validator `Config` with rdns's explicit policy
 /// values rather than the crate's raw defaults.
-// Not called from cache-entry construction yet -- section-04 wires
-// `validate_response` into `build_rrset_entry`/`build_negative_entry`.
-// Remove this allow once that lands.
-#[allow(dead_code)]
 pub(crate) fn validator_config() -> ValidatorConfig {
     let mut config = ValidatorConfig::new();
     config.set_nsec3_iter_insecure(NSEC3_ITER_INSECURE);
@@ -77,7 +74,6 @@ pub(crate) fn validator_config() -> ValidatorConfig {
 /// so callers that need to distinguish "ran, Indeterminate" from "never
 /// ran" (section-05's metrics) still can -- `DnssecState::Unvalidated`
 /// alone can't tell those apart.
-#[allow(dead_code)] // not constructed outside this module yet -- section-04 wires it in
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct DnssecValidationOutcome {
     pub(crate) state: DnssecState,
@@ -119,10 +115,6 @@ fn bogus_outcome(reason: impl Into<String>) -> DnssecValidationOutcome {
 /// `ResolutionRequest` so they land in the same cache-namespace generation
 /// as the request being validated, rather than a fixed/stale one (see
 /// `backend_cache_namespace`).
-// Not called from cache-entry construction yet -- section-04 wires
-// `validate_response` into `build_rrset_entry`/`build_negative_entry`.
-// Remove this allow once that lands.
-#[allow(dead_code)]
 pub(crate) async fn validate_response(
     response: &Message,
     trust_anchors: TrustAnchors,
@@ -277,7 +269,7 @@ fn chase_error(error: ResolutionBackendError) -> ClientError {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     #[test]

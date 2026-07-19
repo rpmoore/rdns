@@ -55,12 +55,15 @@ decides one of three outcomes:
   from it (mirroring the live-path DO filter, which is also not grounds
   for eviction).
 - **`Evict`** — serve-stale disabled, beyond the window, stamped with a
-  stale epoch, or carrying any record/RRSIG whose *origin* TTL
-  (`StoredRecord::ttl_at_store`) was 0 (RFC 1035: TTL 0 means "this
-  transaction only"). The check is per record, not `entry.minimum_ttl`:
-  with a `min_positive_ttl` floor configured, `minimum_ttl` is the
-  policy-bounded lifetime and is nonzero even for origin-TTL-0 records
-  (PR #142 review finding). Removed at read time, byte-for-byte the
+  stale epoch, `dnssec_state` is `Bogus` (checked first, ahead of the
+  window/TTL checks below — a known-tampered response must never be
+  served regardless of window or TTL state), or carrying any
+  record/RRSIG whose *origin* TTL (`StoredRecord::ttl_at_store`) was 0
+  (RFC 1035: TTL 0 means "this transaction only"). The TTL-0 check is
+  per record, not `entry.minimum_ttl`: with a `min_positive_ttl` floor
+  configured, `minimum_ttl` is the policy-bounded lifetime and is
+  nonzero even for origin-TTL-0 records (PR #142 review finding).
+  Non-Bogus evictions are removed at read time, byte-for-byte the
   original pre-serve-stale behavior.
 
 Epoch equality is required even for stale service: RFC 8767 staleness is
@@ -113,13 +116,24 @@ TTLs, stale hops serve 30s.
 DNSSEC note: stale RRSIGs are served as stored; signature validity
 windows are absolute timestamps unaffected by TTL, so a validating
 client fails closed on genuinely lapsed signatures exactly as RFC 8767
-anticipates. This resolver performs no local DNSSEC validation —
-`dnssec_state` is only ever `Unvalidated` in production stores
-(`build_rrset_entry`), so the `dnssec_ad_bit` AD=1 path is unreachable
-for cached entries, stale or live. If local validation ever starts
-assigning `Secure`, stale service must additionally revalidate RRSIG
-inception/expiration before asserting AD (RFC 4035 §4.3) — flagged here
-so that feature inherits the requirement.
+anticipates. `dnssec_state` is stamped by `ResolveQuery::validate_for_store`
+(real DNSSEC validation exists as of the DNSSEC entry-wiring work) but is
+currently unreachable in production — `main.rs` doesn't wire trust
+anchors in yet, pending a config-level enable/disable gate
+(`DnssecValidationMode`, still `Disabled`-only) — so every stored entry
+is still `Unvalidated` in practice, and the `dnssec_ad_bit` AD=1 path
+stays unreachable for cached entries, stale or live, until that gate
+lands. Once real verdicts flow: `Bogus` entries are excluded from
+serve-stale outright (see the `Evict` bullet above), so the "stale
+signature that later turns out tampered" case can't be served past
+expiry either way. `Secure`/`Insecure` entries' existing serve-stale
+behavior is unaffected by that exclusion. Entry TTL is separately capped
+at the earliest RRSIG expiration at store time
+(`cap_expires_at_to_rrsig_expiration`, `src/resolver/mod.rs`), so a
+`Secure` entry's `expires_at` (and thus its stale window) already
+reflects signature validity — no additional inception/expiration
+revalidation is needed at stale-serve time beyond what capping already
+guarantees.
 
 Refresh attempt rate under upstream failure: a failed refresh leaves the
 stale entry in place, so each subsequent client query for that name
