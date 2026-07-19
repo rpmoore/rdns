@@ -117,17 +117,16 @@ DNSSEC note: stale RRSIGs are served as stored; signature validity
 windows are absolute timestamps unaffected by TTL, so a validating
 client fails closed on genuinely lapsed signatures exactly as RFC 8767
 anticipates. `dnssec_state` is stamped by `ResolveQuery::validate_for_store`
-(real DNSSEC validation exists as of the DNSSEC entry-wiring work) but is
-currently unreachable in production — `main.rs` doesn't wire trust
-anchors in yet, pending a config-level enable/disable gate
-(`DnssecValidationMode`, still `Disabled`-only) — so every stored entry
-is still `Unvalidated` in practice, and the `dnssec_ad_bit` AD=1 path
-stays unreachable for cached entries, stale or live, until that gate
-lands. Once real verdicts flow: `Bogus` entries are excluded from
-serve-stale outright (see the `Evict` bullet above), so the "stale
-signature that later turns out tampered" case can't be served past
-expiry either way. `Secure`/`Insecure` entries' existing serve-stale
-behavior is unaffected by that exclusion. Entry TTL is separately capped
+and is live in production as of the status/metrics work (`main.rs`'s
+`trust_anchors_to_wire_in` wires real trust anchors in whenever
+`RecursiveResolutionConfig::dnssec_validation` is `Enabled`, the
+default) — real verdicts flow and the `dnssec_ad_bit` AD=1 path is
+reachable for cached entries, stale or live. `Bogus` entries are
+excluded from serve-stale outright (see the `Evict` bullet above), so
+the "stale signature that later turns out tampered" case can't be
+served past expiry either way. `Secure`/`Insecure` entries' existing
+serve-stale behavior is unaffected by that exclusion. Entry TTL is
+separately capped
 at the earliest RRSIG expiration at store time
 (`cap_expires_at_to_rrsig_expiration`, `src/resolver/mod.rs`), so a
 `Secure` entry's `expires_at` (and thus its stale window) already

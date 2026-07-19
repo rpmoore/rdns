@@ -75,7 +75,7 @@ pub(crate) fn validator_config() -> ValidatorConfig {
 /// ran" (section-05's metrics) still can -- `DnssecState::Unvalidated`
 /// alone can't tell those apart.
 #[derive(Debug, Clone, PartialEq)]
-pub(crate) struct DnssecValidationOutcome {
+pub(crate) struct ValidationRunOutcome {
     pub(crate) state: DnssecState,
     pub(crate) validation_state: ValidationState,
 }
@@ -93,8 +93,8 @@ fn map_validation_state(state: ValidationState, reason: Option<String>) -> Dnsse
     }
 }
 
-fn bogus_outcome(reason: impl Into<String>) -> DnssecValidationOutcome {
-    DnssecValidationOutcome {
+fn bogus_outcome(reason: impl Into<String>) -> ValidationRunOutcome {
+    ValidationRunOutcome {
         state: DnssecState::Bogus(reason.into()),
         validation_state: ValidationState::Bogus,
     }
@@ -121,7 +121,7 @@ pub(crate) async fn validate_response(
     backend: Arc<dyn ResolutionBackend>,
     backend_generation: u64,
     deadline: Instant,
-) -> DnssecValidationOutcome {
+) -> ValidationRunOutcome {
     let bytes = Bytes::copy_from_slice(response.original_bytes.as_ref());
     let mut domain_msg = match DomainMessage::from_octets(bytes) {
         Ok(msg) => msg,
@@ -149,7 +149,7 @@ pub(crate) async fn validate_response(
     match outcome {
         Ok(Ok((state, ede))) => {
             let reason = ede.map(|e| e.to_string());
-            DnssecValidationOutcome {
+            ValidationRunOutcome {
                 state: map_validation_state(state, reason),
                 validation_state: state,
             }

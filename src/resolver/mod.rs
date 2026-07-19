@@ -24,6 +24,7 @@ use std::time::{Duration, SystemTime};
 
 use bytes::Bytes;
 use domain::dnssec::validator::anchor::TrustAnchors;
+use domain::dnssec::validator::context::ValidationState;
 use serde::Serialize;
 use tokio::sync::mpsc;
 use tokio::task::JoinSet;
@@ -59,8 +60,7 @@ pub use cache::{
 };
 
 mod dnssec_validation;
-#[allow(unused_imports)] // wired in by section-04
-pub(crate) use dnssec_validation::{DnssecValidationOutcome, validate_response, validator_config};
+pub(crate) use dnssec_validation::validate_response;
 
 pub mod policy;
 pub use policy::{
@@ -2470,6 +2470,28 @@ pub enum BackendHealth {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub enum DnssecValidationStatus {
     Disabled,
+    Enabled,
+}
+
+/// Per-query DNSSEC validation outcome, recorded via
+/// `MetricsSink::record_dnssec_validation_outcome` as the
+/// `dnssec_validation_results_total` counter's `outcome` label. Distinct
+/// from `dnssec_validation::ValidationRunOutcome` (the internal
+/// state/`ValidationState` pair `validate_for_store` consumes) -- this is
+/// the metrics-facing, five-way label set, not a richer status/mode enum.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DnssecValidationOutcome {
+    Secure,
+    Insecure,
+    Bogus,
+    Indeterminate,
+    /// Validation did not run for this query: either
+    /// `DnssecValidationMode::Disabled` (no trust anchors configured), or
+    /// the query never reached the recursive validation path at all.
+    /// Distinct from `Indeterminate` (validation ran and came back
+    /// inconclusive) -- collapsing the two would make it impossible for an
+    /// operator to tell "DNSSEC is off" from "DNSSEC is on and confused."
+    NotAttempted,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2570,6 +2592,11 @@ impl BackendSnapshot {
 
     pub fn with_root_hints_status(mut self, root_hints: BackendRootHintsStatus) -> Self {
         self.root_hints = Some(root_hints);
+        self
+    }
+
+    pub fn with_dnssec_validation_status(mut self, status: DnssecValidationStatus) -> Self {
+        self.dnssec_validation = status;
         self
     }
 
@@ -6238,6 +6265,13 @@ impl ResolveQuery {
     /// treating this as a bug to silently fix later.
     async fn validate_for_store(&self, response: &Message) -> DnssecState {
         let Some(trust_anchor_lines) = self.trust_anchors.as_ref() else {
+            // No trust anchors configured -- either `DnssecValidationMode::
+            // Disabled` (main.rs never wires anchors in for that mode) or a
+            // constructor that never called `with_trust_anchors`. Either
+            // way, the DS/DNSKEY chase never runs, so this is
+            // `NotAttempted`, not `Indeterminate`.
+            self.metrics
+                .record_dnssec_validation_outcome(DnssecValidationOutcome::NotAttempted);
             return DnssecState::Unvalidated;
         };
         let trust_anchors = match TrustAnchors::from_u8(trust_anchor_lines.join("\n").as_bytes()) {
@@ -6254,6 +6288,19 @@ impl ResolveQuery {
                     "configured DNSSEC trust anchors failed to parse; \
                      validation unavailable for this fetch"
                 );
+                // Unlike "no trust anchors configured" above, this is a live
+                // misconfiguration -- validation was supposed to run
+                // (anchors *are* configured, mode is Enabled) but can't.
+                // Bucketing this under `NotAttempted` would make it
+                // indistinguishable from the routine opt-out case, so an
+                // operator watching the counter would have no
+                // metric-driven signal that DNSSEC is silently broken, only
+                // this log line. `Bogus` matches `validate_response`'s own
+                // fail-closed convention for chase timeouts/transport
+                // errors (see its doc comment) -- "couldn't validate" fails
+                // closed here too, not silently to `NotAttempted`.
+                self.metrics
+                    .record_dnssec_validation_outcome(DnssecValidationOutcome::Bogus);
                 return DnssecState::Unvalidated;
             }
         };
@@ -6267,6 +6314,8 @@ impl ResolveQuery {
             deadline,
         )
         .await;
+        self.metrics
+            .record_dnssec_validation_outcome(dnssec_outcome_metric(outcome.validation_state));
         outcome.state
     }
 
@@ -6450,6 +6499,19 @@ impl ResolveQuery {
             QueryEventRecordResult::Sampled => ResolverMetric::QueryEventSampled,
         };
         self.metrics.increment(metric);
+    }
+}
+
+/// Maps `domain`'s raw `ValidationState` (from a completed validator run --
+/// i.e. `validate_response` was actually called, unlike the `NotAttempted`
+/// cases in `validate_for_store`) onto the metrics-facing
+/// `DnssecValidationOutcome`.
+fn dnssec_outcome_metric(state: ValidationState) -> DnssecValidationOutcome {
+    match state {
+        ValidationState::Secure => DnssecValidationOutcome::Secure,
+        ValidationState::Insecure => DnssecValidationOutcome::Insecure,
+        ValidationState::Bogus => DnssecValidationOutcome::Bogus,
+        ValidationState::Indeterminate => DnssecValidationOutcome::Indeterminate,
     }
 }
 
@@ -9133,6 +9195,12 @@ pub trait MetricsSink: Send + Sync {
 
     fn record_backend_status(&self, _status: &BackendStatus) {}
 
+    /// Records one DNSSEC validation outcome for a stored cache entry.
+    /// Called exactly once per `ResolutionMode::Recursive` store (never for
+    /// `Forward`, which has no DNSSEC concept -- see `validate_for_store`'s
+    /// call sites).
+    fn record_dnssec_validation_outcome(&self, _outcome: DnssecValidationOutcome) {}
+
     /// Per-query variant of `increment` carrying the requesting client's
     /// source IP, so sinks can label the metric by where the query came
     /// from. The resolver calls this (never plain `increment`) for every
@@ -10898,9 +10966,14 @@ mod tests {
         backend_statuses: Mutex<Vec<BackendStatus>>,
         source_increments: Mutex<Vec<(ResolverMetric, IpAddr)>>,
         source_durations: Mutex<Vec<(ResolverMetric, IpAddr)>>,
+        dnssec_outcomes: Mutex<Vec<DnssecValidationOutcome>>,
     }
 
     impl MetricsSink for RecordingMetrics {
+        fn record_dnssec_validation_outcome(&self, outcome: DnssecValidationOutcome) {
+            self.dnssec_outcomes.lock().unwrap().push(outcome);
+        }
+
         fn increment(&self, metric: ResolverMetric) {
             self.increments.lock().unwrap().push(metric);
         }
@@ -11778,11 +11851,12 @@ mod tests {
             DNSKEY_RECORD_TYPE,
             material.dnskey_response_wire.clone(),
         )]));
+        let metrics = Arc::new(RecordingMetrics::default());
         let service = resolve_service_with_recursive_cache(
             backend,
             Arc::new(NoopDnsCache),
             Arc::new(RecordingEvents::default()),
-            Arc::new(RecordingMetrics::default()),
+            Arc::clone(&metrics),
             1232,
         )
         .with_trust_anchors(vec![material.trust_anchor_line.clone()]);
@@ -11794,6 +11868,45 @@ mod tests {
             dnssec_state,
             DnssecState::Secure,
             "expected a real validator run against a known-good signed response to produce Secure"
+        );
+        assert_eq!(
+            *metrics.dnssec_outcomes.lock().unwrap(),
+            vec![DnssecValidationOutcome::Secure]
+        );
+    }
+
+    #[tokio::test]
+    async fn validate_for_store_records_bogus_outcome_for_a_tampered_signature() {
+        use crate::resolver::dnssec_validation::tests::fixture;
+        use domain::rdata::dnssec::Timestamp;
+
+        let now = Timestamp::now();
+        let expiration = Timestamp::from(now.into_int().wrapping_add(3600));
+        let material = fixture::build_zone("example.test.", now, expiration);
+        let mut wire = material.a_response_wire.clone();
+        fixture::flip_last_byte_of(&mut wire, &material.a_rrsig_rdata);
+        let backend: Arc<dyn ResolutionBackend> = Arc::new(ScriptedNameKeyedBackend::new(vec![(
+            material.apex.trim_end_matches('.').to_string(),
+            DNSKEY_RECORD_TYPE,
+            material.dnskey_response_wire.clone(),
+        )]));
+        let metrics = Arc::new(RecordingMetrics::default());
+        let service = resolve_service_with_recursive_cache(
+            backend,
+            Arc::new(NoopDnsCache),
+            Arc::new(RecordingEvents::default()),
+            Arc::clone(&metrics),
+            1232,
+        )
+        .with_trust_anchors(vec![material.trust_anchor_line.clone()]);
+
+        let response = fixture::rdns_message(wire);
+        let dnssec_state = service.validate_for_store(&response).await;
+
+        assert!(matches!(dnssec_state, DnssecState::Bogus(_)));
+        assert_eq!(
+            *metrics.dnssec_outcomes.lock().unwrap(),
+            vec![DnssecValidationOutcome::Bogus]
         );
     }
 
@@ -11813,11 +11926,12 @@ mod tests {
             DNSKEY_RECORD_TYPE,
             material.dnskey_response_wire.clone(),
         )]));
+        let metrics = Arc::new(RecordingMetrics::default());
         let service = resolve_service_with_recursive_cache(
             Arc::clone(&backend) as Arc<dyn ResolutionBackend>,
             Arc::new(NoopDnsCache),
             Arc::new(RecordingEvents::default()),
-            Arc::new(RecordingMetrics::default()),
+            Arc::clone(&metrics),
             1232,
         );
 
@@ -11829,6 +11943,69 @@ mod tests {
             backend.calls(),
             0,
             "no trust anchors configured must skip the validator entirely, never touching the backend"
+        );
+        assert_eq!(
+            *metrics.dnssec_outcomes.lock().unwrap(),
+            vec![DnssecValidationOutcome::NotAttempted],
+            "no trust anchors configured (mode disabled) must record NotAttempted, not silence \
+             and not Indeterminate"
+        );
+    }
+
+    #[tokio::test]
+    async fn validate_for_store_records_bogus_when_trust_anchors_fail_to_parse() {
+        // Trust anchors *are* configured (so this isn't the "mode disabled"
+        // path above) but aren't valid zonefile data -- a live
+        // misconfiguration under a requester who believes DNSSEC is on.
+        // Fails closed to `Bogus` for metrics purposes, distinct from the
+        // benign `NotAttempted` bucket used when no anchors are configured
+        // at all.
+        let backend: Arc<dyn ResolutionBackend> =
+            Arc::new(ScriptedNameKeyedBackend::new(Vec::new()));
+        let metrics = Arc::new(RecordingMetrics::default());
+        let service = resolve_service_with_recursive_cache(
+            Arc::clone(&backend),
+            Arc::new(NoopDnsCache),
+            Arc::new(RecordingEvents::default()),
+            Arc::clone(&metrics),
+            1232,
+        )
+        .with_trust_anchors(vec!["not a valid zonefile trust anchor line".to_string()]);
+
+        let response = response_message_for_question(
+            QuestionKey::new("example.com", A_RECORD_TYPE, 1),
+            ResponseCode::NoError,
+            vec![a_record("example.com", 60)],
+            Vec::new(),
+            Vec::new(),
+            false,
+        );
+        let dnssec_state = service.validate_for_store(&response).await;
+
+        assert_eq!(dnssec_state, DnssecState::Unvalidated);
+        assert_eq!(
+            *metrics.dnssec_outcomes.lock().unwrap(),
+            vec![DnssecValidationOutcome::Bogus]
+        );
+    }
+
+    #[test]
+    fn dnssec_outcome_metric_maps_every_validation_state() {
+        assert_eq!(
+            dnssec_outcome_metric(ValidationState::Secure),
+            DnssecValidationOutcome::Secure
+        );
+        assert_eq!(
+            dnssec_outcome_metric(ValidationState::Insecure),
+            DnssecValidationOutcome::Insecure
+        );
+        assert_eq!(
+            dnssec_outcome_metric(ValidationState::Bogus),
+            DnssecValidationOutcome::Bogus
+        );
+        assert_eq!(
+            dnssec_outcome_metric(ValidationState::Indeterminate),
+            DnssecValidationOutcome::Indeterminate
         );
     }
 
@@ -11860,11 +12037,12 @@ mod tests {
             shard_count: Some(1),
             ..CacheConfig::default()
         }));
+        let metrics = Arc::new(RecordingMetrics::default());
         let service = resolve_service_with_cache(
             Arc::clone(&backend) as Arc<dyn ResolutionBackend>,
             Arc::clone(&cache) as Arc<dyn DomainDnsCache>,
             Arc::new(RecordingEvents::default()),
-            Arc::new(RecordingMetrics::default()),
+            Arc::clone(&metrics),
             1232,
         )
         // Anchors configured but unparseable as real zonefile data -- if
@@ -11904,6 +12082,12 @@ mod tests {
             }
             other => panic!("expected Answered after storing the fetched entry, got {other:?}"),
         }
+
+        assert!(
+            metrics.dnssec_outcomes.lock().unwrap().is_empty(),
+            "Forward mode must never call record_dnssec_validation_outcome -- silence, \
+             not an explicit NotAttempted emission, since Forward has no DNSSEC concept"
+        );
     }
 
     #[tokio::test]

@@ -100,9 +100,9 @@ pub struct StoredRecord {
 /// covers both "never validated" (DNSSEC validation not attempted for this
 /// entry) and `domain`'s `ValidationState::Indeterminate` (ran but
 /// inconclusive) — `dnssec_validation::validate_response`'s
-/// `DnssecValidationOutcome` carries the raw `ValidationState` alongside
+/// `ValidationRunOutcome` carries the raw `ValidationState` alongside
 /// this collapsed value so callers that need to tell those two cases apart
-/// (e.g. section-05's metrics) still can.
+/// (e.g. section-05's `DnssecValidationOutcome` metric) still can.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub enum DnssecState {
     #[default]

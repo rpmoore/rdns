@@ -1187,12 +1187,14 @@ fn canonical_authority_name(name: &str) -> Result<String, ConfigError> {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DnssecValidationMode {
     Disabled,
+    Enabled,
 }
 
 impl DnssecValidationMode {
     fn cache_namespace_label(self) -> &'static str {
         match self {
             Self::Disabled => "disabled",
+            Self::Enabled => "enabled",
         }
     }
 }
@@ -1996,7 +1998,8 @@ impl RawRecursiveResolutionConfig {
         self,
     ) -> Result<RecursiveResolutionConfig, ConfigError> {
         let dnssec_validation = match self.dnssec_validation.as_deref() {
-            None | Some("disabled") => DnssecValidationMode::Disabled,
+            None | Some("enabled") => DnssecValidationMode::Enabled,
+            Some("disabled") => DnssecValidationMode::Disabled,
             Some(other) => {
                 return Err(ConfigError::InvalidTomlConfig {
                     message: format!("unknown dnssec_validation mode: {other}"),
@@ -4014,8 +4017,83 @@ a.root-servers.net.      3600000      Aaaa  2001:503:ba3e::2:30
             recursive.allowed_transports,
             vec![RecursiveTransport::Udp, RecursiveTransport::Tcp]
         );
-        assert_eq!(recursive.dnssec_validation, DnssecValidationMode::Disabled);
+        assert_eq!(recursive.dnssec_validation, DnssecValidationMode::Enabled);
         assert_eq!(recursive.dname_handling, DnameHandlingPolicy::Defer);
+    }
+
+    #[test]
+    fn dnssec_validation_mode_cache_namespace_labels_differ() {
+        assert_eq!(
+            DnssecValidationMode::Enabled.cache_namespace_label(),
+            "enabled"
+        );
+        assert_eq!(
+            DnssecValidationMode::Disabled.cache_namespace_label(),
+            "disabled"
+        );
+        assert_ne!(
+            DnssecValidationMode::Enabled.cache_namespace_label(),
+            DnssecValidationMode::Disabled.cache_namespace_label()
+        );
+    }
+
+    #[test]
+    fn toml_config_round_trip_honors_explicit_dnssec_validation_disabled() {
+        let mut toml = valid_toml();
+        toml.push_str(
+            r#"
+            [resolution]
+            mode = "recursive"
+
+            [resolution.recursive]
+            root_hints = "bundled"
+            root_hints_version = "bundled:v1"
+            dnssec_validation = "disabled"
+            "#,
+        );
+
+        let config = RuntimeConfig::from_toml_str(&toml).unwrap();
+        let recursive = config.resolution.recursive.as_ref().unwrap();
+        assert_eq!(recursive.dnssec_validation, DnssecValidationMode::Disabled);
+    }
+
+    #[test]
+    fn toml_config_round_trip_honors_explicit_dnssec_validation_enabled() {
+        let mut toml = valid_toml();
+        toml.push_str(
+            r#"
+            [resolution]
+            mode = "recursive"
+
+            [resolution.recursive]
+            root_hints = "bundled"
+            root_hints_version = "bundled:v1"
+            dnssec_validation = "enabled"
+            "#,
+        );
+
+        let config = RuntimeConfig::from_toml_str(&toml).unwrap();
+        let recursive = config.resolution.recursive.as_ref().unwrap();
+        assert_eq!(recursive.dnssec_validation, DnssecValidationMode::Enabled);
+    }
+
+    #[test]
+    fn toml_config_round_trip_rejects_unknown_dnssec_validation_mode() {
+        let mut toml = valid_toml();
+        toml.push_str(
+            r#"
+            [resolution]
+            mode = "recursive"
+
+            [resolution.recursive]
+            root_hints = "bundled"
+            root_hints_version = "bundled:v1"
+            dnssec_validation = "sometimes"
+            "#,
+        );
+
+        let error = RuntimeConfig::from_toml_str(&toml).unwrap_err();
+        assert!(matches!(error, ConfigError::InvalidTomlConfig { .. }));
     }
 
     #[test]
