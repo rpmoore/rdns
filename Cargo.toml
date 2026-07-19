@@ -37,3 +37,11 @@ tracing-subscriber = { version = "0.3.23", features = ["json", "env-filter"] }
 
 [dev-dependencies]
 tokio = { version = "1.28.2", features = ["test-util"] }
+# unstable-sign is dev-only: it generates the deterministic signed test-zone
+# fixture for the DNSSEC validator tests (no external signing tool like
+# ldns-signzone is assumed to be on the host). Cargo's feature resolver keeps
+# dev-dependency-only features out of the release/lib build.
+domain = { version = "0.12.1", default-features = false, features = ["zonefile", "bytes", "std", "siphasher", "unstable-sign", "ring"] }
+# For computing the DS digest of the fixture's child-zone DNSKEY by hand
+# (RFC 4034 Appendix B) -- `domain` doesn't expose a Dnskey-to-Ds builder.
+ring = "0.17"

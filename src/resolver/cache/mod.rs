@@ -36,7 +36,7 @@ pub(crate) use assemble::STALE_WIRE_TTL_SECS;
 pub(crate) use assemble::{
     RefreshHint, ResolvedAnswer, ResolvedNegative, assemble_negative_response, assemble_response,
 };
-pub use entry::{NegativeEntry, NegativeKey, RRsetEntry, StoredRecord};
+pub use entry::{DnssecState, NegativeEntry, NegativeKey, RRsetEntry, StoredRecord};
 pub(crate) use singleflight::{
     InFlightMiss, MissKey, ShardedSingleFlight, SingleFlightLeader, SingleFlightTicket,
 };

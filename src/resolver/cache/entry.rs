@@ -96,22 +96,19 @@ pub struct StoredRecord {
 }
 
 /// Mirrors RFC 6840 §3.1's "BAD cache" concept and Unbound/BIND-style
-/// internal validation-state tracking. Every entry starts and stays
-/// `Unvalidated` until real DNSSEC validation is implemented (out of scope
-/// for this whole rework) — this enum exists purely so the data model
-/// doesn't need reshaping again when that work happens later.
+/// internal validation-state tracking. `Unvalidated` is the default and
+/// covers both "never validated" (DNSSEC validation not attempted for this
+/// entry) and `domain`'s `ValidationState::Indeterminate` (ran but
+/// inconclusive) — `dnssec_validation::validate_response`'s
+/// `DnssecValidationOutcome` carries the raw `ValidationState` alongside
+/// this collapsed value so callers that need to tell those two cases apart
+/// (e.g. section-05's metrics) still can.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub enum DnssecState {
     #[default]
     Unvalidated,
-    // Not constructed anywhere yet — real DNSSEC validation is out of
-    // scope for this whole rework; these variants exist so the data
-    // model doesn't need reshaping again when that work happens later.
-    #[allow(dead_code)]
     Insecure,
-    #[allow(dead_code)]
     Secure,
-    #[allow(dead_code)]
     Bogus(String), // reason, for diagnostics; short negative-style TTL applies
 }
 

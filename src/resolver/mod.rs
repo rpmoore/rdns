@@ -57,6 +57,10 @@ pub use cache::{
     StoredRecord,
 };
 
+mod dnssec_validation;
+#[allow(unused_imports)] // wired in by section-04
+pub(crate) use dnssec_validation::{DnssecValidationOutcome, validate_response, validator_config};
+
 pub mod policy;
 pub use policy::{
     CidrPrefixError, ClientIdentity, ClientSelector, DomainName, DomainNameError, DomainSelector,

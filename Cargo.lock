@@ -180,8 +180,10 @@ dependencies = [
  "octseq",
  "rand",
  "ring",
+ "secrecy",
  "serde",
  "siphasher",
+ "smallvec",
  "tokio",
  "tracing",
 ]
@@ -873,6 +875,7 @@ dependencies = [
  "opentelemetry_sdk",
  "prometheus",
  "rand",
+ "ring",
  "serde",
  "serde_json",
  "socket2",
@@ -933,6 +936,15 @@ name = "scopeguard"
 version = "1.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "94143f37725109f92c262ed2cf5e59bce7498c01bcc1502d7b9afe439a4e9f49"
+
+[[package]]
+name = "secrecy"
+version = "0.10.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e891af845473308773346dc847b2c23ee78fe442e0472ac50e22a18a93d3ae5a"
+dependencies = [
+ "zeroize",
+]
 
 [[package]]
 name = "serde"
@@ -1514,6 +1526,12 @@ dependencies = [
  "syn 2.0.117",
  "synstructure",
 ]
+
+[[package]]
+name = "zeroize"
+version = "1.9.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e13c156562582aa81c60cb29407084cdb54c4164760106ab78e6c5b0858cf64e"
 
 [[package]]
 name = "zerotrie"
