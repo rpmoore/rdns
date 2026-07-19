@@ -4688,9 +4688,13 @@ impl ResolveQuery {
             return outcome;
         }
 
-        let mut cache_probe = self
-            .probe_cache(&backend_snapshot, &request, &decoded)
-            .await;
+        let mut cache_probe = match self
+            .probe_cache(&backend_snapshot, &request, &decoded, started_at)
+            .await
+        {
+            Ok(probe) => probe,
+            Err(outcome) => return outcome,
+        };
         if let Some(response_bytes) = cache_probe.hit {
             return self
                 .finish_cache_hit(
@@ -5374,19 +5378,71 @@ impl ResolveQuery {
         backend_snapshot: &BackendSnapshot,
         request: &ResolveRequest,
         decoded: &DecodedQuery,
-    ) -> CacheProbe {
+        started_at: SystemTime,
+    ) -> Result<CacheProbe, ResolveOutcome> {
+        // BADCOOKIE (RFC 7873 §5.2.4) runs before the `cache_supported`
+        // narrowing below: it's an independent rejection decision, not a
+        // cache-admissibility one -- a request can fail `cache_supported`
+        // (bypass the cache) while still needing to pass this check, or
+        // pass it while still needing a BADCOOKIE reject. Ordering
+        // against the EDNS-version check (BADVERS) needs no explicit
+        // logic here: `QueryValidationError::UnsupportedEdnsVersion` is
+        // produced at decode time, inside `decode_or_protocol_error`,
+        // which early-returns before `probe_cache` is ever called -- a
+        // request with an unsupported EDNS version never produces a
+        // `DecodedQuery` in the first place, so it structurally cannot
+        // reach this check.
+        if invalid_server_cookie(
+            decoded,
+            request.observed_source.is_tcp(),
+            &self.cookie_secret,
+            request.client_ip,
+        )
+        .is_some()
+        {
+            self.metrics
+                .increment_with_source(ResolverMetric::ProtocolError, request.client_ip);
+            let decision = ResolveDecision {
+                client_ip: request.client_ip,
+                question: Some(decoded.question.clone()),
+                kind: ResolveDecisionKind::ProtocolError(
+                    QueryValidationError::InvalidServerCookie.response_code(),
+                ),
+            };
+            let response_bytes = self.responses.protocol_error(
+                request.request_id,
+                &QueryValidationError::InvalidServerCookie,
+                Some(&decoded.message),
+                &self.cookie_secret,
+                request.client_ip,
+                self.clock.now(),
+                self.protocol.configured_max_udp_payload_size(),
+            );
+            return Err(self
+                .finish_uniform(
+                    started_at,
+                    request,
+                    decoded_original_question_name(decoded),
+                    decision,
+                    response_bytes,
+                    None,
+                    Some(QueryEventBackend::from_snapshot(backend_snapshot)),
+                )
+                .await);
+        }
+
         if !cache_supported(decoded) {
             self.metrics
                 .increment_with_source(ResolverMetric::CacheBypass, request.client_ip);
             self.metrics
                 .increment_with_source(ResolverMetric::CacheMiss, request.client_ip);
-            return CacheProbe {
+            return Ok(CacheProbe {
                 miss_key: None,
                 hit: None,
                 store_allowed: false,
                 event_cache_result: Some(QueryEventCacheResult::Bypass),
                 refresh_hints: Vec::new(),
-            };
+            });
         }
 
         // No effective-payload-size class here: a UDP query and a TCP query
@@ -5435,7 +5491,7 @@ impl ResolveQuery {
             ResolutionMode::Forward => decoded.features.dnssec_ok,
         };
 
-        CacheProbe {
+        Ok(CacheProbe {
             miss_key: Some((
                 decoded.question.qname.clone(),
                 decoded.question.qtype,
@@ -5447,7 +5503,7 @@ impl ResolveQuery {
             store_allowed,
             event_cache_result: Some(event_cache_result),
             refresh_hints,
-        }
+        })
     }
 
     /// Maps a cache lookup outcome to whether the eventual backend result
@@ -6805,6 +6861,47 @@ fn cache_supported(query: &DecodedQuery) -> bool {
         .unwrap_or(true)
 }
 
+/// Returns `Some(client_cookie)` when `decoded` must be rejected with a
+/// BADCOOKIE response (RFC 7873 §5.2.4): a server-cookie tail is present
+/// but invalid, stale, or structurally malformed, AND the request arrived
+/// over UDP (RFC 7873 §5.2.3's TCP carve-out means this never fires for
+/// `is_tcp == true`, regardless of how invalid the presented cookie is).
+/// Returns `None` for: no COOKIE option, first-contact (client-only)
+/// cookies, duplicate COOKIE options, TCP transport, or a server-cookie
+/// tail that matches the fresh recompute. Independent of `cache_supported`
+/// above: a request can fail that (bypass the cache) while still needing
+/// to pass this check, or pass that while still needing a BADCOOKIE
+/// reject.
+fn invalid_server_cookie(
+    decoded: &DecodedQuery,
+    is_tcp: bool,
+    cookie_secret: &CookieSecret,
+    client_ip: IpAddr,
+) -> Option<ClientCookie> {
+    if is_tcp {
+        return None;
+    }
+    let options = &decoded.message.edns.as_ref()?.options;
+    match crate::protocol::edns_cookie::locate_cookie_for_verification(options) {
+        crate::protocol::edns_cookie::CookieVerification::NoCookieOption
+        | crate::protocol::edns_cookie::CookieVerification::Duplicate
+        | crate::protocol::edns_cookie::CookieVerification::ClientOnly(_) => None,
+        crate::protocol::edns_cookie::CookieVerification::Malformed { client_cookie } => {
+            client_cookie
+        }
+        crate::protocol::edns_cookie::CookieVerification::ClientAndServer {
+            client_cookie,
+            server_cookie_tail,
+        } => (!crate::protocol::edns_cookie::server_cookie_matches(
+            cookie_secret,
+            client_cookie,
+            &server_cookie_tail,
+            client_ip,
+        ))
+        .then_some(client_cookie),
+    }
+}
+
 pub struct StandardProtocolCodec {
     configured_max_udp_payload_size: usize,
 }
@@ -6893,38 +6990,51 @@ impl ResponseFactory for BasicResponseFactory {
         }
 
         // BADCOOKIE (RFC 7873 §5.2.4/§5.3): same "doesn't fit `ResponseCode`"
-        // reasoning as BADVERS above. Unlike `UnsupportedEdnsVersion`, no
-        // caller produces this variant yet -- that's section-08's job, once
-        // cookie detection is wired into `probe_cache` -- so this arm is
-        // unreachable from any current code path. It's included now so
-        // section-08 only has to raise the error, not touch this routing.
-        //
-        // PLACEHOLDER, not the final extraction logic: re-parses `request`'s
-        // EDNS options via `edns_cookie::parse_cookie_option` to recover the
-        // client cookie to echo. That function returns `None` for a
-        // malformed-length COOKIE option -- one of the two cases
-        // `QueryValidationError::InvalidServerCookie`'s doc comment says
-        // this variant covers -- so once this arm becomes reachable, a
-        // malformed-but-present cookie would silently fall through to the
-        // generic FormErr path below instead of BADCOOKIE. section-08
-        // replaces this with `edns_cookie::locate_cookie_for_verification`
-        // (shared with its own `probe_cache` check) before making this arm
-        // reachable from real traffic; do not rely on this placeholder
-        // beyond that point.
-        if let (QueryValidationError::InvalidServerCookie, Some(request)) = (error, request)
-            && let Some(client_cookie) = request
-                .edns
-                .as_ref()
-                .and_then(|edns| crate::protocol::edns_cookie::parse_cookie_option(&edns.options))
-        {
-            return build_badcookie_response(
-                request,
-                client_cookie,
-                cookie_secret,
-                client_ip,
-                now,
-                configured_max_udp_payload_size,
-            );
+        // reasoning as BADVERS above. Produced by `probe_cache`'s
+        // `invalid_server_cookie` check (section-08). Recovers the client
+        // cookie to echo via `locate_cookie_for_verification` -- the same
+        // richer parsing function `invalid_server_cookie` itself uses, so
+        // there is one source of truth for "what's the client cookie
+        // here" instead of two independent re-implementations that could
+        // diverge. Unlike `parse_cookie_option`, this correctly recovers a
+        // client cookie for the malformed-length case, not just the
+        // valid-length-but-wrong-hash case.
+        if let (QueryValidationError::InvalidServerCookie, Some(request)) = (error, request) {
+            let client_cookie = request.edns.as_ref().and_then(|edns| {
+                match crate::protocol::edns_cookie::locate_cookie_for_verification(&edns.options) {
+                    crate::protocol::edns_cookie::CookieVerification::ClientAndServer {
+                        client_cookie,
+                        ..
+                    } => Some(client_cookie),
+                    crate::protocol::edns_cookie::CookieVerification::Malformed {
+                        client_cookie,
+                    } => client_cookie,
+                    // NoCookieOption / Duplicate / ClientOnly can't reach this
+                    // special case: `invalid_server_cookie` (the only
+                    // producer of this error variant) never returns a reject
+                    // decision for those.
+                    _ => None,
+                }
+            });
+            return match client_cookie {
+                Some(client_cookie) => build_badcookie_response(
+                    request,
+                    client_cookie,
+                    cookie_secret,
+                    client_ip,
+                    now,
+                    configured_max_udp_payload_size,
+                ),
+                // Defensive only, not reachable from any real caller today
+                // -- degrade to the generic FormErr path instead of
+                // panicking.
+                None => build_question_aware_error_response(
+                    Some(request),
+                    request_id,
+                    ResponseCode::FormErr,
+                    configured_max_udp_payload_size,
+                ),
+            };
         }
 
         // `QueryValidationError::response_code()` only ever actually
@@ -23824,11 +23934,19 @@ mod tests {
     /// and that `ConfiguredResponseFactory` delegates identically.
     #[test]
     fn protocol_error_routes_invalid_server_cookie_to_badcookie_response() {
+        // A client-cookie-only (8-byte) option is a realistic
+        // `ClientVerification::ClientOnly` shape that `invalid_server_cookie`
+        // never rejects (RFC 7873 §5.2.3 first contact) -- this routing
+        // test needs a fixture `invalid_server_cookie` could actually
+        // reject, so it presents a (garbage, thus invalid) 16-byte
+        // server-cookie tail alongside the client cookie instead.
         let client_cookie: ClientCookie = [1, 2, 3, 4, 5, 6, 7, 8];
+        let server_cookie_tail = [0xffu8; 16];
         let mut cookie_option = Vec::new();
         cookie_option.extend_from_slice(&10u16.to_be_bytes()); // COOKIE option code
-        cookie_option.extend_from_slice(&8u16.to_be_bytes());
+        cookie_option.extend_from_slice(&24u16.to_be_bytes());
         cookie_option.extend_from_slice(&client_cookie);
+        cookie_option.extend_from_slice(&server_cookie_tail);
 
         let request_bytes =
             a_query_with_edns_details(0x4242, "example.com", 4096, false, 0, 0, &cookie_option);
@@ -23879,6 +23997,498 @@ mod tests {
             basic_response, configured_response,
             "ConfiguredResponseFactory must delegate identically to BasicResponseFactory"
         );
+    }
+
+    /// Same routing test as
+    /// `protocol_error_routes_invalid_server_cookie_to_badcookie_response`,
+    /// but for the malformed-length case specifically (section-08's fix to
+    /// the section-07 placeholder): proves `locate_cookie_for_verification`
+    /// recovers a client cookie to echo for a structurally invalid tail,
+    /// not just the well-formed-but-wrong-hash case.
+    #[test]
+    fn protocol_error_routes_malformed_server_cookie_to_badcookie_response() {
+        let client_cookie: ClientCookie = [8, 7, 6, 5, 4, 3, 2, 1];
+        let mut cookie_option = Vec::new();
+        cookie_option.extend_from_slice(&10u16.to_be_bytes()); // COOKIE option code
+        cookie_option.extend_from_slice(&9u16.to_be_bytes()); // malformed length: 9
+        cookie_option.extend_from_slice(&client_cookie);
+        cookie_option.push(0xAB);
+
+        let request_bytes =
+            a_query_with_edns_details(0x5252, "example.com", 4096, false, 0, 0, &cookie_option);
+        let request = Message::parse(&request_bytes).unwrap();
+
+        let cookie_secret = CookieSecret::generate();
+        let client_ip: IpAddr = "192.0.2.66".parse().unwrap();
+        let now = SystemTime::UNIX_EPOCH;
+
+        let response = BasicResponseFactory.protocol_error(
+            Some(0x5252),
+            &QueryValidationError::InvalidServerCookie,
+            Some(&request),
+            &cookie_secret,
+            client_ip,
+            now,
+            1232,
+        );
+        let parsed = Message::parse(&response).unwrap();
+        let opt = parsed
+            .additionals
+            .iter()
+            .find_map(|record| match &record.record {
+                RecordData::OPT(info) => Some(info),
+                _ => None,
+            })
+            .expect("expected an OPT record in the BADCOOKIE response");
+        let combined_extended_rcode =
+            (u16::from(opt.extended_rcode) << 4) | u16::from(parsed.header.r_code());
+        assert_eq!(
+            combined_extended_rcode, 23,
+            "a malformed-length server-cookie tail must still route to BADCOOKIE, not fall \
+             through to the generic FormErr path"
+        );
+    }
+
+    fn cookie_option_bytes_with_tail(client_cookie: ClientCookie, tail: &[u8]) -> Vec<u8> {
+        let mut out = Vec::with_capacity(4 + 8 + tail.len());
+        out.extend_from_slice(&10u16.to_be_bytes()); // COOKIE option code
+        out.extend_from_slice(&((8 + tail.len()) as u16).to_be_bytes());
+        out.extend_from_slice(&client_cookie);
+        out.extend_from_slice(tail);
+        out
+    }
+
+    /// §B2 test 1 (ordering): a query with both an unsupported EDNS
+    /// version and an otherwise-invalid server cookie must produce
+    /// BADVERS, never reach cookie logic, and never produce BADCOOKIE.
+    /// `QueryValidationError::UnsupportedEdnsVersion` is raised at decode
+    /// time (`decode_or_protocol_error`), which early-returns before
+    /// `probe_cache`'s cookie check ever runs -- this proves the
+    /// short-circuit, not just that BADVERS eventually wins.
+    #[tokio::test]
+    async fn resolve_edns_version_error_takes_priority_over_invalid_cookie() {
+        let upstream = Arc::new(StaticUpstream::new(Err(UpstreamError::Timeout)));
+        let events = Arc::new(RecordingEvents::default());
+        let metrics = Arc::new(RecordingMetrics::default());
+        let service = resolve_service(upstream.clone(), events, metrics);
+
+        let client_cookie: ClientCookie = [1, 2, 3, 4, 5, 6, 7, 8];
+        let bogus_tail = [0xFFu8; 16];
+        let cookie_option = cookie_option_bytes_with_tail(client_cookie, &bogus_tail);
+        // version 7: unsupported (rdns only implements version 0).
+        let request_bytes =
+            a_query_with_edns_details(0x1001, "example.com", 4096, false, 0, 7, &cookie_option);
+
+        let outcome = service
+            .resolve(ResolveRequest::new(
+                "192.0.2.10".parse().unwrap(),
+                SystemTime::UNIX_EPOCH,
+                request_bytes,
+            ))
+            .await;
+
+        assert_eq!(
+            outcome.decision.kind,
+            ResolveDecisionKind::ProtocolError(ResponseCode::FormErr)
+        );
+        let response = Message::parse(&outcome.response_bytes).unwrap();
+        let opt = response
+            .additionals
+            .iter()
+            .find_map(|record| match &record.record {
+                RecordData::OPT(info) => Some(info),
+                _ => None,
+            })
+            .expect("expected an OPT record");
+        let combined_extended_rcode =
+            (u16::from(opt.extended_rcode) << 4) | u16::from(response.header.r_code());
+        assert_eq!(
+            combined_extended_rcode, 16,
+            "an unsupported EDNS version must produce BADVERS even when the presented cookie \
+             is also invalid -- the decode-time check runs first and never reaches probe_cache"
+        );
+        assert!(
+            upstream.requests.lock().unwrap().is_empty(),
+            "BADVERS is produced at decode time -- probe_cache and any backend fetch must \
+             never run"
+        );
+    }
+
+    /// §B2 test 2: a client cookie with a tampered (wrong-hash, otherwise
+    /// well-formed 16-byte) server-cookie tail, presented over UDP, must
+    /// be rejected with BADCOOKIE (combined extended RCODE 23).
+    #[tokio::test]
+    async fn resolve_rejects_tampered_server_cookie_over_udp_with_badcookie() {
+        let upstream = Arc::new(StaticUpstream::new(Err(UpstreamError::Timeout)));
+        let events = Arc::new(RecordingEvents::default());
+        let metrics = Arc::new(RecordingMetrics::default());
+        let secret = Arc::new(CookieSecret::generate());
+        let service =
+            resolve_service(upstream.clone(), events, metrics).with_cookie_secret(secret.clone());
+
+        let client_cookie: ClientCookie = [1, 2, 3, 4, 5, 6, 7, 8];
+        let client_ip: IpAddr = "192.0.2.10".parse().unwrap();
+        let mut tail = crate::protocol::edns_cookie::build_server_cookie(
+            secret.as_ref(),
+            client_cookie,
+            client_ip,
+            SystemTime::UNIX_EPOCH,
+        );
+        tail[15] ^= 0xFF; // tamper the hash
+        let cookie_option = cookie_option_bytes_with_tail(client_cookie, &tail);
+        let request_bytes =
+            a_query_with_edns_options(0x1002, "example.com", 4096, false, &cookie_option);
+
+        let outcome = service
+            .resolve(ResolveRequest::new(
+                client_ip,
+                SystemTime::UNIX_EPOCH,
+                request_bytes,
+            ))
+            .await;
+
+        assert_eq!(
+            outcome.decision.kind,
+            ResolveDecisionKind::ProtocolError(ResponseCode::FormErr),
+            "response_code() buckets InvalidServerCookie as FormErr for metrics purposes"
+        );
+        let response = Message::parse(&outcome.response_bytes).unwrap();
+        let opt = response
+            .additionals
+            .iter()
+            .find_map(|record| match &record.record {
+                RecordData::OPT(info) => Some(info),
+                _ => None,
+            })
+            .expect("expected an OPT record in the BADCOOKIE response");
+        let combined_extended_rcode =
+            (u16::from(opt.extended_rcode) << 4) | u16::from(response.header.r_code());
+        assert_eq!(combined_extended_rcode, 23, "23 == BADCOOKIE");
+        assert!(
+            upstream.requests.lock().unwrap().is_empty(),
+            "a BADCOOKIE rejection must never reach the backend"
+        );
+    }
+
+    /// §B2 test 3: RFC 7873 §5.2.3's TCP carve-out -- the identical
+    /// tampered-cookie bytes from
+    /// `resolve_rejects_tampered_server_cookie_over_udp_with_badcookie`
+    /// must be processed normally (never BADCOOKIE) when the same request
+    /// arrives over TCP.
+    #[tokio::test]
+    async fn resolve_accepts_tampered_server_cookie_over_tcp() {
+        let upstream = Arc::new(StaticUpstream::new(Err(UpstreamError::Timeout)));
+        let events = Arc::new(RecordingEvents::default());
+        let metrics = Arc::new(RecordingMetrics::default());
+        let secret = Arc::new(CookieSecret::generate());
+        let service =
+            resolve_service(upstream.clone(), events, metrics).with_cookie_secret(secret.clone());
+
+        let client_cookie: ClientCookie = [1, 2, 3, 4, 5, 6, 7, 8];
+        let client_ip: IpAddr = "192.0.2.10".parse().unwrap();
+        let mut tail = crate::protocol::edns_cookie::build_server_cookie(
+            secret.as_ref(),
+            client_cookie,
+            client_ip,
+            SystemTime::UNIX_EPOCH,
+        );
+        tail[15] ^= 0xFF;
+        let cookie_option = cookie_option_bytes_with_tail(client_cookie, &tail);
+        let request_bytes =
+            a_query_with_edns_options(0x1003, "example.com", 4096, false, &cookie_option);
+
+        let outcome = service
+            .resolve(ResolveRequest::new_with_observed_source(
+                ObservedSourceEndpoint::tcp("192.0.2.10:5555".parse().unwrap(), None),
+                SystemTime::UNIX_EPOCH,
+                request_bytes,
+            ))
+            .await;
+
+        assert_eq!(
+            outcome.decision.kind,
+            ResolveDecisionKind::BackendFailure,
+            "over TCP, an invalid server cookie must never trigger BADCOOKIE -- processing \
+             must continue to the backend"
+        );
+        assert!(
+            !upstream.requests.lock().unwrap().is_empty(),
+            "TCP carve-out: processing must reach the backend, not short-circuit on the \
+             invalid cookie"
+        );
+    }
+
+    /// §B2 test 4: a malformed (wrong-length) server-cookie tail over UDP
+    /// must also produce BADCOOKIE, not be silently treated as absent.
+    #[tokio::test]
+    async fn resolve_rejects_malformed_server_cookie_tlv_over_udp_with_badcookie() {
+        let upstream = Arc::new(StaticUpstream::new(Err(UpstreamError::Timeout)));
+        let events = Arc::new(RecordingEvents::default());
+        let metrics = Arc::new(RecordingMetrics::default());
+        let service = resolve_service(upstream.clone(), events, metrics);
+
+        let client_cookie: ClientCookie = [1, 2, 3, 4, 5, 6, 7, 8];
+        // Total option length 20: a 12-byte tail, not a valid 16-byte
+        // Standard Server Cookie.
+        let malformed_tail = [0u8; 12];
+        let cookie_option = cookie_option_bytes_with_tail(client_cookie, &malformed_tail);
+        let request_bytes =
+            a_query_with_edns_options(0x1004, "example.com", 4096, false, &cookie_option);
+
+        let outcome = service
+            .resolve(ResolveRequest::new(
+                "192.0.2.10".parse().unwrap(),
+                SystemTime::UNIX_EPOCH,
+                request_bytes,
+            ))
+            .await;
+
+        assert_eq!(
+            outcome.decision.kind,
+            ResolveDecisionKind::ProtocolError(ResponseCode::FormErr)
+        );
+        let response = Message::parse(&outcome.response_bytes).unwrap();
+        let opt = response
+            .additionals
+            .iter()
+            .find_map(|record| match &record.record {
+                RecordData::OPT(info) => Some(info),
+                _ => None,
+            })
+            .expect("expected an OPT record in the BADCOOKIE response");
+        let combined_extended_rcode =
+            (u16::from(opt.extended_rcode) << 4) | u16::from(response.header.r_code());
+        assert_eq!(
+            combined_extended_rcode, 23,
+            "a malformed-length server-cookie tail must produce BADCOOKIE, not be treated as \
+             absent"
+        );
+    }
+
+    /// §B2 test 5: the same malformed-TLV request from
+    /// `resolve_rejects_malformed_server_cookie_tlv_over_udp_with_badcookie`
+    /// must be processed normally over TCP.
+    #[tokio::test]
+    async fn resolve_accepts_malformed_server_cookie_tlv_over_tcp() {
+        let upstream = Arc::new(StaticUpstream::new(Err(UpstreamError::Timeout)));
+        let events = Arc::new(RecordingEvents::default());
+        let metrics = Arc::new(RecordingMetrics::default());
+        let service = resolve_service(upstream.clone(), events, metrics);
+
+        let client_cookie: ClientCookie = [1, 2, 3, 4, 5, 6, 7, 8];
+        let malformed_tail = [0u8; 12];
+        let cookie_option = cookie_option_bytes_with_tail(client_cookie, &malformed_tail);
+        let request_bytes =
+            a_query_with_edns_options(0x1005, "example.com", 4096, false, &cookie_option);
+
+        let outcome = service
+            .resolve(ResolveRequest::new_with_observed_source(
+                ObservedSourceEndpoint::tcp("192.0.2.10:5555".parse().unwrap(), None),
+                SystemTime::UNIX_EPOCH,
+                request_bytes,
+            ))
+            .await;
+
+        assert_eq!(outcome.decision.kind, ResolveDecisionKind::BackendFailure);
+        assert!(!upstream.requests.lock().unwrap().is_empty());
+    }
+
+    /// §B2 test 6: a client cookie with no server-cookie tail at all
+    /// (first contact, RFC 7873 §5.2.3) over UDP must never produce
+    /// BADCOOKIE, and the response must still carry a freshly issued
+    /// server cookie. Written before the resolver-wiring change actually
+    /// landed, per the plan's explicit warning that an earlier draft got
+    /// this exact case wrong.
+    #[tokio::test]
+    async fn resolve_accepts_first_contact_cookie_over_udp_and_attaches_fresh_cookie() {
+        // A successful backend fetch, not a failure: cookie-echo
+        // (`mirrored_client_opt_record_with_cookie`) only runs on the
+        // miss-path response actually served to this requester, not on a
+        // synthetic backend-failure/SERVFAIL response -- so this test
+        // needs a real answer to observe the attached cookie.
+        let upstream = Arc::new(StaticUpstream::new(Ok(upstream_response(
+            a_response_with_answer(0x1006, "example.com", 60),
+        ))));
+        let events = Arc::new(RecordingEvents::default());
+        let metrics = Arc::new(RecordingMetrics::default());
+        let secret = Arc::new(CookieSecret::generate());
+        let service =
+            resolve_service(upstream.clone(), events, metrics).with_cookie_secret(secret.clone());
+
+        let client_cookie: ClientCookie = [1, 2, 3, 4, 5, 6, 7, 8];
+        let mut cookie_option = Vec::new();
+        cookie_option.extend_from_slice(&10u16.to_be_bytes());
+        cookie_option.extend_from_slice(&8u16.to_be_bytes());
+        cookie_option.extend_from_slice(&client_cookie);
+        let client_ip: IpAddr = "192.0.2.10".parse().unwrap();
+        let request_bytes =
+            a_query_with_edns_options(0x1006, "example.com", 4096, false, &cookie_option);
+
+        let outcome = service
+            .resolve(ResolveRequest::new(
+                client_ip,
+                SystemTime::UNIX_EPOCH,
+                request_bytes,
+            ))
+            .await;
+
+        assert_eq!(
+            outcome.decision.kind,
+            ResolveDecisionKind::Allowed,
+            "first contact (client-cookie-only) must never trigger BADCOOKIE"
+        );
+        assert!(!upstream.requests.lock().unwrap().is_empty());
+        let response = Message::parse(&outcome.response_bytes).unwrap();
+        let opt = response
+            .additionals
+            .iter()
+            .find_map(|record| match &record.record {
+                RecordData::OPT(info) => Some(info),
+                _ => None,
+            })
+            .expect("an EDNS requester with a cookie must get a cookie-bearing OPT record back");
+        assert_eq!(opt.options.len(), 4 + 8 + 16);
+        assert_eq!(&opt.options[4..12], &client_cookie);
+        let expected_server_cookie = crate::protocol::edns_cookie::build_server_cookie(
+            secret.as_ref(),
+            client_cookie,
+            client_ip,
+            SystemTime::UNIX_EPOCH,
+        );
+        assert_eq!(
+            &opt.options[12..28],
+            &expected_server_cookie,
+            "first contact must still get a freshly issued, correct server cookie attached"
+        );
+    }
+
+    /// §B2 test 7: identical first-contact behavior over TCP.
+    #[tokio::test]
+    async fn resolve_accepts_first_contact_cookie_over_tcp() {
+        let upstream = Arc::new(StaticUpstream::new(Err(UpstreamError::Timeout)));
+        let events = Arc::new(RecordingEvents::default());
+        let metrics = Arc::new(RecordingMetrics::default());
+        let service = resolve_service(upstream.clone(), events, metrics);
+
+        let client_cookie: ClientCookie = [1, 2, 3, 4, 5, 6, 7, 8];
+        let mut cookie_option = Vec::new();
+        cookie_option.extend_from_slice(&10u16.to_be_bytes());
+        cookie_option.extend_from_slice(&8u16.to_be_bytes());
+        cookie_option.extend_from_slice(&client_cookie);
+        let request_bytes =
+            a_query_with_edns_options(0x1007, "example.com", 4096, false, &cookie_option);
+
+        let outcome = service
+            .resolve(ResolveRequest::new_with_observed_source(
+                ObservedSourceEndpoint::tcp("192.0.2.10:5555".parse().unwrap(), None),
+                SystemTime::UNIX_EPOCH,
+                request_bytes,
+            ))
+            .await;
+
+        assert_eq!(outcome.decision.kind, ResolveDecisionKind::BackendFailure);
+        assert!(!upstream.requests.lock().unwrap().is_empty());
+    }
+
+    /// §B2 test 8: a server cookie recomputed with a different secret than
+    /// the one that issued it (simulating a process restart that rotated
+    /// the secret) must be rejected with BADCOOKIE over UDP.
+    #[tokio::test]
+    async fn resolve_rejects_server_cookie_issued_under_a_different_secret() {
+        let upstream = Arc::new(StaticUpstream::new(Err(UpstreamError::Timeout)));
+        let events = Arc::new(RecordingEvents::default());
+        let metrics = Arc::new(RecordingMetrics::default());
+        let issuing_secret = CookieSecret::generate();
+        let verifying_secret = Arc::new(CookieSecret::generate());
+        let service =
+            resolve_service(upstream.clone(), events, metrics).with_cookie_secret(verifying_secret);
+
+        let client_cookie: ClientCookie = [1, 2, 3, 4, 5, 6, 7, 8];
+        let client_ip: IpAddr = "192.0.2.10".parse().unwrap();
+        let tail = crate::protocol::edns_cookie::build_server_cookie(
+            &issuing_secret,
+            client_cookie,
+            client_ip,
+            SystemTime::UNIX_EPOCH,
+        );
+        let cookie_option = cookie_option_bytes_with_tail(client_cookie, &tail);
+        let request_bytes =
+            a_query_with_edns_options(0x1008, "example.com", 4096, false, &cookie_option);
+
+        let outcome = service
+            .resolve(ResolveRequest::new(
+                client_ip,
+                SystemTime::UNIX_EPOCH,
+                request_bytes,
+            ))
+            .await;
+
+        assert_eq!(
+            outcome.decision.kind,
+            ResolveDecisionKind::ProtocolError(ResponseCode::FormErr)
+        );
+        let response = Message::parse(&outcome.response_bytes).unwrap();
+        let opt = response
+            .additionals
+            .iter()
+            .find_map(|record| match &record.record {
+                RecordData::OPT(info) => Some(info),
+                _ => None,
+            })
+            .expect("expected an OPT record in the BADCOOKIE response");
+        let combined_extended_rcode =
+            (u16::from(opt.extended_rcode) << 4) | u16::from(response.header.r_code());
+        assert_eq!(
+            combined_extended_rcode, 23,
+            "a cookie issued under a rotated-away secret must be rejected as invalid"
+        );
+    }
+
+    /// §B2 test 9, end to end (the unit-level version,
+    /// `server_cookie_matches_reuses_ip_normalization_for_mapped_v6`, lives
+    /// in `edns_cookie.rs`): a request whose `client_ip` is an IPv4-mapped
+    /// IPv6 address must accept an otherwise-valid server cookie the same
+    /// way a plain IPv4 address would, proving `ResolveRequest.client_ip`
+    /// threads unchanged through `probe_cache`/`invalid_server_cookie` --
+    /// not just that the leaf verification function handles the address
+    /// shape correctly in isolation.
+    #[tokio::test]
+    async fn resolve_accepts_valid_cookie_from_mapped_ipv6_client() {
+        let upstream = Arc::new(StaticUpstream::new(Ok(upstream_response(
+            a_response_with_answer(0x1009, "example.com", 60),
+        ))));
+        let events = Arc::new(RecordingEvents::default());
+        let metrics = Arc::new(RecordingMetrics::default());
+        let secret = Arc::new(CookieSecret::generate());
+        let service =
+            resolve_service(upstream.clone(), events, metrics).with_cookie_secret(secret.clone());
+
+        let client_cookie: ClientCookie = [1, 2, 3, 4, 5, 6, 7, 8];
+        let client_ip: IpAddr = "::ffff:192.0.2.1".parse().unwrap();
+        let tail = crate::protocol::edns_cookie::build_server_cookie(
+            secret.as_ref(),
+            client_cookie,
+            client_ip,
+            SystemTime::UNIX_EPOCH,
+        );
+        let cookie_option = cookie_option_bytes_with_tail(client_cookie, &tail);
+        let request_bytes =
+            a_query_with_edns_options(0x1009, "example.com", 4096, false, &cookie_option);
+
+        let outcome = service
+            .resolve(ResolveRequest::new(
+                client_ip,
+                SystemTime::UNIX_EPOCH,
+                request_bytes,
+            ))
+            .await;
+
+        assert_eq!(
+            outcome.decision.kind,
+            ResolveDecisionKind::Allowed,
+            "a valid server cookie from a mapped-v6 client must never trigger BADCOOKIE"
+        );
+        assert!(!upstream.requests.lock().unwrap().is_empty());
     }
 
     /// RFC 1035 §4.1.1: RD=0 asks rdns not to pursue the query on the
