@@ -34,10 +34,10 @@ pub use crate::protocol::edns_cookie::ClientCookie;
 use crate::protocol::{
     Message, NameCompressor, QueryDecodeFailure, QueryValidationError, Record, RecordData,
     ResponseCode, build_a_answers_response, build_a_block_response, build_aaaa_answers_response,
-    build_aaaa_block_response, build_badvers_response, build_nodata_response,
-    build_nxdomain_response, build_question_aware_error_response, build_refused_response,
-    build_servfail_response, build_txt_answer_response, message_question_wire, rewrite_response_id,
-    rewrite_response_request_fields,
+    build_aaaa_block_response, build_badcookie_response, build_badvers_response,
+    build_nodata_response, build_nxdomain_response, build_question_aware_error_response,
+    build_refused_response, build_servfail_response, build_txt_answer_response,
+    message_question_wire, rewrite_response_id, rewrite_response_request_fields,
 };
 // Re-exported (not just used privately): `src/main.rs` is a separate
 // binary crate and must construct one via `CookieSecret::generate()` to
@@ -4773,6 +4773,9 @@ impl ResolveQuery {
                     request_id,
                     &error,
                     recovered_message.as_deref(),
+                    &self.cookie_secret,
+                    request.client_ip,
+                    self.clock.now(),
                     self.protocol.configured_max_udp_payload_size(),
                 );
                 Err(self
@@ -6866,6 +6869,9 @@ impl ResponseFactory for BasicResponseFactory {
         request_id: Option<u16>,
         error: &QueryValidationError,
         request: Option<&Message>,
+        cookie_secret: &CookieSecret,
+        client_ip: IpAddr,
+        now: SystemTime,
         configured_max_udp_payload_size: usize,
     ) -> Vec<u8> {
         // BADVERS (RFC 6891 §6.1.3) doesn't fit `ResponseCode` (a plain
@@ -6884,6 +6890,41 @@ impl ResponseFactory for BasicResponseFactory {
             (error, request)
         {
             return build_badvers_response(request, configured_max_udp_payload_size);
+        }
+
+        // BADCOOKIE (RFC 7873 §5.2.4/§5.3): same "doesn't fit `ResponseCode`"
+        // reasoning as BADVERS above. Unlike `UnsupportedEdnsVersion`, no
+        // caller produces this variant yet -- that's section-08's job, once
+        // cookie detection is wired into `probe_cache` -- so this arm is
+        // unreachable from any current code path. It's included now so
+        // section-08 only has to raise the error, not touch this routing.
+        //
+        // PLACEHOLDER, not the final extraction logic: re-parses `request`'s
+        // EDNS options via `edns_cookie::parse_cookie_option` to recover the
+        // client cookie to echo. That function returns `None` for a
+        // malformed-length COOKIE option -- one of the two cases
+        // `QueryValidationError::InvalidServerCookie`'s doc comment says
+        // this variant covers -- so once this arm becomes reachable, a
+        // malformed-but-present cookie would silently fall through to the
+        // generic FormErr path below instead of BADCOOKIE. section-08
+        // replaces this with `edns_cookie::locate_cookie_for_verification`
+        // (shared with its own `probe_cache` check) before making this arm
+        // reachable from real traffic; do not rely on this placeholder
+        // beyond that point.
+        if let (QueryValidationError::InvalidServerCookie, Some(request)) = (error, request)
+            && let Some(client_cookie) = request
+                .edns
+                .as_ref()
+                .and_then(|edns| crate::protocol::edns_cookie::parse_cookie_option(&edns.options))
+        {
+            return build_badcookie_response(
+                request,
+                client_cookie,
+                cookie_secret,
+                client_ip,
+                now,
+                configured_max_udp_payload_size,
+            );
         }
 
         // `QueryValidationError::response_code()` only ever actually
@@ -6959,12 +7000,18 @@ impl ResponseFactory for ConfiguredResponseFactory {
         request_id: Option<u16>,
         error: &QueryValidationError,
         request: Option<&Message>,
+        cookie_secret: &CookieSecret,
+        client_ip: IpAddr,
+        now: SystemTime,
         configured_max_udp_payload_size: usize,
     ) -> Vec<u8> {
         BasicResponseFactory.protocol_error(
             request_id,
             error,
             request,
+            cookie_secret,
+            client_ip,
+            now,
             configured_max_udp_payload_size,
         )
     }
@@ -9133,11 +9180,20 @@ pub trait ResponseFactory: Send + Sync {
     /// failed for a reason other than the wire format itself being
     /// unparseable (e.g. an unsupported opcode). It's `None` only when the
     /// packet genuinely couldn't be parsed at all.
+    ///
+    /// `cookie_secret`, `client_ip`, and `now` exist only for
+    /// `QueryValidationError::InvalidServerCookie`'s BADCOOKIE response
+    /// (`build_badcookie_response`), which must attach a freshly issued
+    /// server cookie -- every other variant ignores them.
+    #[allow(clippy::too_many_arguments)]
     fn protocol_error(
         &self,
         request_id: Option<u16>,
         error: &QueryValidationError,
         request: Option<&Message>,
+        cookie_secret: &CookieSecret,
+        client_ip: IpAddr,
+        now: SystemTime,
         configured_max_udp_payload_size: usize,
     ) -> Vec<u8>;
 
@@ -23756,6 +23812,73 @@ mod tests {
             "the OPT record must advertise this resolver's own configured UDP payload size, not the requester's"
         );
         assert!(upstream.requests.lock().unwrap().is_empty());
+    }
+
+    /// `QueryValidationError::InvalidServerCookie` is not yet producible by
+    /// any real caller (that's section-08's job, once cookie detection is
+    /// wired into `probe_cache`), so this exercises `protocol_error`
+    /// directly rather than through a full `service.resolve(...)` --
+    /// matching how `query_validation_errors_map_to_response_codes` tests
+    /// `response_code()` directly in `protocol::tests`. Proves the special
+    /// case is actually reached (a BADCOOKIE response), not just defined,
+    /// and that `ConfiguredResponseFactory` delegates identically.
+    #[test]
+    fn protocol_error_routes_invalid_server_cookie_to_badcookie_response() {
+        let client_cookie: ClientCookie = [1, 2, 3, 4, 5, 6, 7, 8];
+        let mut cookie_option = Vec::new();
+        cookie_option.extend_from_slice(&10u16.to_be_bytes()); // COOKIE option code
+        cookie_option.extend_from_slice(&8u16.to_be_bytes());
+        cookie_option.extend_from_slice(&client_cookie);
+
+        let request_bytes =
+            a_query_with_edns_details(0x4242, "example.com", 4096, false, 0, 0, &cookie_option);
+        let request = Message::parse(&request_bytes).unwrap();
+
+        let cookie_secret = CookieSecret::generate();
+        let client_ip: IpAddr = "192.0.2.55".parse().unwrap();
+        let now = SystemTime::UNIX_EPOCH;
+
+        let basic_response = BasicResponseFactory.protocol_error(
+            Some(0x4242),
+            &QueryValidationError::InvalidServerCookie,
+            Some(&request),
+            &cookie_secret,
+            client_ip,
+            now,
+            1232,
+        );
+        let parsed = Message::parse(&basic_response).unwrap();
+        let opt = parsed
+            .additionals
+            .iter()
+            .find_map(|record| match &record.record {
+                RecordData::OPT(info) => Some(info),
+                _ => None,
+            })
+            .expect("expected an OPT record in the BADCOOKIE response");
+        let combined_extended_rcode =
+            (u16::from(opt.extended_rcode) << 4) | u16::from(parsed.header.r_code());
+        assert_eq!(
+            combined_extended_rcode, 23,
+            "23 == BADCOOKIE -- InvalidServerCookie must route to build_badcookie_response, \
+             not the generic FormErr path"
+        );
+
+        let configured_response = ConfiguredResponseFactory::new(BlockResponseConfig::default())
+            .unwrap()
+            .protocol_error(
+                Some(0x4242),
+                &QueryValidationError::InvalidServerCookie,
+                Some(&request),
+                &cookie_secret,
+                client_ip,
+                now,
+                1232,
+            );
+        assert_eq!(
+            basic_response, configured_response,
+            "ConfiguredResponseFactory must delegate identically to BasicResponseFactory"
+        );
     }
 
     /// RFC 1035 §4.1.1: RD=0 asks rdns not to pursue the query on the

@@ -229,6 +229,17 @@ secret rotation) is in
 `docs/plans/edns_cookie_cache/claude-plan.md`. If you're checking whether
 rdns has DNS Cookie *protection*: no — it has Cookie *echo/interop* only.
 
+**This is being actively closed, in stages** (`docs/plans/sec_work/`,
+Track B): `src/protocol/mod.rs`'s `build_badcookie_response` and
+`QueryValidationError::InvalidServerCookie` (added in section-07) already
+build the correct BADCOOKIE wire response and bucket it for metrics, and
+`ResponseFactory::protocol_error` already threads the `cookie_secret`/
+`client_ip`/`now` a real check will need — but nothing in the codebase can
+produce `InvalidServerCookie` yet, so every statement above is still
+accurate as of section-07. Section-08 wires actual server-cookie
+recompute-and-compare into `probe_cache`, at which point this section needs
+a rewrite, not an addendum.
+
 # Concurrency model, in one sentence
 
 Every lookup and every store takes exactly one shard's `Mutex`, for the
