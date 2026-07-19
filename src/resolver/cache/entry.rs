@@ -109,7 +109,7 @@ pub enum DnssecState {
     Unvalidated,
     Insecure,
     Secure,
-    Bogus(String), // reason, for diagnostics; short negative-style TTL applies
+    Bogus(String), // reason, for diagnostics; excluded from serve-stale (see stale_servability)
 }
 
 /// All negative-cache entries for one owner name. Lives inside a shard's

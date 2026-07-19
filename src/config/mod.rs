@@ -857,6 +857,25 @@ impl RecursiveResolutionConfig {
         );
         hash_namespace_field(
             &mut hash,
+            "trust-anchor-source",
+            self.trust_anchor_source.cache_namespace_label(),
+        );
+        // Hashes actual trust-anchor content (each DS/DNSKEY line), not just
+        // the Bundled/Static label above -- mirrors the root-hints loop
+        // above. Without this, switching between two different `Static`
+        // anchor sets (or Bundled -> Static and back) would leave the
+        // cache namespace unchanged, letting Secure/Bogus verdicts
+        // computed under the old trust-anchor set persist past a
+        // trust-anchor rotation until natural TTL expiry -- a
+        // security-relevant gap flagged during Track A's security review
+        // (plan §C2).
+        if let Ok(trust_anchors) = self.load_trust_anchors() {
+            for anchor in &trust_anchors {
+                hash_namespace_field(&mut hash, "trust-anchor", anchor);
+            }
+        }
+        hash_namespace_field(
+            &mut hash,
             "authority-timeout-nanos",
             &self.per_authority_timeout.as_nanos().to_string(),
         );
@@ -908,10 +927,6 @@ pub enum TrustAnchorSource {
 }
 
 impl TrustAnchorSource {
-    // Not yet wired into `authority_config_hash()` — whether the trust-anchor
-    // source should namespace the cache is left for section-03/04 to decide
-    // once it's clear what changing it actually invalidates.
-    #[allow(dead_code)]
     fn cache_namespace_label(&self) -> &'static str {
         match self {
             Self::Bundled => "bundled",
@@ -2691,6 +2706,79 @@ mod tests {
         assert_ne!(
             config.backend_cache_namespace(),
             changed_roots.backend_cache_namespace()
+        );
+    }
+
+    /// Regression test for the security-review finding (Track A §C2):
+    /// before this, `authority_config_hash` never hashed the trust-anchor
+    /// source at all, so switching trust anchors (Bundled -> Static, or
+    /// between two different `Static` sets) left the cache namespace
+    /// unchanged -- Secure/Bogus verdicts computed under the old anchor
+    /// set would persist past a trust-anchor rotation until natural TTL
+    /// expiry.
+    #[test]
+    fn recursive_cache_namespace_changes_with_trust_anchor_source() {
+        let mut bundled = RecursiveResolutionConfig::new(
+            "root-hints:v1",
+            vec![root_hint("a.root-servers.example")],
+            DnssecValidationMode::Enabled,
+        );
+        bundled.trust_anchor_source = TrustAnchorSource::Bundled;
+        let bundled_config = RuntimeConfig::new_with_resolution(
+            vec![SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 5300)],
+            ResolutionConfig::recursive(3, bundled),
+            Vec::new(),
+            Duration::from_secs(2),
+            1232,
+        )
+        .unwrap();
+
+        let mut static_a = RecursiveResolutionConfig::new(
+            "root-hints:v1",
+            vec![root_hint("a.root-servers.example")],
+            DnssecValidationMode::Enabled,
+        );
+        static_a.trust_anchor_source = TrustAnchorSource::Static(vec![
+            ". 172800 IN DS 20326 8 2 E06D44B80B8F1D39A95C0B0D7C65D08458E880409BBC683457104237C7F8EC8D"
+                .to_string(),
+        ]);
+        let static_a_config = RuntimeConfig::new_with_resolution(
+            vec![SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 5300)],
+            ResolutionConfig::recursive(3, static_a),
+            Vec::new(),
+            Duration::from_secs(2),
+            1232,
+        )
+        .unwrap();
+
+        assert_ne!(
+            bundled_config.backend_cache_namespace(),
+            static_a_config.backend_cache_namespace(),
+            "switching from Bundled to Static trust anchors must bump the cache namespace"
+        );
+
+        let mut static_b = RecursiveResolutionConfig::new(
+            "root-hints:v1",
+            vec![root_hint("a.root-servers.example")],
+            DnssecValidationMode::Enabled,
+        );
+        static_b.trust_anchor_source = TrustAnchorSource::Static(vec![
+            ". 172800 IN DS 38696 8 2 683D2D0ACB8C9B712A1948B27F741219298D0A450D612C483AF444A4C0FB2B16"
+                .to_string(),
+        ]);
+        let static_b_config = RuntimeConfig::new_with_resolution(
+            vec![SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 5300)],
+            ResolutionConfig::recursive(3, static_b),
+            Vec::new(),
+            Duration::from_secs(2),
+            1232,
+        )
+        .unwrap();
+
+        assert_ne!(
+            static_a_config.backend_cache_namespace(),
+            static_b_config.backend_cache_namespace(),
+            "two different Static trust-anchor sets must not share a cache namespace"
         );
     }
 

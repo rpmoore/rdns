@@ -8,7 +8,7 @@ description: >
           an inline backend round trip.
 resource: src/resolver/cache/shard.rs
 tags: [cache, dns, resolver, serve-stale, rfc8767, refresh]
-timestamp: 2026-07-16T00:00:00Z
+timestamp: 2026-07-19T00:00:00Z
 ---
 
 Before this feature, `Shard::lookup_hop` evicted every expired entry at
@@ -121,13 +121,14 @@ and is live in production as of the status/metrics work (`main.rs`'s
 `trust_anchors_to_wire_in` wires real trust anchors in whenever
 `RecursiveResolutionConfig::dnssec_validation` is `Enabled`, the
 default) — real verdicts flow and the `dnssec_ad_bit` AD=1 path is
-reachable for cached entries, stale or live. `Bogus` entries are
-excluded from serve-stale outright (see the `Evict` bullet above), so
-the "stale signature that later turns out tampered" case can't be
-served past expiry either way. `Secure`/`Insecure` entries' existing
-serve-stale behavior is unaffected by that exclusion. Entry TTL is
-separately capped
-at the earliest RRSIG expiration at store time
+reachable for cached entries, stale or live. See
+[dnssec-validation](../dnssec-validation.md) for the validator itself;
+this section only covers its serve-stale-specific interaction. `Bogus`
+entries are excluded from serve-stale outright (see the `Evict` bullet
+above), so the "stale signature that later turns out tampered" case
+can't be served past expiry either way. `Secure`/`Insecure` entries'
+existing serve-stale behavior is unaffected by that exclusion. Entry
+TTL is separately capped at the earliest RRSIG expiration at store time
 (`cap_expires_at_to_rrsig_expiration`, `src/resolver/mod.rs`), so a
 `Secure` entry's `expires_at` (and thus its stale window) already
 reflects signature validity — no additional inception/expiration

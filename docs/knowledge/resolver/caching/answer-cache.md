@@ -4,7 +4,7 @@ title: DNS Answer Cache
 description: Sharded, in-memory cache of backend/upstream DNS answers, keyed by domain name.
 resource: src/resolver/cache/mod.rs
 tags: [cache, dns, resolver]
-timestamp: 2026-07-15T00:00:00Z
+timestamp: 2026-07-19T00:00:00Z
 ---
 
 Caches responses obtained from actual backend resolution — forwarding or
@@ -51,7 +51,7 @@ concurrency.
 |---|---|
 | `records` / `soa_record` + proof records | The actual RRset or negative-cache proof material. |
 | `stored_at` / `expires_at` | TTL bookkeeping — `expires_at` is checked on every lookup; an expired entry is served stale (within the [serve-stale](serve-stale.md) window, positive entries only), kept-but-missed (in-window but DO-filtered for *this* reader — a DO=true reader vs. `dnssec_complete == false` misses while the entry stays for DO=false readers), or deleted immediately at read time (not just filtered out), see `Shard::lookup_hop`/`stale_servability`. |
-| `dnssec_state` | RFC 6840 §3.1 validation state, computed by `ResolveQuery::validate_for_store` for `ResolutionMode::Recursive` fetches (`Unvalidated`/`Insecure`/`Secure`/`Bogus`) — `Bogus` entries are additionally excluded from [serve-stale](serve-stale.md) eligibility. Live in production as of the status/metrics work: `main.rs`'s `trust_anchors_to_wire_in` wires real trust anchors in whenever `RecursiveResolutionConfig::dnssec_validation` is `Enabled` (the default) — otherwise orthogonal to everything else in this document. |
+| `dnssec_state` | RFC 6840 §3.1 validation state, computed by `ResolveQuery::validate_for_store` for `ResolutionMode::Recursive` fetches only (`Unvalidated`/`Insecure`/`Secure`/`Bogus`) — `Bogus` entries are additionally excluded from [serve-stale](serve-stale.md) eligibility. `Forward` mode never populates a real verdict; see [dnssec-validation](../dnssec-validation.md) for the validator itself — otherwise orthogonal to everything else in this document. |
 | `dnssec_complete` | Whether this entry was populated by a fetch that actually requested DNSSEC material (DO=1). A DO=1 reader must never be served an entry where this is `false`, even if TTL-valid — see `Shard::lookup_hop`'s DO-aware filtering. |
 | `authoritative` | The backend response's own AA bit, replayed on a cache hit. |
 | `cache_epoch` | Cache-identity tag, compared for equality at lookup/sweep time. See [cache-epoch](cache-epoch.md) for the whole mechanism — this field is the one piece of it that lives on the entry itself. |

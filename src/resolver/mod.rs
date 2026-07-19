@@ -6301,7 +6301,7 @@ impl ResolveQuery {
                 // closed here too, not silently to `NotAttempted`.
                 self.metrics
                     .record_dnssec_validation_outcome(DnssecValidationOutcome::Bogus);
-                return DnssecState::Unvalidated;
+                return DnssecState::Bogus("trust anchors failed to parse".to_string());
             }
         };
         let snapshot = self.backend.current();
@@ -11957,9 +11957,11 @@ mod tests {
         // Trust anchors *are* configured (so this isn't the "mode disabled"
         // path above) but aren't valid zonefile data -- a live
         // misconfiguration under a requester who believes DNSSEC is on.
-        // Fails closed to `Bogus` for metrics purposes, distinct from the
-        // benign `NotAttempted` bucket used when no anchors are configured
-        // at all.
+        // Fails closed to `Bogus` for both the stored `DnssecState` (so
+        // SERVFAIL/serve-stale gating treats it exactly like a tampered
+        // response) and the metric, distinct from the benign
+        // `NotAttempted` bucket used when no anchors are configured at
+        // all.
         let backend: Arc<dyn ResolutionBackend> =
             Arc::new(ScriptedNameKeyedBackend::new(Vec::new()));
         let metrics = Arc::new(RecordingMetrics::default());
@@ -11982,7 +11984,7 @@ mod tests {
         );
         let dnssec_state = service.validate_for_store(&response).await;
 
-        assert_eq!(dnssec_state, DnssecState::Unvalidated);
+        assert!(matches!(dnssec_state, DnssecState::Bogus(_)));
         assert_eq!(
             *metrics.dnssec_outcomes.lock().unwrap(),
             vec![DnssecValidationOutcome::Bogus]
