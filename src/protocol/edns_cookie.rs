@@ -15,10 +15,17 @@
 //! RFC 7873 DNS Cookie EDNS option parsing, cache-admission narrowing, and
 //! RFC 9018 server-cookie construction.
 //!
-//! This module never validates an incoming server cookie's hash or
-//! timestamp (no BADCOOKIE handling, no secret rotation) -- see the parent
-//! plan's non-goals. It only extracts the client cookie from a query and
-//! computes a fresh server cookie to attach to every response.
+//! This module itself only extracts the client cookie from a query
+//! (`parse_cookie_option`/`locate_cookie_option`) and computes a fresh
+//! server cookie to attach to every response (`build_server_cookie`) --
+//! no secret rotation is implemented (see the parent plan's non-goals).
+//! Incoming server-cookie *verification* (recompute-and-compare,
+//! BADCOOKIE rejection) is not done here: `locate_cookie_for_verification`
+//! and `server_cookie_matches` below are the building blocks, but the
+//! transport-conditional gating decision (UDP rejects an invalid cookie,
+//! TCP doesn't -- RFC 7873 §5.2.3/§5.2.4) lives in
+//! `src/resolver/mod.rs`'s `invalid_server_cookie`, called from
+//! `probe_cache`.
 
 use std::net::IpAddr;
 use std::time::SystemTime;
@@ -115,9 +122,11 @@ fn locate_cookie_option(options: &[u8]) -> Option<(ClientCookie, bool)> {
 /// with code 10 (COOKIE). Returns `Some(client_cookie)` only when the
 /// option is present exactly once and has a well-formed RFC 7873 §4 length
 /// (8, or 16-40 inclusive) -- extracting just the first 8 bytes (the
-/// client cookie) and discarding any server-cookie bytes present (this
-/// implementation never validates an incoming server cookie, per the
-/// plan's decided non-goals).
+/// client cookie) and discarding any server-cookie bytes present. This
+/// function itself never validates a presented server cookie; that check
+/// (recompute-and-compare, transport-conditional BADCOOKIE gating) is
+/// `locate_cookie_for_verification`/`server_cookie_matches` below plus
+/// `src/resolver/mod.rs`'s `invalid_server_cookie`, not this function.
 ///
 /// Returns `None` when: no COOKIE option is present, more than one COOKIE
 /// option is present, or the option's length is malformed.

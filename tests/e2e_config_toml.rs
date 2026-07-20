@@ -965,6 +965,119 @@ async fn ad_bit_is_never_set_on_any_response() {
     server.shutdown().await;
 }
 
+/// Hand-built RFC 7873 COOKIE option TLV: an 8-byte client cookie plus a
+/// garbage (structurally well-formed but wrong) 16-byte server-cookie
+/// tail. Mirrors `cookie_option_bytes_with_tail` in
+/// `src/resolver/mod.rs`'s test module, re-derived here since that helper
+/// is private to its own crate module and not exported.
+fn tampered_cookie_option_bytes() -> Vec<u8> {
+    let mut out = Vec::with_capacity(4 + 8 + 16);
+    out.extend_from_slice(&10u16.to_be_bytes()); // COOKIE option code
+    out.extend_from_slice(&24u16.to_be_bytes()); // 8-byte client + 16-byte tail
+    out.extend_from_slice(&[1, 2, 3, 4, 5, 6, 7, 8]); // client cookie
+    out.extend_from_slice(&[0xAAu8; 16]); // garbage server-cookie tail
+    out
+}
+
+// §B3 e2e test A: this is exactly the kind of behavior that's easy to get
+// right in a unit test against the check function but wrong in wiring
+// (e.g. forgetting to thread transport type through correctly) -- a
+// tampered server cookie sent over UDP to a real running server must be
+// rejected with BADCOOKIE (combined extended RCODE 23), and the response
+// must carry a well-formed 24-byte COOKIE option (RFC 7873 §4) echoing the
+// client cookie back, so a legitimate client can retry with a fresh
+// server cookie.
+#[tokio::test]
+async fn bad_server_cookie_over_udp_returns_badcookie_with_fresh_cookie() {
+    // Queries a name with no local-zone entry: `try_local_lookup` runs
+    // before `probe_cache` in `resolve()`'s pipeline, so a local-zone hit
+    // like `known-a.rdns.test` would short-circuit before the cookie check
+    // ever runs. A BADCOOKIE rejection never reaches the backend either
+    // way, so the upstream here only needs to exist, not actually answer.
+    let (upstream_addr, _upstream_task) = spawn_silent_upstream().await;
+    let server = start_forward_server(&forward_toml(upstream_addr.port())).await;
+
+    let request = RawQueryBuilder::new(0x2007, "cookie-check.rdns.test", 1)
+        .edns(1232, false)
+        .edns_options(tampered_cookie_option_bytes())
+        .build();
+    let response = send_udp(server.udp_addr, &request).await;
+    let message = parse_response(&response);
+
+    let opt = message
+        .additionals
+        .iter()
+        .find_map(|record| match &record.record {
+            RecordData::OPT(info) => Some(info),
+            _ => None,
+        })
+        .expect("expected an OPT record in the BADCOOKIE response");
+    let combined_extended_rcode =
+        (u16::from(opt.extended_rcode) << 4) | u16::from(message.header.r_code());
+    assert_eq!(combined_extended_rcode, 23, "23 == BADCOOKIE");
+    assert_eq!(
+        opt.options.len(),
+        4 + 8 + 16,
+        "well-formed COOKIE option: 4-byte TLV header + 8-byte client cookie + 16-byte server \
+         cookie"
+    );
+    assert_eq!(
+        &opt.options[0..2],
+        &10u16.to_be_bytes(),
+        "COOKIE option code"
+    );
+    assert_eq!(
+        &opt.options[2..4],
+        &24u16.to_be_bytes(),
+        "RFC 7873 COOKIE option length: 8-byte client + 16-byte server cookie"
+    );
+    assert_eq!(
+        &opt.options[4..12],
+        &[1, 2, 3, 4, 5, 6, 7, 8],
+        "client cookie must be echoed back unchanged"
+    );
+
+    server.shutdown().await;
+}
+
+// §B3 e2e test B: RFC 7873 §5.2.3's TCP carve-out -- the identical
+// tampered-cookie bytes from
+// `bad_server_cookie_over_udp_returns_badcookie_with_fresh_cookie` must be
+// processed normally (never BADCOOKIE) when sent over TCP instead,
+// proving the same tampered bytes get materially different treatment
+// purely based on transport.
+#[tokio::test]
+async fn bad_server_cookie_over_tcp_returns_normal_answer() {
+    // Same non-local-entry name as the UDP test above, but this time the
+    // query must actually reach the backend (TCP's carve-out means
+    // processing continues normally), so the upstream needs a real answer
+    // to hand back.
+    let (upstream_addr, _upstream_task) = spawn_canned_upstream(|id| {
+        a_response_from_upstream(id, "cookie-check.rdns.test", [203, 0, 113, 77])
+    })
+    .await;
+    let server = start_forward_server(&forward_toml(upstream_addr.port())).await;
+
+    let request = RawQueryBuilder::new(0x2008, "cookie-check.rdns.test", 1)
+        .edns(1232, false)
+        .edns_options(tampered_cookie_option_bytes())
+        .build();
+    let response = send_tcp(server.tcp_addr, &request).await;
+    let message = parse_response(&response);
+
+    assert_eq!(
+        message.header.r_code(),
+        NOERROR,
+        "over TCP, a tampered server cookie must never trigger BADCOOKIE"
+    );
+    assert!(
+        !message.answers.is_empty(),
+        "processing must continue normally to a real answer, not short-circuit"
+    );
+
+    server.shutdown().await;
+}
+
 /// An NXDOMAIN response carrying a SOA record in the AUTHORITY section
 /// (RFC 2308 §2.2: the SOA's MINIMUM field lets a negative-caching
 /// resolver derive a negative-cache TTL for the name).

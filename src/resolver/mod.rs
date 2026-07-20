@@ -24491,6 +24491,110 @@ mod tests {
         assert!(!upstream.requests.lock().unwrap().is_empty());
     }
 
+    /// §B3 test: a request whose EDNS options contain **two** COOKIE
+    /// options must be processed identically to a cookie-less request --
+    /// no BADCOOKIE on either transport, and no bespoke duplicate-specific
+    /// handling. `locate_cookie_for_verification` collapses this case to
+    /// `CookieVerification::Duplicate`, which `invalid_server_cookie`
+    /// treats the same as `NoCookieOption` (never an error), mirroring
+    /// `locate_cookie_option`'s pre-existing duplicate-rejection behavior
+    /// pinned by `parse_cookie_option_rejects_duplicates` in
+    /// `edns_cookie.rs`.
+    #[tokio::test]
+    async fn resolve_duplicate_cookie_options_processed_normally_not_badcookie_udp() {
+        let upstream = Arc::new(StaticUpstream::new(Ok(upstream_response(
+            a_response_with_answer(0x100a, "example.com", 60),
+        ))));
+        let events = Arc::new(RecordingEvents::default());
+        let metrics = Arc::new(RecordingMetrics::default());
+        let service = resolve_service(upstream.clone(), events, metrics);
+
+        let client_cookie: ClientCookie = [1, 2, 3, 4, 5, 6, 7, 8];
+        let bogus_tail = [0xFFu8; 16];
+        let mut cookie_options = cookie_option_bytes_with_tail(client_cookie, &bogus_tail);
+        cookie_options
+            .extend_from_slice(&cookie_option_bytes_with_tail(client_cookie, &bogus_tail));
+        let request_bytes =
+            a_query_with_edns_options(0x100a, "example.com", 4096, false, &cookie_options);
+
+        let outcome = service
+            .resolve(ResolveRequest::new(
+                "192.0.2.10".parse().unwrap(),
+                SystemTime::UNIX_EPOCH,
+                request_bytes,
+            ))
+            .await;
+
+        assert_eq!(
+            outcome.decision.kind,
+            ResolveDecisionKind::Allowed,
+            "a duplicate-COOKIE-option request must never trigger BADCOOKIE -- it must fall \
+             through to exactly the same path a cookie-less request takes"
+        );
+        assert!(!upstream.requests.lock().unwrap().is_empty());
+        let response = Message::parse(&outcome.response_bytes).unwrap();
+        // `prepare_backend_result`'s forward-mode own-cookie rebuild
+        // (`rebuild_forward_response_with_own_cookie`) only triggers when
+        // `decoded.features.client_cookie.is_some()` -- and
+        // `parse_cookie_option` (which populates that field) returns `None`
+        // for a duplicate COOKIE option, same as for a genuinely absent one
+        // -- so this response is the upstream's raw relayed bytes verbatim,
+        // exactly as a genuinely cookie-less request would get. No OPT (let
+        // alone a COOKIE option) is synthesized for either case.
+        let has_cookie_option = response.additionals.iter().any(
+            |record| matches!(&record.record, RecordData::OPT(info) if !info.options.is_empty()),
+        );
+        assert!(
+            !has_cookie_option,
+            "a duplicate-COOKIE-option request must get no COOKIE option echoed back, exactly \
+             like a genuinely cookie-less request -- locate_cookie_option collapses duplicates \
+             to None, same as absent"
+        );
+    }
+
+    /// §B3 test: the TCP counterpart of
+    /// `resolve_duplicate_cookie_options_processed_normally_not_badcookie_udp`
+    /// -- duplicate COOKIE options are processed normally on TCP too (TCP
+    /// never runs the cookie check at all, but this pins the observable
+    /// behavior explicitly rather than relying on that implementation
+    /// detail).
+    #[tokio::test]
+    async fn resolve_duplicate_cookie_options_processed_normally_not_badcookie_tcp() {
+        let upstream = Arc::new(StaticUpstream::new(Ok(upstream_response(
+            a_response_with_answer(0x100b, "example.com", 60),
+        ))));
+        let events = Arc::new(RecordingEvents::default());
+        let metrics = Arc::new(RecordingMetrics::default());
+        let service = resolve_service(upstream.clone(), events, metrics);
+
+        let client_cookie: ClientCookie = [1, 2, 3, 4, 5, 6, 7, 8];
+        let bogus_tail = [0xFFu8; 16];
+        let mut cookie_options = cookie_option_bytes_with_tail(client_cookie, &bogus_tail);
+        cookie_options
+            .extend_from_slice(&cookie_option_bytes_with_tail(client_cookie, &bogus_tail));
+        let request_bytes =
+            a_query_with_edns_options(0x100b, "example.com", 4096, false, &cookie_options);
+
+        let outcome = service
+            .resolve(ResolveRequest::new_with_observed_source(
+                ObservedSourceEndpoint::tcp("192.0.2.10:5555".parse().unwrap(), None),
+                SystemTime::UNIX_EPOCH,
+                request_bytes,
+            ))
+            .await;
+
+        assert_eq!(outcome.decision.kind, ResolveDecisionKind::Allowed);
+        assert!(!upstream.requests.lock().unwrap().is_empty());
+        let response = Message::parse(&outcome.response_bytes).unwrap();
+        let has_cookie_option = response.additionals.iter().any(
+            |record| matches!(&record.record, RecordData::OPT(info) if !info.options.is_empty()),
+        );
+        assert!(
+            !has_cookie_option,
+            "duplicate COOKIE options must get no COOKIE option echoed back over TCP either"
+        );
+    }
+
     /// RFC 1035 §4.1.1: RD=0 asks rdns not to pursue the query on the
     /// client's behalf. rdns has no authoritative-only mode with
     /// delegation data to hand back as a referral, so it implements this
