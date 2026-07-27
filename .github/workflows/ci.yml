@@ -108,8 +108,13 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      - name: Install just
+        uses: taiki-e/install-action@v2
+        with:
+          tool: just
+
       - name: Check bundled IANA data freshness
-        run: make check-bundled-data-freshness
+        run: just check-bundled-data-freshness
 
   okf-lint:
     name: Lint OKF knowledge docs
