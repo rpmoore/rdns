@@ -191,6 +191,9 @@ in `src/config/mod.rs`. To refresh it when a root server's address changes:
 curl -sS https://www.internic.net/domain/named.root -o src/config/named.root
 ```
 
+Or `just update-iana-data`, which refreshes both this file and the TLD
+list below in one step.
+
 Then rebuild — `parse_named_root` re-derives `bundled_root_hints()` from
 the new file automatically, no other code changes needed. It reads the
 standard BIND zone-file shape IANA publishes (`;`-prefixed comments,
@@ -319,6 +322,9 @@ binary at compile time. Refresh it the same way as the root hints list:
 ```bash
 curl -sS https://data.iana.org/TLD/tlds-alpha-by-domain.txt -o src/config/tlds-alpha-by-domain.txt
 ```
+
+Or `just update-iana-data`, which refreshes both this file and the root
+hints file above in one step.
 
 Then rebuild — `parse_iana_tlds`/`bundled_iana_tlds()` re-derive the
 checked set from the new file automatically, no other code changes

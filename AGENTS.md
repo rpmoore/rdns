@@ -32,6 +32,10 @@ These run without being asked, no explicit request needed:
 
 See `RUST.md` for Rust-specific formatting, linting, testing, and code-standard rules (fmt/clippy/test gates, error handling, dependency policy, etc.). That file is the source of truth for anything toolchain- or language-level; this file stays scoped to process and workflow.
 
+## Task Runner
+
+Repeatable project commands (fmt, bench, coverage, bundled-data refresh/freshness-check, etc.) live in the `justfile`. Use `just <recipe>` for these. There is no `Makefile` — do not add one or reach for `make`; add new recipes to `justfile` instead.
+
 ## Software Development Practices
 
 - Write small, testable functions with one clear responsibility.
