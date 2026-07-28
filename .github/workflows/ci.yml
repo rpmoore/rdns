@@ -132,4 +132,4 @@ jobs:
       - name: Run okf-lint
         run: |
           docker run --rm -v "$PWD/docs/knowledge":/data:ro \
-            rpmoore/okf-lint@sha256:5d653a1fc2bd6d007cfc181205de9fc1d1acd6874360b53688cbc4a7fc9da333 /data
+            rpmoore/okf-lint@sha256:fe92390c2790fab391855dc4d4eb459be801743a777ec54ee274abe15f804523 /data
