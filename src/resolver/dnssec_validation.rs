@@ -56,7 +56,13 @@ use crate::protocol::Message;
 const NSEC3_ITER_INSECURE: u16 = 100;
 const NSEC3_ITER_BOGUS: u16 = 500;
 const MAX_NODE_VALIDITY: Duration = Duration::from_secs(604_800);
-const MAX_BOGUS_VALIDITY: Duration = Duration::from_secs(30);
+// `pub(crate)`, not private: also used by `resolver::mod`'s
+// `cap_expires_at_for_bogus` to bound a `Bogus`-validated cache entry's own
+// `expires_at` to the same short window, not just the validator's internal
+// DS/DNSKEY chase node cache (`set_max_bogus_validity` below only bounds
+// that -- it never reached the resolver's own cache-entry TTL, letting a
+// transient chase timeout pin SERVFAIL for the full response TTL).
+pub(crate) const MAX_BOGUS_VALIDITY: Duration = Duration::from_secs(30);
 
 /// Builds the `domain` validator `Config` with rdns's explicit policy
 /// values rather than the crate's raw defaults.

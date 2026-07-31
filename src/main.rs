@@ -589,6 +589,7 @@ struct ReloadMaterials {
     backend_snapshot: BackendSnapshot,
     local_entries: Arc<InMemoryLocalDnsEntries>,
     counts: LocalEntryCounts,
+    trust_anchors: Option<Vec<String>>,
 }
 
 /// Loads and fully builds everything a reload needs to publish — reading
@@ -604,11 +605,19 @@ fn build_reload_materials(
     let config = load_runtime_config(Some(config_path))?;
     let backend_snapshot = build_backend_snapshot(&config, metrics)?;
     let (local_entries, counts) = build_local_entries(&config, Some(config_path))?;
+    // Loaded here (not left to the resolver's stale startup-only value) so
+    // toggling `dnssec_validation` or rotating anchor files via SIGHUP
+    // actually takes effect -- see `ResolveQuery::republish_trust_anchors`'s
+    // doc comment. `?` matches `build_backend_snapshot`/`build_local_entries`
+    // above: any failure here fails the whole reload rather than partially
+    // applying it.
+    let trust_anchors = trust_anchors_to_wire_in(&config)?;
     Ok(ReloadMaterials {
         config,
         backend_snapshot,
         local_entries,
         counts,
+        trust_anchors,
     })
 }
 
@@ -665,8 +674,10 @@ fn apply_reload_result(
             backend_snapshot,
             local_entries,
             counts,
+            trust_anchors,
         })) => {
             resolver.publish_reload(backend_snapshot, local_entries);
+            resolver.republish_trust_anchors(trust_anchors);
             info!(
                 path = %path.display(),
                 upstreams = config.upstreams.len(),

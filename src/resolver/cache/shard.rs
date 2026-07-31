@@ -32,6 +32,7 @@ use std::time::{Duration, SystemTime};
 
 use super::entry::{
     DnssecState, DomainNegativeEntries, DomainRecordSets, NegativeEntry, NegativeKey, RRsetEntry,
+    StoredRecord,
 };
 use super::lru::ShardLru;
 use crate::config::{LeakRate, RefreshConfig};
@@ -546,6 +547,28 @@ fn stale_servability(
     if matches!(entry.dnssec_state, DnssecState::Bogus(_)) {
         return StaleServability::Evict;
     }
+    // A `Secure` entry's RRSIGs have their own cryptographic validity
+    // window (`signature_expiration`), independent of -- and not
+    // necessarily equal to -- `expires_at`: `cap_expires_at_to_rrsig_
+    // expiration` (`resolver::mod`) only *caps* `expires_at` to the
+    // earliest RRSIG expiration when that's *tighter* than the
+    // TTL-derived value, so being past `expires_at` here does not by
+    // itself prove the RRSIGs have cryptographically expired (a short
+    // origin TTL with a long-lived RRSIG is a routine, harmless case).
+    // What it does mean, when the RRSIGs *are* now past their own
+    // expiration, is that continuing to serve-stale would keep the entry
+    // marked `Secure` (AD=1 for a DO/AD requester, per `dnssec_ad_bit`)
+    // and put an now-cryptographically-invalid RRSIG on the wire for a
+    // DO=true reader throughout the entire stale window -- defeating
+    // DNSSEC validation the same way a served-stale `Bogus` entry would,
+    // just via signature expiry instead of an outright tampering
+    // detection. Checked only for `Secure` (not `Insecure`/`Unvalidated`,
+    // which carry no cryptographic claim to invalidate).
+    if entry.dnssec_state == DnssecState::Secure
+        && !rrsigs_still_cryptographically_valid(&entry.rrsigs, now)
+    {
+        return StaleServability::Evict;
+    }
     // The TTL-0 exclusion checks each stored record's own origin TTL
     // (`ttl_at_store`), not `entry.minimum_ttl`: with a configured
     // `min_positive_ttl` floor, `minimum_ttl` is the policy-bounded cache
@@ -572,6 +595,21 @@ fn stale_servability(
         return StaleServability::KeepButMiss;
     }
     StaleServability::Servable
+}
+
+/// Whether every RRSIG in `rrsigs` is still within its own cryptographic
+/// validity window as of `now` -- mirrors the expiration extraction
+/// `resolver::mod::cap_expires_at_to_rrsig_expiration` uses at store time,
+/// but as a live `now`-relative check rather than a store-time cap. `true`
+/// (vacuously) when `rrsigs` is empty -- nothing to have expired.
+fn rrsigs_still_cryptographically_valid(rrsigs: &[StoredRecord], now: SystemTime) -> bool {
+    rrsigs.iter().all(|record| match &record.rdata {
+        RecordData::RRSIG {
+            signature_expiration,
+            ..
+        } => SystemTime::UNIX_EPOCH + Duration::from_secs(*signature_expiration as u64) > now,
+        _ => true,
+    })
 }
 
 /// Pure trigger-formula check — see
@@ -2049,6 +2087,61 @@ mod tests {
         assert!(
             matches!(result, HopResult::Answer(_, true)),
             "expected a Secure expired entry to still be stale-served, got {result:?}"
+        );
+    }
+
+    #[test]
+    fn lookup_hop_evicts_expired_secure_entry_with_cryptographically_expired_rrsig() {
+        // Regression coverage for a PR review finding: a `Secure` entry
+        // whose only RRSIG's own `signature_expiration` has already
+        // passed must be excluded from serve-stale the same way a `Bogus`
+        // entry is -- continuing to serve it would keep claiming AD=1
+        // (`dnssec_ad_bit` only checks `dnssec_state == Secure`, not
+        // signature currency) and put a cryptographically-invalid RRSIG on
+        // the wire for a DO=true reader throughout the whole stale window.
+        let shard = stale_shard();
+        let domain = "expired-rrsig-stale.example.com";
+        let now = SystemTime::now();
+        let mut entry = expired_rrset_entry(now);
+        entry.dnssec_state = DnssecState::Secure;
+        entry.rrsigs = vec![StoredRecord {
+            rtype: 46, // RRSIG
+            rclass: IN_QCLASS,
+            ttl_at_store: 300,
+            rdata: RecordData::RRSIG {
+                type_covered: A_QTYPE,
+                algorithm: 8,
+                labels: 2,
+                original_ttl: 300,
+                // Already in the past relative to `now` (real wall-clock
+                // seconds since epoch, comfortably behind `SystemTime::now()`).
+                signature_expiration: 1_000_000_000,
+                signature_inception: 900_000_000,
+                key_tag: 1,
+                signer_name: "example.com".to_string(),
+                signature: vec![0xaa],
+            },
+        }];
+        shard.store_positive(domain, (A_QTYPE, IN_QCLASS), entry);
+
+        let result = shard.lookup_hop(
+            domain,
+            A_QTYPE,
+            IN_QCLASS,
+            false,
+            1,
+            now,
+            &test_refresh_config(),
+        );
+
+        assert!(
+            matches!(result, HopResult::Miss),
+            "expected a Secure entry with a cryptographically expired RRSIG to be evicted \
+             rather than stale-served, got {result:?}"
+        );
+        assert!(
+            !shard.contains_positive(domain, (A_QTYPE, IN_QCLASS)),
+            "must not remain cached, same as the Bogus exclusion"
         );
     }
 

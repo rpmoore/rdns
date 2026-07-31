@@ -1064,7 +1064,11 @@ fn build_rrset_entry(
     let rtype = records.first().map_or(0, |record| record.rtype);
     let rclass = records.first().map_or(0, |record| record.rclass);
     let rrsigs = matching_rrsigs(&response.answers, owner, rtype, rclass);
-    let expires_at = cap_expires_at_to_rrsig_expiration(stored_at + ttl, rrsigs.iter());
+    let expires_at = cap_expires_at_for_bogus(
+        cap_expires_at_to_rrsig_expiration(stored_at + ttl, rrsigs.iter()),
+        stored_at,
+        &dnssec_state,
+    );
     RRsetEntry {
         records: records.iter().copied().map(to_stored_record).collect(),
         rrsigs,
@@ -1109,6 +1113,30 @@ fn cap_expires_at_to_rrsig_expiration<'a>(
     }
 }
 
+/// Caps `expires_at` at `stored_at + dnssec_validation::MAX_BOGUS_VALIDITY`
+/// when `dnssec_state` is `Bogus`, same short retry window the validator's
+/// own internal DS/DNSKEY chase node cache already uses
+/// (`dnssec_validation::validator_config`'s `set_max_bogus_validity`). A
+/// validation timeout or transport error during the chase is deliberately
+/// mapped to `Bogus` (see `dnssec_validation::map_validation_state`), but
+/// without this cap the resulting cache entry's `expires_at` was still
+/// derived purely from the response TTL/RRSIG expiration -- a transient
+/// failure could otherwise pin SERVFAIL (via `dnssec_servfail_check`) in
+/// cache for the full TTL instead of being retried after a short window. A
+/// no-op for every other `DnssecState`, and whenever the RRSIG-capped
+/// `expires_at` is already tighter than the bogus window.
+fn cap_expires_at_for_bogus(
+    expires_at: SystemTime,
+    stored_at: SystemTime,
+    dnssec_state: &DnssecState,
+) -> SystemTime {
+    if !matches!(dnssec_state, DnssecState::Bogus(_)) {
+        return expires_at;
+    }
+    let bogus_deadline = stored_at + dnssec_validation::MAX_BOGUS_VALIDITY;
+    expires_at.min(bogus_deadline)
+}
+
 /// Builds the terminal `NegativeEntry` for a decomposed store. `metadata`
 /// was already computed by `negative_ttl` (via `ttl_for_response`), which
 /// only succeeds after finding a covering SOA record satisfying exactly
@@ -1151,11 +1179,15 @@ fn build_negative_entry(
     .into_iter()
     .next();
     let proof_records = negative_proof_records(&response.authorities, metadata.qclass);
-    let expires_at = cap_expires_at_to_rrsig_expiration(
-        stored_at + ttl,
-        soa_rrsig
-            .iter()
-            .chain(proof_records.iter().map(|(_, record)| record)),
+    let expires_at = cap_expires_at_for_bogus(
+        cap_expires_at_to_rrsig_expiration(
+            stored_at + ttl,
+            soa_rrsig
+                .iter()
+                .chain(proof_records.iter().map(|(_, record)| record)),
+        ),
+        stored_at,
+        &dnssec_state,
     );
     NegativeEntry {
         kind: metadata.kind,
@@ -1964,6 +1996,49 @@ fn truncated_response_for_query(
         &decoded.question_wire,
         opt.as_ref(),
     )
+}
+
+/// Minimal SERVFAIL for a `Bogus`-validated recursive miss response, applied
+/// to the triggering client's own reply -- mirrors
+/// `resolver::cache::assemble::build_servfail`'s shape (header + echoed
+/// question + mirrored OPT, no answer/authority/AD, TC=0) so a bogus first
+/// response looks identical to what a later cache-hit SERVFAIL
+/// (`dnssec_servfail_check`) would have produced. Per RFC 6840 §5.9, forcing
+/// SERVFAIL for `Bogus` data is CD-bit-gated by the caller, not here.
+fn dnssec_bogus_servfail_response_for_query(
+    decoded: &DecodedQuery,
+    configured_max_udp_payload_size: usize,
+    cookie_secret: &CookieSecret,
+    client_ip: IpAddr,
+    now: SystemTime,
+) -> Vec<u8> {
+    let opt = mirrored_client_opt_record_with_cookie(
+        &decoded.message,
+        configured_max_udp_payload_size,
+        cookie_secret,
+        client_ip,
+        now,
+    );
+    let mut response = Vec::new();
+    crate::protocol::write_message_header(
+        &mut response,
+        decoded.message.header.id,
+        decoded.message.header.rd(),
+        false, // TC=0 -- this is a validation verdict, not a truncation
+        false, // AA=0 -- SERVFAIL carries no validated answer to be authoritative about
+        false, // AD=0 -- Bogus is the opposite of authenticated
+        decoded.message.header.cd(),
+        ResponseCode::ServFail,
+        1,
+        0,
+        0,
+        u16::from(opt.is_some()),
+    );
+    response.extend_from_slice(&decoded.question_wire);
+    if let Some(opt) = &opt {
+        crate::protocol::write_opt_record(&mut response, opt);
+    }
+    response
 }
 
 /// Whether `decoded`'s own request would already produce byte-identical
@@ -4092,6 +4167,27 @@ async fn process_refresh_job(resolver: Arc<ResolveQuery>, job: RefreshJob) {
                 ResolutionMode::Recursive => resolver.validate_for_store(&response_message).await,
                 ResolutionMode::Forward => DnssecState::Unvalidated,
             };
+            // A `Bogus` verdict on the refreshed response (deliberately
+            // including a transient DS/DNSKEY chase timeout or transport
+            // error, not just a genuinely tampered response -- see
+            // `validate_for_store`'s doc comment) must not overwrite
+            // whatever was already cached: refresh runs *before* the old
+            // entry expires specifically to keep serving a still-valid
+            // answer without a client-visible miss, so replacing a
+            // `Secure`/`Unvalidated` entry with a freshly `Bogus` one here
+            // would immediately turn every subsequent CD=0 hit into
+            // SERVFAIL (via `dnssec_servfail_check`) -- strictly worse than
+            // doing nothing. Treated the same as the cacheability/parse
+            // failures above: `RefreshFailed`, old entry left untouched,
+            // leader still completed with the raw fetch result so a
+            // coalesced follower isn't blocked on it.
+            if matches!(dnssec_state, DnssecState::Bogus(_)) {
+                resolver.metrics.increment(ResolverMetric::RefreshFailed);
+                if let Some(leader) = leader {
+                    leader.complete(Ok(response));
+                }
+                return;
+            }
             let synthetic_request =
                 ResolveRequest::new(Ipv4Addr::UNSPECIFIED.into(), now, Vec::new());
             resolver
@@ -4195,7 +4291,15 @@ pub struct ResolveQuery {
     // passing unmodified, same as before this section. Whether validation
     // is *policy-enabled* (`DnssecValidationMode`) is section-05's concern;
     // this section only wires the mechanism.
-    trust_anchors: Option<Vec<String>>,
+    //
+    // `RwLock`-wrapped (not a plain field) so a SIGHUP config reload can
+    // actually change it: `republish_trust_anchors` takes `&self` and
+    // swaps the contents in place, mirroring `BackendHandle`'s
+    // read-lock/publish pattern for the backend snapshot. Before this, the
+    // field could only ever be set once via `with_trust_anchors` at
+    // startup -- toggling `dnssec_validation` or rotating anchors via
+    // reload silently had no effect until process restart.
+    trust_anchors: RwLock<Option<Vec<String>>>,
     // Bounds the DS/DNSKEY chase `validate_for_store` performs before
     // storing an entry -- same reasoning as `max_chain_depth`/`chaos` for
     // why this is a post-construction override (`with_dnssec_validation_deadline`)
@@ -4337,7 +4441,7 @@ impl ResolveQuery {
             cookie_secret: Arc::new(CookieSecret::generate()),
             refresh_config: crate::config::RefreshConfig::default(),
             refresh_sender,
-            trust_anchors: None,
+            trust_anchors: RwLock::new(None),
             dnssec_validation_deadline: DEFAULT_DNSSEC_VALIDATION_DEADLINE,
         }
     }
@@ -4485,9 +4589,30 @@ impl ResolveQuery {
     /// zonefile lines rather than a parsed `TrustAnchors`, and why this is a
     /// post-construction override rather than a parameter threaded through
     /// every `with_cache*` constructor.
-    pub fn with_trust_anchors(mut self, trust_anchors: Vec<String>) -> Self {
-        self.trust_anchors = Some(trust_anchors);
+    pub fn with_trust_anchors(self, trust_anchors: Vec<String>) -> Self {
+        *self
+            .trust_anchors
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(trust_anchors);
         self
+    }
+
+    /// Republishes the trust-anchor set (and, by extension, whether DNSSEC
+    /// validation is reachable at all -- see `validate_for_store`) on an
+    /// already-constructed, `Arc`-shared `ResolveQuery`. `&self`, unlike
+    /// `with_trust_anchors`, so `main.rs`'s SIGHUP reload path can call it
+    /// without owning the resolver. `None` disables validation (matches
+    /// `trust_anchors_to_wire_in` returning `None` for
+    /// `DnssecValidationMode::Disabled` or forward mode) -- unlike
+    /// `with_trust_anchors`'s startup-only "leave default untouched"
+    /// framing, this always applies exactly what's passed, so toggling
+    /// `dnssec_validation` off via reload actually takes effect instead of
+    /// leaving stale anchors in place.
+    pub fn republish_trust_anchors(&self, trust_anchors: Option<Vec<String>>) {
+        *self
+            .trust_anchors
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = trust_anchors;
     }
 
     /// Overrides the default DS/DNSKEY chase deadline
@@ -4599,7 +4724,7 @@ impl ResolveQuery {
             cookie_secret: Arc::new(CookieSecret::generate()),
             refresh_config: crate::config::RefreshConfig::default(),
             refresh_sender,
-            trust_anchors: None,
+            trust_anchors: RwLock::new(None),
             dnssec_validation_deadline: DEFAULT_DNSSEC_VALIDATION_DEADLINE,
         }
     }
@@ -5392,11 +5517,65 @@ impl ResolveQuery {
         // request with an unsupported EDNS version never produces a
         // `DecodedQuery` in the first place, so it structurally cannot
         // reach this check.
+        //
+        // A COOKIE option present but too short to even hold the mandatory
+        // 8-byte client cookie (declared length 0-7, still TLV-consistent
+        // per `validate_edns_options` -- e.g. length 3 with exactly 3 bytes
+        // of data present -- so this is reachable from a real decoded wire
+        // message, not just directly-constructed test vectors) has no
+        // client cookie available to echo, so it structurally cannot be
+        // answered BADCOOKIE (RFC 7873 §5.2.4's response format requires
+        // echoing the client's own cookie). Per RFC 7873 §5.2.2 this must
+        // be FORMERR -- checked ahead of and independent of the BADCOOKIE
+        // check below (which only ever sees `Malformed { client_cookie:
+        // Some(_) }`, unaffected by this), and unlike BADCOOKIE this is not
+        // transport-gated: a malformed option is a basic protocol
+        // violation, not an anti-spoofing mechanism specific to UDP.
+        if decoded.message.edns.as_ref().is_some_and(|edns| {
+            matches!(
+                crate::protocol::edns_cookie::locate_cookie_for_verification(&edns.options),
+                crate::protocol::edns_cookie::CookieVerification::Malformed {
+                    client_cookie: None
+                }
+            )
+        }) {
+            self.metrics
+                .increment_with_source(ResolverMetric::ProtocolError, request.client_ip);
+            let decision = ResolveDecision {
+                client_ip: request.client_ip,
+                question: Some(decoded.question.clone()),
+                kind: ResolveDecisionKind::ProtocolError(
+                    QueryValidationError::InvalidEdns.response_code(),
+                ),
+            };
+            let response_bytes = self.responses.protocol_error(
+                request.request_id,
+                &QueryValidationError::InvalidEdns,
+                Some(&decoded.message),
+                &self.cookie_secret,
+                request.client_ip,
+                self.clock.now(),
+                self.protocol.configured_max_udp_payload_size(),
+            );
+            return Err(self
+                .finish_uniform(
+                    started_at,
+                    request,
+                    decoded_original_question_name(decoded),
+                    decision,
+                    response_bytes,
+                    None,
+                    Some(QueryEventBackend::from_snapshot(backend_snapshot)),
+                )
+                .await);
+        }
+
         if invalid_server_cookie(
             decoded,
             request.observed_source.is_tcp(),
             &self.cookie_secret,
             request.client_ip,
+            self.clock.now(),
         )
         .is_some()
         {
@@ -5842,6 +6021,24 @@ impl ResolveQuery {
             return self.backend_failure_response(request, decoded, decoded.question.clone());
         }
 
+        // Validation always runs for a recursive fetch whenever it's
+        // reachable at all (see `validate_for_store`'s doc comment on the
+        // synchronous-on-the-triggering-client's-own-reply-path trade-off),
+        // independent of whether *this* response happens to be cache-store
+        // admissible: a query that legitimately bypasses caching (e.g. EDNS
+        // with a non-COOKIE option, so `cache_supported` rejects it) must
+        // still get a DNSSEC-validated response when DNSSEC is enabled, not
+        // raw unvalidated backend bytes just because nothing gets cached.
+        // Its result is applied to *this* response below (SERVFAIL on
+        // `Bogus`, AD on `Secure`) regardless of `cache_store_allowed`, and
+        // additionally stored for future hits when storage is admissible.
+        // Forward mode never validates at all -- keeps trusting the
+        // upstream's AD bit verbatim, unchanged by this whole feature.
+        let dnssec_state = match backend_mode {
+            ResolutionMode::Recursive => self.validate_for_store(&response_message).await,
+            ResolutionMode::Forward => DnssecState::Unvalidated,
+        };
+
         if let (true, Some(_miss_key)) = (cache_store_allowed, &miss_key) {
             if response.cache_directive.is_cacheable() {
                 // For the recursive backend, upstream is now always asked for
@@ -5878,21 +6075,14 @@ impl ResolveQuery {
                     ResolutionMode::Recursive => false,
                     ResolutionMode::Forward => response_message.header.aa(),
                 };
-                // Validation always runs (when reachable at all -- see
-                // `validate_for_store`) and its result is always stored,
-                // independent of *this* request's own CD bit: the entry is
-                // shared across every future requester of this name/type, so
-                // a CD=1 fetcher must not cause a later CD=0 requester to be
-                // served an entry that was never actually validated. CD-bit
-                // gating happens only at response-assembly time
-                // (`dnssec_servfail_check`/`negative_dnssec_servfail_check`),
-                // never here. Forward mode never validates at all -- keeps
-                // trusting the upstream's AD bit verbatim, unchanged by this
-                // whole feature (see `validate_for_store`'s doc comment).
-                let dnssec_state = match backend_mode {
-                    ResolutionMode::Recursive => self.validate_for_store(&response_message).await,
-                    ResolutionMode::Forward => DnssecState::Unvalidated,
-                };
+                // Validation result is always stored independent of *this*
+                // request's own CD bit: the entry is shared across every
+                // future requester of this name/type, so a CD=1 fetcher must
+                // not cause a later CD=0 requester to be served an entry
+                // that was never actually validated. CD-bit gating happens
+                // only at response-assembly time
+                // (`dnssec_servfail_check`/`negative_dnssec_servfail_check`,
+                // and the triggering-client gating just below).
                 self.store_cache_response(
                     cache_epoch,
                     &response_message,
@@ -5900,7 +6090,7 @@ impl ResolveQuery {
                     request,
                     store_dnssec_ok,
                     store_authoritative,
-                    dnssec_state,
+                    dnssec_state.clone(),
                 )
                 .await;
             } else {
@@ -6241,6 +6431,39 @@ impl ResolveQuery {
             }
         }
 
+        // Apply this fetch's own DNSSEC verdict to the triggering client's
+        // response, not just to what got cached for future lookups (see
+        // `validate_for_store`'s doc comment -- validating this response
+        // and then serving it unvalidated to the very requester who paid
+        // for the chase would defeat the point). Mirrors
+        // `dnssec_servfail_check`/`dnssec_ad_bit`'s cache-hit-path behavior:
+        // SERVFAIL on `Bogus` unless CD=1, AD=1 on `Secure` when DO or AD
+        // was requested. Runs after every filtering/truncation/rebuild pass
+        // above has already settled `response_bytes`, so a `Secure` AD-bit
+        // flip only touches the header flags word in place, and a `Bogus`
+        // SERVFAIL replaces it outright, matching `build_servfail`'s
+        // header+question+OPT-only shape regardless of what content
+        // filtering/truncation would otherwise have produced.
+        if backend_mode == ResolutionMode::Recursive {
+            if matches!(dnssec_state, DnssecState::Bogus(_)) && !decoded.features.checking_disabled
+            {
+                response_bytes = dnssec_bogus_servfail_response_for_query(
+                    decoded,
+                    configured_max_udp_payload_size,
+                    &self.cookie_secret,
+                    request.client_ip,
+                    self.clock.now(),
+                );
+            } else if dnssec_state == DnssecState::Secure
+                && (decoded.features.dnssec_ok || decoded.features.authenticated_data)
+                && response_bytes.len() >= 4
+            {
+                let mut flags = u16::from_be_bytes([response_bytes[2], response_bytes[3]]);
+                flags |= 0x0020; // AD
+                response_bytes[2..4].copy_from_slice(&flags.to_be_bytes());
+            }
+        }
+
         let decision = ResolveDecision {
             client_ip: request.client_ip,
             question: Some(question),
@@ -6323,7 +6546,17 @@ impl ResolveQuery {
     /// section-05's latency-relevant metrics after rollout rather than
     /// treating this as a bug to silently fix later.
     async fn validate_for_store(&self, response: &Message) -> DnssecState {
-        let Some(trust_anchor_lines) = self.trust_anchors.as_ref() else {
+        // Cloned out from behind the lock (rather than held as a guard)
+        // because the chase below awaits -- a `std::sync::RwLockReadGuard`
+        // must not be held across an await point, and reading a fresh
+        // snapshot here also means a concurrent `republish_trust_anchors`
+        // (SIGHUP reload) never blocks or races an in-flight validation.
+        let trust_anchor_lines = self
+            .trust_anchors
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+        let Some(trust_anchor_lines) = trust_anchor_lines.as_ref() else {
             // No trust anchors configured -- either `DnssecValidationMode::
             // Disabled` (main.rs never wires anchors in for that mode) or a
             // constructor that never called `with_trust_anchors`. Either
@@ -6877,6 +7110,7 @@ fn invalid_server_cookie(
     is_tcp: bool,
     cookie_secret: &CookieSecret,
     client_ip: IpAddr,
+    now: SystemTime,
 ) -> Option<ClientCookie> {
     if is_tcp {
         return None;
@@ -6897,6 +7131,7 @@ fn invalid_server_cookie(
             client_cookie,
             &server_cookie_tail,
             client_ip,
+            now,
         ))
         .then_some(client_cookie),
     }
@@ -12042,6 +12277,66 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn republish_trust_anchors_updates_validation_without_reconstructing_the_service() {
+        // Regression coverage for a PR review finding: `trust_anchors` used
+        // to be a plain field settable only once via `with_trust_anchors`
+        // at construction time -- a SIGHUP config reload had no way to
+        // change it short of restarting the whole process, so toggling
+        // `dnssec_validation` or rotating anchors via reload silently had
+        // no effect. `republish_trust_anchors` (called from
+        // `main.rs::apply_reload_result`) must actually change what
+        // `validate_for_store` sees on the same, already-constructed
+        // `ResolveQuery`.
+        use crate::resolver::dnssec_validation::tests::fixture;
+        use domain::rdata::dnssec::Timestamp;
+
+        let now = Timestamp::now();
+        let expiration = Timestamp::from(now.into_int().wrapping_add(3600));
+        let material = fixture::build_zone("example.test.", now, expiration);
+        let backend: Arc<dyn ResolutionBackend> = Arc::new(ScriptedNameKeyedBackend::new(vec![(
+            material.apex.trim_end_matches('.').to_string(),
+            DNSKEY_RECORD_TYPE,
+            material.dnskey_response_wire.clone(),
+        )]));
+        let metrics = Arc::new(RecordingMetrics::default());
+        // No `.with_trust_anchors(...)` -- starts exactly like a resolver
+        // built under `DnssecValidationMode::Disabled`.
+        let service = resolve_service_with_recursive_cache(
+            backend,
+            Arc::new(NoopDnsCache),
+            Arc::new(RecordingEvents::default()),
+            Arc::clone(&metrics),
+            1232,
+        );
+
+        let response = fixture::rdns_message(material.a_response_wire.clone());
+
+        assert_eq!(
+            service.validate_for_store(&response).await,
+            DnssecState::Unvalidated,
+            "no trust anchors configured yet -- validation must be unreachable"
+        );
+
+        service.republish_trust_anchors(Some(vec![material.trust_anchor_line.clone()]));
+
+        assert_eq!(
+            service.validate_for_store(&response).await,
+            DnssecState::Secure,
+            "republishing trust anchors on the same, already-constructed service must make \
+             validation reachable immediately, matching what a SIGHUP reload needs"
+        );
+
+        service.republish_trust_anchors(None);
+
+        assert_eq!(
+            service.validate_for_store(&response).await,
+            DnssecState::Unvalidated,
+            "republishing None must disable validation again -- a reload that turns \
+             dnssec_validation off must actually take effect, not leave stale anchors in place"
+        );
+    }
+
+    #[tokio::test]
     async fn validate_for_store_records_bogus_outcome_for_a_tampered_signature() {
         use crate::resolver::dnssec_validation::tests::fixture;
         use domain::rdata::dnssec::Timestamp;
@@ -12333,6 +12628,185 @@ mod tests {
         assert_eq!(
             observed_states[0], observed_states[1],
             "the stored dnssec_state must be identical for a CD=0 and a CD=1 fetch of the same data"
+        );
+    }
+
+    #[tokio::test]
+    async fn resolve_recursive_miss_servfails_triggering_client_on_bogus_response() {
+        // Regression coverage for a PR review finding: `validate_for_store`'s
+        // verdict used to be applied only to what got cached for *future*
+        // lookups (via `store_cache_response`), never to the response
+        // actually returned to the client whose own cache-miss triggered
+        // this fetch -- that requester paid the full DS/DNSKEY chase latency
+        // and then got served the raw, potentially-tampered upstream bytes
+        // anyway. Only a later cache hit would have gone through
+        // `dnssec_servfail_check` and produced SERVFAIL.
+        use crate::resolver::dnssec_validation::tests::fixture;
+        use domain::rdata::dnssec::Timestamp;
+
+        let now = Timestamp::now();
+        let expiration = Timestamp::from(now.into_int().wrapping_add(3600));
+        let material = fixture::build_zone("example.test.", now, expiration);
+        let mut tampered_wire = material.a_response_wire.clone();
+        fixture::flip_last_byte_of(&mut tampered_wire, &material.a_rrsig_rdata);
+        let apex = material.apex.trim_end_matches('.').to_string();
+
+        let backend: Arc<dyn ResolutionBackend> = Arc::new(ScriptedNameKeyedBackend::new(vec![
+            (apex.clone(), A_RECORD_TYPE, tampered_wire),
+            (
+                apex.clone(),
+                DNSKEY_RECORD_TYPE,
+                material.dnskey_response_wire.clone(),
+            ),
+        ]));
+        let cache = Arc::new(ShardedDnsCache::new(&CacheConfig {
+            max_entries: 16,
+            shard_count: Some(1),
+            ..CacheConfig::default()
+        }));
+        let service = resolve_service_with_recursive_cache(
+            backend,
+            Arc::clone(&cache) as Arc<dyn DomainDnsCache>,
+            Arc::new(RecordingEvents::default()),
+            Arc::new(RecordingMetrics::default()),
+            1232,
+        )
+        .with_trust_anchors(vec![material.trust_anchor_line.clone()]);
+
+        let outcome = service
+            .resolve(ResolveRequest::new(
+                "192.0.2.10".parse().unwrap(),
+                SystemTime::UNIX_EPOCH,
+                a_query(0x4242, &apex),
+            ))
+            .await;
+
+        let parsed = Message::parse(&outcome.response_bytes).unwrap();
+        assert_eq!(
+            parsed.header.r_code(),
+            ResponseCode::ServFail as u8,
+            "the triggering client must get SERVFAIL for a Bogus-validated response, not the \
+             raw tampered answer"
+        );
+        assert!(
+            parsed.answers.is_empty(),
+            "a Bogus SERVFAIL must carry no answer data"
+        );
+    }
+
+    #[tokio::test]
+    async fn resolve_recursive_miss_sets_ad_bit_for_secure_response_when_do_requested() {
+        // Sibling of the SERVFAIL regression above: a genuinely `Secure`
+        // verdict must also reach the triggering client's own response
+        // (AD=1), not just get recorded for a later cache hit to discover.
+        use crate::resolver::dnssec_validation::tests::fixture;
+        use domain::rdata::dnssec::Timestamp;
+
+        let now = Timestamp::now();
+        let expiration = Timestamp::from(now.into_int().wrapping_add(3600));
+        let material = fixture::build_zone("example.test.", now, expiration);
+        let apex = material.apex.trim_end_matches('.').to_string();
+
+        let backend: Arc<dyn ResolutionBackend> = Arc::new(ScriptedNameKeyedBackend::new(vec![
+            (
+                apex.clone(),
+                A_RECORD_TYPE,
+                material.a_response_wire.clone(),
+            ),
+            (
+                apex.clone(),
+                DNSKEY_RECORD_TYPE,
+                material.dnskey_response_wire.clone(),
+            ),
+        ]));
+        let cache = Arc::new(ShardedDnsCache::new(&CacheConfig {
+            max_entries: 16,
+            shard_count: Some(1),
+            ..CacheConfig::default()
+        }));
+        let service = resolve_service_with_recursive_cache(
+            backend,
+            Arc::clone(&cache) as Arc<dyn DomainDnsCache>,
+            Arc::new(RecordingEvents::default()),
+            Arc::new(RecordingMetrics::default()),
+            1232,
+        )
+        .with_trust_anchors(vec![material.trust_anchor_line.clone()]);
+
+        let outcome = service
+            .resolve(ResolveRequest::new(
+                "192.0.2.10".parse().unwrap(),
+                SystemTime::UNIX_EPOCH,
+                a_query_with_edns(0x4242, &apex, 1232, true),
+            ))
+            .await;
+
+        let parsed = Message::parse(&outcome.response_bytes).unwrap();
+        assert_eq!(parsed.header.r_code(), ResponseCode::NoError as u8);
+        assert!(
+            parsed.header.ad(),
+            "the triggering client must see AD=1 for a Secure-validated response when it asked \
+             for DNSSEC material, not just have that state recorded for a later cache hit"
+        );
+    }
+
+    #[tokio::test]
+    async fn resolve_recursive_miss_validates_dnssec_even_when_cache_store_bypassed() {
+        // Regression coverage for a second PR review finding: DNSSEC
+        // validation used to be nested under `cache_store_allowed &&
+        // is_cacheable()`, so a query that legitimately bypasses caching
+        // (any EDNS option besides a lone COOKIE makes `cache_supported`
+        // reject it) got an entirely unvalidated response even with DNSSEC
+        // enabled. An NSID option (code 3) here is exactly such a case.
+        use crate::resolver::dnssec_validation::tests::fixture;
+        use domain::rdata::dnssec::Timestamp;
+
+        let now = Timestamp::now();
+        let expiration = Timestamp::from(now.into_int().wrapping_add(3600));
+        let material = fixture::build_zone("example.test.", now, expiration);
+        let mut tampered_wire = material.a_response_wire.clone();
+        fixture::flip_last_byte_of(&mut tampered_wire, &material.a_rrsig_rdata);
+        let apex = material.apex.trim_end_matches('.').to_string();
+
+        let backend: Arc<dyn ResolutionBackend> = Arc::new(ScriptedNameKeyedBackend::new(vec![
+            (apex.clone(), A_RECORD_TYPE, tampered_wire),
+            (
+                apex.clone(),
+                DNSKEY_RECORD_TYPE,
+                material.dnskey_response_wire.clone(),
+            ),
+        ]));
+        let cache = Arc::new(ShardedDnsCache::new(&CacheConfig {
+            max_entries: 16,
+            shard_count: Some(1),
+            ..CacheConfig::default()
+        }));
+        let service = resolve_service_with_recursive_cache(
+            backend,
+            Arc::clone(&cache) as Arc<dyn DomainDnsCache>,
+            Arc::new(RecordingEvents::default()),
+            Arc::new(RecordingMetrics::default()),
+            1232,
+        )
+        .with_trust_anchors(vec![material.trust_anchor_line.clone()]);
+
+        let nsid_option = [0u8, 3, 0, 0]; // OPT code 3 (NSID), zero-length data
+        let query = a_query_with_edns_options(0x4242, &apex, 1232, false, &nsid_option);
+
+        let outcome = service
+            .resolve(ResolveRequest::new(
+                "192.0.2.10".parse().unwrap(),
+                SystemTime::UNIX_EPOCH,
+                query,
+            ))
+            .await;
+
+        let parsed = Message::parse(&outcome.response_bytes).unwrap();
+        assert_eq!(
+            parsed.header.r_code(),
+            ResponseCode::ServFail as u8,
+            "a cache-bypassed query must still get a validated (SERVFAIL-on-Bogus) response, \
+             not raw unvalidated backend bytes just because nothing gets cached"
         );
     }
 
@@ -16863,6 +17337,47 @@ mod tests {
     }
 
     #[test]
+    fn build_rrset_entry_caps_bogus_expiry_to_max_bogus_validity() {
+        // Regression coverage for a PR review finding: `MAX_BOGUS_VALIDITY`
+        // (`dnssec_validation::MAX_BOGUS_VALIDITY`, 30s) only bounded the
+        // validator's own internal DS/DNSKEY chase node cache, never the
+        // resolver's own cache-entry `expires_at` -- so a transient chase
+        // timeout or transport error (mapped to `Bogus`) on a response with
+        // a long TTL and no RRSIGs at all got no capping whatsoever,
+        // pinning SERVFAIL (via `dnssec_servfail_check`) in cache for the
+        // full response TTL instead of a short retry window.
+        let question = QuestionKey::new("example.com", A_RECORD_TYPE, 1);
+        let ttl = Duration::from_secs(3600);
+        let response = response_message_for_question(
+            question.clone(),
+            ResponseCode::NoError,
+            vec![a_record("example.com", 3600)],
+            Vec::new(),
+            Vec::new(),
+            true,
+        );
+
+        let decomposed = decompose_response_for_store(
+            &response,
+            &question,
+            ttl,
+            None,
+            SystemTime::UNIX_EPOCH,
+            true,
+            true,
+            DnssecState::Bogus("chase timed out".to_string()),
+        );
+
+        let (_, _, _, entry) = &decomposed.positive[0];
+        assert_eq!(
+            entry.expires_at,
+            SystemTime::UNIX_EPOCH + dnssec_validation::MAX_BOGUS_VALIDITY,
+            "expected a Bogus entry's expires_at capped to MAX_BOGUS_VALIDITY, not the full \
+             3600s response TTL"
+        );
+    }
+
+    #[test]
     fn build_negative_entry_caps_ttl_to_earlier_soa_rrsig_expiration() {
         // The SOA's `minimum` (120) governs the negative TTL
         // (`ttl_for_response`), so the RRSIG expiration must be tighter
@@ -16900,6 +17415,44 @@ mod tests {
             negative_entry.expires_at,
             SystemTime::UNIX_EPOCH + Duration::from_secs(60),
             "expected the negative entry's expires_at capped to the SOA RRSIG's earlier expiration"
+        );
+    }
+
+    #[test]
+    fn build_negative_entry_caps_bogus_expiry_to_max_bogus_validity() {
+        // Negative-entry sibling of
+        // `build_rrset_entry_caps_bogus_expiry_to_max_bogus_validity` -- the
+        // same missing cap applied to `build_negative_entry`.
+        let question = QuestionKey::new("nx.example.com", A_RECORD_TYPE, 1);
+        let response = response_message_for_question(
+            question.clone(),
+            ResponseCode::NxDomain,
+            Vec::new(),
+            vec![soa_record("example.com", 3600, 120)],
+            Vec::new(),
+            true,
+        );
+        let policy = CacheTtlPolicy::default();
+        let (ttl, negative_meta) = policy.ttl_for_response(&response).expect("cacheable");
+        assert!(negative_meta.is_some());
+
+        let decomposed = decompose_response_for_store(
+            &response,
+            &question,
+            ttl,
+            negative_meta.as_ref(),
+            SystemTime::UNIX_EPOCH,
+            true,
+            true,
+            DnssecState::Bogus("chase timed out".to_string()),
+        );
+
+        let (_, _, negative_entry) = decomposed.negative.expect("expected a negative entry");
+        assert_eq!(
+            negative_entry.expires_at,
+            SystemTime::UNIX_EPOCH + dnssec_validation::MAX_BOGUS_VALIDITY,
+            "expected a Bogus negative entry's expires_at capped to MAX_BOGUS_VALIDITY, not the \
+             full 120s SOA-minimum-derived TTL"
         );
     }
 
@@ -20559,6 +21112,157 @@ mod tests {
             metrics.count(ResolverMetric::CacheStaleHit),
             1,
             "the post-refresh query is a fresh hit, not another stale serve"
+        );
+    }
+
+    /// A `ResolutionBackend` answering a fixed apex's DNSKEY query with one
+    /// canned response, and its A query with the Nth entry of a scripted
+    /// sequence (clamped to the last entry once exhausted) -- lets a test
+    /// drive an initial fetch and a later refresh through two different A
+    /// responses (e.g. good-then-tampered) while keeping the DNSKEY chase
+    /// response constant across both.
+    struct SequencedApexBackend {
+        apex: String,
+        dnskey_response: Vec<u8>,
+        a_responses: Vec<Vec<u8>>,
+        a_call_count: AtomicU64,
+    }
+
+    impl ResolutionBackend for SequencedApexBackend {
+        fn resolve<'a>(
+            &'a self,
+            request: ResolutionRequest,
+        ) -> BoxFuture<'a, Result<ResolutionResponse, ResolutionBackendError>> {
+            Box::pin(async move {
+                let question = &request.query.question;
+                if question.qname != self.apex {
+                    return Err(ResolutionBackendError::NoBackendsAvailable);
+                }
+                let wire = if question.qtype == DNSKEY_RECORD_TYPE {
+                    self.dnskey_response.clone()
+                } else if question.qtype == A_RECORD_TYPE {
+                    let index = self.a_call_count.fetch_add(1, Ordering::SeqCst) as usize;
+                    self.a_responses[index.min(self.a_responses.len() - 1)].clone()
+                } else {
+                    return Err(ResolutionBackendError::NoBackendsAvailable);
+                };
+                Ok(ResolutionResponse::forwarded_bytes(
+                    wire,
+                    SystemTime::now(),
+                    0,
+                    "sequenced-apex-backend",
+                ))
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn process_refresh_job_does_not_overwrite_secure_entry_with_bogus_verdict() {
+        // Regression coverage for a PR review finding: a proactive refresh
+        // that fetches successfully but validates `Bogus` (including a
+        // transient DS/DNSKEY chase failure, not just a genuinely tampered
+        // response) used to unconditionally overwrite whatever was already
+        // cached and record `RefreshSucceeded` -- silently downgrading a
+        // still-valid `Secure` entry and turning every subsequent CD=0 hit
+        // into SERVFAIL. An ordinary fetch/cacheability failure already
+        // left the old entry untouched (`RefreshFailed`); a `Bogus`
+        // verdict must be treated the same way.
+        use crate::resolver::dnssec_validation::tests::fixture;
+        use domain::rdata::dnssec::Timestamp;
+
+        let now = Timestamp::now();
+        let expiration = Timestamp::from(now.into_int().wrapping_add(3600));
+        let material = fixture::build_zone("example.test.", now, expiration);
+        let apex = material.apex.trim_end_matches('.').to_string();
+        let mut tampered_wire = material.a_response_wire.clone();
+        fixture::flip_last_byte_of(&mut tampered_wire, &material.a_rrsig_rdata);
+
+        let backend: Arc<dyn ResolutionBackend> = Arc::new(SequencedApexBackend {
+            apex: apex.clone(),
+            dnskey_response: material.dnskey_response_wire.clone(),
+            a_responses: vec![material.a_response_wire.clone(), tampered_wire],
+            a_call_count: AtomicU64::new(0),
+        });
+        let cache = Arc::new(ShardedDnsCache::new(&CacheConfig {
+            max_entries: 16,
+            shard_count: Some(1),
+            ..CacheConfig::default()
+        }));
+        let metrics = Arc::new(RecordingMetrics::default());
+        let (sender, mut receiver) = mpsc::channel(4);
+        let service = Arc::new(
+            resolve_service_with_recursive_cache(
+                backend,
+                Arc::clone(&cache) as Arc<dyn DomainDnsCache>,
+                Arc::new(RecordingEvents::default()),
+                Arc::clone(&metrics),
+                1232,
+            )
+            .with_trust_anchors(vec![material.trust_anchor_line.clone()])
+            .with_refresh_config(permissive_refresh_config())
+            .with_refresh_sender(sender),
+        );
+
+        let t0 = SystemTime::UNIX_EPOCH;
+        // First call: genuine miss, fetches the good signed response
+        // (`a_responses[0]`), validates Secure, stores it.
+        let first = service
+            .resolve(ResolveRequest::new(
+                "192.0.2.10".parse().unwrap(),
+                t0,
+                a_query(0x1111, &apex),
+            ))
+            .await;
+        assert_eq!(first.decision.kind, ResolveDecisionKind::Allowed);
+        let first_parsed = Message::parse(&first.response_bytes).unwrap();
+        assert_eq!(first_parsed.header.r_code(), ResponseCode::NoError as u8);
+
+        // Second call: cache hit; the permissive config makes this hit's
+        // own popularity increment immediately qualify for a refresh hint.
+        let second = service
+            .resolve(ResolveRequest::new(
+                "192.0.2.11".parse().unwrap(),
+                t0,
+                a_query(0x2222, &apex),
+            ))
+            .await;
+        assert_eq!(second.decision.kind, ResolveDecisionKind::CacheHit);
+
+        let job = receiver
+            .try_recv()
+            .expect("the hot cache hit must enqueue a refresh job");
+        process_refresh_job(Arc::clone(&service), job).await;
+
+        // The refresh's own fetch got `a_responses[1]` (tampered ->
+        // Bogus) -- it must have been rejected, not stored.
+        assert_eq!(
+            metrics.count(ResolverMetric::RefreshFailed),
+            1,
+            "a Bogus-validated refresh must count as RefreshFailed"
+        );
+        assert_eq!(
+            metrics.count(ResolverMetric::RefreshSucceeded),
+            0,
+            "a Bogus-validated refresh must never count as RefreshSucceeded"
+        );
+
+        // A third query (still well within the original entry's TTL) must
+        // still see the original Secure-validated answer -- NOERROR, not
+        // SERVFAIL -- proving the Bogus refresh never overwrote it.
+        let third = service
+            .resolve(ResolveRequest::new(
+                "192.0.2.12".parse().unwrap(),
+                t0,
+                a_query(0x3333, &apex),
+            ))
+            .await;
+        assert_eq!(third.decision.kind, ResolveDecisionKind::CacheHit);
+        let third_parsed = Message::parse(&third.response_bytes).unwrap();
+        assert_eq!(
+            third_parsed.header.r_code(),
+            ResponseCode::NoError as u8,
+            "the pre-existing Secure entry must still be served after a Bogus refresh attempt, \
+             not SERVFAIL from an overwritten Bogus entry"
         );
     }
 
@@ -24291,6 +24995,64 @@ mod tests {
 
         assert_eq!(outcome.decision.kind, ResolveDecisionKind::BackendFailure);
         assert!(!upstream.requests.lock().unwrap().is_empty());
+    }
+
+    /// Regression coverage for a PR review finding: a COOKIE option too
+    /// short to hold even an 8-byte client cookie (declared length 0-7,
+    /// fully TLV-consistent -- see
+    /// `CookieVerification::Malformed`'s doc comment) used to fall through
+    /// `invalid_server_cookie` as `Malformed { client_cookie: None }` ->
+    /// `None`, the exact same return value as a genuinely absent COOKIE
+    /// option -- so it was silently processed as if no cookie had been
+    /// presented at all. There's no client cookie available to echo, so
+    /// RFC 7873 §5.2.4's BADCOOKIE response can't be built either; this
+    /// must be FORMERR (RFC 7873 §5.2.2), checked independent of transport
+    /// (unlike BADCOOKIE, not UDP-only -- this is a basic protocol
+    /// violation, not an anti-spoofing check).
+    #[tokio::test]
+    async fn resolve_rejects_too_short_cookie_option_with_formerr() {
+        let upstream = Arc::new(StaticUpstream::new(Err(UpstreamError::Timeout)));
+        let events = Arc::new(RecordingEvents::default());
+        let metrics = Arc::new(RecordingMetrics::default());
+        let service = resolve_service(upstream.clone(), events, metrics);
+
+        // COOKIE option (code 10), declared length 3, exactly 3 bytes of
+        // data present -- not truncated, just too short for a client
+        // cookie.
+        let mut cookie_option = Vec::new();
+        cookie_option.extend_from_slice(&10u16.to_be_bytes());
+        cookie_option.extend_from_slice(&3u16.to_be_bytes());
+        cookie_option.extend_from_slice(&[1, 2, 3]);
+        let request_bytes =
+            a_query_with_edns_options(0x1006, "example.com", 4096, false, &cookie_option);
+
+        let outcome = service
+            .resolve(ResolveRequest::new(
+                "192.0.2.10".parse().unwrap(),
+                SystemTime::UNIX_EPOCH,
+                request_bytes,
+            ))
+            .await;
+
+        assert_eq!(
+            outcome.decision.kind,
+            ResolveDecisionKind::ProtocolError(ResponseCode::FormErr),
+            "a too-short COOKIE option must be rejected with FORMERR, not silently processed as \
+             if no cookie were presented"
+        );
+        let response = Message::parse(&outcome.response_bytes).unwrap();
+        assert_eq!(response.header.r_code(), ResponseCode::FormErr as u8);
+        let has_badcookie_extended_rcode = response.additionals.iter().any(
+            |record| matches!(&record.record, RecordData::OPT(info) if info.extended_rcode != 0),
+        );
+        assert!(
+            !has_badcookie_extended_rcode,
+            "must be plain FORMERR, not BADCOOKIE -- there's no client cookie available to echo"
+        );
+        assert!(
+            upstream.requests.lock().unwrap().is_empty(),
+            "a FORMERR-rejected query must never reach the backend"
+        );
     }
 
     /// §B2 test 6: a client cookie with no server-cookie tail at all

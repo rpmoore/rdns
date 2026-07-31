@@ -8,7 +8,7 @@ description: >
           that executes the refetch.
 resource: src/resolver/cache/shard.rs
 tags: [cache, dns, resolver, refresh, popularity, worker-pool]
-timestamp: 2026-07-16T00:00:00Z
+timestamp: 2026-07-31T00:00:00Z
 ---
 
 The [answer-cache](answer-cache.md) is purely reactive by default: an entry
@@ -245,7 +245,17 @@ not merely idle ones.
    unparseable response) — the stale entry is simply left untouched and
    falls back to ordinary reactive-miss behavior at its real expiry.
    Best-effort by design, naturally bounded by the worker pool's fixed
-   size and channel capacity, not a backoff mechanism.
+   size and channel capacity, not a backoff mechanism. A `Bogus` DNSSEC
+   verdict on the refreshed response (recursive mode only; includes a
+   transient DS/DNSKEY chase timeout or transport error, not just a
+   genuinely tampered response — see
+   [dnssec-validation](../dnssec-validation.md)) counts as a failure the
+   same way: the fetch still succeeded at the transport level, but
+   `process_refresh_job` treats a `Bogus` verdict identically to a
+   fetch/cacheability failure, skipping the store and leaving the old
+   (possibly still-`Secure`) entry in place — refresh runs specifically to
+   avoid a client-visible miss, so overwriting a valid entry with a fresh
+   `Bogus` one would be strictly worse than doing nothing.
 
 Why the recheck uses `dnssec_ok = false` while the fetch always uses
 `true`: `Shard::take_live_positive`/`take_live_cname_hop` treat any entry

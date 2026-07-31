@@ -10,7 +10,7 @@ description: >
           answer.
 resource: src/resolver/dnssec_validation.rs
 tags: [dns, resolver, dnssec, security, validation, metrics]
-timestamp: 2026-07-19T00:00:00Z
+timestamp: 2026-07-31T00:00:00Z
 ---
 
 # What it is
@@ -44,11 +44,30 @@ it and continues to trust the upstream's AD bit verbatim (see
   `dnssec_state` parameter call `validate_for_store` for
   `ResolutionMode::Recursive` and hardcode `DnssecState::Unvalidated` for
   `ResolutionMode::Forward` — the client-miss path
-  (`src/resolver/mod.rs:5834`) and the refresh-worker path
-  (`src/resolver/mod.rs:4092`). The stored verdict flows into
-  `build_rrset_entry`/`build_negative_entry` (`src/resolver/mod.rs:1054`,
+  (`prepare_backend_result`, `src/resolver/mod.rs`) and the
+  refresh-worker path (`process_refresh_job`). The stored verdict flows
+  into `build_rrset_entry`/`build_negative_entry` (`src/resolver/mod.rs:1054`,
   `:1126`), stamped onto every hop of a CNAME chain and the terminal
   negative entry alike.
+- In `prepare_backend_result`, validation runs unconditionally for
+  `ResolutionMode::Recursive` — independent of `cache_store_allowed`
+  (whether this response is even cache-admissible, e.g. a non-COOKIE EDNS
+  option makes `cache_supported` reject it). Its verdict gates *both* the
+  stored entry *and* the response returned to the triggering client
+  itself: `Bogus` (with `checking_disabled == false`) replaces the
+  response with a minimal SERVFAIL
+  (`dnssec_bogus_servfail_response_for_query`); `Secure` (with DO or AD
+  requested) sets AD=1 in place on the already-assembled response bytes.
+  Before this, the verdict was computed and stored but never applied to
+  the fetch's own triggering response — only a *later* cache hit (via
+  `dnssec_servfail_check`/`dnssec_ad_bit`) would see it.
+- `process_refresh_job`'s own `validate_for_store` call: a `Bogus`
+  verdict on a proactively-refreshed response is treated the same as a
+  fetch/cacheability failure (`RefreshFailed`, old entry left
+  untouched) — a refresh runs *before* the old entry expires specifically
+  to avoid a client-visible miss, so overwriting a still-valid entry with
+  a fresh `Bogus` one (including a transient chase timeout) would be
+  strictly worse than leaving the old entry in place.
 
 # Trust anchor sourcing
 
@@ -160,7 +179,7 @@ metric label.
 Validation always runs (when reachable at all) and its result is always
 stored, independent of the storing request's own CD bit — the cache
 entry is shared across every future requester of that name/type. CD-bit
-gating happens only at response-assembly time:
+gating happens both at response-assembly time on a cache *hit* —
 `dnssec_servfail_check`/`negative_dnssec_servfail_check`
 (`src/resolver/cache/assemble.rs:426`, `:447`) force SERVFAIL for a
 CD=0 requester when any hop in the chain (or the negative entry itself)
@@ -169,24 +188,64 @@ themselves — pinned by
 `assemble_response_servfails_on_bogus_when_checking_enabled`,
 `assemble_response_servfails_on_mixed_state_cname_chain_with_any_bogus_hop`,
 and their negative-response siblings (`src/resolver/cache/assemble.rs:1609`,
-`:1663`, `:1813`, `:1870`). `dnssec_ad_bit`/`negative_dnssec_ad_bit`
-(`assemble.rs:469`, `:486`) assert AD=1 only for a `Secure` chain/entry.
+`:1663`, `:1813`, `:1870`) — and, equivalently, on the initial *miss*
+that triggered the fetch, via `prepare_backend_result`'s own gating (see
+above). `dnssec_ad_bit`/`negative_dnssec_ad_bit` (`assemble.rs:469`,
+`:486`) assert AD=1 only for a `Secure` chain/entry; the negative-side
+variant additionally requires `NegativeEntry::dnssec_proof_material_fresh`
+(see below), and only when the requester set DO *or* AD — not just DO —
+since `Shard::take_live_negative`'s own lookup-time freshness recheck is
+DO-only.
 
 A `Bogus` entry is never eligible for serve-stale — see
 [serve-stale](caching/serve-stale.md)'s `stale_servability` admission
 rule, checked ahead of the window/TTL checks specifically so a
-known-tampered response can't be served past expiry either way.
+known-tampered response can't be served past expiry either way. A
+`Secure` entry whose RRSIGs have themselves cryptographically expired
+(distinct from the entry's `expires_at`, see TTL capping below) is
+excluded from serve-stale the same way — see
+[serve-stale](caching/serve-stale.md).
 
 # TTL capping
 
 Effective cache TTL is capped at the earliest RRSIG expiration among the
 records/proof material being stored, via
 `cap_expires_at_to_rrsig_expiration` (`src/resolver/mod.rs:1093`),
-applied whenever RRSIGs are present regardless of `DnssecState` — a
-`Secure` entry's `expires_at` (and thus its serve-stale window) already
-reflects signature validity, so no additional inception/expiration
-revalidation is needed at stale-serve time beyond what this capping
-already guarantees.
+applied whenever RRSIGs are present regardless of `DnssecState`. This
+cap only *tightens* `expires_at` when the RRSIG expiration is earlier
+than the TTL-derived value — when the RRSIG is longer-lived than the
+TTL (a routine, harmless case), `expires_at` still reflects the TTL, not
+the RRSIG. Serve-stale therefore cannot infer "past RRSIG cryptographic
+validity" from "past `expires_at`" alone; `stale_servability`
+(`src/resolver/cache/shard.rs`) additionally checks each stored RRSIG's
+own `signature_expiration` against `now` directly for `Secure` entries,
+excluding (evicting) one whose RRSIGs have themselves expired even
+though it's still within the ordinary stale window — see
+[serve-stale](caching/serve-stale.md).
+
+Separately, a cache entry whose `dnssec_state` is `Bogus` (including a
+transient DS/DNSKEY chase timeout or transport error, not just a
+tampered response — see Fail-closed handling above) has its
+`expires_at` additionally capped to `stored_at +
+dnssec_validation::MAX_BOGUS_VALIDITY` (30s) in `build_rrset_entry`/
+`build_negative_entry`, the same short retry window the validator's own
+internal chase-node cache already uses
+(`dnssec_validation::validator_config`'s `set_max_bogus_validity`) —
+without this, a transient failure could otherwise pin SERVFAIL in cache
+for the full response TTL instead of being retried shortly.
+
+# Trust-anchor / mode reload (SIGHUP)
+
+`ResolveQuery.trust_anchors` is `RwLock`-wrapped, not a plain field:
+`republish_trust_anchors(&self, ...)` lets `main.rs`'s SIGHUP reload
+path (`apply_reload_result` → `build_reload_materials` →
+`trust_anchors_to_wire_in`) swap the active anchor set (or clear it,
+disabling validation) on an already-constructed, `Arc`-shared resolver —
+mirroring `BackendHandle`'s own reload-swap pattern for the backend
+snapshot. Before this, `trust_anchors` was set once via the
+construction-time-only `with_trust_anchors` builder, so toggling
+`dnssec_validation` or rotating anchor files via SIGHUP had no effect
+until process restart.
 
 # Metrics
 
@@ -233,7 +292,19 @@ rollout for its impact.
   `validate_for_store_records_bogus_when_trust_anchors_fail_to_parse`,
   `resolve_forward_mode_never_invokes_dnssec_validator`,
   `build_rrset_entry_caps_ttl_to_earlier_rrsig_expiration`,
-  `build_negative_entry_caps_ttl_to_earlier_soa_rrsig_expiration`.
+  `build_negative_entry_caps_ttl_to_earlier_soa_rrsig_expiration`,
+  `build_rrset_entry_caps_bogus_expiry_to_max_bogus_validity`,
+  `build_negative_entry_caps_bogus_expiry_to_max_bogus_validity`,
+  `resolve_recursive_miss_servfails_triggering_client_on_bogus_response`,
+  `resolve_recursive_miss_sets_ad_bit_for_secure_response_when_do_requested`,
+  `resolve_recursive_miss_validates_dnssec_even_when_cache_store_bypassed`,
+  `process_refresh_job_does_not_overwrite_secure_entry_with_bogus_verdict`,
+  `republish_trust_anchors_updates_validation_without_reconstructing_the_service`.
+- Negative-entry AD/freshness coupling
+  (`src/resolver/cache/assemble.rs`):
+  `assemble_negative_response_withholds_ad_for_ad_only_query_when_proof_material_stale`.
+- Serve-stale RRSIG-expiry exclusion (`src/resolver/cache/shard.rs`):
+  `lookup_hop_evicts_expired_secure_entry_with_cryptographically_expired_rrsig`.
 - CD-bit gating and AD assertion (`src/resolver/cache/assemble.rs`):
   `assemble_response_copies_cd_bit_from_requester`,
   `assemble_response_ad_bit_for_secure_entry_unaffected_by_cd_bit`,

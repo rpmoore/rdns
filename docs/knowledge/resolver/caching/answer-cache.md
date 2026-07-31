@@ -4,7 +4,7 @@ title: DNS Answer Cache
 description: Sharded, in-memory cache of backend/upstream DNS answers, keyed by domain name.
 resource: src/resolver/cache/mod.rs
 tags: [cache, dns, resolver]
-timestamp: 2026-07-19T01:00:00Z
+timestamp: 2026-07-31T00:00:00Z
 ---
 
 Caches responses obtained from actual backend resolution — forwarding or
@@ -213,15 +213,34 @@ read" — cookies are just another instance of it, not an exception.
 protection exists.** As of Track B (`docs/plans/sec_work/`), this resolver
 **does** validate an incoming *server* cookie (recompute-and-compare via
 `build_server_cookie`/`server_cookie_matches`, wired into `probe_cache` by
-`invalid_server_cookie`, `src/resolver/mod.rs:6875-6903`) and **does**
+`invalid_server_cookie`, `src/resolver/mod.rs`) and **does**
 generate BADCOOKIE (RCODE 23, `build_badcookie_response`) for a tampered,
-stale, or malformed server-cookie tail — but **only over UDP**. RFC 7873
-§5.2.3's TCP carve-out means the identical invalid cookie presented over
-TCP is still processed normally, unconditionally, exactly as this section
-described for *all* transports before Track B — `invalid_server_cookie`
-returns `None` immediately for any TCP request without inspecting the
-cookie at all. Say this transport split explicitly: a reader skimming only
-the first sentence should not conclude BADCOOKIE applies uniformly.
+stale, or malformed (but at-least-8-byte) server-cookie tail — but **only
+over UDP**. RFC 7873 §5.2.3's TCP carve-out means the identical invalid
+cookie presented over TCP is still processed normally, unconditionally,
+exactly as this section described for *all* transports before Track B —
+`invalid_server_cookie` returns `None` immediately for any TCP request
+without inspecting the cookie at all. Say this transport split explicitly:
+a reader skimming only the first sentence should not conclude BADCOOKIE
+applies uniformly.
+
+`server_cookie_matches` (`src/protocol/edns_cookie.rs`) also enforces an
+RFC 9018 §4.3 age window on the server cookie's own embedded timestamp
+(`MAX_SERVER_COOKIE_AGE` 1 hour past, `MAX_SERVER_COOKIE_FUTURE_SKEW` 5
+minutes future) before even computing the hash — a validly-hashed but
+stale or implausibly-future-dated cookie is rejected the same way a
+tampered one is. This mostly matters once secret rotation exists (not yet
+implemented, see `edns_cookie.rs`'s module doc comment): without
+rotation, a hash-valid cookie would otherwise stay accepted indefinitely
+regardless of age.
+
+A COOKIE option too short to even hold an 8-byte client cookie (declared
+length 0-7, still a structurally valid TLV) gets FORMERR
+(`probe_cache`, `src/resolver/mod.rs`) — RFC 7873 §5.2.2, since there's
+no client cookie available to echo back in a BADCOOKIE response at all.
+This is checked independent of transport (a basic protocol violation, not
+UDP-specific anti-spoofing), ahead of and separate from the BADCOOKIE
+check.
 
 A client cookie with **no server-cookie tail at all** (first contact, RFC
 7873 §5.2.3) is unchanged by Track B and still processed normally on both

@@ -483,15 +483,32 @@ fn dnssec_ad_bit(chain: &[(String, Arc<RRsetEntry>)], features: &QueryFeatures) 
 /// CNAME hops at all (the common case) still has `negative` itself to
 /// validate, so the "nothing to have validated" rule that empty-guards
 /// `dnssec_ad_bit` doesn't apply.
+///
+/// Also requires `negative.dnssec_proof_material_fresh(now)`: `Shard::
+/// take_live_negative`'s own freshness recheck only runs when the
+/// *lookup's* `dnssec_ok` (the requester's DO flag) is true, since that's
+/// the only case it can cheaply force a miss/re-fetch for. But AD is set
+/// here whenever DO *or* AD was requested -- an AD=1, DO=0 reader skips
+/// that lookup-time recheck entirely, yet without this second check here
+/// could still receive AD=1 backed by SOA/NSEC/RRSIG proof material whose
+/// own (individually-TTLed) freshness already lapsed, even though the
+/// entry's outer SOA-derived `expires_at` hasn't. Re-deriving the same
+/// freshness verdict here (rather than threading a second `lookup_hop`
+/// parameter through the whole `DomainDnsCache` trait) keeps this fix
+/// contained to where the AD bit is actually decided -- the entry is still
+/// served either way (its outer TTL is still current), just never with a
+/// stale-backed AD=1.
 fn negative_dnssec_ad_bit(
     chain: &[(String, Arc<RRsetEntry>)],
     negative: &NegativeEntry,
     features: &QueryFeatures,
+    now: SystemTime,
 ) -> bool {
     if !(features.dnssec_ok || features.authenticated_data) {
         return false;
     }
     negative.dnssec_state == DnssecState::Secure
+        && negative.dnssec_proof_material_fresh(now)
         && chain
             .iter()
             .all(|(_, entry)| entry.dnssec_state == DnssecState::Secure)
@@ -758,7 +775,7 @@ pub(crate) fn assemble_negative_response(
     }
 
     let dnssec_ok = requester_features.dnssec_ok;
-    let ad = negative_dnssec_ad_bit(&resolved.chain, &resolved.negative, requester_features);
+    let ad = negative_dnssec_ad_bit(&resolved.chain, &resolved.negative, requester_features, now);
     let authoritative = chain_authoritative(&resolved.chain) && resolved.negative.authoritative;
     let an_count = chain_answer_count(&resolved.chain, dnssec_ok);
     let ns_count = negative_authority_count(&resolved.negative, dnssec_ok);
@@ -2516,6 +2533,83 @@ mod tests {
             !Message::parse(&mixed_response).unwrap().header.ad(),
             "an Unvalidated CNAME hop must prevent AD=1 even when the terminal negative entry \
              is Secure"
+        );
+    }
+
+    #[test]
+    fn assemble_negative_response_withholds_ad_for_ad_only_query_when_proof_material_stale() {
+        // Regression coverage for a PR review finding: `Shard::
+        // take_live_negative`'s own proof-material-freshness recheck only
+        // runs when the *lookup's* `dnssec_ok` (DO flag) is true -- an
+        // AD=1, DO=0 query skips that recheck entirely, since forcing a
+        // miss/re-fetch there is the DO=true-only mechanism. Without a
+        // second check here, at assembly time, such a query could still
+        // receive AD=1 backed by a SOA RRSIG whose own (individually-TTLed)
+        // freshness already lapsed, even though the entry's outer
+        // SOA-derived `expires_at` is nowhere close.
+        let stored_at = SystemTime::now();
+        let mut secure_negative = negative_entry(
+            stored_at,
+            3600, // overall negative TTL/expires_at -- stays live throughout this test
+            Some(StoredRecord {
+                rtype: 46, // RRSIG
+                rclass: IN_QCLASS,
+                ttl_at_store: 5, // far shorter than the 3600s negative TTL
+                rdata: RecordData::RRSIG {
+                    type_covered: 6, // SOA
+                    algorithm: 8,
+                    labels: 2,
+                    original_ttl: 5,
+                    signature_expiration: 2_000_000_000,
+                    signature_inception: 1_900_000_000,
+                    key_tag: 1,
+                    signer_name: "example.com".to_string(),
+                    signature: vec![0xaa],
+                },
+            }),
+            Vec::new(),
+        );
+        secure_negative.dnssec_state = DnssecState::Secure;
+        let resolved = ResolvedNegative {
+            chain: Vec::new(),
+            terminal_name: "nx.example.com".to_string(),
+            negative: secure_negative.into(),
+        };
+        let wire = question_wire("nx.example.com", A_QTYPE, IN_QCLASS);
+
+        // 10s later: the SOA RRSIG's own 5s TTL has lapsed, but the overall
+        // 3600s negative TTL is nowhere near expiry.
+        let query_time = stored_at + Duration::from_secs(10);
+        let ad_only_features = QueryFeatures {
+            recursion_desired: true,
+            authenticated_data: true,
+            checking_disabled: false,
+            dnssec_ok: false,
+            edns_udp_payload_size: None,
+            client_cookie: None,
+        };
+        let response = assemble_negative_response(
+            1,
+            &wire,
+            &ad_only_features,
+            &resolved,
+            ResponseCode::NxDomain,
+            query_time,
+            false,
+            4096,
+            &test_cookie_secret(),
+            test_client_ip(),
+        );
+        let parsed = Message::parse(&response).unwrap();
+        assert_eq!(
+            parsed.header.r_code(),
+            ResponseCode::NxDomain as u8,
+            "the entry is still live overall -- it must still be served, just without AD=1"
+        );
+        assert!(
+            !parsed.header.ad(),
+            "AD=1, DO=0 must not receive AD=1 backed by SOA RRSIG proof material whose own TTL \
+             already lapsed, even though the entry's outer expires_at hasn't"
         );
     }
 

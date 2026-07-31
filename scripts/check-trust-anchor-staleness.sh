@@ -61,9 +61,14 @@ echo "CMS signature verified against $pem_url"
 
 status=0
 
-# Extract (key_tag, digest) pairs currently bundled in root-anchor.txt.
-# Zonefile-format DS line: <owner> <ttl> IN DS <key_tag> <algorithm> <digest_type> <digest>
-declare -A bundled_digest_by_tag=()
+# Extract (key_tag, algorithm, digest_type, digest) tuples currently bundled
+# in root-anchor.txt. Zonefile-format DS line:
+# <owner> <ttl> IN DS <key_tag> <algorithm> <digest_type> <digest>
+# Comparing the full tuple (not just key_tag+digest) matters because a
+# 16-bit key tag alone cannot uniquely identify an anchor, and an edit that
+# changes algorithm or digest_type while leaving the digest string
+# untouched would otherwise pass unnoticed.
+declare -A bundled_tuple_by_tag=()
 while IFS= read -r line; do
   line="${line%%;*}"
   line="$(echo "$line" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')"
@@ -71,11 +76,13 @@ while IFS= read -r line; do
   read -r -a fields <<< "$line"
   [[ "${#fields[@]}" -eq 8 ]] || continue
   key_tag="${fields[4]}"
+  algorithm="${fields[5]}"
+  digest_type="${fields[6]}"
   digest="${fields[7]}"
-  bundled_digest_by_tag["$key_tag"]="$digest"
+  bundled_tuple_by_tag["$key_tag"]="${algorithm}:${digest_type}:${digest^^}"
 done < "$bundled_file"
 
-if [[ "${#bundled_digest_by_tag[@]}" -eq 0 ]]; then
+if [[ "${#bundled_tuple_by_tag[@]}" -eq 0 ]]; then
   echo "::error::No DS entries found in $bundled_file to compare"
   exit 1
 fi
@@ -95,23 +102,35 @@ parse_epoch() {
   printf -v "$out_var" '%s' "$parsed"
 }
 
+# Key tags seen in IANA's XML at all (valid or expired), so we can flag a
+# bundled anchor IANA has dropped from the feed entirely (revoked/retired)
+# -- distinct from one that's merely past its validUntil.
+declare -A seen_iana_tags=()
+records_processed=0
+
 # Each <KeyDigest> element is emitted on its own opening tag line by IANA's
 # XML, with KeyTag/Digest as child elements on subsequent lines - reformat
 # so each KeyDigest's full record (tag line + children up to </KeyDigest>)
 # is on one line, then process record by record.
 while IFS= read -r record; do
   key_tag="$(echo "$record" | grep -oP '<KeyTag>\K[0-9]+' || true)"
+  algorithm="$(echo "$record" | grep -oP '<Algorithm>\K[0-9]+' || true)"
+  digest_type="$(echo "$record" | grep -oP '<DigestType>\K[0-9]+' || true)"
   digest="$(echo "$record" | grep -oP '<Digest>\K[0-9A-Fa-f]+' || true)"
   valid_from="$(echo "$record" | grep -oP 'validFrom="\K[^"]+' || true)"
   valid_until="$(echo "$record" | grep -oP 'validUntil="\K[^"]+' || true)"
 
-  if [[ -z "$key_tag" || -z "$digest" ]]; then
+  if [[ -z "$key_tag" || -z "$algorithm" || -z "$digest_type" || -z "$digest" ]]; then
     echo "::error::Could not confirm trust-anchor freshness: failed to parse a KeyDigest record from $xml_url"
     status=1
     continue
   fi
 
-  bundled_digest="${bundled_digest_by_tag[$key_tag]:-}"
+  records_processed=$((records_processed + 1))
+  seen_iana_tags["$key_tag"]=1
+  iana_tuple="${algorithm}:${digest_type}:${digest^^}"
+
+  bundled_tuple="${bundled_tuple_by_tag[$key_tag]:-}"
 
   currently_valid=1
   if [[ -n "$valid_until" ]]; then
@@ -125,7 +144,7 @@ while IFS= read -r record; do
     fi
   fi
 
-  if [[ -z "$bundled_digest" ]]; then
+  if [[ -z "$bundled_tuple" ]]; then
     if [[ "$currently_valid" -eq 1 ]]; then
       echo "::error::IANA key tag $key_tag (validFrom=$valid_from) is currently valid but not present in $bundled_file - bundle is missing an anchor"
       status=1
@@ -133,8 +152,8 @@ while IFS= read -r record; do
     continue
   fi
 
-  if [[ "${bundled_digest^^}" != "${digest^^}" ]]; then
-    echo "::error::Bundled digest for key tag $key_tag does not match IANA's published digest - refresh $bundled_file from $xml_url"
+  if [[ "$bundled_tuple" != "$iana_tuple" ]]; then
+    echo "::error::Bundled key tag $key_tag (algorithm:digest_type:digest = $bundled_tuple) does not match IANA's published record ($iana_tuple) - refresh $bundled_file from $xml_url"
     status=1
     continue
   fi
@@ -147,9 +166,27 @@ while IFS= read -r record; do
     if [[ "$remaining" -le "$warning_seconds" ]]; then
       remaining_days=$((remaining / 86400))
       echo "::warning::Bundled key tag $key_tag expires in $remaining_days day(s) ($valid_until) - plan a refresh of $bundled_file"
+      # Scheduled runs only notify operators via GitHub's
+      # scheduled-workflow-failure email on nonzero exit; a warning
+      # annotation alone on a green run gives no proactive signal, so
+      # entering the window fails the check even though it isn't yet a
+      # hard mismatch.
+      status=1
     fi
   fi
 done < <(grep -Pzo '(?s)<KeyDigest[^>]*>.*?</KeyDigest>' "$xml_file" | tr '\0' '\n' | tr '\n' ' ' | sed 's/<KeyDigest/\n<KeyDigest/g' | tail -n +2; echo)
+
+if [[ "$records_processed" -eq 0 ]]; then
+  echo "::error::Could not confirm trust-anchor freshness: no KeyDigest records parsed from $xml_url - IANA may have changed the XML format"
+  status=1
+fi
+
+for key_tag in "${!bundled_tuple_by_tag[@]}"; do
+  if [[ -z "${seen_iana_tags[$key_tag]:-}" ]]; then
+    echo "::error::Bundled key tag $key_tag is not present in IANA's published root-anchors.xml at all - IANA may have revoked/retired this anchor; verify and remove it from $bundled_file if so"
+    status=1
+  fi
+done
 
 if [[ "$status" -eq 0 ]]; then
   echo "Trust anchor staleness check passed: bundled digests match IANA and are within the ${warning_threshold_days}-day warning window"

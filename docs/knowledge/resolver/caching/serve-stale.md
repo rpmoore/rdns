@@ -8,7 +8,7 @@ description: >
           an inline backend round trip.
 resource: src/resolver/cache/shard.rs
 tags: [cache, dns, resolver, serve-stale, rfc8767, refresh]
-timestamp: 2026-07-19T00:00:00Z
+timestamp: 2026-07-31T00:00:00Z
 ---
 
 Before this feature, `Shard::lookup_hop` evicted every expired entry at
@@ -57,10 +57,14 @@ decides one of three outcomes:
 - **`Evict`** — serve-stale disabled, beyond the window, stamped with a
   stale epoch, `dnssec_state` is `Bogus` (checked first, ahead of the
   window/TTL checks below — a known-tampered response must never be
-  served regardless of window or TTL state), or carrying any
-  record/RRSIG whose *origin* TTL (`StoredRecord::ttl_at_store`) was 0
-  (RFC 1035: TTL 0 means "this transaction only"). The TTL-0 check is
-  per record, not `entry.minimum_ttl`: with a `min_positive_ttl` floor
+  served regardless of window or TTL state), `dnssec_state` is `Secure`
+  but its own RRSIGs have cryptographically expired
+  (`rrsigs_still_cryptographically_valid`, checked against each RRSIG's
+  `signature_expiration` directly, independent of `expires_at` — see the
+  DNSSEC note below for why `expires_at` alone can't answer this), or
+  carrying any record/RRSIG whose *origin* TTL (`StoredRecord::ttl_at_store`)
+  was 0 (RFC 1035: TTL 0 means "this transaction only"). The TTL-0 check
+  is per record, not `entry.minimum_ttl`: with a `min_positive_ttl` floor
   configured, `minimum_ttl` is the policy-bounded lifetime and is
   nonzero even for origin-TTL-0 records (PR #142 review finding).
   Non-Bogus evictions are removed at read time, byte-for-byte the
@@ -113,10 +117,7 @@ all three places (`write_rrset`, `chain_contains_stale` in
 vice versa) ages each hop independently — live hops serve normal aged
 TTLs, stale hops serve 30s.
 
-DNSSEC note: stale RRSIGs are served as stored; signature validity
-windows are absolute timestamps unaffected by TTL, so a validating
-client fails closed on genuinely lapsed signatures exactly as RFC 8767
-anticipates. `dnssec_state` is stamped by `ResolveQuery::validate_for_store`
+DNSSEC note: `dnssec_state` is stamped by `ResolveQuery::validate_for_store`
 and is live in production as of the status/metrics work (`main.rs`'s
 `trust_anchors_to_wire_in` wires real trust anchors in whenever
 `RecursiveResolutionConfig::dnssec_validation` is `Enabled`, the
@@ -126,14 +127,24 @@ reachable for cached entries, stale or live. See
 this section only covers its serve-stale-specific interaction. `Bogus`
 entries are excluded from serve-stale outright (see the `Evict` bullet
 above), so the "stale signature that later turns out tampered" case
-can't be served past expiry either way. `Secure`/`Insecure` entries'
-existing serve-stale behavior is unaffected by that exclusion. Entry
-TTL is separately capped at the earliest RRSIG expiration at store time
-(`cap_expires_at_to_rrsig_expiration`, `src/resolver/mod.rs`), so a
-`Secure` entry's `expires_at` (and thus its stale window) already
-reflects signature validity — no additional inception/expiration
-revalidation is needed at stale-serve time beyond what capping already
-guarantees.
+can't be served past expiry either way. `Insecure` entries' existing
+serve-stale behavior is unaffected by any DNSSEC-specific exclusion.
+
+Entry TTL is separately capped at the earliest RRSIG expiration at store
+time (`cap_expires_at_to_rrsig_expiration`, `src/resolver/mod.rs`), but
+only when that's *tighter* than the TTL-derived value — a longer-lived
+RRSIG paired with a short origin TTL is a routine case where `expires_at`
+still reflects the TTL, not the RRSIG. So "past `expires_at`" does not
+by itself mean "RRSIGs cryptographically expired," and stale RRSIGs are
+*not* simply served as stored past that point: `stale_servability`
+separately re-checks each stored RRSIG's own `signature_expiration`
+against `now` for `Secure` entries specifically (see the `Evict` bullet
+above) and evicts once they've expired — otherwise, continuing to serve
+stale would keep asserting AD=1 (`dnssec_ad_bit` only checks
+`dnssec_state == Secure`, not signature currency) and put an
+already-cryptographically-invalid RRSIG on the wire for a DO=true reader
+throughout the entire stale window, undermining DNSSEC validation the
+same way an un-excluded `Bogus` entry would.
 
 Refresh attempt rate under upstream failure: a failed refresh leaves the
 stale entry in place, so each subsequent client query for that name
@@ -169,4 +180,6 @@ and siblings (`src/resolver/cache/shard.rs`),
 `_beyond_stale_window_as_miss` (`src/resolver/cache/assemble.rs`), and
 the end-to-end cycle
 `resolve_serves_stale_hit_then_background_refresh_restores_freshness`
-(`src/resolver/mod.rs`).
+(`src/resolver/mod.rs`). RRSIG-expiry exclusion:
+`lookup_hop_evicts_expired_secure_entry_with_cryptographically_expired_rrsig`
+(`src/resolver/cache/shard.rs`).

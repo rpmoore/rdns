@@ -28,7 +28,7 @@
 //! `probe_cache`.
 
 use std::net::IpAddr;
-use std::time::SystemTime;
+use std::time::{Duration, SystemTime};
 
 use domain::base::Serial;
 use domain::base::opt::cookie::{ClientCookie as DomainClientCookie, StandardServerCookie};
@@ -165,15 +165,23 @@ pub(crate) enum CookieVerification {
         server_cookie_tail: Vec<u8>,
     },
     /// A single COOKIE option present but structurally invalid (length not
-    /// 8 and not in 16-40) -- RFC 7873 §5.2.4 treats this the same as an
-    /// invalid server cookie, never the same as `NoCookieOption`.
-    /// `client_cookie` is `Some` whenever at least 8 bytes of option data
-    /// were actually available to read (true for every malformed length
-    /// reachable from a real decoded wire message, since
-    /// `validate_edns_options` already guarantees TLV-length consistency
-    /// before this ever runs); `None` only for the degenerate <8-byte
-    /// case, which exists so this function stays total against
-    /// directly-constructed test byte vectors.
+    /// 8 and not in 16-40) -- RFC 7873 §5.2.4 treats a `Some` here the same
+    /// as an invalid server cookie (routed to BADCOOKIE by
+    /// `resolver::invalid_server_cookie`), never the same as
+    /// `NoCookieOption`. `client_cookie` is `Some` whenever at least 8
+    /// bytes of option data were available to read: every malformed length
+    /// of 9-15 or 16+ (`validate_edns_options` already guarantees
+    /// TLV-length consistency, so "malformed" here only ever means "wrong
+    /// length", never "truncated"). `None` for the 0-7-byte case -- this
+    /// **is** reachable from a real decoded wire message (a COOKIE option
+    /// declaring, and fully providing, e.g. 3 bytes of data is a
+    /// structurally valid TLV, just semantically too short for a client
+    /// cookie), not merely a synthetic test case. `resolver::probe_cache`
+    /// checks for this specific `None` case ahead of and independently of
+    /// `invalid_server_cookie`/BADCOOKIE: there is no client cookie
+    /// available to echo, so RFC 7873 §5.2.4's BADCOOKIE response format
+    /// cannot be constructed at all here -- this must be FORMERR instead
+    /// (RFC 7873 §5.2.2).
     Malformed { client_cookie: Option<ClientCookie> },
 }
 
@@ -321,11 +329,42 @@ pub(crate) fn build_server_cookie(
 /// this resolver only ever issues 16-byte RFC 9018 "Standard Server
 /// Cookies" (`build_server_cookie` has no other output shape), so a
 /// different-length tail can never be one this resolver issued.
+/// RFC 9018 §4.3: a server SHOULD treat a Standard Server Cookie whose
+/// embedded timestamp is too far in the past or future as invalid, bounding
+/// how long a captured/replayed cookie stays accepted. 1 hour past / 5
+/// minutes future are the values BIND9 and Unbound both use in practice;
+/// RFC 9018 leaves the exact window to the implementation. Not yet
+/// exercised by anything else in this module -- `rdns` never rotates its
+/// cookie secret (see this module's doc comment), so a hash-valid cookie is
+/// otherwise accepted indefinitely regardless of this check; this becomes
+/// load-bearing the moment secret rotation is added.
+const MAX_SERVER_COOKIE_AGE: Duration = Duration::from_secs(3600);
+const MAX_SERVER_COOKIE_FUTURE_SKEW: Duration = Duration::from_secs(300);
+
+/// Whether `timestamp` (the server cookie's embedded RFC 9018 §4.4 Unix
+/// timestamp) is within `now`'s acceptable age/future-skew window. Compares
+/// as plain `i64` seconds-since-epoch (not `Serial`'s wraparound-safe
+/// arithmetic): with a multi-decade validity horizon nowhere near the u32
+/// timestamp field's ~2106 rollover, a direct `i64` difference is exact and
+/// simpler than reasoning about RFC 1982 serial-number wraparound for a
+/// window this narrow.
+fn timestamp_within_acceptable_window(timestamp: Serial, now: SystemTime) -> bool {
+    let now_secs = now
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs() as i64;
+    let timestamp_secs = i64::from(timestamp.into_int());
+    let age_secs = now_secs - timestamp_secs;
+    age_secs <= MAX_SERVER_COOKIE_AGE.as_secs() as i64
+        && age_secs >= -(MAX_SERVER_COOKIE_FUTURE_SKEW.as_secs() as i64)
+}
+
 pub(crate) fn server_cookie_matches(
     secret: &CookieSecret,
     client_cookie: ClientCookie,
     presented_tail: &[u8],
     client_ip: IpAddr,
+    now: SystemTime,
 ) -> bool {
     let Ok(tail): Result<[u8; 16], _> = presented_tail.try_into() else {
         return false;
@@ -344,6 +383,9 @@ pub(crate) fn server_cookie_matches(
     }
     let reserved = [tail[1], tail[2], tail[3]];
     let timestamp = Serial::from_be_bytes([tail[4], tail[5], tail[6], tail[7]]);
+    if !timestamp_within_acceptable_window(timestamp, now) {
+        return false;
+    }
     let mut hash = [0u8; 8];
     hash.copy_from_slice(&tail[8..16]);
 
@@ -665,6 +707,26 @@ mod tests {
     }
 
     #[test]
+    fn locate_cookie_for_verification_short_but_tlv_consistent_option_is_malformed_none() {
+        // Unlike `locate_cookie_for_verification_truncated_tlv_is_malformed_none`
+        // above (whose 3-byte-short-of-its-own-declared-length shape is
+        // unreachable past `validate_edns_options`), this is a genuinely
+        // reachable real-traffic shape: a COOKIE option that declares
+        // length 3 and fully provides exactly 3 bytes of data is a
+        // structurally valid TLV (nothing overruns the buffer), just
+        // semantically too short to ever hold an 8-byte client cookie.
+        // `resolver::probe_cache` must route this to FORMERR, not silently
+        // process it as if no cookie were presented at all.
+        let options = [0, 10, 0, 3, 1, 2, 3];
+        assert_eq!(
+            locate_cookie_for_verification(&options),
+            CookieVerification::Malformed {
+                client_cookie: None
+            }
+        );
+    }
+
+    #[test]
     fn locate_cookie_for_verification_rejects_duplicates() {
         let mut options = cookie_option_bytes(CLIENT_COOKIE, None);
         options.extend_from_slice(&cookie_option_bytes(CLIENT_COOKIE, None));
@@ -685,7 +747,8 @@ mod tests {
             &secret,
             CLIENT_COOKIE,
             &tail,
-            client_ip
+            client_ip,
+            now
         ));
     }
 
@@ -701,7 +764,8 @@ mod tests {
             &secret,
             CLIENT_COOKIE,
             &tail,
-            client_ip
+            client_ip,
+            now
         ));
     }
 
@@ -709,11 +773,13 @@ mod tests {
     fn server_cookie_matches_rejects_wrong_length() {
         let secret = CookieSecret::generate();
         let client_ip = IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1));
+        let now = SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000);
         assert!(!server_cookie_matches(
             &secret,
             CLIENT_COOKIE,
             &SERVER_COOKIE_TAIL, // 8 bytes, not 16
-            client_ip
+            client_ip,
+            now
         ));
     }
 
@@ -729,32 +795,34 @@ mod tests {
             &verifying_secret,
             CLIENT_COOKIE,
             &tail,
-            client_ip
+            client_ip,
+            now
         ));
     }
 
     /// Regression test: a naive "recompute with verification-time `now`"
     /// implementation would make every previously-issued cookie appear
     /// invalid the instant a second elapses, since the timestamp is part
-    /// of the hash input. Issues at one instant, verifies at a much later
-    /// one -- must still match, proving the recompute reuses the
-    /// presented cookie's own embedded timestamp rather than "now".
+    /// of the hash input. Issues at one instant, verifies 30 minutes later
+    /// (comfortably inside `MAX_SERVER_COOKIE_AGE`'s 1-hour window, so this
+    /// exercises only the hash-recompute behavior, not the age check) --
+    /// must still match, proving the recompute reuses the presented
+    /// cookie's own embedded timestamp rather than the verification-time
+    /// `now`.
     #[test]
     fn server_cookie_matches_accepts_cookie_after_time_has_advanced() {
         let secret = CookieSecret::generate();
         let client_ip = IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1));
         let issued_at = SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000);
         let tail = build_server_cookie(&secret, CLIENT_COOKIE, client_ip, issued_at);
+        let verified_at = issued_at + Duration::from_secs(1800);
 
-        // `server_cookie_matches` takes no `now` parameter at all -- this
-        // test's real assertion is that omission itself, but verifying
-        // against a fresh recompute at a later instant as a sanity check
-        // still applies here since the tail's own timestamp is reused.
         assert!(server_cookie_matches(
             &secret,
             CLIENT_COOKIE,
             &tail,
-            client_ip
+            client_ip,
+            verified_at
         ));
     }
 
@@ -769,7 +837,72 @@ mod tests {
             &secret,
             CLIENT_COOKIE,
             &tail,
-            client_ip
+            client_ip,
+            now
+        ));
+    }
+
+    #[test]
+    fn server_cookie_matches_rejects_a_cookie_older_than_the_max_age_window() {
+        // Regression coverage for a PR review finding: `server_cookie_matches`
+        // used to check only version+hash, with no timestamp/age check at
+        // all -- a validly-hashed but stale server cookie stayed accepted
+        // indefinitely, when RFC 9018 §4.3 says the embedded timestamp
+        // should be checked against a permitted age window.
+        let secret = CookieSecret::generate();
+        let client_ip = IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1));
+        let issued_at = SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000);
+        let tail = build_server_cookie(&secret, CLIENT_COOKIE, client_ip, issued_at);
+
+        // One second past MAX_SERVER_COOKIE_AGE (1 hour) -- hash is still
+        // perfectly valid, only the age check should reject this.
+        let verified_at = issued_at + MAX_SERVER_COOKIE_AGE + Duration::from_secs(1);
+        assert!(!server_cookie_matches(
+            &secret,
+            CLIENT_COOKIE,
+            &tail,
+            client_ip,
+            verified_at
+        ));
+    }
+
+    #[test]
+    fn server_cookie_matches_rejects_a_cookie_timestamped_too_far_in_the_future() {
+        let secret = CookieSecret::generate();
+        let client_ip = IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1));
+        let issued_at = SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000);
+        let tail = build_server_cookie(&secret, CLIENT_COOKIE, client_ip, issued_at);
+
+        // Verifying one second *before* MAX_SERVER_COOKIE_FUTURE_SKEW ahead
+        // of the issue time -- from the verifier's perspective, this cookie
+        // claims to have been issued in the future, beyond tolerable clock
+        // skew.
+        let verified_at = issued_at - MAX_SERVER_COOKIE_FUTURE_SKEW - Duration::from_secs(1);
+        assert!(!server_cookie_matches(
+            &secret,
+            CLIENT_COOKIE,
+            &tail,
+            client_ip,
+            verified_at
+        ));
+    }
+
+    #[test]
+    fn server_cookie_matches_accepts_a_cookie_at_the_edge_of_the_age_window() {
+        // Boundary check: exactly at the age limit must still be accepted
+        // (the check is `>`, not `>=`, on the age itself).
+        let secret = CookieSecret::generate();
+        let client_ip = IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1));
+        let issued_at = SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000);
+        let tail = build_server_cookie(&secret, CLIENT_COOKIE, client_ip, issued_at);
+
+        let verified_at = issued_at + MAX_SERVER_COOKIE_AGE;
+        assert!(server_cookie_matches(
+            &secret,
+            CLIENT_COOKIE,
+            &tail,
+            client_ip,
+            verified_at
         ));
     }
 }
