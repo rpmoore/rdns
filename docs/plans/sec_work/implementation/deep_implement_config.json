@@ -1,0 +1,67 @@
+{
+  "plugin_root": "/home/rpmoore/.claude/plugins/cache/piercelamb-plugins/deep-implement/0.2.1",
+  "sections_dir": "/home/rpmoore/code/rdns/docs/plans/sec_work/sections",
+  "target_dir": "/home/rpmoore/code/rdns",
+  "state_dir": "/home/rpmoore/code/rdns/docs/plans/sec_work/implementation",
+  "git_root": "/home/rpmoore/code/rdns",
+  "commit_style": "simple",
+  "test_command": "uv run pytest",
+  "sections": [
+    "section-01-dnssec-deps",
+    "section-02-dnssec-trust-anchor",
+    "section-03-dnssec-validator-core",
+    "section-04-dnssec-entry-wiring",
+    "section-05-dnssec-status-metrics",
+    "section-06-dnssec-review-docs",
+    "section-07-badcookie-wire-rcode",
+    "section-08-badcookie-detection",
+    "section-09-badcookie-review-docs"
+  ],
+  "sections_state": {
+    "section-01-dnssec-deps": {
+      "status": "complete",
+      "commit_hash": "ccef4451ec932a0478296bbecc004839f8923079"
+    },
+    "section-02-dnssec-trust-anchor": {
+      "status": "complete",
+      "commit_hash": "a2ae3d3358ee9e06b2591c11a87d6a5050e1f6ba"
+    },
+    "section-03-dnssec-validator-core": {
+      "status": "complete",
+      "commit_hash": "85361ac"
+    },
+    "section-04-dnssec-entry-wiring": {
+      "status": "complete",
+      "commit_hash": "b9c953e"
+    },
+    "section-05-dnssec-status-metrics": {
+      "status": "complete",
+      "commit_hash": "2079d024b3b4ef4710cf35a7d0b32b19224edfae"
+    },
+    "section-06-dnssec-review-docs": {
+      "status": "complete",
+      "commit_hash": "489d3a7197e1a9ee323b4cc9deda26f9c0a74fdd"
+    },
+    "section-07-badcookie-wire-rcode": {
+      "status": "complete",
+      "commit_hash": "cf34d0b"
+    },
+    "section-08-badcookie-detection": {
+      "status": "complete",
+      "commit_hash": "8c6ddcc"
+    },
+    "section-09-badcookie-review-docs": {
+      "status": "complete",
+      "commit_hash": "f1a4f05"
+    }
+  },
+  "pre_commit": {
+    "present": false,
+    "type": "none",
+    "config_file": null,
+    "native_hook": null,
+    "may_modify_files": false,
+    "detected_formatters": []
+  },
+  "created_at": "2026-07-19T04:06:33.053204+00:00"
+}
