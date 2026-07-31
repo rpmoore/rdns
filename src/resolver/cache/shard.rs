@@ -598,16 +598,29 @@ fn stale_servability(
 }
 
 /// Whether every RRSIG in `rrsigs` is still within its own cryptographic
-/// validity window as of `now` -- mirrors the expiration extraction
-/// `resolver::mod::cap_expires_at_to_rrsig_expiration` uses at store time,
-/// but as a live `now`-relative check rather than a store-time cap. `true`
+/// validity window (inception..=expiration) as of `now` -- mirrors the
+/// expiration extraction `resolver::mod::cap_expires_at_to_rrsig_expiration`
+/// uses at store time, but as a live `now`-relative check rather than a
+/// store-time cap, and covering both ends of the window: an RRSIG whose
+/// `signature_inception` is still in the future is just as cryptographically
+/// invalid as one past its `signature_expiration` (clock skew on the
+/// storing path, or a pre-published zone, can produce this shape) -- no
+/// validator would accept it either way, so it must not be served with
+/// AD=1 during the stale window any more than an expired one would. `true`
 /// (vacuously) when `rrsigs` is empty -- nothing to have expired.
 fn rrsigs_still_cryptographically_valid(rrsigs: &[StoredRecord], now: SystemTime) -> bool {
     rrsigs.iter().all(|record| match &record.rdata {
         RecordData::RRSIG {
             signature_expiration,
+            signature_inception,
             ..
-        } => SystemTime::UNIX_EPOCH + Duration::from_secs(*signature_expiration as u64) > now,
+        } => {
+            let expiration =
+                SystemTime::UNIX_EPOCH + Duration::from_secs(u64::from(*signature_expiration));
+            let inception =
+                SystemTime::UNIX_EPOCH + Duration::from_secs(u64::from(*signature_inception));
+            expiration > now && inception <= now
+        }
         _ => true,
     })
 }
@@ -2142,6 +2155,61 @@ mod tests {
         assert!(
             !shard.contains_positive(domain, (A_QTYPE, IN_QCLASS)),
             "must not remain cached, same as the Bogus exclusion"
+        );
+    }
+
+    #[test]
+    fn lookup_hop_evicts_expired_secure_entry_with_not_yet_valid_rrsig() {
+        // Sibling of the expired-RRSIG test above, covering the other end
+        // of the validity window: an RRSIG whose `signature_inception` is
+        // still in the future (clock skew on the storing path, or a
+        // pre-published zone) is just as cryptographically invalid as one
+        // past its expiration -- no validator would accept it either way.
+        let shard = stale_shard();
+        let domain = "not-yet-valid-rrsig-stale.example.com";
+        let now = SystemTime::now();
+        let now_secs = now
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as u32;
+        let mut entry = expired_rrset_entry(now);
+        entry.dnssec_state = DnssecState::Secure;
+        entry.rrsigs = vec![StoredRecord {
+            rtype: 46, // RRSIG
+            rclass: IN_QCLASS,
+            ttl_at_store: 300,
+            rdata: RecordData::RRSIG {
+                type_covered: A_QTYPE,
+                algorithm: 8,
+                labels: 2,
+                original_ttl: 300,
+                signature_expiration: now_secs + 7200, // 2h from now
+                signature_inception: now_secs + 3600,  // 1h from now -- not yet valid
+                key_tag: 1,
+                signer_name: "example.com".to_string(),
+                signature: vec![0xaa],
+            },
+        }];
+        shard.store_positive(domain, (A_QTYPE, IN_QCLASS), entry);
+
+        let result = shard.lookup_hop(
+            domain,
+            A_QTYPE,
+            IN_QCLASS,
+            false,
+            1,
+            now,
+            &test_refresh_config(),
+        );
+
+        assert!(
+            matches!(result, HopResult::Miss),
+            "expected a Secure entry with a not-yet-valid RRSIG to be evicted rather than \
+             stale-served, got {result:?}"
+        );
+        assert!(
+            !shard.contains_positive(domain, (A_QTYPE, IN_QCLASS)),
+            "must not remain cached, same as the expired-RRSIG exclusion"
         );
     }
 

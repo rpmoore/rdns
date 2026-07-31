@@ -58,10 +58,13 @@ decides one of three outcomes:
   stale epoch, `dnssec_state` is `Bogus` (checked first, ahead of the
   window/TTL checks below — a known-tampered response must never be
   served regardless of window or TTL state), `dnssec_state` is `Secure`
-  but its own RRSIGs have cryptographically expired
+  but its own RRSIGs are outside their cryptographic validity window
   (`rrsigs_still_cryptographically_valid`, checked against each RRSIG's
-  `signature_expiration` directly, independent of `expires_at` — see the
-  DNSSEC note below for why `expires_at` alone can't answer this), or
+  `signature_expiration` *and* `signature_inception` directly, independent
+  of `expires_at` — see the DNSSEC note below for why `expires_at` alone
+  can't answer this; a future `signature_inception` is just as invalid as
+  a past `signature_expiration`, e.g. from clock skew on the storing path
+  or a pre-published zone), or
   carrying any record/RRSIG whose *origin* TTL (`StoredRecord::ttl_at_store`)
   was 0 (RFC 1035: TTL 0 means "this transaction only"). The TTL-0 check
   is per record, not `entry.minimum_ttl`: with a `min_positive_ttl` floor
