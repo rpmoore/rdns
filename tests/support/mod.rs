@@ -687,7 +687,13 @@ impl RawQueryBuilder {
             // the low 16-bit flags half, i.e. 0x8000 of the full u32.
             let ext_flags: u32 = if dnssec_ok { 0x8000 } else { 0 };
             bytes.extend_from_slice(&ext_flags.to_be_bytes());
-            let rdlength = self.edns_options.as_ref().map_or(0, |o| o.len()) as u16;
+            let options_len = self.edns_options.as_ref().map_or(0, |o| o.len());
+            assert!(
+                options_len <= u16::MAX as usize,
+                "edns_options blob of {options_len} bytes exceeds u16 RDLENGTH -- this helper \
+                 would silently truncate it into a malformed OPT record"
+            );
+            let rdlength = options_len as u16;
             bytes.extend_from_slice(&rdlength.to_be_bytes());
             if let Some(options) = &self.edns_options {
                 bytes.extend_from_slice(options);

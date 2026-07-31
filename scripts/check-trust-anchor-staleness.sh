@@ -83,6 +83,18 @@ fi
 now_epoch="$(date -u +%s)"
 warning_seconds=$((warning_threshold_days * 86400))
 
+# `date -d` failing under `set -e` would abort the whole script instead of
+# reporting the same "couldn't confirm freshness" finding as a fetch or
+# CMS-verification failure. Parse into the caller's named variable and
+# report a parse failure the same way.
+parse_epoch() {
+  local input="$1" out_var="$2" parsed
+  if ! parsed="$(date -u -d "$input" +%s 2>/dev/null)"; then
+    return 1
+  fi
+  printf -v "$out_var" '%s' "$parsed"
+}
+
 # Each <KeyDigest> element is emitted on its own opening tag line by IANA's
 # XML, with KeyTag/Digest as child elements on subsequent lines - reformat
 # so each KeyDigest's full record (tag line + children up to </KeyDigest>)
@@ -103,7 +115,11 @@ while IFS= read -r record; do
 
   currently_valid=1
   if [[ -n "$valid_until" ]]; then
-    valid_until_epoch="$(date -u -d "$valid_until" +%s)"
+    if ! parse_epoch "$valid_until" valid_until_epoch; then
+      echo "::error::Could not confirm trust-anchor freshness: failed to parse validUntil=\"$valid_until\" for key tag $key_tag"
+      status=1
+      continue
+    fi
     if [[ "$now_epoch" -ge "$valid_until_epoch" ]]; then
       currently_valid=0
     fi
@@ -127,7 +143,6 @@ while IFS= read -r record; do
     echo "::error::Bundled key tag $key_tag expired on $valid_until - refresh $bundled_file from $xml_url"
     status=1
   elif [[ -n "$valid_until" ]]; then
-    valid_until_epoch="$(date -u -d "$valid_until" +%s)"
     remaining=$((valid_until_epoch - now_epoch))
     if [[ "$remaining" -le "$warning_seconds" ]]; then
       remaining_days=$((remaining / 86400))
