@@ -30,6 +30,8 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime};
 
+use domain::base::Serial;
+
 use super::entry::{
     DnssecState, DomainNegativeEntries, DomainRecordSets, NegativeEntry, NegativeKey, RRsetEntry,
     StoredRecord,
@@ -608,18 +610,31 @@ fn stale_servability(
 /// validator would accept it either way, so it must not be served with
 /// AD=1 during the stale window any more than an expired one would. `true`
 /// (vacuously) when `rrsigs` is empty -- nothing to have expired.
+///
+/// Compares via `domain::base::Serial` (RFC 1982 serial-number arithmetic),
+/// not a naive absolute-`SystemTime` conversion: RFC 4034 SS3.1.5 requires
+/// RRSIG inception/expiration to be compared this way specifically because
+/// the 32-bit field wraps (~2106) -- converting straight to `SystemTime` by
+/// adding seconds-since-epoch would misjudge validity for any RRSIG whose
+/// window straddles that rollover (e.g. `inception` just before it,
+/// `expiration` just after). `now` is truncated to the same 32-bit space
+/// via `Serial`, matching this module's existing use of `Serial` for SOA
+/// serials.
 fn rrsigs_still_cryptographically_valid(rrsigs: &[StoredRecord], now: SystemTime) -> bool {
+    let now_serial = Serial(
+        now.duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs() as u32,
+    );
     rrsigs.iter().all(|record| match &record.rdata {
         RecordData::RRSIG {
             signature_expiration,
             signature_inception,
             ..
         } => {
-            let expiration =
-                SystemTime::UNIX_EPOCH + Duration::from_secs(u64::from(*signature_expiration));
-            let inception =
-                SystemTime::UNIX_EPOCH + Duration::from_secs(u64::from(*signature_inception));
-            expiration >= now && inception <= now
+            let expiration = Serial(*signature_expiration);
+            let inception = Serial(*signature_inception);
+            now_serial <= expiration && now_serial >= inception
         }
         _ => true,
     })
@@ -2265,6 +2280,65 @@ mod tests {
             matches!(result, HopResult::Answer(_, true)),
             "expected a Secure entry at exactly its RRSIG's signature_expiration to still be \
              stale-servable, got {result:?}"
+        );
+    }
+
+    #[test]
+    fn lookup_hop_serves_stale_secure_entry_with_rrsig_window_crossing_32bit_rollover() {
+        // Regression coverage for a PR review finding: RFC 4034 SS3.1.5
+        // requires RRSIG inception/expiration to be compared via RFC 1982
+        // serial-number arithmetic, not by converting the raw 32-bit value
+        // straight to an absolute `SystemTime` -- the field wraps (~2106).
+        // A naive absolute conversion would put `signature_inception =
+        // u32::MAX - 7200` at a `SystemTime` far in the future (near the
+        // 2106 rollover) and `signature_expiration = 3600` at a
+        // `SystemTime` near the Unix epoch (1970) -- i.e. numerically
+        // *before* the inception it's supposed to follow -- so the naive
+        // check would treat this RRSIG as permanently invalid regardless
+        // of `now`, even though its real (wrapped) validity window is
+        // perfectly ordinary. `now = 0` sits inside that wrapped window
+        // (short RFC 1982 forward-distance from both endpoints), so a
+        // correct `Serial`-based comparison must still treat it as valid.
+        // `now` is pinned to a small-but-nonzero offset from `UNIX_EPOCH`
+        // (not exactly the rollover point) so `expired_rrset_entry`'s own
+        // `now - 600s` doesn't underflow.
+        let shard = stale_shard();
+        let domain = "rrsig-rollover.example.com";
+        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(700);
+        let mut entry = expired_rrset_entry(now);
+        entry.dnssec_state = DnssecState::Secure;
+        entry.rrsigs = vec![StoredRecord {
+            rtype: 46, // RRSIG
+            rclass: IN_QCLASS,
+            ttl_at_store: 300,
+            rdata: RecordData::RRSIG {
+                type_covered: A_QTYPE,
+                algorithm: 8,
+                labels: 2,
+                original_ttl: 300,
+                signature_expiration: 3600, // 1h after the rollover point
+                signature_inception: u32::MAX - 7200, // 2h before the rollover point
+                key_tag: 1,
+                signer_name: "example.com".to_string(),
+                signature: vec![0xaa],
+            },
+        }];
+        shard.store_positive(domain, (A_QTYPE, IN_QCLASS), entry);
+
+        let result = shard.lookup_hop(
+            domain,
+            A_QTYPE,
+            IN_QCLASS,
+            false,
+            1,
+            now,
+            &test_refresh_config(),
+        );
+
+        assert!(
+            matches!(result, HopResult::Answer(_, true)),
+            "expected a Secure entry whose RRSIG validity window wraps the 32-bit rollover to \
+             still be stale-servable when now falls inside that window, got {result:?}"
         );
     }
 
