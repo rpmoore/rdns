@@ -5,7 +5,7 @@
   "state_dir": "/home/rpmoore/code/rdns/docs/plans/sec_work/implementation",
   "git_root": "/home/rpmoore/code/rdns",
   "commit_style": "simple",
-  "test_command": "uv run pytest",
+  "test_command": "cargo test",
   "sections": [
     "section-01-dnssec-deps",
     "section-02-dnssec-trust-anchor",
