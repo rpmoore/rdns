@@ -25,7 +25,7 @@ use opentelemetry::metrics::{Counter, Gauge, Histogram, MeterProvider, Observabl
 use opentelemetry_sdk::metrics::SdkMeterProvider;
 use prometheus::Registry;
 use rdns::config::{
-    LocalZoneConfig, MAX_LOCAL_ZONE_FILE_BYTES, RefreshConfig,
+    DnssecValidationMode, LocalZoneConfig, MAX_LOCAL_ZONE_FILE_BYTES, RefreshConfig,
     ResolutionMode as ConfigResolutionMode, RootHintsSource as ConfigRootHintsSource,
     RuntimeConfig, parse_local_zone_file,
 };
@@ -34,9 +34,9 @@ use rdns::delivery::metrics_http::MetricsServer;
 use rdns::delivery::upstream::{ForwardingResolutionBackend, RecursiveAuthorityTransportClient};
 use rdns::resolver::{
     BackendHealth, BackendRootHintsStatus, BackendSnapshot, BackendStatus, BasicResponseFactory,
-    CacheTtlPolicy, ChannelQueryEventSink, Clock, CookieSecret, DnssecValidationStatus,
-    DomainDnsCache, DomainName, InMemoryLocalDnsEntries, InMemoryQueryEventStore,
-    InMemoryQueryEventStoreConfig, InMemorySuspiciousLookupClassifier,
+    CacheTtlPolicy, ChannelQueryEventSink, Clock, CookieSecret, DnssecValidationOutcome,
+    DnssecValidationStatus, DomainDnsCache, DomainName, InMemoryLocalDnsEntries,
+    InMemoryQueryEventStore, InMemoryQueryEventStoreConfig, InMemorySuspiciousLookupClassifier,
     InMemorySuspiciousLookupClassifierConfig, LocalDnsEntry, MetricsSink, NoopPolicyEvaluator,
     QueryEventRecordResult, QueryEventSink, QueryEventV1, RecursiveResolutionBackend,
     RecursiveResolverConfig, RecursiveRootHint, ResolutionMode as ResolverResolutionMode,
@@ -153,9 +153,18 @@ async fn main() -> io::Result<()> {
     .with_single_flight_shard_count(cache.shard_count())
     .with_chaos_config(config.chaos.clone())
     .with_cookie_secret(cookie_secret)
-    .with_refresh_config(config.refresh);
+    .with_refresh_config(config.refresh)
+    .with_dnssec_validation_deadline(config.per_query_deadline);
     if config.refresh.enabled {
         resolver_builder = resolver_builder.with_refresh_sender(refresh_tx);
+    }
+    // Leaving `ResolveQuery::trust_anchors` at its default `None` is the
+    // actual DNSSEC kill switch: `validate_for_store` treats "no trust
+    // anchors configured" as "don't run the DS/DNSKEY chase at all" (see
+    // its doc comment), so this is the one place that decision takes
+    // effect in production, not just in tests.
+    if let Some(trust_anchors) = trust_anchors_to_wire_in(&config)? {
+        resolver_builder = resolver_builder.with_trust_anchors(trust_anchors);
     }
     let resolver = Arc::new(resolver_builder);
 
@@ -580,6 +589,7 @@ struct ReloadMaterials {
     backend_snapshot: BackendSnapshot,
     local_entries: Arc<InMemoryLocalDnsEntries>,
     counts: LocalEntryCounts,
+    trust_anchors: Option<Vec<String>>,
 }
 
 /// Loads and fully builds everything a reload needs to publish — reading
@@ -595,11 +605,19 @@ fn build_reload_materials(
     let config = load_runtime_config(Some(config_path))?;
     let backend_snapshot = build_backend_snapshot(&config, metrics)?;
     let (local_entries, counts) = build_local_entries(&config, Some(config_path))?;
+    // Loaded here (not left to the resolver's stale startup-only value) so
+    // toggling `dnssec_validation` or rotating anchor files via SIGHUP
+    // actually takes effect -- see `ResolveQuery::republish_trust_anchors`'s
+    // doc comment. `?` matches `build_backend_snapshot`/`build_local_entries`
+    // above: any failure here fails the whole reload rather than partially
+    // applying it.
+    let trust_anchors = trust_anchors_to_wire_in(&config)?;
     Ok(ReloadMaterials {
         config,
         backend_snapshot,
         local_entries,
         counts,
+        trust_anchors,
     })
 }
 
@@ -656,8 +674,10 @@ fn apply_reload_result(
             backend_snapshot,
             local_entries,
             counts,
+            trust_anchors,
         })) => {
             resolver.publish_reload(backend_snapshot, local_entries);
+            resolver.republish_trust_anchors(trust_anchors);
             info!(
                 path = %path.display(),
                 upstreams = config.upstreams.len(),
@@ -748,6 +768,11 @@ fn build_forward_backend_snapshot(config: &RuntimeConfig) -> io::Result<BackendS
         ForwardingResolutionBackend::from_runtime_config(config)
             .map_err(|error| io::Error::other(format!("invalid upstream config: {error:?}")))?,
     );
+    // No `.with_dnssec_validation_status(...)` call -- `BackendSnapshot::new`'s
+    // default (`Disabled`) is correct and intentional here, not a missed
+    // wiring spot: Forward mode has no DNSSEC validation concept at all
+    // (see `ResolveQuery::validate_for_store`'s doc comment), so its status
+    // must always read `Disabled` regardless of any config value.
     Ok(BackendSnapshot::new(
         backend,
         ResolverResolutionMode::Forward,
@@ -803,6 +828,9 @@ fn build_recursive_backend_snapshot(
         root_hints_source_label(&recursive.root_hints_source),
         recursive.root_hints_version.clone(),
         SystemTime::now(),
+    ))
+    .with_dnssec_validation_status(dnssec_validation_status_for_mode(
+        recursive.dnssec_validation,
     )))
 }
 
@@ -811,6 +839,46 @@ fn root_hints_source_label(source: &ConfigRootHintsSource) -> &'static str {
         ConfigRootHintsSource::Bundled => "bundled",
         ConfigRootHintsSource::Static(_) => "static",
     }
+}
+
+/// Maps the config-level `DnssecValidationMode` onto the resolver-level
+/// `DnssecValidationStatus` -- kept as a free function rather than a method
+/// on either enum since the two types are deliberately duplicated across
+/// the config/resolver layer boundary (mirrors `ResolutionMode`/
+/// `ResolverResolutionMode`).
+fn dnssec_validation_status_for_mode(mode: DnssecValidationMode) -> DnssecValidationStatus {
+    match mode {
+        DnssecValidationMode::Disabled => DnssecValidationStatus::Disabled,
+        DnssecValidationMode::Enabled => DnssecValidationStatus::Enabled,
+    }
+}
+
+/// The trust anchors to hand `ResolveQuery::with_trust_anchors`, or `None`
+/// to leave the resolver's default (`None`, meaning "never validate")
+/// untouched. `None` is returned both for `ResolutionMode::Forward` (no
+/// `[resolution.recursive]` section at all) and for
+/// `DnssecValidationMode::Disabled` -- either way, `validate_for_store`
+/// must never see any configured anchors, since their mere presence is
+/// the sole signal it uses to decide whether to run the DS/DNSKEY chase.
+fn trust_anchors_to_wire_in(config: &RuntimeConfig) -> io::Result<Option<Vec<String>>> {
+    let Some(recursive) = config.resolution.recursive.as_ref() else {
+        return Ok(None);
+    };
+    if recursive.dnssec_validation != DnssecValidationMode::Enabled {
+        return Ok(None);
+    }
+    // `RecursiveResolutionConfig::validate()` already loaded and validated
+    // these same anchors during config load (`config/mod.rs`), for any
+    // recursive-mode config regardless of `dnssec_validation` -- this
+    // re-load is structurally required (bundled anchors aren't cached on
+    // `RecursiveResolutionConfig` itself) but the error branch below is
+    // practically unreachable in a config that already passed `validate()`,
+    // same "belt and suspenders" shape as other post-validation re-derives
+    // in this file.
+    recursive
+        .load_trust_anchors()
+        .map(Some)
+        .map_err(|error| io::Error::other(format!("invalid trust anchors: {error:?}")))
 }
 
 fn listener_task_result_to_io(result: Result<io::Result<()>, JoinError>) -> io::Result<()> {
@@ -914,6 +982,7 @@ struct OpenTelemetryMetrics {
     backend_generation: Gauge<u64>,
     root_hints_age_seconds: Gauge<f64>,
     dnssec_validation_disabled: Gauge<u64>,
+    dnssec_validation_results_total: Counter<u64>,
     protocol_error_total: Counter<u64>,
     recursion_refused_total: Counter<u64>,
     refresh_triggered_total: Counter<u64>,
@@ -1025,6 +1094,9 @@ impl OpenTelemetryMetrics {
             backend_generation: meter.u64_gauge("backend_generation").build(),
             root_hints_age_seconds: meter.f64_gauge("root_hints_age_seconds").build(),
             dnssec_validation_disabled: meter.u64_gauge("dnssec_validation_disabled").build(),
+            dnssec_validation_results_total: meter
+                .u64_counter("dnssec_validation_results_total")
+                .build(),
             protocol_error_total: meter.u64_counter("protocol_error_total").build(),
             recursion_refused_total: meter.u64_counter("recursion_refused_total").build(),
             refresh_triggered_total: meter.u64_counter("refresh_triggered_total").build(),
@@ -1251,6 +1323,13 @@ impl MetricsSink for OpenTelemetryMetrics {
                 .record(age.as_secs_f64(), &attributes);
         }
     }
+
+    fn record_dnssec_validation_outcome(&self, outcome: DnssecValidationOutcome) {
+        self.dnssec_validation_results_total.add(
+            1,
+            &[KeyValue::new("outcome", dnssec_outcome_label(outcome))],
+        );
+    }
 }
 
 fn backend_status_attributes(status: &BackendStatus) -> Vec<KeyValue> {
@@ -1294,6 +1373,17 @@ fn backend_health_label(health: BackendHealth) -> &'static str {
 fn dnssec_validation_label(status: DnssecValidationStatus) -> &'static str {
     match status {
         DnssecValidationStatus::Disabled => "disabled",
+        DnssecValidationStatus::Enabled => "enabled",
+    }
+}
+
+fn dnssec_outcome_label(outcome: DnssecValidationOutcome) -> &'static str {
+    match outcome {
+        DnssecValidationOutcome::Secure => "secure",
+        DnssecValidationOutcome::Insecure => "insecure",
+        DnssecValidationOutcome::Bogus => "bogus",
+        DnssecValidationOutcome::Indeterminate => "indeterminate",
+        DnssecValidationOutcome::NotAttempted => "not_attempted",
     }
 }
 
@@ -1520,6 +1610,245 @@ mod tests {
             })
             .expect("histogram series labeled with source_ip");
         assert_eq!(labeled.get_histogram().get_sample_count(), 1);
+    }
+
+    #[test]
+    fn dnssec_validation_label_differs_by_status() {
+        assert_eq!(
+            dnssec_validation_label(DnssecValidationStatus::Enabled),
+            "enabled"
+        );
+        assert_eq!(
+            dnssec_validation_label(DnssecValidationStatus::Disabled),
+            "disabled"
+        );
+    }
+
+    #[test]
+    fn dnssec_outcome_label_covers_every_outcome() {
+        assert_eq!(
+            dnssec_outcome_label(DnssecValidationOutcome::Secure),
+            "secure"
+        );
+        assert_eq!(
+            dnssec_outcome_label(DnssecValidationOutcome::Insecure),
+            "insecure"
+        );
+        assert_eq!(
+            dnssec_outcome_label(DnssecValidationOutcome::Bogus),
+            "bogus"
+        );
+        assert_eq!(
+            dnssec_outcome_label(DnssecValidationOutcome::Indeterminate),
+            "indeterminate"
+        );
+        assert_eq!(
+            dnssec_outcome_label(DnssecValidationOutcome::NotAttempted),
+            "not_attempted"
+        );
+    }
+
+    fn sample_backend_status(dnssec_validation: DnssecValidationStatus) -> BackendStatus {
+        BackendStatus {
+            mode: ResolverResolutionMode::Recursive,
+            generation: 1,
+            health: BackendHealth::Healthy,
+            dnssec_validation,
+            cache_namespace: None,
+            root_hints: None,
+        }
+    }
+
+    #[test]
+    fn record_backend_status_dnssec_gauge_reflects_enabled_and_disabled() {
+        let cache = Arc::new(ShardedDnsCache::new(&rdns::config::CacheConfig {
+            max_entries: 16,
+            shard_count: Some(1),
+            ..rdns::config::CacheConfig::default()
+        }));
+        let metrics =
+            OpenTelemetryMetrics::new(Arc::clone(&cache), true).expect("metrics exporter");
+        let gauge_value = |families: &prometheus::proto::MetricFamily| -> f64 {
+            families.get_metric().first().unwrap().get_gauge().value()
+        };
+
+        metrics.record_backend_status(&sample_backend_status(DnssecValidationStatus::Enabled));
+        let families = metrics.registry.gather();
+        let family = families
+            .iter()
+            .find(|family| family.name() == "dnssec_validation_disabled")
+            .expect("dnssec_validation_disabled family");
+        assert_eq!(gauge_value(family), 0.0);
+
+        metrics.record_backend_status(&sample_backend_status(DnssecValidationStatus::Disabled));
+        let families = metrics.registry.gather();
+        let family = families
+            .iter()
+            .find(|family| family.name() == "dnssec_validation_disabled")
+            .expect("dnssec_validation_disabled family");
+        assert_eq!(gauge_value(family), 1.0);
+    }
+
+    #[test]
+    fn record_dnssec_validation_outcome_increments_labeled_counter() {
+        let cache = Arc::new(ShardedDnsCache::new(&rdns::config::CacheConfig {
+            max_entries: 16,
+            shard_count: Some(1),
+            ..rdns::config::CacheConfig::default()
+        }));
+        let metrics =
+            OpenTelemetryMetrics::new(Arc::clone(&cache), true).expect("metrics exporter");
+
+        metrics.record_dnssec_validation_outcome(DnssecValidationOutcome::Secure);
+        metrics.record_dnssec_validation_outcome(DnssecValidationOutcome::Secure);
+        metrics.record_dnssec_validation_outcome(DnssecValidationOutcome::NotAttempted);
+
+        let families = metrics.registry.gather();
+        let series_value = |outcome: &str| -> f64 {
+            families
+                .iter()
+                .find(|family| family.name() == "dnssec_validation_results_total")
+                .and_then(|family| {
+                    family.get_metric().iter().find(|metric| {
+                        metric
+                            .get_label()
+                            .iter()
+                            .any(|label| label.name() == "outcome" && label.value() == outcome)
+                    })
+                })
+                .map(|metric| metric.get_counter().value())
+                .unwrap_or_else(|| panic!("missing outcome={outcome} series"))
+        };
+
+        assert_eq!(series_value("secure"), 2.0);
+        assert_eq!(series_value("not_attempted"), 1.0);
+    }
+
+    #[test]
+    fn dnssec_validation_status_for_mode_maps_both_variants() {
+        assert_eq!(
+            dnssec_validation_status_for_mode(DnssecValidationMode::Enabled),
+            DnssecValidationStatus::Enabled
+        );
+        assert_eq!(
+            dnssec_validation_status_for_mode(DnssecValidationMode::Disabled),
+            DnssecValidationStatus::Disabled
+        );
+    }
+
+    /// Closes the gap section-05 found: before this section,
+    /// `build_recursive_backend_snapshot` always produced
+    /// `DnssecValidationStatus::Disabled` regardless of config.
+    #[test]
+    fn build_recursive_backend_snapshot_reflects_configured_dnssec_validation() {
+        let mut toml = sample_config_toml().to_string();
+        toml.push_str(
+            r#"
+            [resolution]
+            mode = "recursive"
+
+            [resolution.recursive]
+            root_hints = "bundled"
+            root_hints_version = "bundled:v1"
+            dnssec_validation = "enabled"
+            "#,
+        );
+        let config = RuntimeConfig::from_toml_str(&toml).unwrap();
+        let cache = Arc::new(ShardedDnsCache::new(&rdns::config::CacheConfig {
+            max_entries: 16,
+            shard_count: Some(1),
+            ..rdns::config::CacheConfig::default()
+        }));
+        let metrics: Arc<dyn MetricsSink> =
+            Arc::new(OpenTelemetryMetrics::new(cache, true).expect("metrics exporter"));
+
+        let snapshot = build_recursive_backend_snapshot(&config, metrics).unwrap();
+        assert_eq!(snapshot.dnssec_validation, DnssecValidationStatus::Enabled);
+    }
+
+    #[test]
+    fn build_recursive_backend_snapshot_stays_disabled_when_configured_disabled() {
+        let mut toml = sample_config_toml().to_string();
+        toml.push_str(
+            r#"
+            [resolution]
+            mode = "recursive"
+
+            [resolution.recursive]
+            root_hints = "bundled"
+            root_hints_version = "bundled:v1"
+            dnssec_validation = "disabled"
+            "#,
+        );
+        let config = RuntimeConfig::from_toml_str(&toml).unwrap();
+        let cache = Arc::new(ShardedDnsCache::new(&rdns::config::CacheConfig {
+            max_entries: 16,
+            shard_count: Some(1),
+            ..rdns::config::CacheConfig::default()
+        }));
+        let metrics: Arc<dyn MetricsSink> =
+            Arc::new(OpenTelemetryMetrics::new(cache, true).expect("metrics exporter"));
+
+        let snapshot = build_recursive_backend_snapshot(&config, metrics).unwrap();
+        assert_eq!(snapshot.dnssec_validation, DnssecValidationStatus::Disabled);
+    }
+
+    /// Forward mode has no DNSSEC concept at all (A5's scope) -- its status
+    /// must stay `Disabled` no matter what, since there is no
+    /// `[resolution.recursive]` section to read a mode from.
+    #[test]
+    fn build_forward_backend_snapshot_is_always_dnssec_disabled() {
+        let config = RuntimeConfig::from_toml_str(sample_config_toml()).unwrap();
+        let snapshot = build_forward_backend_snapshot(&config).unwrap();
+        assert_eq!(snapshot.dnssec_validation, DnssecValidationStatus::Disabled);
+    }
+
+    #[test]
+    fn trust_anchors_to_wire_in_is_none_when_dnssec_validation_disabled() {
+        let mut toml = sample_config_toml().to_string();
+        toml.push_str(
+            r#"
+            [resolution]
+            mode = "recursive"
+
+            [resolution.recursive]
+            root_hints = "bundled"
+            root_hints_version = "bundled:v1"
+            dnssec_validation = "disabled"
+            "#,
+        );
+        let config = RuntimeConfig::from_toml_str(&toml).unwrap();
+        assert!(trust_anchors_to_wire_in(&config).unwrap().is_none());
+    }
+
+    #[test]
+    fn trust_anchors_to_wire_in_is_none_for_forward_mode() {
+        let config = RuntimeConfig::from_toml_str(sample_config_toml()).unwrap();
+        assert!(trust_anchors_to_wire_in(&config).unwrap().is_none());
+    }
+
+    #[test]
+    fn trust_anchors_to_wire_in_loads_bundled_anchors_when_enabled() {
+        let mut toml = sample_config_toml().to_string();
+        toml.push_str(
+            r#"
+            [resolution]
+            mode = "recursive"
+
+            [resolution.recursive]
+            root_hints = "bundled"
+            root_hints_version = "bundled:v1"
+            dnssec_validation = "enabled"
+            "#,
+        );
+        let config = RuntimeConfig::from_toml_str(&toml).unwrap();
+        let trust_anchors = trust_anchors_to_wire_in(&config)
+            .unwrap()
+            .expect("Enabled mode must produce Some(trust anchors)");
+        assert!(
+            !trust_anchors.is_empty(),
+            "bundled trust anchor source must yield at least one anchor line"
+        );
     }
 
     /// Interning returns the identical attribute set for repeats of one

@@ -568,6 +568,7 @@ pub struct RawQueryBuilder {
     qtype: u16,
     qclass: u16,
     edns: Option<(u16, bool)>,
+    edns_options: Option<Vec<u8>>,
     cd: bool,
 }
 
@@ -584,6 +585,7 @@ impl RawQueryBuilder {
             qtype,
             qclass: 1,
             edns: None,
+            edns_options: None,
             cd: false,
         }
     }
@@ -619,6 +621,20 @@ impl RawQueryBuilder {
 
     pub fn edns(mut self, udp_payload_size: u16, dnssec_ok: bool) -> Self {
         self.edns = Some((udp_payload_size, dnssec_ok));
+        self
+    }
+
+    /// Attaches raw EDNS option TLV bytes (e.g. a hand-built COOKIE option)
+    /// to the OPT record's RDATA. Requires `.edns(...)` to also have been
+    /// called -- the OPT record itself is still gated on `self.edns.is_some()`.
+    pub fn edns_options(mut self, options: Vec<u8>) -> Self {
+        debug_assert!(
+            self.edns.is_some(),
+            "edns_options() requires .edns(...) to be called first -- the OPT record itself \
+             is gated on self.edns.is_some(), so options attached before that would be \
+             silently dropped"
+        );
+        self.edns_options = Some(options);
         self
     }
 
@@ -671,7 +687,17 @@ impl RawQueryBuilder {
             // the low 16-bit flags half, i.e. 0x8000 of the full u32.
             let ext_flags: u32 = if dnssec_ok { 0x8000 } else { 0 };
             bytes.extend_from_slice(&ext_flags.to_be_bytes());
-            bytes.extend_from_slice(&0u16.to_be_bytes()); // RDLENGTH
+            let options_len = self.edns_options.as_ref().map_or(0, |o| o.len());
+            assert!(
+                options_len <= u16::MAX as usize,
+                "edns_options blob of {options_len} bytes exceeds u16 RDLENGTH -- this helper \
+                 would silently truncate it into a malformed OPT record"
+            );
+            let rdlength = options_len as u16;
+            bytes.extend_from_slice(&rdlength.to_be_bytes());
+            if let Some(options) = &self.edns_options {
+                bytes.extend_from_slice(options);
+            }
         }
 
         bytes

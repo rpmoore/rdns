@@ -8,3 +8,5 @@
   by default, and where it's enforced.
 * [metrics-source-ip](metrics-source-ip.md) - Which metrics carry a `source_ip` label for the
   requesting client, how it flows to Prometheus, and why some families stay unlabeled.
+* [dnssec-validation](dnssec-validation.md) - How recursive-mode responses are validated against
+  DNSSEC signatures, the on-by-default kill switch, CD-bit gating, and the outcome metric.

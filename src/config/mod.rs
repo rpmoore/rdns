@@ -20,6 +20,7 @@ use std::time::Duration;
 
 use domain::base::RecordData;
 use domain::base::iana::{Class, Rtype};
+use domain::dnssec::validator::anchor::TrustAnchors;
 use domain::rdata::ZoneRecordData;
 use domain::zonefile::inplace::{Entry, Zonefile};
 use serde::Deserialize;
@@ -726,6 +727,7 @@ pub enum ResolutionMode {
 pub struct RecursiveResolutionConfig {
     pub root_hints_version: String,
     pub root_hints_source: RootHintsSource,
+    pub trust_anchor_source: TrustAnchorSource,
     pub per_authority_timeout: Duration,
     pub max_recursion_depth: u8,
     pub max_cname_restarts: u8,
@@ -743,6 +745,7 @@ impl RecursiveResolutionConfig {
         Self {
             root_hints_version: root_hints_version.into(),
             root_hints_source: RootHintsSource::Static(root_hints),
+            trust_anchor_source: TrustAnchorSource::Bundled,
             per_authority_timeout: Duration::from_millis(750),
             max_recursion_depth: 16,
             max_cname_restarts: 8,
@@ -756,6 +759,7 @@ impl RecursiveResolutionConfig {
         Self {
             root_hints_version: root_hints_version.into(),
             root_hints_source: RootHintsSource::Bundled,
+            trust_anchor_source: TrustAnchorSource::Bundled,
             per_authority_timeout: Duration::from_millis(750),
             max_recursion_depth: 16,
             max_cname_restarts: 8,
@@ -772,6 +776,18 @@ impl RecursiveResolutionConfig {
         }
     }
 
+    /// Returns the configured trust-anchor set as raw zonefile-format
+    /// `DS`/`DNSKEY` lines (one entry per line), deferring the
+    /// `TrustAnchors::from_u8` conversion to callers that actually consume
+    /// `domain`'s validator types, matching how `load_root_hints` keeps
+    /// `RootHintConfig` free of `domain`-crate types.
+    pub fn load_trust_anchors(&self) -> Result<Vec<String>, ConfigError> {
+        match &self.trust_anchor_source {
+            TrustAnchorSource::Bundled => Ok(bundled_trust_anchors()),
+            TrustAnchorSource::Static(entries) => Ok(entries.clone()),
+        }
+    }
+
     pub fn validate(&self) -> Result<(), ConfigError> {
         if self.root_hints_version.trim().is_empty() {
             return Err(ConfigError::InvalidRootHintsVersion);
@@ -782,6 +798,13 @@ impl RecursiveResolutionConfig {
         }
         for root_hint in &root_hints {
             root_hint.validate()?;
+        }
+        let trust_anchors = self.load_trust_anchors()?;
+        if trust_anchors.is_empty() {
+            return Err(ConfigError::MissingTrustAnchors);
+        }
+        for entry in &trust_anchors {
+            validate_trust_anchor_entry(entry)?;
         }
         validate_duration(
             "recursive.per_authority_timeout",
@@ -834,6 +857,25 @@ impl RecursiveResolutionConfig {
         );
         hash_namespace_field(
             &mut hash,
+            "trust-anchor-source",
+            self.trust_anchor_source.cache_namespace_label(),
+        );
+        // Hashes actual trust-anchor content (each DS/DNSKEY line), not just
+        // the Bundled/Static label above -- mirrors the root-hints loop
+        // above. Without this, switching between two different `Static`
+        // anchor sets (or Bundled -> Static and back) would leave the
+        // cache namespace unchanged, letting Secure/Bogus verdicts
+        // computed under the old trust-anchor set persist past a
+        // trust-anchor rotation until natural TTL expiry -- a
+        // security-relevant gap flagged during Track A's security review
+        // (plan §C2).
+        if let Ok(trust_anchors) = self.load_trust_anchors() {
+            for anchor in &trust_anchors {
+                hash_namespace_field(&mut hash, "trust-anchor", anchor);
+            }
+        }
+        hash_namespace_field(
+            &mut hash,
             "authority-timeout-nanos",
             &self.per_authority_timeout.as_nanos().to_string(),
         );
@@ -874,6 +916,59 @@ impl RootHintsSource {
             Self::Static(_) => "static",
         }
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TrustAnchorSource {
+    Bundled,
+    /// Zonefile-format `DS`/`DNSKEY` lines, one per entry — see
+    /// `TrustAnchors::from_u8` in the `domain` crate for the exact grammar.
+    Static(Vec<String>),
+}
+
+impl TrustAnchorSource {
+    fn cache_namespace_label(&self) -> &'static str {
+        match self {
+            Self::Bundled => "bundled",
+            Self::Static(_) => "static",
+        }
+    }
+}
+
+/// IANA's DNS root zone KSK trust anchors, as published at
+/// <https://data.iana.org/root-anchors/root-anchors.xml> (RFC 9718). The
+/// file is embedded at compile time via `include_str!`; `bundled_trust_anchors`
+/// re-derives and validates the bundled entries from it at runtime. Requires
+/// **manual** refresh on future root KSK rollovers (no RFC 5011 automation) —
+/// the scheduled `dnssec-anchor-staleness` workflow flags when a refresh is
+/// needed, it does not perform one.
+const BUNDLED_ROOT_ANCHOR: &str = include_str!("root-anchor.txt");
+
+fn bundled_trust_anchors() -> Vec<String> {
+    TrustAnchors::from_u8(BUNDLED_ROOT_ANCHOR.as_bytes())
+        .unwrap_or_else(|error| panic!("bundled root-anchor.txt asset failed to parse: {error}"));
+    parse_trust_anchor_lines(BUNDLED_ROOT_ANCHOR)
+}
+
+/// Splits a zonefile-format trust-anchor asset into its non-comment,
+/// non-blank data lines. `;` starts a comment, matching `named.root`'s
+/// convention and RFC 1035 zonefile syntax generally.
+fn parse_trust_anchor_lines(source: &str) -> Vec<String> {
+    source
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty() && !line.starts_with(';'))
+        .map(str::to_string)
+        .collect()
+}
+
+fn validate_trust_anchor_entry(entry: &str) -> Result<(), ConfigError> {
+    TrustAnchors::from_u8(entry.as_bytes())
+        .map(|_| ())
+        .map_err(|error| ConfigError::InvalidTrustAnchorEntry {
+            entry: entry.to_string(),
+            message: error.to_string(),
+        })
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1107,12 +1202,14 @@ fn canonical_authority_name(name: &str) -> Result<String, ConfigError> {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DnssecValidationMode {
     Disabled,
+    Enabled,
 }
 
 impl DnssecValidationMode {
     fn cache_namespace_label(self) -> &'static str {
         match self {
             Self::Disabled => "disabled",
+            Self::Enabled => "enabled",
         }
     }
 }
@@ -1493,6 +1590,11 @@ pub enum ConfigError {
     InvalidRootHintEndpoint {
         endpoint: SocketAddr,
     },
+    MissingTrustAnchors,
+    InvalidTrustAnchorEntry {
+        entry: String,
+        message: String,
+    },
     InvalidRecursiveDepth {
         value: u8,
         max: u8,
@@ -1872,6 +1974,10 @@ struct RawRecursiveResolutionConfig {
     root_hints_version: String,
     #[serde(default)]
     root_hints_entries: Vec<RawRootHintConfig>,
+    #[serde(default)]
+    trust_anchor: Option<String>,
+    #[serde(default)]
+    trust_anchor_entries: Vec<String>,
     #[serde(default = "default_per_authority_timeout_ms")]
     per_authority_timeout_ms: u64,
     #[serde(default = "default_max_recursion_depth")]
@@ -1907,7 +2013,8 @@ impl RawRecursiveResolutionConfig {
         self,
     ) -> Result<RecursiveResolutionConfig, ConfigError> {
         let dnssec_validation = match self.dnssec_validation.as_deref() {
-            None | Some("disabled") => DnssecValidationMode::Disabled,
+            None | Some("enabled") => DnssecValidationMode::Enabled,
+            Some("disabled") => DnssecValidationMode::Disabled,
             Some(other) => {
                 return Err(ConfigError::InvalidTomlConfig {
                     message: format!("unknown dnssec_validation mode: {other}"),
@@ -1950,8 +2057,18 @@ impl RawRecursiveResolutionConfig {
                 });
             }
         };
+        let trust_anchor_source = match self.trust_anchor.as_deref() {
+            None | Some("bundled") => TrustAnchorSource::Bundled,
+            Some("static") => TrustAnchorSource::Static(self.trust_anchor_entries),
+            Some(other) => {
+                return Err(ConfigError::InvalidTomlConfig {
+                    message: format!("unknown trust_anchor source: {other}"),
+                });
+            }
+        };
         config.dnssec_validation = dnssec_validation;
         config.dname_handling = dname_handling;
+        config.trust_anchor_source = trust_anchor_source;
         config.per_authority_timeout = Duration::from_millis(self.per_authority_timeout_ms);
         config.max_recursion_depth = self.max_recursion_depth;
         config.max_cname_restarts = self.max_cname_restarts;
@@ -2592,6 +2709,79 @@ mod tests {
         );
     }
 
+    /// Regression test for the security-review finding (Track A §C2):
+    /// before this, `authority_config_hash` never hashed the trust-anchor
+    /// source at all, so switching trust anchors (Bundled -> Static, or
+    /// between two different `Static` sets) left the cache namespace
+    /// unchanged -- Secure/Bogus verdicts computed under the old anchor
+    /// set would persist past a trust-anchor rotation until natural TTL
+    /// expiry.
+    #[test]
+    fn recursive_cache_namespace_changes_with_trust_anchor_source() {
+        let mut bundled = RecursiveResolutionConfig::new(
+            "root-hints:v1",
+            vec![root_hint("a.root-servers.example")],
+            DnssecValidationMode::Enabled,
+        );
+        bundled.trust_anchor_source = TrustAnchorSource::Bundled;
+        let bundled_config = RuntimeConfig::new_with_resolution(
+            vec![SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 5300)],
+            ResolutionConfig::recursive(3, bundled),
+            Vec::new(),
+            Duration::from_secs(2),
+            1232,
+        )
+        .unwrap();
+
+        let mut static_a = RecursiveResolutionConfig::new(
+            "root-hints:v1",
+            vec![root_hint("a.root-servers.example")],
+            DnssecValidationMode::Enabled,
+        );
+        static_a.trust_anchor_source = TrustAnchorSource::Static(vec![
+            ". 172800 IN DS 20326 8 2 E06D44B80B8F1D39A95C0B0D7C65D08458E880409BBC683457104237C7F8EC8D"
+                .to_string(),
+        ]);
+        let static_a_config = RuntimeConfig::new_with_resolution(
+            vec![SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 5300)],
+            ResolutionConfig::recursive(3, static_a),
+            Vec::new(),
+            Duration::from_secs(2),
+            1232,
+        )
+        .unwrap();
+
+        assert_ne!(
+            bundled_config.backend_cache_namespace(),
+            static_a_config.backend_cache_namespace(),
+            "switching from Bundled to Static trust anchors must bump the cache namespace"
+        );
+
+        let mut static_b = RecursiveResolutionConfig::new(
+            "root-hints:v1",
+            vec![root_hint("a.root-servers.example")],
+            DnssecValidationMode::Enabled,
+        );
+        static_b.trust_anchor_source = TrustAnchorSource::Static(vec![
+            ". 172800 IN DS 38696 8 2 683D2D0ACB8C9B712A1948B27F741219298D0A450D612C483AF444A4C0FB2B16"
+                .to_string(),
+        ]);
+        let static_b_config = RuntimeConfig::new_with_resolution(
+            vec![SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 5300)],
+            ResolutionConfig::recursive(3, static_b),
+            Vec::new(),
+            Duration::from_secs(2),
+            1232,
+        )
+        .unwrap();
+
+        assert_ne!(
+            static_a_config.backend_cache_namespace(),
+            static_b_config.backend_cache_namespace(),
+            "two different Static trust-anchor sets must not share a cache namespace"
+        );
+    }
+
     #[test]
     fn parse_named_root_extracts_glue_addresses_grouped_by_owner_in_first_seen_order() {
         let source = "\
@@ -2833,6 +3023,107 @@ a.root-servers.net.      3600000      Aaaa  2001:503:ba3e::2:30
                 transport: RecursiveTransport::Udp
             }
         );
+    }
+
+    #[test]
+    fn bundled_trust_anchors_parses_without_error() {
+        let entries = bundled_trust_anchors();
+        assert_eq!(entries.len(), 2);
+    }
+
+    #[test]
+    fn bundled_root_anchor_source_text_has_the_expected_key_tags() {
+        // `TrustAnchor` (the parsed record group) is `pub(crate)` inside
+        // `domain`, so key tags can't be read back off a `TrustAnchors`
+        // value — assert against the raw source text's `DS` lines instead.
+        let key_tags: Vec<&str> = BUNDLED_ROOT_ANCHOR
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty() && !line.starts_with(';'))
+            .map(|line| {
+                line.split_whitespace()
+                    .nth(4)
+                    .expect("DS line should have a key-tag field")
+            })
+            .collect();
+        assert_eq!(key_tags, vec!["20326", "38696"]);
+
+        // Separately, confirm `domain`'s own parser accepts the same text.
+        assert!(TrustAnchors::from_u8(BUNDLED_ROOT_ANCHOR.as_bytes()).is_ok());
+    }
+
+    #[test]
+    fn recursive_config_toml_honors_static_trust_anchor_override() {
+        let toml = r#"
+            dns_listen = ["127.0.0.1:5300"]
+            per_query_deadline_ms = 2000
+            max_udp_payload_size = 1232
+
+            [resolution]
+            mode = "recursive"
+
+            [resolution.recursive]
+            root_hints = "bundled"
+            root_hints_version = "bundled:v1"
+            trust_anchor = "static"
+            trust_anchor_entries = [
+                ". 172800 IN DS 20326 8 2 E06D44B80B8F1D39A95C0B0D7C65D08458E880409BBC683457104237C7F8EC8D",
+            ]
+        "#;
+
+        let config = RuntimeConfig::from_toml_str(toml).unwrap();
+
+        let recursive = config.resolution.recursive.as_ref().unwrap();
+        assert_eq!(
+            recursive.trust_anchor_source,
+            TrustAnchorSource::Static(vec![
+                ". 172800 IN DS 20326 8 2 E06D44B80B8F1D39A95C0B0D7C65D08458E880409BBC683457104237C7F8EC8D"
+                    .to_string()
+            ])
+        );
+    }
+
+    #[test]
+    fn recursive_config_toml_rejects_empty_static_trust_anchor_override() {
+        let toml = r#"
+            dns_listen = ["127.0.0.1:5300"]
+            per_query_deadline_ms = 2000
+            max_udp_payload_size = 1232
+
+            [resolution]
+            mode = "recursive"
+
+            [resolution.recursive]
+            root_hints = "bundled"
+            root_hints_version = "bundled:v1"
+            trust_anchor = "static"
+        "#;
+
+        let error = RuntimeConfig::from_toml_str(toml).unwrap_err();
+
+        assert_eq!(error, ConfigError::MissingTrustAnchors);
+    }
+
+    #[test]
+    fn recursive_config_toml_rejects_malformed_static_trust_anchor_entry() {
+        let toml = r#"
+            dns_listen = ["127.0.0.1:5300"]
+            per_query_deadline_ms = 2000
+            max_udp_payload_size = 1232
+
+            [resolution]
+            mode = "recursive"
+
+            [resolution.recursive]
+            root_hints = "bundled"
+            root_hints_version = "bundled:v1"
+            trust_anchor = "static"
+            trust_anchor_entries = ["not a valid zonefile DS line"]
+        "#;
+
+        let error = RuntimeConfig::from_toml_str(toml).unwrap_err();
+
+        assert!(matches!(error, ConfigError::InvalidTrustAnchorEntry { .. }));
     }
 
     #[test]
@@ -3814,8 +4105,83 @@ a.root-servers.net.      3600000      Aaaa  2001:503:ba3e::2:30
             recursive.allowed_transports,
             vec![RecursiveTransport::Udp, RecursiveTransport::Tcp]
         );
-        assert_eq!(recursive.dnssec_validation, DnssecValidationMode::Disabled);
+        assert_eq!(recursive.dnssec_validation, DnssecValidationMode::Enabled);
         assert_eq!(recursive.dname_handling, DnameHandlingPolicy::Defer);
+    }
+
+    #[test]
+    fn dnssec_validation_mode_cache_namespace_labels_differ() {
+        assert_eq!(
+            DnssecValidationMode::Enabled.cache_namespace_label(),
+            "enabled"
+        );
+        assert_eq!(
+            DnssecValidationMode::Disabled.cache_namespace_label(),
+            "disabled"
+        );
+        assert_ne!(
+            DnssecValidationMode::Enabled.cache_namespace_label(),
+            DnssecValidationMode::Disabled.cache_namespace_label()
+        );
+    }
+
+    #[test]
+    fn toml_config_round_trip_honors_explicit_dnssec_validation_disabled() {
+        let mut toml = valid_toml();
+        toml.push_str(
+            r#"
+            [resolution]
+            mode = "recursive"
+
+            [resolution.recursive]
+            root_hints = "bundled"
+            root_hints_version = "bundled:v1"
+            dnssec_validation = "disabled"
+            "#,
+        );
+
+        let config = RuntimeConfig::from_toml_str(&toml).unwrap();
+        let recursive = config.resolution.recursive.as_ref().unwrap();
+        assert_eq!(recursive.dnssec_validation, DnssecValidationMode::Disabled);
+    }
+
+    #[test]
+    fn toml_config_round_trip_honors_explicit_dnssec_validation_enabled() {
+        let mut toml = valid_toml();
+        toml.push_str(
+            r#"
+            [resolution]
+            mode = "recursive"
+
+            [resolution.recursive]
+            root_hints = "bundled"
+            root_hints_version = "bundled:v1"
+            dnssec_validation = "enabled"
+            "#,
+        );
+
+        let config = RuntimeConfig::from_toml_str(&toml).unwrap();
+        let recursive = config.resolution.recursive.as_ref().unwrap();
+        assert_eq!(recursive.dnssec_validation, DnssecValidationMode::Enabled);
+    }
+
+    #[test]
+    fn toml_config_round_trip_rejects_unknown_dnssec_validation_mode() {
+        let mut toml = valid_toml();
+        toml.push_str(
+            r#"
+            [resolution]
+            mode = "recursive"
+
+            [resolution.recursive]
+            root_hints = "bundled"
+            root_hints_version = "bundled:v1"
+            dnssec_validation = "sometimes"
+            "#,
+        );
+
+        let error = RuntimeConfig::from_toml_str(&toml).unwrap_err();
+        assert!(matches!(error, ConfigError::InvalidTomlConfig { .. }));
     }
 
     #[test]

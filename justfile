@@ -23,3 +23,6 @@ update-iana-data:
 
 check-bundled-data-freshness:
     ./scripts/check-bundled-data-freshness.sh
+
+check-trust-anchor-staleness:
+    ./scripts/check-trust-anchor-staleness.sh

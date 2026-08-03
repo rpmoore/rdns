@@ -9,7 +9,15 @@ license = "Apache-2.0"
 
 [dependencies]
 bytes = "1"
-domain = { version = "0.12.1", default-features = false, features = ["zonefile", "bytes", "std", "siphasher"] }
+# unstable-validator pulls in DNSSEC validation (domain::dnssec::validator); ring is
+# the crypto backend for signature verification. Both transitively expand the
+# dependency tree — expected, not a bug: moka + unstable-client-transport (validator
+# caching/transport), the crossbeam/event-listener/parking family (moka's internals),
+# uuid (drags in the wasm-bindgen chain), and ring's own cc/untrusted plus a second
+# getrandom/windows-sys pulled in alongside the existing ones. ring also means the
+# build now needs a working C toolchain at build time (via cc), even though runtime
+# linking avoids an OpenSSL system dependency.
+domain = { version = "0.12.1", default-features = false, features = ["zonefile", "bytes", "std", "siphasher", "unstable-validator", "ring"] }
 http-body-util = "0.1"
 hyper = { version = "1", features = ["server", "http1"] }
 hyper-util = { version = "0.1", features = ["tokio"] }
@@ -29,3 +37,11 @@ tracing-subscriber = { version = "0.3.23", features = ["json", "env-filter"] }
 
 [dev-dependencies]
 tokio = { version = "1.28.2", features = ["test-util"] }
+# unstable-sign is dev-only: it generates the deterministic signed test-zone
+# fixture for the DNSSEC validator tests (no external signing tool like
+# ldns-signzone is assumed to be on the host). Cargo's feature resolver keeps
+# dev-dependency-only features out of the release/lib build.
+domain = { version = "0.12.1", default-features = false, features = ["zonefile", "bytes", "std", "siphasher", "unstable-sign", "ring"] }
+# For computing the DS digest of the fixture's child-zone DNSKEY by hand
+# (RFC 4034 Appendix B) -- `domain` doesn't expose a Dnskey-to-Ds builder.
+ring = "0.17"

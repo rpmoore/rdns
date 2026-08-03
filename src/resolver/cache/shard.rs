@@ -30,8 +30,11 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime};
 
+use domain::base::Serial;
+
 use super::entry::{
-    DomainNegativeEntries, DomainRecordSets, NegativeEntry, NegativeKey, RRsetEntry,
+    DnssecState, DomainNegativeEntries, DomainRecordSets, NegativeEntry, NegativeKey, RRsetEntry,
+    StoredRecord,
 };
 use super::lru::ShardLru;
 use crate::config::{LeakRate, RefreshConfig};
@@ -538,6 +541,36 @@ fn stale_servability(
     if entry.cache_epoch != current_epoch {
         return StaleServability::Evict;
     }
+    // A `Bogus` entry must never be served via serve-stale, regardless of
+    // window or TTL state -- serving a known-tampered response past its
+    // expiration defeats the point of validating it in the first place.
+    // Checked early, ahead of the window/zero-TTL checks below, since no
+    // other condition can make a `Bogus` entry servable.
+    if matches!(entry.dnssec_state, DnssecState::Bogus(_)) {
+        return StaleServability::Evict;
+    }
+    // A `Secure` entry's RRSIGs have their own cryptographic validity
+    // window (`signature_expiration`), independent of -- and not
+    // necessarily equal to -- `expires_at`: `cap_expires_at_to_rrsig_
+    // expiration` (`resolver::mod`) only *caps* `expires_at` to the
+    // earliest RRSIG expiration when that's *tighter* than the
+    // TTL-derived value, so being past `expires_at` here does not by
+    // itself prove the RRSIGs have cryptographically expired (a short
+    // origin TTL with a long-lived RRSIG is a routine, harmless case).
+    // What it does mean, when the RRSIGs *are* now past their own
+    // expiration, is that continuing to serve-stale would keep the entry
+    // marked `Secure` (AD=1 for a DO/AD requester, per `dnssec_ad_bit`)
+    // and put an now-cryptographically-invalid RRSIG on the wire for a
+    // DO=true reader throughout the entire stale window -- defeating
+    // DNSSEC validation the same way a served-stale `Bogus` entry would,
+    // just via signature expiry instead of an outright tampering
+    // detection. Checked only for `Secure` (not `Insecure`/`Unvalidated`,
+    // which carry no cryptographic claim to invalidate).
+    if entry.dnssec_state == DnssecState::Secure
+        && !rrsigs_still_cryptographically_valid(&entry.rrsigs, now)
+    {
+        return StaleServability::Evict;
+    }
     // The TTL-0 exclusion checks each stored record's own origin TTL
     // (`ttl_at_store`), not `entry.minimum_ttl`: with a configured
     // `min_positive_ttl` floor, `minimum_ttl` is the policy-bounded cache
@@ -564,6 +597,47 @@ fn stale_servability(
         return StaleServability::KeepButMiss;
     }
     StaleServability::Servable
+}
+
+/// Whether every RRSIG in `rrsigs` is still within its own cryptographic
+/// validity window (inception..=expiration) as of `now` -- mirrors the
+/// expiration extraction `resolver::mod::cap_expires_at_to_rrsig_expiration`
+/// uses at store time, but as a live `now`-relative check rather than a
+/// store-time cap, and covering both ends of the window: an RRSIG whose
+/// `signature_inception` is still in the future is just as cryptographically
+/// invalid as one past its `signature_expiration` (clock skew on the
+/// storing path, or a pre-published zone, can produce this shape) -- no
+/// validator would accept it either way, so it must not be served with
+/// AD=1 during the stale window any more than an expired one would. `true`
+/// (vacuously) when `rrsigs` is empty -- nothing to have expired.
+///
+/// Compares via `domain::base::Serial` (RFC 1982 serial-number arithmetic),
+/// not a naive absolute-`SystemTime` conversion: RFC 4034 SS3.1.5 requires
+/// RRSIG inception/expiration to be compared this way specifically because
+/// the 32-bit field wraps (~2106) -- converting straight to `SystemTime` by
+/// adding seconds-since-epoch would misjudge validity for any RRSIG whose
+/// window straddles that rollover (e.g. `inception` just before it,
+/// `expiration` just after). `now` is truncated to the same 32-bit space
+/// via `Serial`, matching this module's existing use of `Serial` for SOA
+/// serials.
+fn rrsigs_still_cryptographically_valid(rrsigs: &[StoredRecord], now: SystemTime) -> bool {
+    let now_serial = Serial(
+        now.duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs() as u32,
+    );
+    rrsigs.iter().all(|record| match &record.rdata {
+        RecordData::RRSIG {
+            signature_expiration,
+            signature_inception,
+            ..
+        } => {
+            let expiration = Serial(*signature_expiration);
+            let inception = Serial(*signature_inception);
+            now_serial <= expiration && now_serial >= inception
+        }
+        _ => true,
+    })
 }
 
 /// Pure trigger-formula check — see
@@ -1981,6 +2055,290 @@ mod tests {
         assert!(
             shard.contains_positive(domain, (A_QTYPE, IN_QCLASS)),
             "a stale-served entry must stay cached for the next reader"
+        );
+    }
+
+    #[test]
+    fn lookup_hop_evicts_expired_bogus_entry_instead_of_serving_stale() {
+        // section-04 (A6): a `Bogus` entry must never be served via
+        // serve-stale, even within the window that would otherwise make it
+        // servable -- serving a known-tampered response past its expiration
+        // defeats the point of validating it.
+        let shard = stale_shard();
+        let domain = "bogus-stale.example.com";
+        let now = SystemTime::now();
+        let mut entry = expired_rrset_entry(now);
+        entry.dnssec_state = DnssecState::Bogus("signature verification failed".to_string());
+        shard.store_positive(domain, (A_QTYPE, IN_QCLASS), entry);
+
+        let result = shard.lookup_hop(
+            domain,
+            A_QTYPE,
+            IN_QCLASS,
+            false,
+            1,
+            now,
+            &test_refresh_config(),
+        );
+
+        assert!(
+            matches!(result, HopResult::Miss),
+            "expected a Bogus expired entry to be evicted rather than stale-served, got {result:?}"
+        );
+        assert!(
+            !shard.contains_positive(domain, (A_QTYPE, IN_QCLASS)),
+            "a Bogus entry excluded from serve-stale must not remain cached"
+        );
+    }
+
+    #[test]
+    fn lookup_hop_serves_stale_secure_entry_unaffected_by_bogus_exclusion() {
+        // No-regression check: `Secure`/`Insecure` entries keep today's
+        // serve-stale behavior unchanged by the new Bogus exclusion above.
+        let shard = stale_shard();
+        let domain = "secure-stale.example.com";
+        let now = SystemTime::now();
+        let mut entry = expired_rrset_entry(now);
+        entry.dnssec_state = DnssecState::Secure;
+        shard.store_positive(domain, (A_QTYPE, IN_QCLASS), entry);
+
+        let result = shard.lookup_hop(
+            domain,
+            A_QTYPE,
+            IN_QCLASS,
+            false,
+            1,
+            now,
+            &test_refresh_config(),
+        );
+
+        assert!(
+            matches!(result, HopResult::Answer(_, true)),
+            "expected a Secure expired entry to still be stale-served, got {result:?}"
+        );
+    }
+
+    #[test]
+    fn lookup_hop_evicts_expired_secure_entry_with_cryptographically_expired_rrsig() {
+        // Regression coverage for a PR review finding: a `Secure` entry
+        // whose only RRSIG's own `signature_expiration` has already
+        // passed must be excluded from serve-stale the same way a `Bogus`
+        // entry is -- continuing to serve it would keep claiming AD=1
+        // (`dnssec_ad_bit` only checks `dnssec_state == Secure`, not
+        // signature currency) and put a cryptographically-invalid RRSIG on
+        // the wire for a DO=true reader throughout the whole stale window.
+        let shard = stale_shard();
+        let domain = "expired-rrsig-stale.example.com";
+        let now = SystemTime::now();
+        let mut entry = expired_rrset_entry(now);
+        entry.dnssec_state = DnssecState::Secure;
+        entry.rrsigs = vec![StoredRecord {
+            rtype: 46, // RRSIG
+            rclass: IN_QCLASS,
+            ttl_at_store: 300,
+            rdata: RecordData::RRSIG {
+                type_covered: A_QTYPE,
+                algorithm: 8,
+                labels: 2,
+                original_ttl: 300,
+                // Already in the past relative to `now` (real wall-clock
+                // seconds since epoch, comfortably behind `SystemTime::now()`).
+                signature_expiration: 1_000_000_000,
+                signature_inception: 900_000_000,
+                key_tag: 1,
+                signer_name: "example.com".to_string(),
+                signature: vec![0xaa],
+            },
+        }];
+        shard.store_positive(domain, (A_QTYPE, IN_QCLASS), entry);
+
+        let result = shard.lookup_hop(
+            domain,
+            A_QTYPE,
+            IN_QCLASS,
+            false,
+            1,
+            now,
+            &test_refresh_config(),
+        );
+
+        assert!(
+            matches!(result, HopResult::Miss),
+            "expected a Secure entry with a cryptographically expired RRSIG to be evicted \
+             rather than stale-served, got {result:?}"
+        );
+        assert!(
+            !shard.contains_positive(domain, (A_QTYPE, IN_QCLASS)),
+            "must not remain cached, same as the Bogus exclusion"
+        );
+    }
+
+    #[test]
+    fn lookup_hop_evicts_expired_secure_entry_with_not_yet_valid_rrsig() {
+        // Sibling of the expired-RRSIG test above, covering the other end
+        // of the validity window: an RRSIG whose `signature_inception` is
+        // still in the future (clock skew on the storing path, or a
+        // pre-published zone) is just as cryptographically invalid as one
+        // past its expiration -- no validator would accept it either way.
+        let shard = stale_shard();
+        let domain = "not-yet-valid-rrsig-stale.example.com";
+        let now = SystemTime::now();
+        let now_secs = now
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as u32;
+        let mut entry = expired_rrset_entry(now);
+        entry.dnssec_state = DnssecState::Secure;
+        entry.rrsigs = vec![StoredRecord {
+            rtype: 46, // RRSIG
+            rclass: IN_QCLASS,
+            ttl_at_store: 300,
+            rdata: RecordData::RRSIG {
+                type_covered: A_QTYPE,
+                algorithm: 8,
+                labels: 2,
+                original_ttl: 300,
+                signature_expiration: now_secs + 7200, // 2h from now
+                signature_inception: now_secs + 3600,  // 1h from now -- not yet valid
+                key_tag: 1,
+                signer_name: "example.com".to_string(),
+                signature: vec![0xaa],
+            },
+        }];
+        shard.store_positive(domain, (A_QTYPE, IN_QCLASS), entry);
+
+        let result = shard.lookup_hop(
+            domain,
+            A_QTYPE,
+            IN_QCLASS,
+            false,
+            1,
+            now,
+            &test_refresh_config(),
+        );
+
+        assert!(
+            matches!(result, HopResult::Miss),
+            "expected a Secure entry with a not-yet-valid RRSIG to be evicted rather than \
+             stale-served, got {result:?}"
+        );
+        assert!(
+            !shard.contains_positive(domain, (A_QTYPE, IN_QCLASS)),
+            "must not remain cached, same as the expired-RRSIG exclusion"
+        );
+    }
+
+    #[test]
+    fn lookup_hop_serves_stale_secure_entry_at_exact_rrsig_expiration_boundary() {
+        // Boundary regression: `rrsigs_still_cryptographically_valid`'s own
+        // doc comment states the validity window is `inception..=expiration`
+        // (inclusive) -- `now == signature_expiration` exactly must still
+        // count as valid, not one instant past it. An off-by-one here
+        // (`expiration > now` instead of `>=`) would unnecessarily evict an
+        // otherwise-still-valid `Secure` entry right at the boundary.
+        let shard = stale_shard();
+        let domain = "exact-expiration-boundary.example.com";
+        // Fixed, whole-second `now` (not `SystemTime::now()`): the stored
+        // `signature_expiration` field is itself whole-second `u32`
+        // precision, so pinning `now` to a whole second is what actually
+        // lets this test land exactly on the boundary instead of a
+        // sub-second offset making the comparison pass or fail by
+        // coincidence.
+        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+        let now_secs = 1_700_000_000u32;
+        let mut entry = expired_rrset_entry(now);
+        entry.dnssec_state = DnssecState::Secure;
+        entry.rrsigs = vec![StoredRecord {
+            rtype: 46, // RRSIG
+            rclass: IN_QCLASS,
+            ttl_at_store: 300,
+            rdata: RecordData::RRSIG {
+                type_covered: A_QTYPE,
+                algorithm: 8,
+                labels: 2,
+                original_ttl: 300,
+                signature_expiration: now_secs, // exactly now
+                signature_inception: now_secs - 3600,
+                key_tag: 1,
+                signer_name: "example.com".to_string(),
+                signature: vec![0xaa],
+            },
+        }];
+        shard.store_positive(domain, (A_QTYPE, IN_QCLASS), entry);
+
+        let result = shard.lookup_hop(
+            domain,
+            A_QTYPE,
+            IN_QCLASS,
+            false,
+            1,
+            now,
+            &test_refresh_config(),
+        );
+
+        assert!(
+            matches!(result, HopResult::Answer(_, true)),
+            "expected a Secure entry at exactly its RRSIG's signature_expiration to still be \
+             stale-servable, got {result:?}"
+        );
+    }
+
+    #[test]
+    fn lookup_hop_serves_stale_secure_entry_with_rrsig_window_crossing_32bit_rollover() {
+        // Regression coverage for a PR review finding: RFC 4034 SS3.1.5
+        // requires RRSIG inception/expiration to be compared via RFC 1982
+        // serial-number arithmetic, not by converting the raw 32-bit value
+        // straight to an absolute `SystemTime` -- the field wraps (~2106).
+        // A naive absolute conversion would put `signature_inception =
+        // u32::MAX - 7200` at a `SystemTime` far in the future (near the
+        // 2106 rollover) and `signature_expiration = 3600` at a
+        // `SystemTime` near the Unix epoch (1970) -- i.e. numerically
+        // *before* the inception it's supposed to follow -- so the naive
+        // check would treat this RRSIG as permanently invalid regardless
+        // of `now`, even though its real (wrapped) validity window is
+        // perfectly ordinary. `now = 0` sits inside that wrapped window
+        // (short RFC 1982 forward-distance from both endpoints), so a
+        // correct `Serial`-based comparison must still treat it as valid.
+        // `now` is pinned to a small-but-nonzero offset from `UNIX_EPOCH`
+        // (not exactly the rollover point) so `expired_rrset_entry`'s own
+        // `now - 600s` doesn't underflow.
+        let shard = stale_shard();
+        let domain = "rrsig-rollover.example.com";
+        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(700);
+        let mut entry = expired_rrset_entry(now);
+        entry.dnssec_state = DnssecState::Secure;
+        entry.rrsigs = vec![StoredRecord {
+            rtype: 46, // RRSIG
+            rclass: IN_QCLASS,
+            ttl_at_store: 300,
+            rdata: RecordData::RRSIG {
+                type_covered: A_QTYPE,
+                algorithm: 8,
+                labels: 2,
+                original_ttl: 300,
+                signature_expiration: 3600, // 1h after the rollover point
+                signature_inception: u32::MAX - 7200, // 2h before the rollover point
+                key_tag: 1,
+                signer_name: "example.com".to_string(),
+                signature: vec![0xaa],
+            },
+        }];
+        shard.store_positive(domain, (A_QTYPE, IN_QCLASS), entry);
+
+        let result = shard.lookup_hop(
+            domain,
+            A_QTYPE,
+            IN_QCLASS,
+            false,
+            1,
+            now,
+            &test_refresh_config(),
+        );
+
+        assert!(
+            matches!(result, HopResult::Answer(_, true)),
+            "expected a Secure entry whose RRSIG validity window wraps the 32-bit rollover to \
+             still be stale-servable when now falls inside that window, got {result:?}"
         );
     }
 

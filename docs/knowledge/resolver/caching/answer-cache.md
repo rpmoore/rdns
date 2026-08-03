@@ -4,7 +4,7 @@ title: DNS Answer Cache
 description: Sharded, in-memory cache of backend/upstream DNS answers, keyed by domain name.
 resource: src/resolver/cache/mod.rs
 tags: [cache, dns, resolver]
-timestamp: 2026-07-15T00:00:00Z
+timestamp: 2026-07-31T00:00:00Z
 ---
 
 Caches responses obtained from actual backend resolution — forwarding or
@@ -51,7 +51,7 @@ concurrency.
 |---|---|
 | `records` / `soa_record` + proof records | The actual RRset or negative-cache proof material. |
 | `stored_at` / `expires_at` | TTL bookkeeping — `expires_at` is checked on every lookup; an expired entry is served stale (within the [serve-stale](serve-stale.md) window, positive entries only), kept-but-missed (in-window but DO-filtered for *this* reader — a DO=true reader vs. `dnssec_complete == false` misses while the entry stays for DO=false readers), or deleted immediately at read time (not just filtered out), see `Shard::lookup_hop`/`stale_servability`. |
-| `dnssec_state` | RFC 6840 §3.1 validation state; stays `Unvalidated` until real DNSSEC validation exists — orthogonal to everything else in this document. |
+| `dnssec_state` | RFC 6840 §3.1 validation state, computed by `ResolveQuery::validate_for_store` for `ResolutionMode::Recursive` fetches only (`Unvalidated`/`Insecure`/`Secure`/`Bogus`) — `Bogus` entries are additionally excluded from [serve-stale](serve-stale.md) eligibility. `Forward` mode never populates a real verdict; see [dnssec-validation](../dnssec-validation.md) for the validator itself — otherwise orthogonal to everything else in this document. |
 | `dnssec_complete` | Whether this entry was populated by a fetch that actually requested DNSSEC material (DO=1). A DO=1 reader must never be served an entry where this is `false`, even if TTL-valid — see `Shard::lookup_hop`'s DO-aware filtering. |
 | `authoritative` | The backend response's own AA bit, replayed on a cache hit. |
 | `cache_epoch` | Cache-identity tag, compared for equality at lookup/sweep time. See [cache-epoch](cache-epoch.md) for the whole mechanism — this field is the one piece of it that lives on the entry itself. |
@@ -210,24 +210,63 @@ details are applied at serve time" pattern already described above in
 read" — cookies are just another instance of it, not an exception.
 
 **Security trade-off — read this before assuming any anti-spoofing
-protection exists.** This resolver never validates an incoming *server*
-cookie's hash or timestamp window, never generates BADCOOKIE (RCODE 23), and
-never rejects a query for cookie-related reasons — every query is processed
-normally and every response gets a freshly-computed, valid server cookie,
-unconditionally. This is one of RFC 7873's own compliant behaviors (§5.2.3/
-§5.2.4 branch 3: "process the request and provide a normal response"), not a
-corner cut — but it means this implementation gains **no**
-anti-off-path-spoofing value from DNS Cookies. That protection comes from
-the incoming-cookie validation/rejection path this implementation
-deliberately does not build — see the module doc comment at
-`src/protocol/edns_cookie.rs:15-21` ("never validates an incoming server
-cookie's hash or timestamp") and `parse_cookie_option`
-(`src/protocol/edns_cookie.rs:113-131`, whose own doc comment repeats the
-same non-goal at the one function that actually reads an incoming cookie);
-the full non-goals list (no BADCOOKIE, no server-cookie verification, no
-secret rotation) is in
-`docs/plans/edns_cookie_cache/claude-plan.md`. If you're checking whether
-rdns has DNS Cookie *protection*: no — it has Cookie *echo/interop* only.
+protection exists.** As of Track B (`docs/plans/sec_work/`), this resolver
+**does** validate an incoming *server* cookie (recompute-and-compare via
+`build_server_cookie`/`server_cookie_matches`, wired into `probe_cache` by
+`invalid_server_cookie`, `src/resolver/mod.rs`) and **does**
+generate BADCOOKIE (RCODE 23, `build_badcookie_response`) for a tampered,
+stale, or malformed (but at-least-8-byte) server-cookie tail — but **only
+over UDP**. RFC 7873 §5.2.3's TCP carve-out means the identical invalid
+cookie presented over TCP is still processed normally, unconditionally,
+exactly as this section described for *all* transports before Track B —
+`invalid_server_cookie` returns `None` immediately for any TCP request
+without inspecting the cookie at all. Say this transport split explicitly:
+a reader skimming only the first sentence should not conclude BADCOOKIE
+applies uniformly.
+
+`server_cookie_matches` (`src/protocol/edns_cookie.rs`) also enforces an
+RFC 9018 §4.3 age window on the server cookie's own embedded timestamp
+(`MAX_SERVER_COOKIE_AGE` 1 hour past, `MAX_SERVER_COOKIE_FUTURE_SKEW` 5
+minutes future) before even computing the hash — a validly-hashed but
+stale or implausibly-future-dated cookie is rejected the same way a
+tampered one is. This mostly matters once secret rotation exists (not yet
+implemented, see `edns_cookie.rs`'s module doc comment): without
+rotation, a hash-valid cookie would otherwise stay accepted indefinitely
+regardless of age.
+
+A COOKIE option too short to even hold an 8-byte client cookie (declared
+length 0-7, still a structurally valid TLV) gets FORMERR
+(`probe_cache`, `src/resolver/mod.rs`) — RFC 7873 §5.2.2, since there's
+no client cookie available to echo back in a BADCOOKIE response at all.
+This is checked independent of transport (a basic protocol violation, not
+UDP-specific anti-spoofing), ahead of and separate from the BADCOOKIE
+check.
+
+A client cookie with **no server-cookie tail at all** (first contact, RFC
+7873 §5.2.3) is unchanged by Track B and still processed normally on both
+transports, with a fresh server cookie issued — `locate_cookie_for_verification`
+classifies this as `CookieVerification::ClientOnly`, which
+`invalid_server_cookie` never rejects. A request with more than one COOKIE
+option (`CookieVerification::Duplicate`) is treated the same way — not
+specially rejected, not specially trusted, just processed as if no cookie
+had been presented, mirroring `locate_cookie_option`'s pre-existing
+duplicate-collapsing behavior for cookie *echo*.
+
+Net effect: this resolver now gains **some** anti-off-path-spoofing value
+from DNS Cookies over UDP — an off-path attacker without visibility into a
+client's already-issued server cookie cannot forge a response the client
+will accept, matching RFC 7873's intended protection model for that
+transport. It still gains **none** over TCP, where the carve-out means a
+tampered cookie is silently tolerated; that's not a gap this implementation
+introduced, it's RFC 7873 §5.2.3 relying on TCP's own inherent
+difficulty-to-off-path-spoof instead. See
+`src/protocol/edns_cookie.rs:15-21`'s module doc comment and
+`parse_cookie_option`'s doc comment (`:113-131`) for where the validation
+logic actually lives — `parse_cookie_option`/`locate_cookie_option`
+themselves still only extract the client cookie and remain unchanged; the
+new verification path is `locate_cookie_for_verification` and
+`server_cookie_matches`, called from `src/resolver/mod.rs`, not from this
+module.
 
 # Concurrency model, in one sentence
 

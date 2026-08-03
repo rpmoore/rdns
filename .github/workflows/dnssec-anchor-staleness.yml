@@ -1,0 +1,31 @@
+name: DNSSEC trust anchor staleness
+
+# Scheduled, not PR/push-triggered: IANA endpoint flakiness must not block
+# unrelated work. A failing scheduled run notifies via GitHub's own
+# scheduled-workflow-failure emails to repo watchers - see
+# scripts/check-trust-anchor-staleness.sh for what triggers a failure.
+on:
+  schedule:
+    - cron: '0 6 * * 1' # weekly, Monday 06:00 UTC
+  workflow_dispatch:
+
+jobs:
+  trust-anchor-staleness:
+    name: Check bundled trust anchor freshness
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Install just
+        uses: taiki-e/install-action@v2
+        with:
+          tool: just
+
+      - name: Check trust anchor staleness
+        run: just check-trust-anchor-staleness
