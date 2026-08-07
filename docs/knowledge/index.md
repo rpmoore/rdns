@@ -8,3 +8,4 @@ okf_version: "0.1"
   flows from socket to response. Start here.
 * [resolver](resolver/) - DNS resolution engine: caching, recursive/forwarding backends, protocol
   handling.
+* [config](config/) - Runtime settings and the IANA data snapshots bundled into the binary.

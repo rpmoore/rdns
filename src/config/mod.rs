@@ -1021,8 +1021,10 @@ fn is_usable_authority_address(address: IpAddr) -> bool {
 }
 
 /// IANA/InterNIC's root hints zone file, as published at
-/// <https://www.internic.net/domain/named.root>. Update by re-fetching that
-/// URL over this file; the file's contents are embedded at compile time via
+/// <https://www.internic.net/domain/named.root>. Update with
+/// `just update-iana-data`, which leaves this file alone when upstream's
+/// only change is a comment (the `; last update:` header moves on every
+/// publish); the file's contents are embedded at compile time via
 /// `include_str!`, but `parse_named_root` re-derives the bundled hints from
 /// it at runtime (see `bundled_root_hints`), so no other code needs to change.
 const BUNDLED_NAMED_ROOT: &str = include_str!("named.root");
@@ -1080,16 +1082,20 @@ fn parse_named_root(source: &str) -> Result<Vec<RootHintConfig>, String> {
 
 /// IANA's published list of currently-delegated (root-zone) top-level
 /// domains, as fetched from
-/// <https://data.iana.org/TLD/tlds-alpha-by-domain.txt>. Update by
-/// re-fetching that URL over this file; `parse_iana_tlds` re-derives the
-/// bundled set from it at runtime (see `bundled_iana_tlds`).
+/// <https://data.iana.org/TLD/tlds-alpha-by-domain.txt>. Update with
+/// `just update-iana-data`, which leaves this file alone when upstream's
+/// only change is a comment (the `# Version ...` header moves on every
+/// publish); `parse_iana_tlds` re-derives the bundled set from it at
+/// runtime (see `bundled_iana_tlds`).
 ///
 /// This is the *only* list local-zone/local-entry names are checked
 /// against (see `validate_not_registered_tld`). IANA's separate
-/// Special-Use Domain Names registry (RFC 6761: `test`, `invalid`,
-/// `example`, `local`, `onion`, `home.arpa`, `localhost`) is never in this
-/// file, so those names are never rejected by that check — they're
-/// reserved by IANA precisely for non-public use like this.
+/// Special-Use Domain Names registry (`test`, `invalid`, `example`,
+/// `local`, `localhost` from RFC 6761; `onion` from RFC 7686) is never in
+/// this file, so those names are never rejected by that check — they're
+/// reserved by IANA precisely for non-public use like this. `home.arpa`
+/// (RFC 8375) is the exception that *does* need handling, since it sits
+/// under the real `arpa` TLD — see `validate_not_registered_tld`.
 const BUNDLED_IANA_TLDS: &str = include_str!("tlds-alpha-by-domain.txt");
 
 fn bundled_iana_tlds() -> &'static HashSet<String> {
