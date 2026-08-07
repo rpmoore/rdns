@@ -18,7 +18,7 @@ no network fetch and no on-disk assets:
   (`BUNDLED_NAMED_ROOT`, `src/config/mod.rs:1030`), from
   <https://www.internic.net/domain/named.root>.
 - `src/config/tlds-alpha-by-domain.txt` — IANA's currently-delegated TLD
-  list (`BUNDLED_IANA_TLDS`, `src/config/mod.rs:1097`), from
+  list (`BUNDLED_IANA_TLDS`, `src/config/mod.rs:1099`), from
   <https://data.iana.org/TLD/tlds-alpha-by-domain.txt>.
 
 A third bundled IANA asset, `src/config/root-anchor.txt`, is covered by
@@ -55,7 +55,7 @@ single choke point both flow through.
 file's header. It is an operator-supplied opaque string (e.g.
 `"bundled:v1"`) that feeds the cache namespace
 (`src/config/mod.rs:272`) and is only validated as non-empty
-(`ConfigError::InvalidRootHintsVersion`, `src/config/mod.rs:792`).
+(`ConfigError::InvalidRootHintsVersion`, `src/config/mod.rs:793`).
 Refreshing `named.root` does not change it automatically.
 
 It is not, however, the only thing that invalidates the cache on a
@@ -71,11 +71,11 @@ resolver depends on has changed.
 
 # TLD list
 
-`bundled_iana_tlds` (`src/config/mod.rs:1099`) parses once into a
+`bundled_iana_tlds` (`src/config/mod.rs:1101`) parses once into a
 `OnceLock<HashSet<String>>` of lowercased TLDs, panicking on a malformed
 asset for the same reason as above.
 
-`parse_iana_tlds` (`src/config/mod.rs:1110`) is deliberately strict: a
+`parse_iana_tlds` (`src/config/mod.rs:1112`) is deliberately strict: a
 comment is only a line whose first non-blank character is `#` (that's the
 version header), every other non-blank line must be exactly one
 whitespace-free token, and an empty result is an error.
@@ -88,13 +88,14 @@ the freshness check treats a mid-line `#` as drift rather than stripping
 it.
 
 The set has exactly one consumer: `validate_not_registered_tld`
-(`src/config/mod.rs:1151`), via `is_registered_iana_tld`
-(`src/config/mod.rs:1133`). It rejects a local DNS name whose rightmost
+(`src/config/mod.rs:1153`), via `is_registered_iana_tld`
+(`src/config/mod.rs:1135`). It rejects a local DNS name whose rightmost
 label is a real delegated TLD, so a local override can never claim
 authority over a real public domain. `home.arpa` is the one explicit
-exception (RFC 8375), since `arpa` itself is in the list. RFC 6761
-special-use names (`test`, `invalid`, `example`, `local`, `onion`,
-`localhost`) never appear in this file at all, so they need no exception.
+exception (RFC 8375), since `arpa` itself is in the list. The other
+special-use names — `test`, `invalid`, `example`, `local`, `localhost`
+(RFC 6761) and `onion` (RFC 7686) — never appear in this file at all, so
+they need no exception.
 
 # Freshness checking
 

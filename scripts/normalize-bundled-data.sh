@@ -12,7 +12,7 @@
 #              parse_named_root (src/config/mod.rs:1047, which takes
 #              `raw_line.split(';').next()`).
 #   tld-list   only a line whose first non-blank character is `#` is a
-#              comment, matching parse_iana_tlds (src/config/mod.rs:1114,
+#              comment, matching parse_iana_tlds (src/config/mod.rs:1116,
 #              which tests `line.starts_with('#')` on the trimmed line).
 #              A mid-line `#` is left in place: the parser either rejects
 #              the line (`COM # note`, three tokens) or takes it literally
