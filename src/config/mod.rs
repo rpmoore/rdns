@@ -1090,10 +1090,12 @@ fn parse_named_root(source: &str) -> Result<Vec<RootHintConfig>, String> {
 ///
 /// This is the *only* list local-zone/local-entry names are checked
 /// against (see `validate_not_registered_tld`). IANA's separate
-/// Special-Use Domain Names registry (RFC 6761: `test`, `invalid`,
-/// `example`, `local`, `onion`, `home.arpa`, `localhost`) is never in this
-/// file, so those names are never rejected by that check — they're
-/// reserved by IANA precisely for non-public use like this.
+/// Special-Use Domain Names registry (`test`, `invalid`, `example`,
+/// `local`, `localhost` from RFC 6761; `onion` from RFC 7686) is never in
+/// this file, so those names are never rejected by that check — they're
+/// reserved by IANA precisely for non-public use like this. `home.arpa`
+/// (RFC 8375) is the exception that *does* need handling, since it sits
+/// under the real `arpa` TLD — see `validate_not_registered_tld`.
 const BUNDLED_IANA_TLDS: &str = include_str!("tlds-alpha-by-domain.txt");
 
 fn bundled_iana_tlds() -> &'static HashSet<String> {

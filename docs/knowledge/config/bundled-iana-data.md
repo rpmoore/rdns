@@ -56,8 +56,18 @@ file's header. It is an operator-supplied opaque string (e.g.
 `"bundled:v1"`) that feeds the cache namespace
 (`src/config/mod.rs:272`) and is only validated as non-empty
 (`ConfigError::InvalidRootHintsVersion`, `src/config/mod.rs:792`).
-Refreshing `named.root` does not change it automatically — bump it by
-hand when a refresh should invalidate cached recursive results.
+Refreshing `named.root` does not change it automatically.
+
+It is not, however, the only thing that invalidates the cache on a
+refresh. `authority_config_hash` (`src/config/mod.rs:841`) hashes the
+*parsed* hints — every root-hint name and every endpoint — into the same
+namespace, so a refresh that actually changes a root server's address or
+name shifts the namespace on its own, with `root_hints_version` untouched.
+The two cover different cases: the hash handles semantic changes
+automatically, while `root_hints_version` is the operator's explicit
+override for forcing invalidation when the parsed hints are identical.
+A header-only refresh changes neither — which is the point: nothing the
+resolver depends on has changed.
 
 # TLD list
 
@@ -68,9 +78,14 @@ asset for the same reason as above.
 `parse_iana_tlds` (`src/config/mod.rs:1110`) is deliberately strict: a
 comment is only a line whose first non-blank character is `#` (that's the
 version header), every other non-blank line must be exactly one
-whitespace-free token, and an empty result is an error. A mid-line `#`
-is therefore **not** a comment — it makes the line a two-token line and
-fails the parse.
+whitespace-free token, and an empty result is an error.
+
+A mid-line `#` is therefore never a comment, though what happens next
+depends on spacing: `COM # note` is three tokens and fails the parse,
+while `COM#note` is a single token and is silently accepted as the bogus
+TLD `com#note`. Neither outcome is "the data is unchanged", which is why
+the freshness check treats a mid-line `#` as drift rather than stripping
+it.
 
 The set has exactly one consumer: `validate_not_registered_tld`
 (`src/config/mod.rs:1151`), via `is_registered_iana_tld`
@@ -101,6 +116,13 @@ So the check compares bytes first and, only if they differ, compares
 - Byte-identical → pass.
 - Normalized-identical → `::notice`, pass. The bundled copy stays as-is.
 - Otherwise → `::error` plus a unified diff, exit 1.
+
+Both normalizer runs write to files whose exit status is checked, rather
+than being compared through process substitution. Bash does not propagate
+a process substitution's exit status, so a normalizer that failed to run
+would hand `diff` two empty streams — which compare equal, quietly
+downgrading a broken check to "comment-only, pass". A normalization
+failure is instead reported as an error and treated as stale.
 
 `normalize-bundled-data.sh` takes a format mode rather than a comment
 character, because each mode mirrors one parser exactly — that

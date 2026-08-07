@@ -17,8 +17,13 @@ curl_opts=(--fail --silent --show-error --retry 3 --retry-delay 2 --connect-time
 
 status=0
 
-normalize() {
-  "$repo_root/scripts/normalize-bundled-data.sh" "$1" "$2"
+# Writes the normalized form of $2 to $3. Deliberately not used via process
+# substitution: bash does not propagate a process substitution's exit status,
+# so a normalizer that failed to run would feed `diff` two empty streams and
+# look like "identical" — turning a broken check into a silent pass.
+normalize_to() {
+  local format="$1" source="$2" dest="$3"
+  "$repo_root/scripts/normalize-bundled-data.sh" "$format" "$source" > "$dest"
 }
 
 check() {
@@ -35,9 +40,14 @@ check() {
     return
   fi
 
-  if diff -q \
-    <(normalize "$format" "$repo_root/$bundled") \
-    <(normalize "$format" "$fetched") > /dev/null; then
+  if ! normalize_to "$format" "$repo_root/$bundled" "$fetched.bundled.normalized" \
+    || ! normalize_to "$format" "$fetched" "$fetched.upstream.normalized"; then
+    echo "::error file=$bundled::Failed to normalize $bundled for comparison; cannot tell a comment-only change from real drift. Treating as stale."
+    status=1
+    return
+  fi
+
+  if diff -q "$fetched.bundled.normalized" "$fetched.upstream.normalized" > /dev/null; then
     echo "::notice file=$bundled::Upstream differs only in comments/metadata (e.g. version or date header); bundled data is still current, no refresh needed."
     return
   fi

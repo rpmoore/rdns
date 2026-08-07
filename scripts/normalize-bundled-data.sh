@@ -14,8 +14,10 @@
 #   tld-list   only a line whose first non-blank character is `#` is a
 #              comment, matching parse_iana_tlds (src/config/mod.rs:1114,
 #              which tests `line.starts_with('#')` on the trimmed line).
-#              A mid-line `#` is left in place — the parser would reject
-#              such a line, so it must count as drift, not as a comment.
+#              A mid-line `#` is left in place: the parser either rejects
+#              the line (`COM # note`, three tokens) or takes it literally
+#              (`COM#note` becomes the TLD `com#note`). Either way it
+#              changes the parsed result, so it must count as drift.
 #
 # Both modes then collapse runs of whitespace and drop blank lines, since
 # both parsers trim and split on whitespace.
