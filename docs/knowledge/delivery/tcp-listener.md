@@ -13,8 +13,8 @@ timestamp: 2026-08-10T00:00:00Z
 `TcpDnsServer` (`src/delivery/dns.rs:382-585`) is a first-class DNS
 listener, not a large-response fallback: RFC 7766 makes TCP mandatory, and
 `main()` binds it alongside the UDP listener(s) unconditionally
-(`TcpDnsServer::bind_configured`, `src/main.rs:196`, called from
-`src/delivery/dns.rs:463-484`). One `TcpDnsServer` is bound per configured
+(`TcpDnsServer::bind_configured`, `src/delivery/dns.rs:463-484`, called
+from `src/main.rs:196`). One `TcpDnsServer` is bound per configured
 address in `RuntimeConfig::dns_listen` (`src/config/mod.rs:35`).
 
 # Connection limits
