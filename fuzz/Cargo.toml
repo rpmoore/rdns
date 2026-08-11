@@ -1,0 +1,28 @@
+[package]
+name = "rdns-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+
+[dependencies.rdns]
+path = ".."
+
+[[bin]]
+name = "dns_message_parse"
+path = "fuzz_targets/dns_message_parse.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "tcp_frame_decode"
+path = "fuzz_targets/tcp_frame_decode.rs"
+test = false
+doc = false
+bench = false
