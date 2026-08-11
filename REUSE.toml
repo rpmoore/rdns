@@ -16,6 +16,7 @@ path = [
     "config.toml",
     "deny.toml",
     "docs/**",
+    "fuzz/**",
     "justfile",
     "scripts/**",
     "skills-lock.json",

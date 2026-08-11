@@ -41,8 +41,13 @@ jobs:
         with:
           tool: cargo-fuzz
 
+      # -timeout bounds a single input's execution (libFuzzer's own default is 1200s,
+      # which -max_total_time does not preempt mid-call -- a hung input would otherwise
+      # run past this job's timeout-minutes with no crash artifact to show for it).
+      # -max_len covers a full-size TCP DNS frame (2-byte prefix + up to 65535 bytes),
+      # since libFuzzer otherwise caps generated inputs at 4096 bytes.
       - name: Run ${{ matrix.target }} for 5 minutes
-        run: cargo fuzz run ${{ matrix.target }} -- -max_total_time=300
+        run: cargo fuzz run ${{ matrix.target }} -- -max_total_time=300 -timeout=10 -max_len=65538
 
       - name: Upload crash artifacts
         if: failure()

@@ -82,10 +82,14 @@ shared implementation).
   subsequent pipelined queries.
 - Queries are pipelined: `serve_tcp_connection` loops, reading and
   answering one length-prefixed query after another on the same connection
-  until the client closes it or goes idle
   (`src/delivery/dns.rs:661-663`, tested by
   `tcp_server_answers_pipelined_queries_on_one_connection`,
-  `src/delivery/dns.rs:1345`).
+  `src/delivery/dns.rs:1345`). The loop — and the connection — ends on
+  any of: the client closing the connection or going idle past
+  `TCP_CONNECTION_IDLE_TIMEOUT` (see Timeouts below), a length prefix
+  shorter than `DNS_HEADER_LEN` (`src/delivery/dns.rs:692-699`), or an
+  I/O error on the message-body read or the response write
+  (`src/delivery/dns.rs:701-703,773-775`).
 
 # Timeouts
 
@@ -118,7 +122,7 @@ drained within the grace period, they're aborted
 # Shared resolver flow with UDP
 
 `serve_tcp_connection` calls the same `ResolveQuery::resolve`
-(`src/resolver/mod.rs:3702`) that the UDP path uses
+(`src/resolver/mod.rs:4759`) that the UDP path uses
 (`handle_datagram`, `src/delivery/dns.rs:348-368`), passing
 `ObservedSourceEndpoint::tcp(peer_addr, Some(listener))`
 (`src/delivery/dns.rs:731`) so query events and metrics can distinguish

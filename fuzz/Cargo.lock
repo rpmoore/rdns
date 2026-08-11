@@ -914,6 +914,7 @@ dependencies = [
 name = "rdns-fuzz"
 version = "0.0.0"
 dependencies = [
+ "bytes",
  "libfuzzer-sys",
  "rdns",
 ]
