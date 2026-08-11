@@ -1,6 +1,13 @@
 fmt:
     cargo fmt
 
+# Fuzzes one target (default: dns_message_parse) for a bounded time in seconds.
+# Requires the nightly toolchain and cargo-fuzz: `rustup toolchain install nightly`,
+# `cargo install cargo-fuzz`. Available targets: dns_message_parse, tcp_frame_decode
+# (see fuzz/fuzz_targets/). Findings land in fuzz/artifacts/<target>/.
+fuzz target="dns_message_parse" seconds="60":
+    cargo +nightly fuzz run {{target}} -- -max_total_time={{seconds}} -timeout=10 -max_len=65538
+
 bench:
     cargo test --locked --release --test recursive_perf --test cache_concurrency_bench -- --ignored --nocapture --test-threads=1
 

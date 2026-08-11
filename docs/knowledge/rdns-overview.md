@@ -86,8 +86,8 @@ in `resolver/rd-bit-handling.md`.
 build the local-DNS-entries handle, build the resolution backend for
 whichever mode is configured (`build_forward_backend_snapshot` /
 `build_recursive_backend_snapshot`, `src/main.rs:660-661`), bind the UDP
-listener(s) (`UdpDnsServer::bind_configured`, `src/main.rs:152`) and TCP
-listener(s) (`TcpDnsServer::bind_configured`, `src/main.rs:160`), then
+listener(s) (`UdpDnsServer::bind_configured`, `src/main.rs:187`) and TCP
+listener(s) (`TcpDnsServer::bind_configured`, `src/main.rs:196`), then
 serve until shutdown. A SIGHUP handler
 (`spawn_sighup_reload_task`, `src/main.rs:573`) re-reads the config file
 and publishes a new backend/local-entries snapshot atomically, without a

@@ -1,0 +1,59 @@
+name: Nightly fuzzing
+
+# Scheduled, not PR/push-triggered: fuzzing is unbounded-time by nature and
+# must not gate normal development. A failing scheduled run notifies via
+# GitHub's own scheduled-workflow-failure emails to repo watchers, same
+# pattern as dnssec-anchor-staleness.yml. See fuzz/fuzz_targets/ for what
+# each target covers (docs/plan/08-implementation-roadmap.md#milestone-11-tcp-and-operational-hardening).
+on:
+  schedule:
+    - cron: '0 7 * * *' # nightly, 07:00 UTC
+  workflow_dispatch:
+
+jobs:
+  fuzz:
+    name: Fuzz ${{ matrix.target }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [dns_message_parse, tcp_frame_decode]
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Install nightly Rust
+        uses: dtolnay/rust-toolchain@nightly
+
+      - name: Cache Cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: fuzz -> target
+
+      - name: Install cargo-fuzz
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-fuzz
+
+      # -timeout bounds a single input's execution (libFuzzer's own default is 1200s,
+      # which -max_total_time does not preempt mid-call -- a hung input would otherwise
+      # run past this job's timeout-minutes with no crash artifact to show for it).
+      # -max_len covers a full-size TCP DNS frame: 2-byte length prefix + up to 65535
+      # bytes of payload, plus tcp_frame_decode's 1-byte cap selector (65538 total),
+      # since libFuzzer otherwise caps generated inputs at 4096 bytes.
+      - name: Run ${{ matrix.target }} for 5 minutes
+        run: cargo fuzz run ${{ matrix.target }} -- -max_total_time=300 -timeout=10 -max_len=65538
+
+      - name: Upload crash artifacts
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-crash-${{ matrix.target }}
+          path: fuzz/artifacts/${{ matrix.target }}/
+          if-no-files-found: ignore
