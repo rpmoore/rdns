@@ -12,13 +12,13 @@ on:
 
 jobs:
   fuzz:
-    name: Fuzz ${{ matrix.target }}
+    name: Fuzz ${{ matrix.fuzz_target }}
     runs-on: ubuntu-latest
     timeout-minutes: 15
     strategy:
       fail-fast: false
       matrix:
-        target: [dns_message_parse, tcp_frame_decode]
+        fuzz_target: [dns_message_parse]
     permissions:
       contents: read
 
@@ -41,19 +41,26 @@ jobs:
         with:
           tool: cargo-fuzz
 
+      # --target pins the *build triple* (distinct from matrix.fuzz_target, the
+      # libFuzzer target name). cargo-fuzz defaults it to the triple cargo-fuzz
+      # itself was compiled for, not the host: install-action has no cargo-fuzz
+      # manifest and falls back to cargo-binstall, which fetches the musl-built
+      # release binary. That default would build for x86_64-unknown-linux-musl,
+      # which fails twice over -- musl implies crt-static, incompatible with
+      # ASan, and rustup never installed a musl std ("can't find crate for core").
       # -timeout bounds a single input's execution (libFuzzer's own default is 1200s,
       # which -max_total_time does not preempt mid-call -- a hung input would otherwise
       # run past this job's timeout-minutes with no crash artifact to show for it).
-      # -max_len covers a full-size TCP DNS frame: 2-byte length prefix + up to 65535
-      # bytes of payload, plus tcp_frame_decode's 1-byte cap selector (65538 total),
-      # since libFuzzer otherwise caps generated inputs at 4096 bytes.
-      - name: Run ${{ matrix.target }} for 5 minutes
-        run: cargo fuzz run ${{ matrix.target }} -- -max_total_time=300 -timeout=10 -max_len=65538
+      # -max_len covers a full-size DNS message (65535 bytes, the maximum a TCP
+      # length prefix can describe), since libFuzzer otherwise caps generated
+      # inputs at 4096 bytes.
+      - name: Run ${{ matrix.fuzz_target }} for 5 minutes
+        run: cargo fuzz run --target x86_64-unknown-linux-gnu ${{ matrix.fuzz_target }} -- -max_total_time=300 -timeout=10 -max_len=65535
 
       - name: Upload crash artifacts
         if: failure()
         uses: actions/upload-artifact@v4
         with:
-          name: fuzz-crash-${{ matrix.target }}
-          path: fuzz/artifacts/${{ matrix.target }}/
+          name: fuzz-crash-${{ matrix.fuzz_target }}
+          path: fuzz/artifacts/${{ matrix.fuzz_target }}/
           if-no-files-found: ignore
