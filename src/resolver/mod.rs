@@ -2433,8 +2433,8 @@ fn write_hex_bytes(bytes: &mut Vec<u8>, hex: &str) -> Result<(), ResolutionBacke
     if !hex.len().is_multiple_of(2) {
         return Err(ResolutionBackendError::MalformedResponse);
     }
-    let mut chars = hex.as_bytes().chunks_exact(2);
-    for chunk in &mut chars {
+    let (chunks, _remainder) = hex.as_bytes().as_chunks::<2>();
+    for chunk in chunks {
         let high = hex_nibble(chunk[0])?;
         let low = hex_nibble(chunk[1])?;
         bytes.push((high << 4) | low);
