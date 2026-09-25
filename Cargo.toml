@@ -22,9 +22,9 @@ http-body-util = "0.1"
 hyper = { version = "1", features = ["server", "http1"] }
 hyper-util = { version = "0.1", features = ["tokio"] }
 idna = "1"
-opentelemetry = { version = "0.32.0", default-features = false, features = ["metrics"] }
-opentelemetry-prometheus = "0.32"
-opentelemetry_sdk = { version = "0.32.1", default-features = false, features = ["metrics"] }
+opentelemetry = { version = "0.33.0", default-features = false, features = ["metrics"] }
+opentelemetry-prometheus = "0.33.0"
+opentelemetry_sdk = { version = "0.33.0", default-features = false, features = ["metrics"] }
 prometheus = "0.14"
 rand = "0.10"
 serde = { version = "1", features = ["derive"] }
