@@ -23,7 +23,7 @@ hyper = { version = "1", features = ["server", "http1"] }
 hyper-util = { version = "0.1", features = ["tokio"] }
 idna = "1"
 opentelemetry = { version = "0.32.0", default-features = false, features = ["metrics"] }
-opentelemetry-prometheus = "0.32"
+opentelemetry-prometheus = "0.33"
 opentelemetry_sdk = { version = "0.32.1", default-features = false, features = ["metrics"] }
 prometheus = "0.14"
 rand = "0.10"
